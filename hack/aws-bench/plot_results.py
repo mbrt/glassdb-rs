@@ -8,14 +8,24 @@
 #     "seaborn>=0.13",
 # ]
 # ///
-"""Render the canonical perfbench mixed worker and affinity sweeps."""
+"""Plot `perfbench` result files, one set of figures per file.
+
+The scenario recorded in each file selects the figures:
+
+* `mixed`: throughput and latency by shape, one panel per mode. The x-axis is
+  the one dimension that varies: affinity or workers per shape;
+* `contention`: throughput and latency by number of contended keys.
+
+With several runs in a file, lines show the cross-run median. Pass `--canonical`
+to render the four fixed worker and affinity figures of the local S3 model
+instead; that mode insists on the complete grids described in the README.
+"""
 
 from __future__ import annotations
 
 import argparse
-import json
 import math
-from dataclasses import dataclass
+import sys
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -27,7 +37,9 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
 
-SHAPES = ("rwSingle", "rwMany", "roSingle", "roMulti")
+import perfbench_results
+from perfbench_results import SHAPES, ReportError
+
 SHAPE_LABELS = {
     "rwSingle": "RW single-key",
     "rwMany": "RW multi-key",
@@ -42,151 +54,11 @@ EXPECTED_RUNS = (1, 2, 3)
 FIXED_AFFINITY_WORKERS = 20
 WORKER_DATABASE_LIMIT = 5
 METRICS = ("throughput", "p50_ms", "p90_ms")
-
-
-class ReportError(ValueError):
-    """The benchmark report cannot support the requested plots."""
-
-
-@dataclass(frozen=True)
-class ReportMetadata:
-    backend: str
-    model_time_speedup: float
-
-
-def _object(value: Any, field: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ReportError(f"{field} must be an object")
-    return value
-
-
-def _array(value: Any, field: str) -> list[Any]:
-    if not isinstance(value, list):
-        raise ReportError(f"{field} must be an array")
-    return value
-
-
-def _integer(value: Any, field: str, *, minimum: int = 0) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-        raise ReportError(f"{field} must be an integer >= {minimum}")
-    return value
-
-
-def _number(value: Any, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ReportError(f"{field} must be a number")
-    result = float(value)
-    if not math.isfinite(result) or result < 0:
-        raise ReportError(f"{field} must be finite and nonnegative")
-    return result
-
-
-def read_report(path: Path) -> tuple[ReportMetadata, pd.DataFrame]:
-    """Load one version-1 mixed report into one row per run, cell, and shape."""
-    try:
-        report = _object(json.loads(path.read_text()), str(path))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ReportError(f"cannot read {path}: {error}") from error
-
-    if report.get("schemaVersion") != 1 or report.get("scenario") != "mixed":
-        raise ReportError(f"{path}: expected a schema-version 1 mixed report")
-    backend = report.get("backend")
-    if not isinstance(backend, str) or not backend:
-        raise ReportError(f"{path}: backend must be a non-empty string")
-    metadata = ReportMetadata(
-        backend=backend,
-        model_time_speedup=_number(
-            report.get("modelTimeSpeedup"), f"{path}: modelTimeSpeedup"
-        ),
-    )
-
-    rows: list[dict[str, Any]] = []
-    seen_runs: set[int] = set()
-    seen_cells: set[tuple[int, str, int, int, int]] = set()
-    for run_index, run_value in enumerate(_array(report.get("runs"), f"{path}: runs")):
-        run = _object(run_value, f"{path}: runs[{run_index}]")
-        run_id = _integer(run.get("run"), f"{path}: runs[{run_index}].run", minimum=1)
-        if run_id in seen_runs:
-            raise ReportError(f"{path}: duplicate run {run_id}")
-        seen_runs.add(run_id)
-        for cell_index, cell_value in enumerate(
-            _array(run.get("cells"), f"{path}: run {run_id}.cells")
-        ):
-            label = f"{path}: run {run_id} cell {cell_index}"
-            cell = _object(cell_value, label)
-            mode = cell.get("mode")
-            if mode not in ("lo", "hi"):
-                raise ReportError(f"{label}: mode must be lo or hi")
-            affinity = _integer(cell.get("affinityPct"), f"{label}.affinityPct")
-            if affinity > 100:
-                raise ReportError(f"{label}.affinityPct must not exceed 100")
-            database_limit = _integer(
-                cell.get("databaseLimit"), f"{label}.databaseLimit", minimum=1
-            )
-            databases = _integer(cell.get("databases"), f"{label}.databases", minimum=1)
-            workers = _integer(
-                cell.get("workersPerShape"), f"{label}.workersPerShape", minimum=1
-            )
-            if databases != min(database_limit, workers):
-                raise ReportError(
-                    f"{label}: databases={databases} does not equal "
-                    f"min(databaseLimit={database_limit}, workersPerShape={workers})"
-                )
-            failures = _integer(cell.get("failures"), f"{label}.failures")
-            if failures:
-                raise ReportError(f"{label}: contains {failures} failures")
-
-            identity = (run_id, mode, affinity, database_limit, workers)
-            if identity in seen_cells:
-                raise ReportError(f"{label}: duplicate mixed cell {identity}")
-            seen_cells.add(identity)
-
-            shape_values = _array(cell.get("shapes"), f"{label}.shapes")
-            shapes: dict[str, dict[str, Any]] = {}
-            for shape_index, shape_value in enumerate(shape_values):
-                shape_label = f"{label}.shapes[{shape_index}]"
-                shape = _object(shape_value, shape_label)
-                name = shape.get("shape")
-                if name not in SHAPES:
-                    raise ReportError(f"{shape_label}: unknown shape {name!r}")
-                if name in shapes:
-                    raise ReportError(f"{label}: duplicate shape {name}")
-                if shape.get("converged") is not True:
-                    raise ReportError(f"{label}: shape {name} did not converge")
-                shapes[name] = shape
-            if set(shapes) != set(SHAPES):
-                raise ReportError(
-                    f"{label}: shapes are {sorted(shapes)}; expected {sorted(SHAPES)}"
-                )
-
-            for name in SHAPES:
-                shape = shapes[name]
-                p50_ms = _number(shape.get("p50Ms"), f"{label}.{name}.p50Ms")
-                p90_ms = _number(shape.get("p90Ms"), f"{label}.{name}.p90Ms")
-                if p90_ms < p50_ms:
-                    raise ReportError(
-                        f"{label}.{name}: p90Ms={p90_ms} is below p50Ms={p50_ms}"
-                    )
-                rows.append(
-                    {
-                        "run": run_id,
-                        "mode": mode,
-                        "affinity": affinity,
-                        "database_limit": database_limit,
-                        "databases": databases,
-                        "workers": workers,
-                        "shape": name,
-                        "throughput": _number(
-                            shape.get("txPerSec"), f"{label}.{name}.txPerSec"
-                        ),
-                        "p50_ms": p50_ms,
-                        "p90_ms": p90_ms,
-                    }
-                )
-
-    if not rows:
-        raise ReportError(f"{path}: report has no mixed cells")
-    return metadata, pd.DataFrame(rows)
+# Dimensions that a generic mixed report may sweep along its x-axis.
+MIXED_AXES = {
+    "affinity": "Home-collection affinity (%)",
+    "workers": "Concurrent workers per shape",
+}
 
 
 def _values(data: pd.DataFrame, column: str) -> tuple[Any, ...]:
@@ -414,10 +286,157 @@ def plot_affinity_latency(data: pd.DataFrame, out_dir: Path) -> Path:
     return _save(fig, out_dir, "affinity-latency.png")
 
 
+def _mixed_axis(data: pd.DataFrame) -> str:
+    """Return the one dimension along which a mixed report sweeps."""
+    varying = [axis for axis in MIXED_AXES if data[axis].nunique() > 1]
+    if len(varying) != 1 or data["database_limit"].nunique() != 1:
+        raise ReportError(
+            "a mixed report must sweep exactly one of affinity or workers "
+            "with a single database limit"
+        )
+    return varying[0]
+
+
+def _plot_mode_panels(
+    medians: pd.DataFrame,
+    axis: str,
+    metric: str,
+    *,
+    title: str,
+    bands: bool,
+    out_dir: Path,
+    name: str,
+) -> Path:
+    """One panel per mode, sharing the y-axis so modes compare directly."""
+    modes = sorted(medians["mode"].unique())
+    colors = _shape_colors()
+    fig, axes = plt.subplots(
+        1, len(modes), figsize=(max(7 * len(modes), 11), 6), sharey=True, squeeze=False
+    )
+    for index, (ax, mode) in enumerate(zip(axes.flat, modes, strict=True)):
+        mode_medians = medians[medians["mode"] == mode]
+        if bands:
+            _plot_shape_latency_bands(ax, mode_medians, axis, colors, labels=index == 0)
+        else:
+            _plot_shape_lines(ax, mode_medians, axis, metric, colors, labels=index == 0)
+        ax.set_title(f"mode: {mode}")
+        ax.set_xlabel(MIXED_AXES[axis])
+        ax.set_xticks(sorted(mode_medians[axis].unique()))
+        ax.tick_params(axis="x", labelrotation=45)
+    axes.flat[0].set_ylabel("Latency (ms)" if bands else "Transactions / sec")
+    axes.flat[0].set_ylim(bottom=0)
+    fig.suptitle(title)
+    fig.legend(
+        *axes.flat[0].get_legend_handles_labels(),
+        title="Transaction shape",
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.94),
+        ncol=len(SHAPES),
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.80))
+    return _save(fig, out_dir, name)
+
+
+def plot_mixed_report(path: Path, out_dir: Path) -> list[Path]:
+    """Plot throughput and latency of a mixed report against its swept axis."""
+    _, data = perfbench_results.read_mixed(path, require_converged=False)
+    unconverged = int((~data["converged"]).sum())
+    if unconverged:
+        print(f"warning: {path}: {unconverged} shape points did not converge")
+    axis = _mixed_axis(data)
+    medians = median_rows(data, ["mode", axis])
+    return [
+        _plot_mode_panels(
+            medians,
+            axis,
+            "throughput",
+            title="Mixed-workload throughput",
+            bands=False,
+            out_dir=out_dir,
+            name=f"{path.stem}-throughput.png",
+        ),
+        _plot_mode_panels(
+            medians,
+            axis,
+            "p50_ms",
+            title="Mixed-workload latency — p50 line; p50–p90 band",
+            bands=True,
+            out_dir=out_dir,
+            name=f"{path.stem}-latency.png",
+        ),
+    ]
+
+
+def plot_contention_report(path: Path, out_dir: Path) -> list[Path]:
+    """Plot throughput and latency of a contention report by contended keys.
+
+    Only full-overlap cells are drawn: partial overlaps form a second matrix
+    dimension that would turn each figure into a dozen crossing lines.
+    """
+    samples, stats = perfbench_results.read_contention([path])
+    if stats.empty or not (stats["overlap-pct"] == 100).any():
+        raise ReportError(f"{path}: report has no 100% overlap cells")
+    samples = samples[samples["overlap-pct"] == 100]
+    stats = stats[stats["overlap-pct"] == 100]
+
+    latency, ax = plt.subplots(figsize=(8, 5))
+    sns.lineplot(
+        data=samples,
+        x="num-keys",
+        y="latency-ms",
+        estimator="median",
+        errorbar=("pi", 80),
+        marker="o",
+        ax=ax,
+    )
+    ax.set_yscale("log")
+    ax.set_title("Latency under contention\nmedian line; p10–p90 band")
+    ax.set_xlabel("Contended keys (100% overlap)")
+    ax.set_ylabel("Transaction latency (ms, log scale)")
+
+    throughput, ax = plt.subplots(figsize=(8, 5))
+    sns.lineplot(
+        data=stats,
+        x="num-keys",
+        y="tx-per-sec",
+        estimator="median",
+        errorbar=None,
+        marker="o",
+        ax=ax,
+    )
+    ax.set_title("Throughput under contention")
+    ax.set_ylim(bottom=0)
+    ax.set_xlabel("Contended keys (100% overlap)")
+    ax.set_ylabel("Transactions / sec")
+    return [
+        _save(latency, out_dir, f"{path.stem}-latency.png"),
+        _save(throughput, out_dir, f"{path.stem}-throughput.png"),
+    ]
+
+
+PLOTTERS = {
+    "mixed": plot_mixed_report,
+    "contention": plot_contention_report,
+}
+
+
+def plot_file(path: Path, out_dir: Path | None) -> list[Path]:
+    """Plot one result file into `out_dir`, by default next to the file."""
+    scenario = perfbench_results.read_envelope(path)["scenario"]
+    plotter = PLOTTERS.get(scenario)
+    if plotter is None:
+        raise ReportError(f"{path}: no plots for scenario {scenario!r}")
+    return plotter(path, out_dir if out_dir is not None else path.parent)
+
+
 def render(worker_path: Path, affinity_path: Path, out_dir: Path) -> list[Path]:
     """Validate both canonical reports and render their four figures."""
-    worker_metadata, workers = read_report(worker_path)
-    affinity_metadata, affinities = read_report(affinity_path)
+    worker_metadata, workers = perfbench_results.read_mixed(
+        worker_path, require_converged=True
+    )
+    affinity_metadata, affinities = perfbench_results.read_mixed(
+        affinity_path, require_converged=True
+    )
     if worker_metadata != affinity_metadata:
         raise ReportError(
             "worker and affinity reports must use the same backend and model-time speedup"
@@ -430,7 +449,6 @@ def render(worker_path: Path, affinity_path: Path, out_dir: Path) -> list[Path]:
         )
     validate_worker_sweep(workers)
     validate_affinity_sweep(affinities)
-    sns.set_theme(style="whitegrid", context="talk")
     return [
         plot_worker_throughput(workers, out_dir),
         plot_worker_latency(workers, out_dir),
@@ -441,14 +459,40 @@ def render(worker_path: Path, affinity_path: Path, out_dir: Path) -> list[Path]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    base = Path(__file__).resolve().parent / "out-sweeps"
-    parser.add_argument("--workers", type=Path, default=base / "workers.json")
-    parser.add_argument("--affinity", type=Path, default=base / "affinity.json")
-    parser.add_argument("--out", type=Path, default=base)
+    sweeps = Path(__file__).resolve().parent / "out-sweeps"
+    parser.add_argument("files", nargs="*", type=Path, help="perfbench result files")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        help="figure directory (default: beside each result file, or out-sweeps)",
+    )
+    parser.add_argument(
+        "--canonical",
+        action="store_true",
+        help="render the fixed worker and affinity figures instead of FILES",
+    )
+    parser.add_argument("--workers", type=Path, default=sweeps / "workers.json")
+    parser.add_argument("--affinity", type=Path, default=sweeps / "affinity.json")
     args = parser.parse_args()
-    render(args.workers, args.affinity, args.out)
+    if bool(args.files) == args.canonical:
+        parser.error("pass result files, or --canonical, but not both")
+
+    sns.set_theme(style="whitegrid", context="talk")
+    if args.canonical:
+        render(args.workers, args.affinity, args.out or sweeps)
+    else:
+        for path in args.files:
+            plot_file(path, args.out)
     return 0
 
 
+def run() -> int:
+    try:
+        return main()
+    except ReportError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run())

@@ -245,7 +245,7 @@ class CompareTest(unittest.TestCase):
             for database_limit in (1, 3)
         ]
 
-        with self.assertRaisesRegex(ValueError, "mixed-sweep plotter"):
+        with self.assertRaisesRegex(ValueError, "plot_results.py"):
             compare.mixed_shape_table(cells, cells)
 
     def test_perfbench_contention_envelope_converts_to_legacy_frames(self) -> None:

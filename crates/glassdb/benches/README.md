@@ -4,7 +4,7 @@
 record on a line starting with `diagnostic-costs: `. CI reads this record from
 the captured benchmark log; no output-path setting is needed. `make bench`
 runs these cases and the wider transaction microbenchmarks. Local and CI revision comparisons use
-`hack/aws-bench/compare-refs.sh`.
+`hack/aws-bench/compare_refs.sh`.
 
 The selected cases are self-contained in `diagnostics.rs`. The existing
 `transactions.rs` suite is independent. Select a target with Cargo; Criterion

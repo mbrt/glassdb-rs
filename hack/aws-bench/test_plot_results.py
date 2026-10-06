@@ -12,27 +12,19 @@
 from __future__ import annotations
 
 import copy
-import importlib.util
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
 
-def load_plotter():
-    path = Path(__file__).with_name("plot-mixed-sweeps.py")
-    spec = importlib.util.spec_from_file_location("mixed_sweep_plotter", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+import perfbench_results
+import plot_results as plotter
 
 
-plotter = load_plotter()
+def read_canonical(path: Path):
+    return perfbench_results.read_mixed(path, require_converged=True)
 
 
 def shape_rows(run: int, affinity: int, databases: int, workers: int) -> list[dict]:
@@ -129,8 +121,8 @@ class MixedSweepPlotterTest(unittest.TestCase):
             affinity_path = self.write_report(
                 directory, "affinity.json", affinity_report()
             )
-            worker_metadata, workers = plotter.read_report(workers_path)
-            affinity_metadata, affinities = plotter.read_report(affinity_path)
+            worker_metadata, workers = read_canonical(workers_path)
+            affinity_metadata, affinities = read_canonical(affinity_path)
 
         self.assertEqual(worker_metadata, affinity_metadata)
         plotter.validate_worker_sweep(workers)
@@ -151,7 +143,7 @@ class MixedSweepPlotterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write_report(Path(directory_name), "invalid.json", invalid)
             with self.assertRaisesRegex(plotter.ReportError, "does not equal"):
-                plotter.read_report(path)
+                read_canonical(path)
 
     def test_unconverged_shape_is_rejected(self) -> None:
         invalid = affinity_report()
@@ -159,7 +151,7 @@ class MixedSweepPlotterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write_report(Path(directory_name), "invalid.json", invalid)
             with self.assertRaisesRegex(plotter.ReportError, "did not converge"):
-                plotter.read_report(path)
+                read_canonical(path)
 
     def test_p90_latency_must_not_be_below_p50(self) -> None:
         invalid = worker_report()
@@ -168,14 +160,14 @@ class MixedSweepPlotterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write_report(Path(directory_name), "invalid.json", invalid)
             with self.assertRaisesRegex(plotter.ReportError, "below p50Ms"):
-                plotter.read_report(path)
+                read_canonical(path)
 
     def test_series_use_plain_lines_and_latency_bands(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write_report(
                 Path(directory_name), "workers.json", worker_report()
             )
-            _, workers = plotter.read_report(path)
+            _, workers = read_canonical(path)
         medians = plotter.median_rows(workers, ["workers"])
         colors = plotter._shape_colors()
 
@@ -198,7 +190,7 @@ class MixedSweepPlotterTest(unittest.TestCase):
             path = self.write_report(
                 Path(directory_name), "affinity.json", affinity_report()
             )
-            _, affinities = plotter.read_report(path)
+            _, affinities = read_canonical(path)
 
         figures = {}
 
@@ -268,6 +260,160 @@ class MixedSweepPlotterTest(unittest.TestCase):
             affinity_path = self.write_report(directory, "affinity.json", affinity)
             with self.assertRaisesRegex(plotter.ReportError, "same backend"):
                 plotter.render(workers_path, affinity_path, directory / "plots")
+
+
+class GenericPlotterTest(unittest.TestCase):
+    def write_report(self, directory: Path, name: str, value: dict) -> Path:
+        path = directory / name
+        path.write_text(json.dumps(value))
+        return path
+
+    def real_mixed_report(self, cells: list[dict]) -> dict:
+        value = report([{"run": 1, "cells": cells}])
+        value.update(backend="s3", modelTimeSpeedup=1.0)
+        return value
+
+    def contention_report(self, overlap_pct: list[int]) -> dict:
+        def contention_cell(num_keys: int, overlap_pct: int) -> dict:
+            return {
+                "numKeys": num_keys,
+                "overlap": 1,
+                "overlapPct": overlap_pct,
+                "committed": 2,
+                "durationMs": 1000,
+                "txPerSec": 2.0,
+                "samplesMs": [10.0, 20.0],
+                "replays": 0,
+                "directCandidates": 2,
+                "directLanded": 2,
+                "workerDrainMs": 1,
+                "failures": 0,
+            }
+
+        return {
+            "schemaVersion": 1,
+            "scenario": "contention",
+            "backend": "s3",
+            "modelTimeSpeedup": 1.0,
+            "runs": [
+                {
+                    "run": 1,
+                    "cells": [
+                        contention_cell(num_keys, pct)
+                        for num_keys in (1, 2, 3)
+                        for pct in overlap_pct
+                    ],
+                }
+            ],
+        }
+
+    def test_mixed_report_is_plotted_without_canonical_grid(self) -> None:
+        cells = []
+        for mode in ("lo", "hi"):
+            for affinity in (0, 50, 100):
+                cells.append({**cell(1, affinity, 4, 8), "mode": mode})
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            path = self.write_report(
+                directory, "mixed.json", self.real_mixed_report(cells)
+            )
+
+            outputs = plotter.plot_file(path, None)
+
+            self.assertEqual(
+                {output.name for output in outputs},
+                {"mixed-throughput.png", "mixed-latency.png"},
+            )
+            self.assertTrue(all(output.parent == directory for output in outputs))
+
+    def test_worker_sweep_and_single_run_median_are_plotted(self) -> None:
+        cells = [cell(1, 100, 4, workers) for workers in (1, 4, 8)]
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            path = self.write_report(
+                directory, "mixed.json", self.real_mixed_report(cells)
+            )
+            _, data = perfbench_results.read_mixed(path, require_converged=False)
+
+            self.assertEqual(plotter._mixed_axis(data), "workers")
+            medians = plotter.median_rows(data, ["mode", "workers"])
+            self.assertEqual(len(medians), 3 * len(plotter.SHAPES))
+            self.assertEqual(
+                medians.iloc[0]["throughput"],
+                data[
+                    (data["workers"] == medians.iloc[0]["workers"])
+                    & (data["shape"] == medians.iloc[0]["shape"])
+                ].iloc[0]["throughput"],
+            )
+
+    def test_unconverged_shapes_are_plotted_with_a_warning(self) -> None:
+        unconverged = cell(1, 0, 4, 8)
+        unconverged["shapes"][0]["converged"] = False
+        cells = [unconverged, cell(1, 100, 4, 8)]
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            path = self.write_report(
+                directory, "mixed.json", self.real_mixed_report(cells)
+            )
+            with mock.patch("builtins.print") as printed:
+                plotter.plot_file(path, directory)
+            self.assertIn("did not converge", str(printed.call_args_list))
+
+    def test_mixed_report_must_sweep_exactly_one_dimension(self) -> None:
+        cells = [
+            cell(1, affinity, 4, workers) for affinity in (0, 100) for workers in (4, 8)
+        ]
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            path = self.write_report(
+                directory, "mixed.json", self.real_mixed_report(cells)
+            )
+            with self.assertRaisesRegex(plotter.ReportError, "exactly one"):
+                plotter.plot_file(path, directory)
+
+    def test_contention_report_plots_full_overlap_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            path = self.write_report(
+                directory, "contention.json", self.contention_report([50, 100])
+            )
+
+            outputs = plotter.plot_file(path, directory / "plots")
+
+            self.assertEqual(
+                {output.name for output in outputs},
+                {"contention-latency.png", "contention-throughput.png"},
+            )
+
+    def test_contention_report_without_full_overlap_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            path = self.write_report(
+                directory, "contention.json", self.contention_report([50])
+            )
+            with self.assertRaisesRegex(plotter.ReportError, "100% overlap"):
+                plotter.plot_file(path, directory)
+
+    def test_bad_file_is_reported_as_one_line_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(Path(directory_name), "bad.json", {"x": 1})
+            with (
+                mock.patch("sys.argv", ["plot_results.py", str(path)]),
+                mock.patch("sys.stderr") as stderr,
+            ):
+                self.assertEqual(plotter.run(), 1)
+            self.assertIn("bad.json", str(stderr.write.call_args_list))
+
+    def test_scenario_without_plots_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            path = self.write_report(
+                directory,
+                "inline-pressure.json",
+                {"schemaVersion": 1, "scenario": "inline-pressure", "runs": []},
+            )
+            with self.assertRaisesRegex(plotter.ReportError, "no plots"):
+                plotter.plot_file(path, directory)
 
 
 if __name__ == "__main__":

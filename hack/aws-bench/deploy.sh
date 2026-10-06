@@ -151,7 +151,7 @@ deploy() {
   bucket="$(stack_output BucketName)"
   echo ">> uploading perfbench artifacts to s3://$bucket/bin/"
   aws s3 cp "${region_args[@]}" "$binary" "s3://$bucket/$BINARY_S3_KEY"
-  aws s3 cp "${region_args[@]}" "$SCRIPT_DIR/run-perfbench.sh" \
+  aws s3 cp "${region_args[@]}" "$SCRIPT_DIR/run_perfbench.sh" \
     "s3://$bucket/$RUNNER_S3_KEY"
   aws s3 cp "${region_args[@]}" "$config" "s3://$bucket/$CONFIG_S3_KEY"
 
