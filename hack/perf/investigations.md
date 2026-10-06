@@ -265,6 +265,32 @@ key was a loss on the same keys, and its time was not split time. In the
 round of 68 s, 13 of 23 losses were of this kind. The keys of a round are now
 the keys that its members read and publish.
 
+### Avoidable time after the retry fix
+
+The same instrumentation on `c458496e8`, 4 runs of 650 model seconds, and runs
+of each fixed tree. A long run where the rules measured but made no change
+gave the steady rates. Rates are in seconds for each model second:
+
+| Side | Measured | Real, from the fixed trees | Measured / real |
+| --- | ---: | ---: | ---: |
+| Split side, one leaf, both splitters | `3.0` to `3.6` | `3.7` | `0.82` to `0.95` |
+| Split side, one leaf, one splitter | `1.3` to `1.8` | | |
+| Merge side, two leaves | `1.0` to `1.1` | `5.0` | `0.20` to `0.22` |
+
+Both sides were stable across runs. The two topologies cost almost the same,
+but one leaf lost 1.25 worker seconds less in each second. The leaf split and
+merged about 12 times in 60 model seconds.
+
+An offline replay of the windows tested option A: a change records in its
+leaves the rate that paid for it, and the opposite change needs more than a
+margin `m` times that rate, which halves every `H` seconds. With the mean rate
+of the state before the change landed, the sum over the instances, `H` of 60 s,
+and `m` of 1.5, the replay made about 0.9 changes in 60 model seconds. But it
+kept two leaves for 0.94 of the time, because the merge side measured about 4
+times too little. With the merge side multiplied by 3 or more, it kept one
+leaf. With the rate of one instance instead of the sum, it also kept two
+leaves.
+
 ## 2026-09-26: ADR-074 splits in the mixed hi mode
 
 Status: in the engine as `TopologyPolicy::AvoidableTime`, the default policy
