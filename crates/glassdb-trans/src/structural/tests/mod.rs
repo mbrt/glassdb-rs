@@ -13,9 +13,11 @@ use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::leaf_coord::StructuralHinter;
 use crate::monitor::TxFinalStatus;
 use crate::node_locking::GateAcquisition;
+use crate::retry_timing::RetryTiming;
 use glassdb_backend::Backend;
 use glassdb_backend::memory::MemoryBackend;
 use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture, RecordingBackend};
+use glassdb_concurr::RetrySchedule;
 use glassdb_data::{LogicalKey, NodeId, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord, TxWrite};
 use glassdb_storage::{
@@ -281,7 +283,7 @@ fn restructurer_with_candidates_and_hints(
 ) -> Restructurer {
     let mon = store.foundation.monitor_for(
         bg,
-        RetryConfig::default(),
+        RetrySchedule::default(),
         crate::monitor::ProtocolTiming::default(),
     );
     restructurer_with_monitor_and_hints(store, bg, mon, candidates, gc_hints)
@@ -308,13 +310,13 @@ fn restructurer_with_monitor_and_hints(
         store.nodes.clone(),
         key_state.clone(),
         mon.clone(),
-        RetryConfig::default(),
+        RetryTiming::default(),
         *candidates.policy(),
         Arc::new(candidates.clone()),
     );
     Restructurer::with_candidates(
         Arc::downgrade(bg),
-        TopologyMembership::new(store.records.clone(), mon.clone(), RetryConfig::default()),
+        TopologyMembership::new(store.records.clone(), mon.clone(), RetrySchedule::default()),
         store.nodes.clone(),
         store.intent_store.clone(),
         store.timeline.clone(),
@@ -335,7 +337,7 @@ fn restructurer_and_monitor(
 ) -> (Restructurer, Monitor) {
     let mon = store.foundation.monitor_for(
         bg,
-        RetryConfig::default(),
+        RetrySchedule::default(),
         crate::monitor::ProtocolTiming::default(),
     );
     let candidates = MaintenanceCandidates::with_policy(policy);

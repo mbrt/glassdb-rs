@@ -8,6 +8,7 @@ draining, and a versioned JSON result envelope:
 perfbench mixed
 perfbench contention
 perfbench inline-pressure
+perfbench split-merge-fight
 ```
 
 Raw backend latency remains in `backendbench`. Criterion owns controlled
@@ -115,6 +116,24 @@ limits the pressure phase.
 cargo run --release -p glassdb-bench-scale --bin perfbench -- \
   --backend=memory --delays=s3 --delay-scale=0.2 \
   --output=/tmp/inline-pressure.json inline-pressure --settle-timeout=5s
+```
+
+`split-merge-fight` runs a stable load under which the topology policies of
+database instances disagree. One collection has two keys in one leaf. Splitter
+instances write one key each, so they lose leaf CASes to each other, and their
+policy splits the leaf between the keys. A merger instance scans both keys, so
+after the split its scans cross into the right leaf, and its policy merges the
+leaves again. The scenario reports the splits and merges in the warmup and in
+the measurement, the throughput and protocol counters of each instance, and
+the splits and merges of each instance in each wall second of the warmup and
+the measurement. The `fixed-1` and
+`fixed-2` policies keep one or two leaves, to give the throughput of each
+topology without structural changes.
+
+```bash
+cargo run --release -p glassdb-bench-scale --bin perfbench -- \
+  --backend=memory --delays=s3 --delay-scale=0.2 --runs=3 \
+  --output=/tmp/split-merge-fight.json split-merge-fight
 ```
 
 All subcommands support `--backend=memory|fakes3|s3|gcs`. Real S3 and GCS use

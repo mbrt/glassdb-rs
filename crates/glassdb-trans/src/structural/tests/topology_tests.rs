@@ -11,10 +11,11 @@ async fn departure_backs_off_after_a_rejected_cas() {
     let bg = Arc::new(Background::new());
     let mon = store.foundation.monitor_for(
         &bg,
-        RetryConfig::default(),
+        RetrySchedule::default(),
         crate::monitor::ProtocolTiming::default(),
     );
-    let topology = TopologyMembership::new(store.records.clone(), mon, RetryConfig::default());
+    let retry = RetryTiming::default().contention;
+    let topology = TopologyMembership::new(store.records.clone(), mon, retry);
     let (departing, admitted) = (tx_id(b"departing"), tx_id(b"admitted"));
     let mut record = CollectionRecord::new();
     assert!(record.add_topology_participant(departing));
@@ -62,7 +63,7 @@ async fn departure_backs_off_after_a_rejected_cas() {
     );
 
     // The first backoff delay is at least half of the initial interval.
-    assert!(start.elapsed() >= RetryConfig::default().initial_interval / 2);
+    assert!(start.elapsed() >= retry.initial_interval / 2);
     let (record, _) = store
         .records
         .load_record(

@@ -27,7 +27,7 @@
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use glassdb_concurr::{Background, Backoff, RetryConfig, rt};
+use glassdb_concurr::{Background, Backoff, RetrySchedule, rt};
 use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord, TxWrite};
 use glassdb_storage::{
@@ -330,7 +330,7 @@ pub struct Algo {
     timeline: Timeline,
     // Factory for each transaction's same-identity acquisition schedule. Other
     // coordination loops own independent schedules from the same engine policy.
-    acquisition_retry: RetryConfig,
+    acquisition_retry: RetrySchedule,
     node_size_policy: NodeSizePolicy,
     collection_reservation_limit: usize,
     collection_commit: CollectionCommit,
@@ -349,7 +349,7 @@ impl Algo {
     pub fn new(
         nodes: NodeStore,
         timeline: Timeline,
-        acquisition_retry: RetryConfig,
+        acquisition_retry: RetrySchedule,
         locker: Locker,
         coord: LeafCoordinator,
         mon: Monitor,
@@ -1333,7 +1333,7 @@ mod tests {
         BackendOp, HookBackend, HookFuture, OpLog, OpRecord, RecordingBackend,
     };
     use glassdb_backend::{Backend, StatsBackend, memory::MemoryBackend};
-    use glassdb_concurr::RetryConfig;
+    use glassdb_concurr::RetrySchedule;
     use glassdb_data::{
         CollectionAddress, CollectionId, CollectionName, DatabaseId, DbPrefix, LeafRef, NodeId,
         ObjectPath,
@@ -1498,7 +1498,7 @@ mod tests {
                 StructuralHintSink::detached(),
             ),
             tctx.timeline.clone(),
-            RetryConfig::default(),
+            RetrySchedule::default(),
         );
         match reader.read(key, Duration::MAX).await {
             Ok(outcome) => outcome,
@@ -2211,7 +2211,7 @@ mod tests {
     // exercises locked commit's renewed serial-fallback behaviour.
     #[tokio::test(start_paused = true)]
     async fn cas_contention_renews_before_serial_acquisition() {
-        let retry = RetryConfig {
+        let retry = RetrySchedule {
             initial_interval: Duration::from_millis(10),
             max_interval: Duration::from_millis(20),
         };
@@ -2224,8 +2224,7 @@ mod tests {
             .unwrap();
         let mut config = EngineConfig::default();
         config.set_cache_size(1024);
-        config.set_retry_initial_interval(retry.initial_interval);
-        config.set_retry_max_interval(retry.max_interval);
+        config.set_retry_timing(crate::retry_timing::RetryTiming::uniform(retry));
         config.set_inline_policy(InlinePolicy::none());
         let status_backend = backend.clone();
         let engine = Engine::open(

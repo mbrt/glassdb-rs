@@ -4,11 +4,25 @@ use std::time::Duration;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath};
 
 use super::{
-    AvoidableTimeRule, ChangeRequest, LeafId, LeafWindow, MERGE_THRESHOLD, PairWindow,
+    AvoidableTimeRule, ChangeRequest, LeafId, LeafWindow, MERGE_THRESHOLD, PairWindow, RuleRequest,
     SPLIT_THRESHOLD, TopologyRule, TopologyWindow,
 };
 
 const CHANGE_TIME: Duration = Duration::from_millis(500);
+
+// Returns the changes that a rule asks for, without their rates.
+trait DecideChanges {
+    fn changes(&mut self, window: &TopologyWindow) -> Vec<ChangeRequest>;
+}
+
+impl DecideChanges for AvoidableTimeRule {
+    fn changes(&mut self, window: &TopologyWindow) -> Vec<ChangeRequest> {
+        self.decide(window)
+            .into_iter()
+            .map(|request: RuleRequest| request.change)
+            .collect()
+    }
+}
 
 fn leaf(byte: u8) -> LeafId {
     LeafId::new(ObjectPath::Node {
@@ -95,7 +109,7 @@ fn decide_over(
 ) -> Vec<ChangeRequest> {
     let mut requests = Vec::new();
     for _ in 0..windows {
-        let decided = rule.decide(&window);
+        let decided = rule.changes(&window);
         for request in &decided {
             let (ChangeRequest::Split(id)
             | ChangeRequest::SplitAt(id, _)
@@ -143,7 +157,7 @@ fn a_slower_split_needs_more_split_side_time() {
 fn one_window_does_not_pay_for_a_split_that_the_load_does_not_keep_paying_for() {
     let mut rule = AvoidableTimeRule::default();
 
-    let burst = rule.decide(&window(vec![(leaf(1), delayed(split_pays() * 14))], vec![]));
+    let burst = rule.changes(&window(vec![(leaf(1), delayed(split_pays() * 14))], vec![]));
     let after = decide_over(
         &mut rule,
         window(vec![(leaf(1), LeafWindow::default())], vec![]),
@@ -159,8 +173,8 @@ fn a_leaf_does_not_split_again_before_its_split_lands() {
     let mut rule = AvoidableTimeRule::default();
     let loaded = window(vec![(leaf(1), delayed(split_pays() * 2))], vec![]);
 
-    let first = (0..30).find_map(|_| Some(rule.decide(&loaded)).filter(|r| !r.is_empty()));
-    let next = rule.decide(&loaded);
+    let first = (0..30).find_map(|_| Some(rule.changes(&loaded)).filter(|r| !r.is_empty()));
+    let next = rule.changes(&loaded);
 
     assert_eq!(first, Some(vec![ChangeRequest::Split(leaf(1))]));
     assert_eq!(next, vec![]);
@@ -230,10 +244,10 @@ fn two_leaves_merge_when_merge_side_time_pays_for_the_merge_and_both_split_sides
     let does_not_pay = window(leaves(), vec![scan_crossing(1, 2, both_sides)]);
 
     assert_eq!(
-        AvoidableTimeRule::default().decide(&pays),
+        AvoidableTimeRule::default().changes(&pays),
         vec![ChangeRequest::Merge(leaf(1))]
     );
-    assert_eq!(AvoidableTimeRule::default().decide(&does_not_pay), vec![]);
+    assert_eq!(AvoidableTimeRule::default().changes(&does_not_pay), vec![]);
 }
 
 #[test]
@@ -263,13 +277,13 @@ fn the_split_side_time_of_two_leaves_keeps_them_apart() {
 fn the_crossing_conflicts_of_earlier_windows_merge_two_leaves() {
     let mut rule = AvoidableTimeRule::default();
 
-    let with_pair = rule.decide(&window(
+    let with_pair = rule.changes(&window(
         vec![(leaf(1), contended()), (leaf(2), contended())],
         vec![crossing_conflicts(1, 2, ms(1200))],
     ));
     // Another instance can change the leaves, so that no pair of this window
     // has the time of the transactions over them.
-    let without_pair = rule.decide(&window(vec![], vec![]));
+    let without_pair = rule.changes(&window(vec![], vec![]));
 
     assert_eq!(with_pair, vec![]);
     assert_eq!(without_pair, vec![ChangeRequest::Merge(leaf(1))]);
@@ -291,7 +305,7 @@ fn a_leaf_that_split_recently_can_split_again_but_not_merge() {
     );
 
     assert_eq!(
-        AvoidableTimeRule::default().decide(&window),
+        AvoidableTimeRule::default().changes(&window),
         vec![ChangeRequest::Split(leaf(1))]
     );
 }
@@ -311,7 +325,7 @@ fn a_leaf_that_merged_recently_can_merge_again_but_not_split() {
     );
 
     assert_eq!(
-        AvoidableTimeRule::default().decide(&window),
+        AvoidableTimeRule::default().changes(&window),
         vec![ChangeRequest::Merge(leaf(5))]
     );
 }
@@ -328,7 +342,58 @@ fn a_leaf_that_splits_or_merges_does_not_merge_again_in_the_same_window() {
     );
 
     assert_eq!(
-        AvoidableTimeRule::default().decide(&window),
+        AvoidableTimeRule::default().changes(&window),
         vec![ChangeRequest::Split(leaf(4)), ChangeRequest::Merge(leaf(1)),]
     );
+}
+
+// Asserts that `requests` is one request for `change` at about `rate`. The
+// mean is a float, so it can differ by some nanoseconds.
+fn assert_requests(requests: Vec<RuleRequest>, change: ChangeRequest, rate: Duration) {
+    let [request] = <[RuleRequest; 1]>::try_from(requests).unwrap();
+    assert_eq!(request.change, change);
+    assert!(
+        request.rate.abs_diff(rate) < Duration::from_micros(1),
+        "{request:?}"
+    );
+}
+
+// ADR-076: a request carries the mean rate since the last change of its leaf,
+// and its leaves keep it as their paid rate. A window in which the leaf has no
+// time counts as zero, and a change of the leaf starts the mean again.
+#[test]
+fn a_split_request_carries_the_mean_split_side_rate_since_the_leaf_changed() {
+    let mut rule = AvoidableTimeRule::default();
+    let changed = LeafWindow {
+        split_recently: true,
+        ..delayed(ms(10))
+    };
+    assert_eq!(
+        rule.decide(&window(vec![(leaf(1), changed)], vec![])),
+        vec![]
+    );
+    assert_eq!(rule.decide(&window(vec![], vec![])), vec![]);
+
+    let requests = rule.decide(&window(vec![(leaf(1), delays_of_one_split())], vec![]));
+
+    assert_requests(
+        requests,
+        ChangeRequest::Split(leaf(1)),
+        (ms(10) + delays_of_one_split().delay_time) / 3,
+    );
+}
+
+#[test]
+fn a_merge_request_carries_the_mean_merge_side_rate_of_its_pair() {
+    let mut rule = AvoidableTimeRule::default();
+    let below = merge_pays() / 2;
+    assert_eq!(
+        rule.decide(&window(vec![], vec![scan_crossing(1, 2, below)])),
+        vec![]
+    );
+
+    let above = merge_pays() * 3;
+    let requests = rule.decide(&window(vec![], vec![scan_crossing(1, 2, above)]));
+
+    assert_requests(requests, ChangeRequest::Merge(leaf(1)), (below + above) / 2);
 }

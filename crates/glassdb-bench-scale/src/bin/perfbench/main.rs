@@ -4,6 +4,7 @@ mod backend;
 mod contention;
 mod inline_pressure;
 mod mixed;
+mod split_merge_fight;
 
 #[cfg(target_env = "musl")]
 #[global_allocator]
@@ -50,6 +51,9 @@ enum Command {
     Contention(contention::Options),
     /// Measure how leaves adapt to aggregate inline-admission pressure.
     InlinePressure(inline_pressure::Options),
+    /// Measure database instances whose topology policies split and merge
+    /// the same leaf under a stable load.
+    SplitMergeFight(split_merge_fight::Options),
 }
 
 #[derive(Serialize)]
@@ -101,10 +105,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::InlinePressure(options) => serde_json::to_value(Report {
             schema_version: SCHEMA_VERSION,
             scenario: "inline-pressure",
-            backend,
+            backend: backend.clone(),
             model_time_speedup,
             latency_jitter: cli.backend.latency_jitter,
             runs: inline_pressure::run(handle, &factory, options, execution)?,
+        })?,
+        Command::SplitMergeFight(options) => serde_json::to_value(Report {
+            schema_version: SCHEMA_VERSION,
+            scenario: "split-merge-fight",
+            backend,
+            model_time_speedup,
+            latency_jitter: cli.backend.latency_jitter,
+            runs: split_merge_fight::run(handle, &factory, options, execution)?,
         })?,
     };
     write_json(cli.output, &value)

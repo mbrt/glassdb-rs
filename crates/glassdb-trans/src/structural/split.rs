@@ -46,11 +46,12 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
+use glassdb_data::{CollectionAddress, NodeId, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::{
-    IndexNode, LeafEntry, LeafObservation, Node, NodeStore, Requirement, StorageError, Timeline,
-    TreeRouter,
+    IndexNode, LeafEntry, LeafObservation, Node, NodeStore, PaidChange, Payment, Requirement,
+    StorageError, Timeline, TreeRouter,
 };
 
 use crate::error::TransError;
@@ -90,6 +91,8 @@ pub(super) enum SplitReason {
     /// measured median can differ from the median at the split.
     Demand {
         at: Option<Vec<u8>>,
+        /// The avoidable time in each second that pays for the split.
+        rate: Duration,
     },
 }
 
@@ -109,6 +112,9 @@ pub(super) enum SplitTarget<'a> {
 
 /// The node writes of one split. The source gate protects them until the
 /// source shrink or the root rewrite lands.
+// One value exists for each split, and only while it runs, so the size of its
+// largest variant costs nothing.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum SplitPlan {
     NonRoot {
         source_id: NodeId,
@@ -217,12 +223,17 @@ impl Splitter {
                     SplitNeed::NotActionable
                 }
             }
-            SplitReason::Demand { at } => {
+            SplitReason::Demand { at, rate } => {
                 let divisible = node.as_leaf().is_some_and(|leaf| match at {
                     Some(key) => leaf.divides_at(key),
                     None => leaf.len() >= 2,
                 });
-                if divisible {
+                let pays = self.candidates.paid_rates().pays_more(
+                    PaidChange::Split,
+                    *rate,
+                    [node.paid_rate()],
+                );
+                if divisible && pays {
                     SplitNeed::Split
                 } else {
                     SplitNeed::NotActionable
@@ -383,7 +394,7 @@ impl Splitter {
         let right_id = prepared
             .nonroot_sibling()
             .expect("a prepared non-root intent always reserves one sibling");
-        let Some((right, split_key)) = reason.divide(&mut source, right_id) else {
+        let Some((right, split_key)) = reason.divide(&mut source, right_id, prepared.id()) else {
             return Prepared::Cancel(Ok(()));
         };
         source.remove_structural_gate(worker);
@@ -414,7 +425,8 @@ impl Splitter {
         let (left_id, right_id) = prepared
             .root_children()
             .expect("a prepared root intent always reserves two children");
-        let (left, right, split_key) = split_into_children(reason, node, right_id, worker);
+        let (left, right, split_key) =
+            split_into_children(reason, node, right_id, prepared.id(), worker);
         let index = Node::index(IndexNode::from_children([
             (Vec::new(), left_id),
             (split_key.clone(), right_id),
@@ -465,6 +477,9 @@ impl Splitter {
     ) {
         self.reclamation.record(reclaimed, false);
         self.stats.record_split();
+        if let Some(paid) = outputs[0].1.paid_rate() {
+            self.candidates.paid_rates().landed(&paid.intent);
+        }
         for (id, node) in outputs {
             self.enqueue_if_over_soft_cap(collection, id, node);
             if node.as_leaf().is_some() {
@@ -511,11 +526,26 @@ impl SplitReason {
     }
 
     /// Divides `node` like [`Node::split`], at the key that the reason asks
-    /// for, if any.
-    fn divide(&self, node: &mut Node, right_id: NodeId) -> Option<(Node, Vec<u8>)> {
+    /// for, if any. A split that a topology rule asked for keeps its rate as
+    /// the paid rate of its leaves (ADR-076).
+    fn divide(
+        &self,
+        node: &mut Node,
+        right_id: NodeId,
+        intent: &StructuralIntentId,
+    ) -> Option<(Node, Vec<u8>)> {
         match self {
-            SplitReason::Demand { at: Some(key) } => node.split_leaf_at(right_id, key),
-            _ => node.split(right_id),
+            SplitReason::Demand { at, rate } => {
+                let paid = Some(Payment {
+                    per_second: *rate,
+                    intent: *intent,
+                });
+                match at {
+                    Some(key) => node.split_leaf_at(right_id, key, paid),
+                    None => node.split(right_id, paid),
+                }
+            }
+            _ => node.split(right_id, None),
         }
     }
 }
@@ -536,11 +566,12 @@ fn split_into_children(
     reason: &SplitReason,
     node: &Node,
     right_id: NodeId,
+    intent: &StructuralIntentId,
     structure_holder: &TxId,
 ) -> (Node, Node, Vec<u8>) {
     let mut source = node.clone();
     let (right, split_key) = reason
-        .divide(&mut source, right_id)
+        .divide(&mut source, right_id, intent)
         .expect("a split source has entries or children in both halves");
     source.remove_structural_gate(structure_holder);
     (source, right, split_key)

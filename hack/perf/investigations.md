@@ -9,6 +9,304 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-10-05: database instances that split and merge the same leaf
+
+Status: reproduced by the perfbench `split-merge-fight` scenario. Paid rates
+(ADR-076) slow the fight from about 25 to about 3 splits and merges in 60 s.
+The merge side still measures about one fifth of its cost.
+
+ADR-074 records that each database instance decides on its own transactions,
+so one instance can split a leaf while another merges it. In the `mixed` hi
+mode with 8 instances, only some runs showed this. The `split-merge-fight`
+scenario shows it in each run.
+
+### Load
+
+One collection has the keys `left` and `right` in one leaf. One splitter
+instance writes `left` and one writes `right`, each with 4 workers. A merger
+instance scans both keys with 8 workers. The splitters lose leaf CASes to each
+other, and their policy splits the leaf between the keys. Each leaf then has
+one key, so it cannot split again. After the split, each scan crosses into the
+right leaf, and the policy of the merger merges the leaves. All instances use
+the avoidable time policy. `fixed-1` and `fixed-2` use the size causes with no
+underfull threshold, and keep one leaf or one leaf for each key.
+
+```console
+perfbench --delays=s3 --runs=3 split-merge-fight --policies=<policy>
+```
+
+The defaults are a warmup of 10 s and a measurement of 60 s, in wall time.
+Model time runs 5 times faster. The 4 processes ran at the same time, two of
+them with `avoidable`.
+
+### Results
+
+Splits and merges are of all instances in the measurement. The throughputs
+are in transactions per model second, for each run:
+
+| Policy | Splits / merges | Left splitter | Right splitter | Merger |
+| --- | --- | ---: | ---: | ---: |
+| `avoidable` | 3/3, 6/7, 11/11, 3/4, 5/5, 4/5 | `5.7`–`7.1` | `2.9`–`7.1` | `84`–`112` |
+| `fixed-1` | 0/0, 0/0, 0/0 | `3.3`–`5.4` | `2.5`–`4.7` | `186`–`189` |
+| `fixed-2` | 0/0, 0/0, 0/0 | `8.0` | `7.9`–`8.0` | `67`–`68` |
+
+All splits came from the splitters, and all merges from the merger. The load
+does not change, but a split and a merge occur about every 5 to 20 s of wall
+time. A merge comes 5 to 15 s after a split, and a split comes 1 to 2 s after
+a merge. Thus the merge side sets the rate. With 1 merger worker, the scans crossed too
+seldom: the leaf split once in the warmup and stayed split. With 30 s
+measurements, a run had 1 to 6 splits, so the default is 60 s.
+
+The splitter workers of one instance write the same key, so most of their
+commits are locked commits (about 0.9 lock calls for each commit), with a
+median latency of about 510 ms in all policies.
+
+### Loads that did not show the fight in each run
+
+A first version of the scenario had more keys in each half, and merger loads
+other than the scan. The runs used 1 to 8 splitter workers, 1 to 32 merger
+workers, 1 to 32 keys in each half, and the S3 and GCS delays. No load had 3
+or more splits and merges in each run of a 30 s measurement:
+
+- With more than one key and more than one writer in each half, the
+  splitters also split their own half. A lost CAS or a queue wait counts when
+  the keys of the two rounds are on different sides of the median. This is
+  also true for two keys of one half. Up to 27 splits made leaves that were
+  too small for the merge side. Scans then crossed many pairs. The cross-leaf
+  transactions were over more than two leaves, and the crossing conflict
+  time does not count them.
+- With one writer in each half, the splitter that won the CASes had no time,
+  and the other one often had almost no commits. A cycle took 10 s or more.
+- When one instance wrote both keys, it made no split. Its writes of both
+  keys were in one coordinator round, so no member waited for a round of
+  the other key.
+- A merger that reads one key of each half, that writes one key of each half,
+  or that reads and writes all keys, conflicts with the splitters. It
+  committed 0 to 2 transactions in each second under the avoidable time
+  policy, and it also got split-side time from its own leaf CASes.
+- On GCS, the splitters had 0.2 to 2 transactions in each second, and the
+  merger merged less often than on S3.
+
+### Other findings
+
+- The size causes ignored the underfull thresholds of the
+  `NodeSizePolicy` of a database instance. `DatabaseMetadata::node_size_policy`
+  kept only the local soft caps, and used the default underfull thresholds.
+  So a `fixed-2` tree with leaf entry minimum 0 merged in the warmup. The
+  change that adds this scenario fixes it.
+- One load can stop two of its instances. In this load, two instances write
+  8 keys of each half, with one worker each. A third instance writes one key
+  of each half in one transaction, with two workers. One splitter and the
+  merger then have no commit and no lock call for the full measurement, more
+  than 130 model seconds. The other splitter commits. This occurred in 1 to 2 of
+  3 runs, with the avoidable time policy and with a `fixed-2` tree that the
+  bug above merged. With a fixed tree of one or two leaves, only the
+  locked commits of the merger starved (0 to 0.9 transactions in each
+  second), and no instance stopped. The cause is not known.
+
+### Avoidable time of the two sides
+
+A fix can let the instances compare the time that a split removes with the
+time that a merge removes. Temporary instrumentation printed the windows of
+the rule, its requests, and the merge checks. Four runs had 19 periods with one
+leaf and 22 periods with two leaves. The rates are in seconds of avoidable time
+for each model second:
+
+| State | Measured side | Window before the request | Whole state |
+| --- | --- | ---: | ---: |
+| One leaf | Split side, both splitters | `1.9` | `1.3` |
+| Two leaves | Merge side, merger | `0.26` | `0.14` |
+
+The real costs are almost equal. With one leaf, the writers lose about 4
+worker seconds in each second (8 against 16 transactions in each second). With
+two leaves, the merger loses about 5 (68 against 187 scans in each second, 8
+workers). So the measured merge side was about 35 times too small. Also:
+
+- The rule decides a split on a moving average that starts at zero at each
+  change. At the request, it was about 10 times below the raw rate.
+- The rule decides a merge on one window. At the request, this window was
+  about 2.3 times the steady rate.
+- While a change waited to land, the split-side rate fell to about 0.2,
+  because the writers waited for the change.
+- In 9% of the merge checks, a live lock holder deferred the merge. Most of
+  the time from a request to the landing was in the change attempts.
+
+### Scan crossings in a validation that reads the leaves again
+
+In 96% of the scans over two leaves, a write changed the first leaf before the
+validation. The validation then read the range again in `scan_coverage`, and
+this read of the second leaf took about 27 ms. Only the check of the second
+leaf in the other 20% of the scans counted as a scan crossing, about 2.7 ms for
+each scan. `scan_coverage` now reports the time of each next leaf that it reads.
+This counts about 28 ms of the 75 ms that the second leaf adds to each scan.
+
+Most of the other time is in the body of the scan, which resolves the lock
+records of the writers. With two leaves, the writers commit about twice as
+often, so this time is larger. A merge removes it, but it is not the time of a
+crossing.
+
+### Typical times of splits and merges
+
+The typical time of a change scales the thresholds of the rule. It was the
+time of the attempt that landed, and most of this time was the wait for the
+structural gate: 73% of the merge time and 90% of the split time. The gate
+round lost leaf CASes to the writers, with a backoff of up to 5 s, and each
+deferred gate ended at a live lock holder. In one run, the first merge took
+13.3 s, and its work took about 0.8 s. The merge threshold became 1.33 s for
+each second, no merge landed after that, and the typical time did not change
+again. The tree stayed split for more than 300 model seconds.
+
+The typical time is now the time that a leaf change holds its gate, until its
+node writes land. Only in this time do the transactions of the leaf wait for
+the change. The first sample still replaces the default, and the typical time
+changes only when a change lands. So one slow change can still raise a
+threshold for a long time, but a wait for writers no longer causes this.
+
+`mixed` on S3 with 1 and 8 databases, affinities 0 and 100, 8 workers for each
+shape, and 2 runs, against the binary before both fixes. The values are the
+geometric means of the shape throughputs:
+
+| Mode | Geometric mean | Cells |
+| --- | ---: | --- |
+| lo | `0.99` | `0.96` to `1.07` |
+| hi | `1.03` | `0.85` to `1.18` |
+
+The lowest hi value is the cell with 8 databases and affinity 0, which is
+noisy (see the 2026-09-26 entry). `split-merge-fight` still had 5 to 11
+splits and merges in each run.
+
+### Avoidable time after the two fixes
+
+The same instrumentation, 4 runs of about 350 model seconds each. Measured and
+real rates are in seconds for each model second. The real rates come from the
+throughputs in the two states:
+
+| Run | Split side, one leaf | Real | Merge side, two leaves | Real |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | `0.86` | `4.17` | `1.09` | `3.90` |
+| 2 | `0.54` | `3.97` | `1.14` | `4.02` |
+| 3 | `1.85` | `4.07` | `1.07` | `3.86` |
+| 4 | `2.26` | `4.18` | `1.09` | `3.74` |
+
+The merge side is now `0.28` of the real cost in each run. The split side is
+`0.14` to `0.54` of it. In the one-leaf state, 73% to 94% of the windows of a
+splitter had no split-side time. In one run, the right splitter had no commit
+for 75 s, and so it measured no time. The typical times stayed at 0.29 s to
+0.50 s for splits and 0.5 s to 1.05 s for merges. A queued split request can
+also land after a merge: one request landed 16 s after the rule made it, and
+the leaf stayed merged for only about 2 s.
+
+### One writer instance takes the leaf from the other
+
+With one fixed leaf, the two writer instances took turns: for 10 to 70 model
+seconds, one instance committed about 8 transactions in each second, and the
+other none. In 4 of 4 runs of 40 s, each instance had 7 to 24 wall seconds
+with no commit.
+
+The instance that has the leaf commits with two leaf CASes for each
+transaction, so it changes the leaf about every 55 ms. Its rounds follow one
+another, and each new round starts its backoff again at 200 ms. A round of the
+other instance needs 70 to 150 ms from its read to its CAS, so it loses
+almost each CAS. Its backoff grows by 1.5 times after each loss, up to 5 s,
+and all workers of the instance wait in that round. In one round of 68 s, 23
+of 24 CASes lost, and 96.6% of the time was backoff. With the backoff of
+these rounds capped at 200 ms, no instance had a second with no commit, and
+the total commits did not change. A cap of 1 s did not remove the gaps.
+
+A sweep of the first delay and the cap of these rounds, in one binary with
+temporary overrides, and the default twice for the noise. Zero seconds are
+the wall seconds with no commit, summed over the two writers and 3 runs of
+40 s:
+
+| First delay / cap | `fixed-1` zero seconds | `avoidable` zero seconds |
+| --- | ---: | ---: |
+| 200 ms / 5 s (default) | `72`, `75` | `44`, `49` |
+| 20 ms / 300 ms | `0` | `0` |
+| 50 ms / 300 ms | `3` | `4` |
+| 100 ms / 300 ms | `3` | `4` |
+| 200 ms / 300 ms | `7` | `5` |
+| 20 ms / 500 ms | `2` | `1` |
+| 50 to 200 ms / 500 ms | `12` to `17` | `3` to `5` |
+
+In `mixed` on S3 (1 and 8 databases, affinities 0 and 100, lo and hi, 2
+runs), the default against itself had `0.96` overall and `0.84` in the cell
+with 8 databases, affinity 0, and hi mode. A first delay of 20 to 100 ms with
+a cap of 300 ms had `1.04` to `1.07` overall, and no cell below `0.96`. In the
+cell with 8 databases, affinity 0, and lo mode, these variants had `1.12` to
+`1.26`, and the p90 of `rwSingle` fell from 458 ms to 260 to 330 ms. The CAS
+retries for each transaction in the cells with 8 databases and affinity 0
+were about two times more (`0.43` to `0.72` to `0.86` in hi mode), and the
+backend operations for each transaction did not change more than the noise.
+In `contention`, a cap of 300 ms had `0.99` to `1.00`. The leaf CAS rounds now
+use a first delay of 20 ms and a cap of 300 ms after a lost CAS, a precondition
+miss, or a validation retry. After an in-doubt CAS, which can come from a
+backend that throttles or fails, they keep the retry schedule of the database
+instance. So the 50 attempts of a round that keeps losing now take about 10 s
+of delays instead of about 3.5 minutes, and the round reports a conflict
+sooner. The sweep ran only with the S3 delays. On GCS, a writer that keeps
+losing sends about 4 CASes in each second to an object that accepts one write
+in each second. Under the avoidable time
+policy, the writers then measure their lost CAS time, and the leaf split and
+merged 15 to 20 times in each run, against 5 to 8.
+
+The short schedule is now `RetryTiming::contention`, which a database instance
+can configure. The CAS loops on collection records and the contended releases
+of locks also use it. On S3, `mixed` and `contention` had `1.01` and `1.00` of
+the version before this change, in 2 runs. These benchmarks seldom contend on
+collection records, and no benchmark measured these loops under contention. On
+GCS, a CAS on a collection record that keeps losing now retries about 3 times
+in each second.
+Waits for backends and for other transactions use `RetryTiming::wait`, with
+the earlier 200 ms to 5 s.
+
+The starved instance also measured little split-side time. A round's keys
+included each key that its CAS changed. The CAS also removes the finished
+holders and the vestigial entries of the other key, so a peer write of that
+key was a loss on the same keys, and its time was not split time. In the
+round of 68 s, 13 of 23 losses were of this kind. The keys of a round are now
+the keys that its members read and publish.
+
+### Avoidable time after the retry fix
+
+The same instrumentation on `c458496e8`, 4 runs of 650 model seconds, and runs
+of each fixed tree. A long run where the rules measured but made no change
+gave the steady rates. Rates are in seconds for each model second:
+
+| Side | Measured | Real, from the fixed trees | Measured / real |
+| --- | ---: | ---: | ---: |
+| Split side, one leaf, both splitters | `3.0` to `3.6` | `3.7` | `0.82` to `0.95` |
+| Split side, one leaf, one splitter | `1.3` to `1.8` | | |
+| Merge side, two leaves | `1.0` to `1.1` | `5.0` | `0.20` to `0.22` |
+
+Both sides were stable across runs. The two topologies cost almost the same,
+but one leaf lost 1.25 worker seconds less in each second. The leaf split and
+merged about 12 times in 60 model seconds.
+
+An offline replay of the windows tested option A: a change records in its
+leaves the rate that paid for it, and the opposite change needs more than a
+margin `m` times that rate, which halves every `H` seconds. With the mean rate
+of the state before the change landed, the sum over the instances, `H` of 60 s,
+and `m` of 1.5, the replay made about 0.9 changes in 60 model seconds. But it
+kept two leaves for 0.94 of the time, because the merge side measured about 4
+times too little. With the merge side multiplied by 3 or more, it kept one
+leaf. With the rate of one instance instead of the sum, it also kept two
+leaves.
+
+### Paid rates
+
+ADR-076 implements option A with the mean rate since the last change, the
+rate of one instance, a margin of 1.5, and a half-life of 60 s. In
+`split-merge-fight` on S3, 3 runs of 60 s against `43a7187f1`:
+
+| Version | Splits / merges | Writers (tx/s) | Merger (scans/s) |
+| --- | --- | ---: | ---: |
+| `43a7187f1` | 29/29, 24/24, 22/22 | `12.0` to `12.9` | `80` to `88` |
+| Paid rates | 2/2, 4/3, 3/2 | `13.0` to `15.1` | `71` to `83` |
+
+The leaves stayed split for most of the time, as the offline replay
+predicted. `mixed` on S3 (1 and 8 databases, affinities 0 and 100, 2 runs) had
+`1.00` in lo mode and `0.98` in hi mode, against `43a7187f1`.
+
 ## 2026-09-26: ADR-074 splits in the mixed hi mode
 
 Status: in the engine as `TopologyPolicy::AvoidableTime`, the default policy

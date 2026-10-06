@@ -17,6 +17,7 @@ mod change;
 mod measurements;
 mod merge;
 mod nodes;
+mod paid_rate;
 mod reclamation;
 mod reconcile;
 mod recovery;
@@ -31,7 +32,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::{Background, RetryConfig, ScanCadence, rt};
+use glassdb_concurr::{Background, ScanCadence, rt};
 use glassdb_data::{CollectionAddress, DbPrefix, ObjectPath, TxId};
 use glassdb_storage::{
     InlinePolicy, NodeSizePolicy, NodeStore, StructuralIntentStore, Timeline, TreeRouter,
@@ -44,10 +45,10 @@ use crate::gc::GcHints;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::Monitor;
+use crate::retry_timing::RetryTiming;
 
 use candidates::{CandidateCause, MaintenanceCandidate, MaintenanceCandidates};
 use change::{ChangeLifecycle, PlannedChange, StructuralTopology};
-use measurements::ChangeKind;
 use merge::Merger;
 use nodes::StructuralNodeAccess;
 use reclamation::ReclamationReporter;
@@ -55,7 +56,7 @@ use reconcile::ParentReconciler;
 use recovery::{RecoveryAction, RecoveryStep, StructuralRecovery};
 use rule::{TOPOLOGY_WINDOW, TopologyRule};
 use split::Splitter;
-use stats::{LandedChanges, Stats};
+use stats::Stats;
 
 pub use candidates::StructuralHintSink;
 pub(crate) use measurements::TypicalTime;
@@ -108,7 +109,7 @@ impl Restructurer {
         timeline: Timeline,
         mon: Monitor,
         key_state: KeyStateResolver,
-        retry: RetryConfig,
+        retry: RetryTiming,
         db_prefix: DbPrefix,
         policy: NodeSizePolicy,
         inline: InlinePolicy,
@@ -268,6 +269,7 @@ impl Restructurer {
             recovery_wake.clone(),
             splitter.clone(),
             merger.clone(),
+            candidates.clone(),
         );
         Restructurer {
             bg,
@@ -308,13 +310,7 @@ impl Restructurer {
                     .inline_pressure_candidates
                     .fetch_add(1, Ordering::Relaxed);
             }
-            let landed = stats.landed();
-            let started = rt::Instant::now();
-            let result = self.process_candidate(&candidate).await;
-            if result.is_ok() {
-                self.record_change_time(&candidate.cause, landed, started.elapsed());
-            }
-            if let Err(e) = result {
+            if let Err(e) = self.process_candidate(&candidate).await {
                 tracing::debug!(
                     target: "glassdb::restructurer",
                     path = %candidate.path,
@@ -395,24 +391,6 @@ impl Restructurer {
                     .run(change, id, StructuralTopology::Owned)
                     .await
             }
-        }
-    }
-
-    /// Records `took` as the time of the change that a candidate with `cause`
-    /// asked for, when a change of that kind landed since `before`. The
-    /// recovery loop can also land a change of that kind in this time, but
-    /// rarely.
-    fn record_change_time(&self, cause: &CandidateCause, before: LandedChanges, took: Duration) {
-        let Some(measurements) = self.candidates.measurements() else {
-            return;
-        };
-        let after = self.stats.landed();
-        let (kind, landed) = match cause {
-            CandidateCause::Split(_) => (ChangeKind::Split, after.splits > before.splits),
-            CandidateCause::Merge(_) => (ChangeKind::Merge, after.merges > before.merges),
-        };
-        if landed {
-            measurements.record_change(kind, took);
         }
     }
 

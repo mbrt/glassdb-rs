@@ -29,6 +29,8 @@ impl DatabaseMetadata {
             .leaf_max_entries(local.leaf_max_entries())
             .node_soft_max_bytes(local.node_soft_max_bytes())
             .index_max_children(local.index_max_children())
+            .leaf_min_entries(local.leaf_min_entries())
+            .index_min_children(local.index_min_children())
             .node_max_bytes(self.node_max_bytes)
             .split_headroom_bytes(self.split_headroom_bytes)
             .build()
@@ -194,6 +196,31 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(created, reopened);
+    }
+
+    // Regression: an open dropped the local underfull thresholds and used the
+    // defaults, so leaves below the default threshold merged.
+    #[tokio::test]
+    async fn an_open_keeps_the_local_split_and_merge_thresholds() {
+        let b = MemoryBackend::new();
+        let metadata = check_or_create_db_meta(
+            &b,
+            "mydb",
+            NodeSizePolicy::default(),
+            ProtocolTiming::default(),
+        )
+        .await
+        .unwrap();
+        let local = NodeSizePolicy::builder()
+            .leaf_max_entries(16)
+            .leaf_min_entries(0)
+            .index_max_children(8)
+            .index_min_children(0)
+            .node_soft_max_bytes(128 * 1024)
+            .build()
+            .unwrap();
+
+        assert_eq!(metadata.node_size_policy(local).unwrap(), local);
     }
 
     #[tokio::test]

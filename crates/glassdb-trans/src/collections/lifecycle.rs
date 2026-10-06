@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use glassdb_concurr::{RetryConfig, rt};
+use glassdb_concurr::{RetrySchedule, rt};
 use glassdb_data::{CollectionAddress, NodeId, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
@@ -40,7 +40,7 @@ pub struct CollectionLifecycle {
     records: CollectionStore,
     nodes: NodeStore,
     monitor: Monitor,
-    retry: RetryConfig,
+    retry: RetrySchedule,
     // A drop must outlive every pre-existing topology participant before its
     // commit point, so fencing settles them rather than racing them.
     topology: Arc<dyn TopologySettler>,
@@ -52,7 +52,7 @@ impl CollectionLifecycle {
         records: CollectionStore,
         nodes: NodeStore,
         monitor: Monitor,
-        retry: RetryConfig,
+        retry: RetrySchedule,
         topology: Arc<dyn TopologySettler>,
     ) -> Self {
         Self {
@@ -587,7 +587,7 @@ mod tests {
             fixture.records.clone(),
             fixture.nodes.clone(),
             fixture.monitor.clone(),
-            RetryConfig::default(),
+            RetrySchedule::default(),
             Arc::new(UnexpectedTopologySettler),
         )
     }
@@ -850,10 +850,10 @@ mod tests {
             TxRecordStore::new(primary.objects.clone(), DbPrefix::try_from("db").unwrap()),
             primary.timeline.clone(),
             Arc::downgrade(&background),
-            RetryConfig::default(),
+            RetrySchedule::default(),
             crate::monitor::ProtocolTiming::default(),
         );
-        let retry = RetryConfig {
+        let retry = RetrySchedule {
             initial_interval: Duration::ZERO,
             max_interval: Duration::ZERO,
         };
@@ -888,7 +888,7 @@ mod tests {
             .load_node(&collection(), &SOURCE, Requirement::ANY)
             .await
             .unwrap();
-        let (right, _) = shrunk.split(RIGHT).unwrap();
+        let (right, _) = shrunk.split(RIGHT, None).unwrap();
         shrunk.remove_structural_gate(&split_id);
         assert!(
             primary
@@ -966,14 +966,14 @@ mod tests {
             TxRecordStore::new(primary.objects.clone(), DbPrefix::try_from("db").unwrap()),
             primary.timeline.clone(),
             Arc::downgrade(&background),
-            RetryConfig::default(),
+            RetrySchedule::default(),
             crate::monitor::ProtocolTiming::default(),
         );
         let lifecycle = CollectionLifecycle::new(
             primary.records.clone(),
             primary.nodes.clone(),
             monitor,
-            RetryConfig::default(),
+            RetrySchedule::default(),
             Arc::new(UnexpectedTopologySettler),
         );
         let collection = collection();

@@ -284,19 +284,41 @@ impl KeyResolver {
             return Ok(Vec::new());
         }
 
-        let leaves = self
+        let Some(mut leaf) = self
             .router
-            .leaves_through(collection, &range.start, frontier, requirement)
+            .first_leaf_at(collection, &range.start, requirement)
             .await
-            .map_err(|error| error.classify_collection_absence(collection))?;
-        let mut covered = Vec::with_capacity(leaves.len());
-        for leaf in leaves {
+            .map_err(|error| error.classify_collection_absence(collection))?
+        else {
+            return Err(StorageError::NotFound.classify_collection_absence(collection));
+        };
+        let mut covered = Vec::new();
+        loop {
             covered.push(
                 self.leaf_coverage(&leaf, own_lock_holder, requirement)
                     .await?,
             );
+            if frontier.is_some_and(|end| leaf.node().is_some_and(|node| node.covers(end))) {
+                return Ok(covered);
+            }
+            // A validation that reads the next leaf again pays for the
+            // crossing too, so a merge of the two leaves removes this time.
+            let started = rt::Instant::now();
+            let Some(next) = self
+                .router
+                .next_leaf(collection, &leaf, requirement)
+                .await
+                .map_err(|error| error.classify_collection_absence(collection))?
+            else {
+                return Ok(covered);
+            };
+            self.structural_hints.scan_crossing_time(
+                leaf.observation.path(),
+                next.observation.path(),
+                started.elapsed(),
+            );
+            leaf = next;
         }
-        Ok(covered)
     }
 
     async fn leaf_coverage(
@@ -521,7 +543,7 @@ mod tests {
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
-    use glassdb_concurr::{Background, RetryConfig};
+    use glassdb_concurr::{Background, RetrySchedule};
     use glassdb_data::{CollectionId, DbPrefix, NodeId, ObjectPath};
     use glassdb_storage::transaction::{TxCommitStatus, TxRecordStore};
     use glassdb_storage::{
@@ -566,7 +588,7 @@ mod tests {
             tx_records,
             timeline.clone(),
             Arc::downgrade(&bg),
-            RetryConfig::default(),
+            RetrySchedule::default(),
             crate::monitor::ProtocolTiming::default(),
         );
         let nodes = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
@@ -991,7 +1013,7 @@ mod tests {
         seed_inline(&seed_store, b"k", &writer, b"hello").await;
 
         let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
-        let reader = Reader::new(resolver, timeline, RetryConfig::default());
+        let reader = Reader::new(resolver, timeline, RetrySchedule::default());
         log.lock().unwrap().clear();
 
         let out = reader
@@ -1075,7 +1097,7 @@ mod tests {
         seed_writer(&seed_store, b"k", &writer, true).await;
 
         let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
-        let reader = Reader::new(resolver, timeline, RetryConfig::default());
+        let reader = Reader::new(resolver, timeline, RetrySchedule::default());
         log.lock().unwrap().clear();
 
         let out = reader
@@ -1106,7 +1128,7 @@ mod tests {
         commit_value(&mon, b"k", &new, false).await;
         seed_hold(&seed_store, b"k", &new).await;
 
-        let reader = Reader::new(resolver, timeline, RetryConfig::default());
+        let reader = Reader::new(resolver, timeline, RetrySchedule::default());
         let out = reader
             .read(&logical_key(b"k"), Duration::MAX)
             .await
@@ -1125,7 +1147,7 @@ mod tests {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let seed_store = store_over(backend.clone()).await;
         let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
-        let reader = Reader::new(resolver, timeline, RetryConfig::default());
+        let reader = Reader::new(resolver, timeline, RetrySchedule::default());
 
         let first = TxId::with_priority(1, b"first");
         seed_inline(&seed_store, b"k", &first, b"same").await;

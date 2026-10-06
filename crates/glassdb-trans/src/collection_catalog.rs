@@ -144,7 +144,7 @@ mod tests {
     use std::sync::Arc;
 
     use glassdb_backend::memory::MemoryBackend;
-    use glassdb_concurr::{Background, RetryConfig};
+    use glassdb_concurr::{Background, RetrySchedule};
     use glassdb_data::{CollectionId, CollectionName, DbPrefix};
     use glassdb_storage::transaction::{
         TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxRecordStore,
@@ -169,7 +169,7 @@ mod tests {
             transactions.clone(),
             timeline.clone(),
             Arc::downgrade(&background),
-            RetryConfig::default(),
+            RetrySchedule::default(),
             crate::monitor::ProtocolTiming::default(),
         );
         let state = CollectionStateResolver::new(
@@ -177,7 +177,7 @@ mod tests {
             transactions,
             timeline,
             monitor.clone(),
-            RetryConfig::default(),
+            RetrySchedule::default(),
         );
         let catalog = CollectionCatalog::new(state);
         (catalog, records, monitor, background)

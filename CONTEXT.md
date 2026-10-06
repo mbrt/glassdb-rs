@@ -449,6 +449,10 @@ _Avoid_: Topology cost, contention cost, structural pressure
 What decides when the leaves of one database instance split and merge: the node sizes, or the avoidable time.
 _Avoid_: Leaf changes, split policy
 
+**Paid rate**:
+The rate of avoidable time that paid for the last split or merge that a topology rule asked for, kept in the leaves of that change with its kind. The opposite change of these leaves must pay more.
+_Avoid_: Change record, change justification, change cost
+
 **Topology participant**:
 A transaction identity that a collection record lists while it can make structural changes to the collection tree.
 _Avoid_: Topology lock

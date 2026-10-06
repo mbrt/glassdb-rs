@@ -7,11 +7,12 @@
 //! the merge.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use glassdb_data::{CollectionAddress, NodeId, StructuralIntentId, TxId};
 use glassdb_storage::{
-    LeafBody, LeafObservation, MergeTarget, Node, NodeBody, NodeStore, Requirement, StorageError,
-    Timeline, TreeRouter,
+    LeafBody, LeafObservation, MergeTarget, Node, NodeBody, NodeStore, PaidChange, Requirement,
+    StorageError, Timeline, TreeRouter,
 };
 
 use crate::error::TransError;
@@ -51,7 +52,10 @@ pub(super) enum MergeReason {
     /// The node is below an underfull threshold.
     Underfull,
     /// A topology rule decided that the leaf merges.
-    Demand,
+    Demand {
+        /// The avoidable time in each second that pays for the merge.
+        rate: Duration,
+    },
 }
 
 /// The node writes of one merge. The source gate protects them until the
@@ -61,6 +65,8 @@ pub(super) struct MergePlan {
     target: TargetState,
     merge: MergeTarget,
     reclaimed: Vec<TxId>,
+    /// The rate that pays for a merge that a topology rule asked for.
+    rate: Option<Duration>,
 }
 
 /// A merge target and the state that the merge decision used.
@@ -173,6 +179,12 @@ impl Merger {
                 .to_vec(),
             generation: target.node.membership_generation(),
         };
+        // A merge that only goes ahead because its source has no live entries
+        // did not pay for itself, so it keeps no paid rate (ADR-076).
+        let rate = match reason {
+            MergeReason::Demand { rate } if self.pays_more(rate, &left, &target.node) => Some(rate),
+            _ => None,
+        };
         Prepared::Ready {
             change: ReadyChange::Merge(merge.clone()),
             plan: MergePlan {
@@ -180,6 +192,7 @@ impl Merger {
                 target,
                 merge,
                 reclaimed,
+                rate,
             },
         }
     }
@@ -200,9 +213,10 @@ impl Merger {
             target,
             merge,
             reclaimed,
+            rate,
         } = plan;
         match self
-            .absorb(collection, &merge, &left, intent, target)
+            .absorb(collection, &merge, &left, intent, target, rate)
             .await?
         {
             Some(target_reclaimed) => self.reclamation.record(&target_reclaimed, false),
@@ -222,6 +236,9 @@ impl Merger {
         }
         self.reclamation.record(&reclaimed, false);
         self.stats.record_merge();
+        if rate.is_some() {
+            self.candidates.paid_rates().landed(intent);
+        }
         if drained.as_leaf().is_some() {
             for id in [*source, merge.node_id] {
                 self.candidates
@@ -303,6 +320,12 @@ impl Merger {
         let policy = self.candidates.policy();
         let fits_bytes = left.content_encoded_len() + right.content_encoded_len()
             <= policy.node_soft_max_bytes().min(policy.content_limit()) / 2;
+        // A merge that a topology rule asked for must pay more than the paid
+        // rates of a split of the two leaves (ADR-076).
+        let pays = match reason {
+            MergeReason::Demand { rate } => self.pays_more(rate, &left, &right),
+            MergeReason::Underfull => false,
+        };
         match (left.body(), right.body()) {
             (NodeBody::Leaf(left), NodeBody::Leaf(right)) => {
                 let inline_len = |leaf: &LeafBody| -> usize {
@@ -310,7 +333,7 @@ impl Merger {
                 };
                 let underfull = left.entries().filter(|entry| entry.exists()).count()
                     < self.candidates.leaf_min_live_entries();
-                (reason == MergeReason::Demand || underfull)
+                (pays || underfull)
                     && left.len() + right.len() <= policy.leaf_max_entries() / 2
                     && inline_len(left) + inline_len(right)
                         <= self.candidates.inline().max_leaf_bytes / 2
@@ -324,6 +347,16 @@ impl Merger {
             }
             _ => false,
         }
+    }
+
+    /// Reports whether a merge of `left` into `right` that pays `rate` pays
+    /// more than the paid rates of a split of the two leaves.
+    fn pays_more(&self, rate: Duration, left: &Node, right: &Node) -> bool {
+        self.candidates.paid_rates().pays_more(
+            PaidChange::Merge,
+            rate,
+            [left.paid_rate(), right.paid_rate()],
+        )
     }
 
     /// Reports whether a holder of any claim on `node` can still be live.
@@ -359,6 +392,7 @@ impl Merger {
         left: &Node,
         intent: &StructuralIntentId,
         target: TargetState,
+        rate: Option<Duration>,
     ) -> Result<Option<Vec<TxId>>, TransError> {
         let mut current = (target.node, target.observation);
         for attempt in 0..NODE_CAS_ATTEMPTS {
@@ -388,7 +422,7 @@ impl Merger {
             // tombstones that have no holder when it lands. R's gate is not
             // necessary for that (ADR-073).
             let reclaimed = reclaim_holder_free_tombstones(&mut right);
-            right.absorb(left, *intent)?;
+            right.absorb(left, *intent, rate)?;
             let policy = self.candidates.policy();
             if right.content_encoded_len() > policy.content_limit()
                 || right.encoded_len() > policy.node_max_bytes()
@@ -412,7 +446,7 @@ impl MergeReason {
     pub(super) fn class(self) -> u8 {
         match self {
             MergeReason::Underfull => 4,
-            MergeReason::Demand => 5,
+            MergeReason::Demand { .. } => 5,
         }
     }
 }

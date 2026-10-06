@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::time::Duration;
 
 use glassdb_proto as pb;
 use prost::Message;
@@ -541,6 +542,32 @@ pub enum NodeBody {
     Index(IndexNode),
 }
 
+/// The kind of a structural change that a paid rate is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaidChange {
+    Split,
+    Merge,
+}
+
+/// The rate of avoidable time that paid for the last split or merge of a leaf
+/// that a topology rule asked for (ADR-076).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaidRate {
+    pub change: PaidChange,
+    /// The avoidable time in each second that paid for the change.
+    pub per_second: Duration,
+    /// The structural intent of the change, which identifies the paid rate.
+    pub intent: StructuralIntentId,
+}
+
+/// The avoidable time in each second that pays for one split that a topology
+/// rule asked for, and the structural intent of the split (ADR-076).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Payment {
+    pub per_second: Duration,
+    pub intent: StructuralIntentId,
+}
+
 /// A decoded B-link tree node: a body plus the high-key and right-sibling that
 /// make descent self-correcting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -556,6 +583,37 @@ pub struct Node {
     locks: NodeLocks,
     /// Set after a merge moved the range and entries into the right sibling.
     drained: bool,
+    paid_rate: Option<PaidRate>,
+}
+
+impl PaidRate {
+    fn to_pb(&self) -> pb::PaidRate {
+        let change = match self.change {
+            PaidChange::Split => pb::paid_rate::Change::Split,
+            PaidChange::Merge => pb::paid_rate::Change::Merge,
+        };
+        pb::PaidRate {
+            change: change.into(),
+            nanos_per_second: u64::try_from(self.per_second.as_nanos()).unwrap_or(u64::MAX),
+            intent: self.intent.as_bytes().to_vec(),
+        }
+    }
+
+    /// Returns the paid rate, or none when a later version wrote a kind of
+    /// change that this version does not know. A paid rate only holds a
+    /// change, so a node without it is still valid.
+    fn from_pb(raw: pb::PaidRate) -> Option<Self> {
+        let change = match pb::paid_rate::Change::try_from(raw.change).ok()? {
+            pb::paid_rate::Change::Split => PaidChange::Split,
+            pb::paid_rate::Change::Merge => PaidChange::Merge,
+            pb::paid_rate::Change::Unspecified => return None,
+        };
+        Some(Self {
+            change,
+            per_second: Duration::from_nanos(raw.nanos_per_second),
+            intent: StructuralIntentId::try_from(raw.intent.as_slice()).ok()?,
+        })
+    }
 }
 
 impl Node {
@@ -569,6 +627,7 @@ impl Node {
             body: NodeBody::Leaf(leaf),
             locks: NodeLocks::default(),
             drained: false,
+            paid_rate: None,
         }
     }
 
@@ -581,6 +640,7 @@ impl Node {
             body: NodeBody::Index(index),
             locks: NodeLocks::default(),
             drained: false,
+            paid_rate: None,
         }
     }
 
@@ -646,6 +706,12 @@ impl Node {
         self.drained
     }
 
+    /// Returns the paid rate of the last change of the node that a topology
+    /// rule asked for, if any.
+    pub fn paid_rate(&self) -> Option<&PaidRate> {
+        self.paid_rate.as_ref()
+    }
+
     /// Empties the node and links it to the `target` that absorbed its entries,
     /// keeping its level.
     pub fn drain(&mut self, target: NodeId) {
@@ -654,14 +720,21 @@ impl Node {
             NodeBody::Index(_) => NodeBody::Index(IndexNode::default()),
         };
         self.right_sibling = Some(target);
+        self.paid_rate = None;
         self.locks.clear_holders();
         self.drained = true;
     }
 
     /// Adds the range and entries of `left`, the gated left sibling, to this
-    /// node and reserves this node for the merge of `intent` (ADR-073). Fails
-    /// if the two nodes are at different levels.
-    pub fn absorb(&mut self, left: &Node, intent: StructuralIntentId) -> Result<(), StorageError> {
+    /// node and reserves this node for the merge of `intent` (ADR-073). A
+    /// leaf keeps `paid` as the paid rate of the merge, and loses an earlier
+    /// paid rate (ADR-076). Fails if the two nodes are at different levels.
+    pub fn absorb(
+        &mut self,
+        left: &Node,
+        intent: StructuralIntentId,
+        paid: Option<Duration>,
+    ) -> Result<(), StorageError> {
         self.body = match (&self.body, &left.body) {
             (NodeBody::Leaf(right), NodeBody::Leaf(left)) => NodeBody::Leaf(
                 LeafBody::from_entries(left.entries().chain(right.entries()).cloned()),
@@ -684,16 +757,29 @@ impl Node {
             .locks
             .membership_generation
             .max(left.locks.membership_generation);
+        self.paid_rate = self.as_leaf().and(paid).map(|per_second| PaidRate {
+            change: PaidChange::Merge,
+            per_second,
+            intent,
+        });
         Ok(())
     }
 
     /// Reverts the absorb of the merge of `intent`, after its drain can no
     /// longer land: restores `boundary` as the low key and removes the entries
-    /// below it (ADR-073). Returns `false` and changes nothing if this node does
-    /// not hold the merge reservation of `intent`.
+    /// below it (ADR-073), and the paid rate of the merge (ADR-076). Returns
+    /// `false` and changes nothing if this node does not hold the merge
+    /// reservation of `intent`.
     pub fn abandon_merge(&mut self, intent: &StructuralIntentId, boundary: &[u8]) -> bool {
         if !self.locks.remove_merge_reservation(intent) {
             return false;
+        }
+        if self
+            .paid_rate
+            .as_ref()
+            .is_some_and(|paid| paid.intent == *intent)
+        {
+            self.paid_rate = None;
         }
         match &mut self.body {
             NodeBody::Leaf(leaf) => {
@@ -896,10 +982,13 @@ impl Node {
     /// the parent. Returns `None` when the node is too small to divide (fewer
     /// than two entries/children), so a caller never produces an empty node.
     ///
+    /// Both leaves of a split keep `paid` as the paid rate of the split, and
+    /// lose an earlier paid rate (ADR-076).
+    ///
     /// This is a pure in-memory transform; persisting the two nodes (create the
     /// sibling, then CAS the shrunk source — the linearization point) is the
     /// caller's multi-step protocol.
-    pub fn split(&mut self, right_id: NodeId) -> Option<(Node, Vec<u8>)> {
+    pub fn split(&mut self, right_id: NodeId, paid: Option<Payment>) -> Option<(Node, Vec<u8>)> {
         let (right_body, split_key) = match &mut self.body {
             NodeBody::Leaf(leaf) => {
                 if leaf.len() < 2 {
@@ -916,17 +1005,22 @@ impl Node {
                 (NodeBody::Index(upper), separator)
             }
         };
-        Some(self.link_right_sibling(right_id, right_body, split_key))
+        Some(self.link_right_sibling(right_id, right_body, split_key, paid))
     }
 
     /// Divides a leaf at `split_key` like [`Node::split`]. Returns `None` when
     /// the node is not a leaf, or when one half would be empty.
-    pub fn split_leaf_at(&mut self, right_id: NodeId, split_key: &[u8]) -> Option<(Node, Vec<u8>)> {
+    pub fn split_leaf_at(
+        &mut self,
+        right_id: NodeId,
+        split_key: &[u8],
+        paid: Option<Payment>,
+    ) -> Option<(Node, Vec<u8>)> {
         let NodeBody::Leaf(leaf) = &mut self.body else {
             return None;
         };
         let upper = leaf.split_off_at(split_key)?;
-        Some(self.link_right_sibling(right_id, NodeBody::Leaf(upper), split_key.to_vec()))
+        Some(self.link_right_sibling(right_id, NodeBody::Leaf(upper), split_key.to_vec(), paid))
     }
 
     /// Encodes the node to its canonical protobuf body (the CAS unit).
@@ -982,6 +1076,7 @@ impl Node {
                 .map(|intent| intent.as_bytes().to_vec())
                 .unwrap_or_default(),
             low_key: self.low_key.clone(),
+            paid_rate: self.paid_rate.as_ref().map(PaidRate::to_pb),
         }
     }
 
@@ -1024,17 +1119,24 @@ impl Node {
                 merge_reservation,
             },
             drained: raw.drained,
+            paid_rate: raw.paid_rate.and_then(PaidRate::from_pb),
         })
     }
 
     /// Makes `right_body` the right sibling of the node, above `split_key`,
-    /// and returns it with the split key.
+    /// and returns it with the split key. Both leaves keep `paid`.
     fn link_right_sibling(
         &mut self,
         right_id: NodeId,
         right_body: NodeBody,
         split_key: Vec<u8>,
+        paid: Option<Payment>,
     ) -> (Node, Vec<u8>) {
+        self.paid_rate = self.as_leaf().and(paid).map(|paid| PaidRate {
+            change: PaidChange::Split,
+            per_second: paid.per_second,
+            intent: paid.intent,
+        });
         // The right sibling takes over the upper range: the old high-key and the
         // old right-sibling link now bound and follow it.
         let right = Node {
@@ -1048,6 +1150,7 @@ impl Node {
                 locks
             },
             drained: false,
+            paid_rate: self.paid_rate.clone(),
         };
         // The retained lower half is now bounded by the split key and links to
         // the new sibling.
@@ -1143,6 +1246,56 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_preserves_the_paid_rate() {
+        let paid = Payment {
+            per_second: Duration::from_micros(1_500_250),
+            intent: intent_id(4),
+        };
+        let mut left = Node::leaf(LeafBody::from_entries([entry(b"a", 1), entry(b"b", 1)]));
+        let (right, _) = left.split(id("right"), Some(paid)).unwrap();
+        assert_eq!(Node::decode(&left.encode()).unwrap(), left);
+
+        let mut merged = right;
+        merged
+            .absorb(&left, intent_id(5), Some(paid.per_second))
+            .unwrap();
+        assert_eq!(Node::decode(&merged.encode()).unwrap(), merged);
+    }
+
+    // ADR-076: both leaves of a split keep its paid rate, and the leaf that
+    // receives a merge keeps the paid rate of the merge. A change that no
+    // topology rule asked for removes the earlier paid rate.
+    #[test]
+    fn splits_and_merges_keep_their_paid_rate_in_their_leaves() {
+        let paid = Payment {
+            per_second: Duration::from_secs(1),
+            intent: intent_id(4),
+        };
+        let split = Some(PaidRate {
+            change: PaidChange::Split,
+            per_second: paid.per_second,
+            intent: paid.intent,
+        });
+        let mut left = Node::leaf(LeafBody::from_entries([entry(b"a", 1), entry(b"b", 1)]));
+        let (mut right, _) = left.split(id("right"), Some(paid)).unwrap();
+        assert_eq!(
+            (left.paid_rate(), right.paid_rate()),
+            (split.as_ref(), split.as_ref())
+        );
+
+        right
+            .absorb(&left, intent_id(5), Some(paid.per_second))
+            .unwrap();
+        assert_eq!(
+            right.paid_rate().map(|paid| paid.change),
+            Some(PaidChange::Merge)
+        );
+
+        let (upper, _) = right.split(id("upper"), None).unwrap();
+        assert_eq!((right.paid_rate(), upper.paid_rate()), (None, None));
+    }
+
+    #[test]
     fn round_trip_preserves_merge_fields() {
         let intent = intent_id(3);
         let mut target = Node::leaf(LeafBody::from_entries([entry(b"a", 1)]));
@@ -1178,7 +1331,7 @@ mod tests {
         assert!(source.structural_gate().is_empty());
         assert_eq!(source.membership_generation(), generation);
         assert!(!source.covers(b"a"));
-        assert!(source.split(id("sibling")).is_none());
+        assert!(source.split(id("sibling"), None).is_none());
     }
 
     #[test]
@@ -1195,7 +1348,7 @@ mod tests {
             .with_high_key(Some(b"t".to_vec()));
         let mut right = original.clone();
 
-        right.absorb(&left, intent).unwrap();
+        right.absorb(&left, intent, None).unwrap();
 
         let keys: Vec<_> = right
             .as_leaf()
@@ -1219,6 +1372,38 @@ mod tests {
         assert_eq!(right.membership_generation(), 5);
     }
 
+    // Regression: an abandoned merge left the paid rate of the merge in its
+    // target, which then held splits for a merge that did not land.
+    #[test]
+    fn abandoning_a_merge_removes_its_paid_rate() {
+        let intent = intent_id(3);
+        let left =
+            Node::leaf(LeafBody::from_entries([entry(b"a", 1)])).with_high_key(Some(b"m".to_vec()));
+        let mut right =
+            Node::leaf(LeafBody::from_entries([entry(b"n", 1)])).with_low_key(b"m".to_vec());
+        right
+            .absorb(&left, intent, Some(Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(right.abandon_merge(&intent, b"m"));
+        assert_eq!(right.paid_rate(), None);
+    }
+
+    // A paid rate only holds a change, so a node whose paid rate has a kind
+    // that a later version added is still valid.
+    #[test]
+    fn a_paid_rate_of_an_unknown_kind_decodes_as_none() {
+        let node = Node::leaf(LeafBody::from_entries([entry(b"a", 1)]));
+        let mut raw = node.to_pb();
+        raw.paid_rate = Some(pb::PaidRate {
+            change: 9,
+            nanos_per_second: 1,
+            intent: intent_id(3).as_bytes().to_vec(),
+        });
+
+        assert_eq!(Node::decode(&raw.encode_to_vec()).unwrap(), node);
+    }
+
     #[test]
     fn absorb_joins_index_children_at_one_level() {
         let intent = intent_id(3);
@@ -1227,7 +1412,7 @@ mod tests {
         let mut right = Node::index(IndexNode::from_children([(b"m".to_vec(), id("B"))]))
             .with_low_key(b"m".to_vec());
 
-        right.absorb(&left, intent).unwrap();
+        right.absorb(&left, intent, None).unwrap();
         let children: Vec<_> = right.as_index().unwrap().children().collect();
         assert_eq!(
             children,
@@ -1237,7 +1422,7 @@ mod tests {
         assert_eq!(right.membership_generation(), 1);
 
         let error = Node::leaf(LeafBody::new())
-            .absorb(&left, intent)
+            .absorb(&left, intent, None)
             .unwrap_err();
         assert_eq!(error.to_string(), "merge nodes are at different levels");
     }
@@ -1522,7 +1707,7 @@ mod tests {
         .with_high_key(Some(b"tiger".to_vec()))
         .with_right_sibling(Some(id("oldRight")));
 
-        let (right, split_key) = src.split(id("newRight")).expect("splittable");
+        let (right, split_key) = src.split(id("newRight"), None).expect("splittable");
         assert_eq!(split_key, b"mango");
         assert_eq!(src.low_key(), b"ant");
         assert_eq!(right.low_key(), b"mango");
@@ -1565,7 +1750,7 @@ mod tests {
         locks.advance_membership_generation();
         src.set_locks(locks);
 
-        let (right, _) = src.split(id("newRight")).expect("splittable");
+        let (right, _) = src.split(id("newRight"), None).expect("splittable");
         assert_eq!(src.membership_generation(), 2);
         assert_eq!(right.membership_generation(), 2);
     }
@@ -1574,9 +1759,13 @@ mod tests {
     fn leaf_split_at_a_key_divides_there_and_relinks() {
         let leaf = LeafBody::from_entries([entry(b"a", 1), entry(b"b", 2), entry(b"c", 3)]);
         let mut src = Node::leaf(leaf).with_right_sibling(Some(id("oldRight")));
-        assert!(src.clone().split_leaf_at(id("newRight"), b"a").is_none());
+        assert!(
+            src.clone()
+                .split_leaf_at(id("newRight"), b"a", None)
+                .is_none()
+        );
 
-        let (right, split_key) = src.split_leaf_at(id("newRight"), b"c").unwrap();
+        let (right, split_key) = src.split_leaf_at(id("newRight"), b"c", None).unwrap();
         assert_eq!(split_key, b"c");
         assert_eq!(src.as_leaf().unwrap().len(), 2);
         assert_eq!(src.high_key(), Some(b"c".as_slice()));
@@ -1589,7 +1778,7 @@ mod tests {
             (b"".to_vec(), id("L0")),
             (b"m".to_vec(), id("L1")),
         ]));
-        assert!(index.split_leaf_at(id("newRight"), b"m").is_none());
+        assert!(index.split_leaf_at(id("newRight"), b"m", None).is_none());
     }
 
     #[test]
@@ -1600,7 +1789,7 @@ mod tests {
             (b"m".to_vec(), id("L2")),
             (b"t".to_vec(), id("L3")),
         ]));
-        let (right, sep) = src.split(id("newRight")).expect("splittable");
+        let (right, sep) = src.split(id("newRight"), None).expect("splittable");
         assert_eq!(
             sep, b"m",
             "promoted separator is the right half's low bound"
@@ -1624,12 +1813,12 @@ mod tests {
     fn split_of_undersized_node_is_none() {
         assert!(
             Node::leaf(LeafBody::from_entries([entry(b"only", 1)]))
-                .split(id("r"))
+                .split(id("r"), None)
                 .is_none()
         );
-        assert!(Node::leaf(LeafBody::new()).split(id("r")).is_none());
+        assert!(Node::leaf(LeafBody::new()).split(id("r"), None).is_none());
         let one_child = Node::index(IndexNode::from_children([(b"".to_vec(), id("L0"))]));
-        assert!(one_child.clone().split(id("r")).is_none());
+        assert!(one_child.clone().split(id("r"), None).is_none());
     }
 
     #[test]

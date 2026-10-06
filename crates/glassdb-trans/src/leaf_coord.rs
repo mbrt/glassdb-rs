@@ -33,9 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::{
-    BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, RetryConfig, Worker, rt,
-};
+use glassdb_concurr::{BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker, rt};
 use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{
     CasReceipt, CasResult, CurrentnessBarrier, LeafBody, LeafEdit, LeafEntry, LeafObservation,
@@ -47,6 +45,7 @@ use hashlink::LinkedHashMap;
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::Monitor;
+use crate::retry_timing::RetryTiming;
 
 /// Maximum inner CAS retries on a single leaf/root before treating the
 /// operation as conflicted and restarting the transaction.
@@ -510,7 +509,7 @@ struct CoordCore {
     tmon: Monitor,
     nodes: NodeStore,
     key_state: KeyStateResolver,
-    retry: RetryConfig,
+    retry: RetryTiming,
     stats: Stats,
     // Where stored over-cap leaves are reported: the background
     // [`Restructurer`](crate::structural::Restructurer)'s queue when one is wired.
@@ -669,8 +668,8 @@ enum CapacityDecision {
 enum PersistResult {
     Applied(CasReceipt<Node>),
     Unchanged(LeafObservation),
-    /// A peer changed the leaf first. Carries the entries this CAS staged.
-    Rejected(LeafBody),
+    /// A peer changed the leaf first.
+    Rejected,
     PreconditionMiss,
     InDoubt(BTreeSet<TxId>),
 }
@@ -692,23 +691,18 @@ struct LostCas {
 }
 
 impl LostCas {
-    /// Records a rejected CAS of `staged` against `expected`, sent at `sent`
-    /// for the round of `members`. A round's keys include keys it reads,
-    /// because a peer change of those also conflicts after any split.
-    fn new(
-        expected: Arc<Node>,
-        staged: &LeafBody,
-        members: &BTreeMap<TxId, LeafMember>,
-        sent: rt::Instant,
-    ) -> Self {
-        let mut round_keys: BTreeSet<Vec<u8>> = members
+    /// Records a rejected CAS against `expected`, sent at `sent` for the
+    /// round of `members`. A round's keys include keys it reads, because a
+    /// peer change of those also conflicts after any split. They do not
+    /// include the other entries that the CAS cleans up, such as vestigial
+    /// entries, because a split puts the entries of the other half out of
+    /// the CAS of the round.
+    fn new(expected: Arc<Node>, members: &BTreeMap<TxId, LeafMember>, sent: rt::Instant) -> Self {
+        let round_keys: BTreeSet<Vec<u8>> = members
             .values()
-            .flat_map(|member| member.policy.leaf_scope_keys())
+            .flat_map(member_keys)
             .map(<[u8]>::to_vec)
             .collect();
-        if let Some(loaded) = expected.as_leaf() {
-            round_keys.extend(changed_keys(loaded, staged).map(<[u8]>::to_vec));
-        }
         Self {
             expected,
             round_keys,
@@ -1206,7 +1200,7 @@ impl CasWorker {
                 }
                 Ok(PersistResult::Applied(receipt))
             }
-            Ok(CasResult::Rejected) => Ok(PersistResult::Rejected(new_leaf)),
+            Ok(CasResult::Rejected) => Ok(PersistResult::Rejected),
             Err(StorageError::Unavailable(_)) => {
                 Ok(PersistResult::InDoubt(plan.staged_ids().cloned().collect()))
             }
@@ -1231,7 +1225,11 @@ impl CasWorker {
         // window. The first load accepts any cached leaf, even for members
         // that require bounded evidence before completion.
         rt::yield_now().await;
-        let mut backoff = self.core.retry.backoff();
+        let mut contention = self.core.retry.contention.backoff();
+        // A CAS that came back in-doubt can be a backend that throttles or
+        // fails, so its retry waits longer.
+        let mut failure = self.core.retry.wait.backoff();
+        let mut failed = false;
         // Policies must distinguish the first attempt from recovery after a CAS
         // failure or a stale transaction dependency.
         let mut reloaded = false;
@@ -1258,7 +1256,13 @@ impl CasWorker {
         let mut load_requirement = Requirement::ANY;
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
+                let backoff = if failed {
+                    &mut failure
+                } else {
+                    &mut contention
+                };
                 rt::sleep(backoff.next_delay()).await;
+                failed = false;
                 self.core.stats.n_retries.fetch_add(1, Ordering::Relaxed);
                 load_requirement = requirement;
             }
@@ -1359,11 +1363,11 @@ impl CasWorker {
                 PersistResult::Unchanged(observed) => (observed, None),
                 // The CAS did not land, or the clean plan's loaded state
                 // changed. Neither resolves an earlier in-doubt mutation.
-                PersistResult::Rejected(staged) => {
+                PersistResult::Rejected => {
                     if self.core.delays.is_some() {
-                        lost_cas = loaded_observation.value().map(|expected| {
-                            LostCas::new(expected.clone(), &staged, &members, sent)
-                        });
+                        lost_cas = loaded_observation
+                            .value()
+                            .map(|expected| LostCas::new(expected.clone(), &members, sent));
                     }
                     reloaded = true;
                     continue;
@@ -1377,6 +1381,7 @@ impl CasWorker {
                 PersistResult::InDoubt(staged_ids) => {
                     in_doubt.extend(staged_ids);
                     reloaded = true;
+                    failed = true;
                     continue;
                 }
             };
@@ -1474,7 +1479,7 @@ impl LeafCoordinator {
         nodes: NodeStore,
         key_state: KeyStateResolver,
         tmon: Monitor,
-        retry: RetryConfig,
+        retry: RetryTiming,
         policy: NodeSizePolicy,
         hinter: Arc<dyn StructuralHinter>,
     ) -> Self {
@@ -1672,7 +1677,7 @@ mod tests {
         policy: NodeSizePolicy,
         hinter: Arc<dyn StructuralHinter>,
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
-        coord_over_retry(backend, policy, hinter, RetryConfig::default()).await
+        coord_over_retry(backend, policy, hinter, RetryTiming::default()).await
     }
 
     // A coordinator with a near-zero CAS backoff, so an exhaustion regression
@@ -1684,10 +1689,10 @@ mod tests {
             backend,
             NodeSizePolicy::default(),
             Arc::new(NoStructuralHints),
-            RetryConfig {
+            RetryTiming::uniform(glassdb_concurr::RetrySchedule {
                 initial_interval: Duration::from_nanos(1),
                 max_interval: Duration::from_nanos(1),
-            },
+            }),
         )
         .await
     }
@@ -1696,7 +1701,7 @@ mod tests {
         backend: Arc<dyn Backend>,
         policy: NodeSizePolicy,
         hinter: Arc<dyn StructuralHinter>,
-        retry: RetryConfig,
+        retry: RetryTiming,
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
         let seed_timeline = Timeline::new();
         let seed_store = NodeStore::new(
@@ -3268,27 +3273,41 @@ mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<Background>,
     ) {
-        let inner = slow_leaf_backend();
         let seed = TxId::with_priority(1, b"seed");
-        store_leaf_entries(
-            &cold_store(inner.clone()),
-            &leaf(),
+        coord_losing_cas_over(
             vec![
                 entry(b"a", LockType::None, None, Some(&seed)),
                 entry(b"b", LockType::None, None, Some(&seed)),
             ],
+            change,
+            wins,
         )
-        .await;
+        .await
+    }
+
+    // Like [`coord_losing_cas`], over a leaf with `entries`.
+    async fn coord_losing_cas_over(
+        entries: Vec<LeafEntry>,
+        change: PeerChange,
+        wins: usize,
+    ) -> (
+        LeafCoordinator,
+        Arc<DelayRecorder>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<Background>,
+    ) {
+        let inner = slow_leaf_backend();
+        store_leaf_entries(&cold_store(inner.clone()), &leaf(), entries).await;
         let (backend, peer_wins) = peer_wins_leaf_cas(inner, change);
         let hints = Arc::new(DelayRecorder::default());
         let (coord, _nodes, _timeline, bg) = coord_over_retry(
             backend,
             NodeSizePolicy::default(),
             hints.clone(),
-            RetryConfig {
+            RetryTiming::uniform(glassdb_concurr::RetrySchedule {
                 initial_interval: Duration::from_nanos(1),
                 max_interval: Duration::from_nanos(1),
-            },
+            }),
         )
         .await;
         peer_wins.store(wins, Ordering::SeqCst);
@@ -3352,6 +3371,65 @@ mod tests {
                 assert!(delays.is_empty(), "{name}: {delays:?}");
             }
         }
+    }
+
+    // Regression: the delay before each leaf CAS of a round grew after each
+    // loss, up to 5 s. When the leaf of a database instance was busy with the
+    // rounds of another instance, the instance committed nothing for tens of
+    // seconds. With that schedule, 10 losses took more than 9 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_round_that_keeps_losing_sends_its_cas_again_soon() {
+        const LOSSES: u32 = 10;
+        let inner = slow_leaf_backend();
+        let seed = TxId::with_priority(1, b"seed");
+        store_leaf_entries(
+            &cold_store(inner.clone()),
+            &leaf(),
+            vec![
+                entry(b"a", LockType::None, None, Some(&seed)),
+                entry(b"b", LockType::None, None, Some(&seed)),
+            ],
+        )
+        .await;
+        let (backend, peer_wins) = peer_wins_leaf_cas(inner, |node| with_peer_writer(node, b"b"));
+        let (coord, _nodes, _timeline, _bg) = coord_over_retry(
+            backend,
+            NodeSizePolicy::default(),
+            Arc::new(DelayRecorder::default()),
+            RetryTiming::default(),
+        )
+        .await;
+        peer_wins.store(LOSSES as usize, Ordering::SeqCst);
+
+        let started = rt::Instant::now();
+        assert!(spawn_lock(&coord, b"a", 2).await.unwrap().unwrap());
+        let took = started.elapsed();
+        coord.close().await;
+
+        assert!(took < Duration::from_secs(6), "{took:?}");
+    }
+
+    // Regression: the keys of a round included each key that its CAS changed,
+    // also a vestigial entry that the CAS only dropped. A loss to a peer write
+    // of that key then was a loss on the same keys, and was not split time.
+    #[tokio::test(start_paused = true)]
+    async fn lost_cas_on_a_key_that_the_round_only_dropped_is_split_time() {
+        let seed = TxId::with_priority(1, b"seed");
+        let (coord, hints, _wins, _bg) = coord_losing_cas_over(
+            vec![
+                entry(b"a", LockType::None, None, Some(&seed)),
+                entry(b"b", LockType::None, None, None),
+            ],
+            |node| with_peer_writer(node, b"b"),
+            1,
+        )
+        .await;
+
+        assert!(spawn_lock(&coord, b"a", 2).await.unwrap().unwrap());
+        coord.close().await;
+
+        assert_lost_cas_time(&hints.take());
+        assert_eq!(hints.split_keys(), vec![b"b".to_vec()]);
     }
 
     // Stages a write lock like [`StageLock`], but stages nothing after a
@@ -4161,6 +4239,36 @@ mod tests {
             future
         });
         backend
+    }
+
+    // A CAS that comes back in-doubt can be a backend that throttles or fails.
+    // Its retry keeps the retry schedule of the database instance, and not the
+    // short delay after a CAS that lost to another change.
+    #[tokio::test(start_paused = true)]
+    async fn a_round_retries_an_in_doubt_cas_with_the_retry_schedule() {
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let seed = TxId::with_priority(1, b"seed");
+        store_leaf_entries(
+            &cold_store(inner.clone()),
+            &leaf(),
+            vec![entry(b"a", LockType::None, None, Some(&seed))],
+        )
+        .await;
+        let (coord, _nodes, _timeline, _bg) = coord_over_retry(
+            in_doubt_then_ok(inner),
+            NodeSizePolicy::default(),
+            Arc::new(DelayRecorder::default()),
+            RetryTiming::default(),
+        )
+        .await;
+
+        let started = rt::Instant::now();
+        spawn_lock(&coord, b"a", 2).await.unwrap().unwrap();
+        let took = started.elapsed();
+        coord.close().await;
+
+        // The jitter of the first delay of 200 ms is at most one half.
+        assert!(took >= Duration::from_millis(100), "{took:?}");
     }
 
     // A member that never stages, but exposes whether the coordinator attributed

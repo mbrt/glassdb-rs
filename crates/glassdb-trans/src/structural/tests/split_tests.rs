@@ -1,5 +1,7 @@
 use super::*;
 
+use glassdb_storage::PaidChange;
+
 #[test]
 fn reclamation_removes_only_holder_free_tombstones() {
     let reclaimed_writer = TxId::with_priority(1, b"reclaimed");
@@ -409,6 +411,7 @@ async fn a_demand_split_divides_the_leaf_at_its_measured_key() {
 
     let above_every_key = SplitReason::Demand {
         at: Some(b"e".to_vec()),
+        rate: Duration::from_secs(1),
     };
     split_path(&sp, &root_path(), &above_every_key)
         .await
@@ -417,6 +420,7 @@ async fn a_demand_split_divides_the_leaf_at_its_measured_key() {
 
     let measured = SplitReason::Demand {
         at: Some(b"b".to_vec()),
+        rate: Duration::from_secs(1),
     };
     split_path(&sp, &root_path(), &measured).await.unwrap();
     assert_eq!(leaf_keys(&s).await, a_then_bcd());
@@ -437,6 +441,7 @@ async fn queued_demand_splits_of_a_leaf_divide_it_at_the_newest_key() {
             priority: candidates.new_id(),
             cause: CandidateCause::Split(SplitReason::Demand {
                 at: Some(at.to_vec()),
+                rate: Duration::from_secs(1),
             }),
         });
     }
@@ -460,6 +465,45 @@ fn a_then_bcd() -> Vec<Vec<Vec<u8>>> {
     ]
 }
 
+// Returns the paid rate of each leaf, in key order.
+async fn leaf_paid_rates(s: &TestStore) -> Vec<Option<(PaidChange, Duration)>> {
+    let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
+        .leaves(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    leaves
+        .iter()
+        .map(|leaf| {
+            let paid = leaf.node().unwrap().paid_rate();
+            paid.map(|paid| (paid.change, paid.per_second))
+        })
+        .collect()
+}
+
+// A root leaf that a merge for a topology rule left, with a paid rate of
+// 1000 ms in each second.
+fn merged_abcd_leaf() -> Node {
+    let left = Node::leaf(LeafBody::from_entries([live(b"a"), live(b"b")]))
+        .with_high_key(Some(b"c".to_vec()));
+    let mut leaf =
+        Node::leaf(LeafBody::from_entries([live(b"c"), live(b"d")])).with_low_key(b"c".to_vec());
+    let intent = test_intent_id("merge");
+    leaf.absorb(&left, intent, Some(Duration::from_secs(1)))
+        .unwrap();
+    leaf.remove_merge_reservation(&intent);
+    leaf
+}
+
+fn demand_split(millis: u64) -> SplitReason {
+    SplitReason::Demand {
+        at: None,
+        rate: Duration::from_millis(millis),
+    }
+}
+
 async fn leaf_keys(s: &TestStore) -> Vec<Vec<Vec<u8>>> {
     let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
         .leaves(
@@ -475,6 +519,44 @@ async fn leaf_keys(s: &TestStore) -> Vec<Vec<Vec<u8>>> {
             keys.map(|entry| entry.key.clone()).collect()
         })
         .collect()
+}
+
+// ADR-076: a split that a topology rule asks for must pay more than 1.5 times
+// the paid rate of the merge that made the leaf, and both leaves of the split
+// keep the paid rate of the split.
+#[tokio::test(start_paused = true)]
+async fn a_demand_split_must_pay_more_than_the_paid_rate_of_the_merge() {
+    let s = store();
+    s.create_root(COLL, &merged_abcd_leaf()).await.unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+
+    split_path(&sp, &root_path(), &demand_split(1500))
+        .await
+        .unwrap();
+    assert_eq!(leaf_keys(&s).await.len(), 1);
+
+    split_path(&sp, &root_path(), &demand_split(1600))
+        .await
+        .unwrap();
+    let paid = Some((PaidChange::Split, Duration::from_millis(1600)));
+    assert_eq!(leaf_paid_rates(&s).await, vec![paid, paid]);
+}
+
+// A split for a cap is not held by a paid rate, and its leaves keep no paid
+// rate, because no topology rule asked for it.
+#[tokio::test(start_paused = true)]
+async fn a_split_for_a_cap_removes_the_paid_rate() {
+    let s = store();
+    s.create_root(COLL, &merged_abcd_leaf()).await.unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+
+    split_path(&sp, &root_path(), &SplitReason::Capacity)
+        .await
+        .unwrap();
+
+    assert_eq!(leaf_paid_rates(&s).await, vec![None, None]);
 }
 
 // A standalone leaf over the cap half-splits: the upper half moves to a fresh
@@ -1365,7 +1447,7 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
     let other_transactions = other.foundation.tx_records.clone();
     let other_mon = other.foundation.monitor_for(
         &other_bg,
-        RetryConfig::default(),
+        RetrySchedule::default(),
         crate::monitor::ProtocolTiming::default(),
     );
     let other_key_state = KeyStateResolver::new(other_mon.clone());
@@ -1373,7 +1455,7 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
         other.nodes.clone(),
         other_key_state,
         other_mon.clone(),
-        RetryConfig::default(),
+        RetryTiming::default(),
         NodeSizePolicy::default(),
         Arc::new(NoStructuralHints),
     );
@@ -1385,10 +1467,10 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
             other_transactions,
             other.timeline.clone(),
             other_mon.clone(),
-            RetryConfig::default(),
+            RetrySchedule::default(),
         ),
         other_mon.clone(),
-        RetryConfig::default(),
+        RetryTiming::default(),
         std::num::NonZeroUsize::MIN,
     );
     other_mon.begin_tx(&holder);

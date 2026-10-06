@@ -268,7 +268,7 @@ mod tests {
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_backend::middleware::{OpLog, RecordingBackend};
-    use glassdb_concurr::{Background, RetryConfig};
+    use glassdb_concurr::{Background, RetrySchedule};
     use glassdb_data::{CollectionAddress, DbPrefix};
     use glassdb_storage::transaction::{TxLock, TxRecord, TxRecordStore, TxWrite};
     use glassdb_storage::{CachedStore, KeyLockState, Timeline};
@@ -287,7 +287,7 @@ mod tests {
             transactions,
             timeline,
             Arc::downgrade(&background),
-            RetryConfig::default(),
+            RetrySchedule::default(),
             ProtocolTiming::default(),
         );
         (monitor, background)

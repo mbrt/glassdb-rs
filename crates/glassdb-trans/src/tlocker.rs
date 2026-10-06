@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::{RetryConfig, join_all_bounded, map_all_bounded, rt};
+use glassdb_concurr::{join_all_bounded, map_all_bounded, rt};
 use glassdb_data::{LeafRef, LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxLock;
 use glassdb_storage::{
@@ -51,6 +51,7 @@ use crate::leaf_coord::{
 };
 use crate::monitor::Monitor;
 use crate::node_locking::NodeLockReconciler;
+use crate::retry_timing::RetryTiming;
 use crate::wound_wait::{Reclaim, try_reclaim};
 
 /// Rounds a release absorbs a contended leaf before returning it to its caller.
@@ -990,8 +991,9 @@ pub(crate) struct KeyLocker {
     router: TreeRouter,
     /// Used to park on a conflicting holder during hold-and-wait.
     tmon: Monitor,
-    /// Backoff config for the hold-and-wait re-poll cadence.
-    retry: RetryConfig,
+    /// The re-poll cadence of hold-and-wait, and the retries of contended
+    /// releases.
+    retry: RetryTiming,
     /// Maximum incomplete leaf operations in one transaction phase.
     parallelism: NonZeroUsize,
     /// Count of lock-acquisition calls (one per `lock()` attempt). Shared across
@@ -1008,7 +1010,7 @@ impl Locker {
         router: TreeRouter,
         collection_state: CollectionStateResolver,
         tmon: Monitor,
-        retry: RetryConfig,
+        retry: RetryTiming,
         parallelism: NonZeroUsize,
     ) -> Self {
         Locker {
@@ -1119,7 +1121,8 @@ impl KeyLocker {
             path: path.clone(),
             requirement: Requirement::ANY,
         };
-        let mut backoff = self.retry.backoff();
+        let mut wait = self.retry.wait.backoff();
+        let mut contention = self.retry.contention.backoff();
         let mut contended = 0;
         loop {
             match self.coord.coordinate(operation.clone()).await? {
@@ -1138,9 +1141,9 @@ impl KeyLocker {
                     }
                 }
                 ReleaseOutcome::Wait(holder) => {
-                    let delay = backoff.next_delay();
+                    let delay = wait.next_delay();
                     if let Woke::FinalStatus = self.wait_for_holder(&holder, delay).await? {
-                        backoff = self.retry.backoff();
+                        wait = self.retry.wait.backoff();
                     }
                     continue;
                 }
@@ -1152,7 +1155,7 @@ impl KeyLocker {
             if contended == RELEASE_CONTENTION_ROUNDS {
                 return Err(TransError::Retry);
             }
-            rt::sleep(backoff.next_delay()).await;
+            rt::sleep(contention.next_delay()).await;
         }
     }
 
@@ -1213,7 +1216,7 @@ impl KeyLocker {
         coord: LeafCoordinator,
         router: TreeRouter,
         tmon: Monitor,
-        retry: RetryConfig,
+        retry: RetryTiming,
         parallelism: NonZeroUsize,
     ) -> Self {
         Self {
@@ -1379,7 +1382,7 @@ impl KeyLocker {
         // Paces the hold-and-wait re-poll. It advances across successive blind
         // polls of a holder that will not budge, and resets whenever a holder
         // finalizes — real progress.
-        let mut backoff = self.retry.backoff();
+        let mut backoff = self.retry.wait.backoff();
         loop {
             let operation = AcquireOperation {
                 id: *id,
@@ -1414,7 +1417,7 @@ impl KeyLocker {
                 AcquireOutcome::Wait(holder) => {
                     let delay = backoff.next_delay();
                     if let Woke::FinalStatus = self.wait_for_holder(&holder, delay).await? {
-                        backoff = self.retry.backoff();
+                        backoff = self.retry.wait.backoff();
                     }
                 }
                 AcquireOutcome::LeafFull => return Ok(LeafOutcome::LeafFull),
@@ -1451,7 +1454,7 @@ mod tests {
         BackendOp, HookBackend, HookFuture, OpLog, RecordingBackend,
     };
     use glassdb_backend::{Backend, memory::MemoryBackend};
-    use glassdb_concurr::RetryConfig;
+    use glassdb_concurr::RetrySchedule;
     use glassdb_data::{CollectionAddress, CollectionId, CollectionName, DbPrefix, ObjectPath};
     use glassdb_storage::transaction::TxCommitStatus;
     use glassdb_storage::{
@@ -1526,7 +1529,7 @@ mod tests {
             nodes.clone(),
             key_state,
             mon.clone(),
-            RetryConfig::default(),
+            RetryTiming::default(),
             policy,
             Arc::new(NoStructuralHints),
         );
@@ -1538,10 +1541,10 @@ mod tests {
                 tx_records,
                 timeline.clone(),
                 mon.clone(),
-                RetryConfig::default(),
+                RetrySchedule::default(),
             ),
             mon.clone(),
-            RetryConfig::default(),
+            RetryTiming::default(),
             parallelism,
         );
         (

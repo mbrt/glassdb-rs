@@ -49,7 +49,7 @@ pub use leaf::{CurrentState, LeafBody, LeafEntry};
 pub use lock::{ExclusiveGate, KeyLockState, LockType, SharedExclusiveLock};
 pub use node::{
     IndexNode, InvalidNodeSizePolicy, Node, NodeBody, NodeLocks, NodeSizePolicy,
-    NodeSizePolicyBuilder,
+    NodeSizePolicyBuilder, PaidChange, PaidRate, Payment,
 };
 pub use node_store::{
     LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodePage, NodeStore,
