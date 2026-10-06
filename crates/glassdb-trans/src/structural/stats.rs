@@ -16,23 +16,6 @@ pub(super) struct Stats {
     pub(super) inline_pressure_completed: AtomicU64,
     pub(super) inline_pressure_deferred: AtomicU64,
     pub(super) inline_pressure_discarded: AtomicU64,
-    landed: LandedCounters,
-}
-
-/// Splits and merges since the restructurer started. [`Stats::take`] does not
-/// reset them, so that the scheduler can see whether a candidate landed a
-/// change.
-#[derive(Default)]
-struct LandedCounters {
-    splits: AtomicU64,
-    merges: AtomicU64,
-}
-
-/// A snapshot of the landed splits and merges.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct LandedChanges {
-    pub(super) splits: u64,
-    pub(super) merges: u64,
 }
 
 /// Background split and merge activity for one snapshot or accumulated
@@ -96,21 +79,11 @@ impl Stats {
     /// Counts one landed split.
     pub(super) fn record_split(&self) {
         self.splits.fetch_add(1, Ordering::Relaxed);
-        self.landed.splits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Counts one landed merge.
     pub(super) fn record_merge(&self) {
         self.merges.fetch_add(1, Ordering::Relaxed);
-        self.landed.merges.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Returns the splits and merges since the restructurer started.
-    pub(super) fn landed(&self) -> LandedChanges {
-        LandedChanges {
-            splits: self.landed.splits.load(Ordering::Relaxed),
-            merges: self.landed.merges.load(Ordering::Relaxed),
-        }
     }
 }
 

@@ -9,6 +9,7 @@
 //! before `Ready`, and leaves it to recovery otherwise.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use glassdb_concurr::rt;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
@@ -18,6 +19,8 @@ use tokio::sync::Notify;
 use crate::error::TransError;
 use crate::node_locking::GateAcquisition;
 
+use super::candidates::MaintenanceCandidates;
+use super::measurements;
 use super::merge::{MergeReason, Merger};
 use super::nodes::StructuralNodeAccess;
 use super::reclamation::ReclamationReporter;
@@ -42,6 +45,8 @@ pub(super) struct ChangeLifecycle {
     recovery_wake: Arc<Notify>,
     splitter: Splitter,
     merger: Merger,
+    // Receives the time of each leaf change that lands.
+    candidates: MaintenanceCandidates,
 }
 
 /// The structural change that one attempt makes.
@@ -129,6 +134,7 @@ impl ChangeLifecycle {
         recovery_wake: Arc<Notify>,
         splitter: Splitter,
         merger: Merger,
+        candidates: MaintenanceCandidates,
     ) -> Self {
         Self {
             recovery,
@@ -139,6 +145,7 @@ impl ChangeLifecycle {
             recovery_wake,
             splitter,
             merger,
+            candidates,
         }
     }
 
@@ -262,6 +269,14 @@ impl<'a> PlannedChange<'a> {
             Self::Merge { .. } => ChangeKind::Merge,
         }
     }
+
+    /// Returns the kind of the change for its typical time.
+    fn measured_kind(self) -> measurements::ChangeKind {
+        match self {
+            Self::Split { .. } => measurements::ChangeKind::Split,
+            Self::Merge { .. } => measurements::ChangeKind::Merge,
+        }
+    }
 }
 
 impl ChangeAttemptOutcome {
@@ -378,6 +393,12 @@ impl StructuralChangeAttempt<'_> {
             Ok(None) => return ChangeAttemptOutcome::retry_cleanly(Err(TransError::Retry)),
             Err(error) => return ChangeAttemptOutcome::retry_cleanly(Err(error)),
         };
+        // The time of a leaf change is the time that it holds the gate, until
+        // the node writes land. Only then do the transactions of the leaf
+        // wait for the change. The wait for the gate depends on the writers
+        // of the leaf instead.
+        let gated = rt::Instant::now();
+        let leaf = node.as_leaf().is_some();
         match self.change {
             PlannedChange::Split { target, reason, .. } => {
                 let planned =
@@ -392,7 +413,8 @@ impl StructuralChangeAttempt<'_> {
                     .splitter
                     .apply(collection, reason, &observation, plan)
                     .await;
-                self.complete(ready, applied).await
+                self.complete(ready, applied, leaf.then(|| gated.elapsed()))
+                    .await
             }
             PlannedChange::Merge { source, reason, .. } => {
                 let planned = lifecycle.merger.prepare(collection, node, reason).await;
@@ -404,7 +426,8 @@ impl StructuralChangeAttempt<'_> {
                     .merger
                     .apply(collection, source, &observation, ready.id(), plan)
                     .await;
-                self.complete(ready, applied).await
+                self.complete(ready, applied, leaf.then(|| gated.elapsed()))
+                    .await
             }
         }
     }
@@ -444,11 +467,13 @@ impl StructuralChangeAttempt<'_> {
     }
 
     /// Reconciles the parent of a change that took effect, and deletes its
-    /// Ready intent.
+    /// Ready intent. `gate_time` is the time that a change of a leaf held
+    /// the gate.
     async fn complete(
         &self,
         ready: ReadyIntent,
         applied: Result<Applied, TransError>,
+        gate_time: Option<Duration>,
     ) -> ChangeAttemptOutcome {
         match applied {
             Ok(Applied::Landed(route)) => {
@@ -465,7 +490,15 @@ impl StructuralChangeAttempt<'_> {
                 {
                     return ChangeAttemptOutcome::recovery_required(ready, error);
                 }
-                self.finish_ready(ready).await
+                let outcome = self.finish_ready(ready).await;
+                if let Some(time) = gate_time
+                    && outcome.result.is_ok()
+                {
+                    self.lifecycle
+                        .candidates
+                        .observe_change_time(self.change.measured_kind(), time);
+                }
+                outcome
             }
             Ok(Applied::Stopped) => self.stop_ready(ready).await,
             Err(error) => ChangeAttemptOutcome::recovery_required(ready, error),

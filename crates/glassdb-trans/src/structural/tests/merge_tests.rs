@@ -2,6 +2,8 @@ use super::*;
 
 use glassdb_backend::middleware::HookOutcome;
 
+use crate::structural::rule::{ChangeRequest, LeafId};
+
 // Leaves below four live entries are underfull, and a merged leaf may hold at
 // most four entries.
 fn mergeable() -> NodeSizePolicy {
@@ -405,6 +407,48 @@ async fn a_deferred_candidate_waits_for_the_sweep_interval() {
 
     rt::sleep(SWEEP_INTERVAL).await;
     assert_eq!(sp.stats_and_reset(), deferred_once);
+}
+
+// Regression: the typical merge time included the time before the merge held
+// its gate, mostly a wait for the writers of the leaf. One slow start then
+// raised the merge threshold of the database instance for a long time. The
+// test makes the start slow with a slow write of the structural intent,
+// which also comes before the gate.
+#[tokio::test(start_paused = true)]
+async fn the_time_before_a_merge_holds_its_gate_is_not_its_typical_time() {
+    const SLOW_START: Duration = Duration::from_secs(20);
+    let hook = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let s = store_with_backend(hook.clone());
+    seed_two_leaves(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
+    let bg = Arc::new(Background::new());
+    let candidates = MaintenanceCandidates::for_topology_rule(mergeable(), InlinePolicy::default());
+    let sp = restructurer_with_candidates(&s, &bg, candidates);
+    let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
+    // The intent is written before the merge gets its gate.
+    hook.set_before(move |op| {
+        let intent =
+            matches!(op, BackendOp::WriteIfNotExists { .. }) && op.path().starts_with(&prefix);
+        Box::pin(async move {
+            if intent {
+                rt::sleep(SLOW_START).await;
+            }
+            rt::sleep(Duration::from_millis(1)).await;
+            Ok(())
+        })
+    });
+
+    sp.candidates
+        .push_request(ChangeRequest::Merge(LeafId::new(node_path("L0"))));
+    sp.run_once().await;
+
+    assert_merged(&s).await;
+    let window = sp.candidates.measurements().unwrap().take_window();
+    // Below the default of 500 ms, so the merge recorded its time.
+    assert!(
+        window.merge_time < Duration::from_millis(400),
+        "{:?}",
+        window.merge_time
+    );
 }
 
 // A merge is optional maintenance, so it never aborts a user transaction.

@@ -91,7 +91,10 @@ impl DatabaseBuilder {
     /// transaction-coordination operation (polling a peer transaction's commit
     /// status, writing a transaction's final log, or reacquiring locks under the
     /// same identity after exhausted leaf contention). The delay grows
-    /// exponentially up to [`DatabaseBuilder::retry_max_interval`].
+    /// exponentially up to [`DatabaseBuilder::retry_max_interval`]. A leaf
+    /// write that loses to the change of another transaction retries after
+    /// about 20 ms first, and at most 300 ms later, so that the database
+    /// instance does not wait while others keep changing the leaf.
     pub fn retry_initial_interval(mut self, interval: Duration) -> Self {
         self.engine_config.set_retry_initial_interval(interval);
         self
@@ -100,6 +103,8 @@ impl DatabaseBuilder {
     /// Sets the upper bound on the per-retry delay for transient
     /// transaction-coordination and same-identity lock-acquisition operations.
     /// This includes jitter and caps the initial interval. Defaults to 5 seconds.
+    /// The retries of a leaf write that lost to another change use at most
+    /// 300 ms.
     pub fn retry_max_interval(mut self, interval: Duration) -> Self {
         self.engine_config.set_retry_max_interval(interval);
         self

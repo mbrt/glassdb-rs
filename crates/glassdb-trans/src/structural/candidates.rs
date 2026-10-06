@@ -267,6 +267,14 @@ impl MaintenanceCandidates {
         }
     }
 
+    /// Records the time that one leaf change of `kind` held the structural
+    /// gate of its source, for a change that landed.
+    pub(super) fn observe_change_time(&self, kind: ChangeKind, took: Duration) {
+        if let Some(measurements) = &self.measurements {
+            measurements.record_change(kind, took);
+        }
+    }
+
     /// Returns the number of live entries under which a non-root leaf is
     /// underfull. A topology rule decides the merges for time, but no
     /// transaction may use a leaf with no live entries again, and then the
