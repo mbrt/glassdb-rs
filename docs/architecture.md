@@ -4,7 +4,7 @@ This document records the structure of GlassDB and the constraints that the
 code cannot state by itself: why a boundary exists, which invariants must hold,
 and which rules keep the protocol correct. Interfaces, parameters, and module
 layouts are in the code. The [ADRs](adr/) record each decision,
-[CONTEXT.md](../CONTEXT.md) defines the vocabulary, and the
+[GLOSSARY.md](../GLOSSARY.md) defines the vocabulary, and the
 [README](../README.md) covers usage and benchmarks.
 
 ## Design goals and trade-offs

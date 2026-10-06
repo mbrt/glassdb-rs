@@ -12,7 +12,7 @@ This guide explains what that evidence proves, what the backend must guarantee
 for the proof to hold, and the constraints that code must keep so that the
 proof stays true. It does not describe the types. The
 [storage evidence rules](storage-consistency.md) give the type rules, and
-[CONTEXT.md](../../CONTEXT.md) defines the terms. The decisions are in
+[GLOSSARY.md](../../GLOSSARY.md) defines the terms. The decisions are in
 [ADR-036](../adr/036-decoded-object-cache-with-bounded-freshness.md),
 [ADR-043](../adr/043-causally-coordinated-backend-operations.md), and
 [ADR-045](../adr/045-optional-persistent-encoded-body-l2-cache.md).

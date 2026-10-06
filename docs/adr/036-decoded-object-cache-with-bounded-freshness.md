@@ -17,7 +17,7 @@ It refines only the caching part of
 [ADR-023](023-slimmed-backend-trait.md): the slim `Backend` trait, opaque content
 revisions, and revision-conditional read remain unchanged.
 
-Terminology below was later aligned with `CONTEXT.md` as errata, with no change
+Terminology below was later aligned with `GLOSSARY.md` as errata, with no change
 to any decision: what this ADR called a "validation watermark" is a *currentness
 watermark*, distinct from the *validation barrier* a transaction allocates to
 open validation. `LogicalTime` is now `SequencePoint`, retained here as written.

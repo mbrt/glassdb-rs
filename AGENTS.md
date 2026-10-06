@@ -3,7 +3,7 @@
 ## Language
 
 - Talk in ASD-STE100 Simplified Technical English. Avoid mannered prose
-- In your language, comments, and documentation, use the terms defined in `CONTEXT.md`
+- In your language, comments, and documentation, use the terms defined in `GLOSSARY.md`
 
 ## Design
 

@@ -20,8 +20,8 @@ After settling decisions, proceed with writing the ADR. When writing a new ADR:
 - Keep them minimal and focused on decisions, architecture, and trade-offs
 - Avoid implementation details
 - Keep the writing concise but readable. Don't use complex prose or unexplained terms
-- Use language from `CONTEXT.md`
-- If in need for a new term, use the `glassdb-domain-modeling` skill to define it in `CONTEXT.md`
+- Use language from `GLOSSARY.md`
+- If in need for a new term, use the `glassdb-domain-modeling` skill to define it in `GLOSSARY.md`
 
 ## Updating
 

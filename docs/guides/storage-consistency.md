@@ -11,7 +11,7 @@ Two type modules require stricter correctness review. Paths are relative to
 Review every change to these files, including visibility, conversions, tests,
 and moves. Changes to their exports must preserve the same restrictions. The
 [cache guide](caching.md) explains the currentness model and the constraints
-that the cache keeps; [CONTEXT.md](../../CONTEXT.md) defines the terms.
+that the cache keeps; [GLOSSARY.md](../../GLOSSARY.md) defines the terms.
 
 ## E1: Sequence points belong to one database instance
 

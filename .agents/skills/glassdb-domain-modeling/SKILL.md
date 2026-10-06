@@ -1,6 +1,6 @@
 ---
 name: glassdb-domain-modeling
-description: Sharpen GlassDB terminology. Use when discussing codebase terminology, editing CONTEXT.md, ADRs, or architecture documentation.
+description: Sharpen GlassDB terminology. Use when discussing codebase terminology, editing GLOSSARY.md, ADRs, or architecture documentation.
 ---
 
 # Domain modeling
@@ -9,13 +9,13 @@ Actively build and sharpen the project's domain model as you design. This is the
 
 ## Structure
 
-Use `CONTEXT.md` at the root of the repository as the canonical GlassDB glossary. Before changing it or recording a decision, read the relevant code, tests, `docs/architecture.md`, `docs/principles.md`, and accepted ADRs.
+Use `GLOSSARY.md` at the root of the repository as the canonical GlassDB glossary. Before changing it or recording a decision, read the relevant code, tests, `docs/architecture.md`, `docs/principles.md`, and accepted ADRs.
 
 ## Language
 
 ### Challenge against the glossary
 
-When the user uses a term that conflicts with the existing language in `CONTEXT.md`, call it out immediately. For example: "Your glossary defines 'transaction cancellation' as dropping the transaction future, but you seem to mean an explicit abort. Which is it?"
+When the user uses a term that conflicts with the existing language in `GLOSSARY.md`, call it out immediately. For example: "Your glossary defines 'transaction cancellation' as dropping the transaction future, but you seem to mean an explicit abort. Which is it?"
 
 ### Sharpen fuzzy language
 
@@ -31,8 +31,8 @@ When the user states how something works, check whether the code agrees. If you 
 
 When the code terminology is inconsistent within itself or with the glossary, call it out with the goal of achieving a single, consistent model.
 
-### Update CONTEXT.md inline
+### Update GLOSSARY.md inline
 
-When a term is resolved, update `CONTEXT.md` right there. Don't batch these up: capture them as they happen. Use the format in [context-format.md](./context-format.md).
+When a term is resolved, update `GLOSSARY.md` right there. Don't batch these up: capture them as they happen. Use the format in [glossary-format.md](./glossary-format.md).
 
-`CONTEXT.md` should be totally devoid of implementation details. Do not treat `CONTEXT.md` as a spec, a scratch pad, or a repository for implementation decisions. It is a glossary and nothing else.
+`GLOSSARY.md` should be totally devoid of implementation details. Do not treat `GLOSSARY.md` as a spec, a scratch pad, or a repository for implementation decisions. It is a glossary and nothing else.
