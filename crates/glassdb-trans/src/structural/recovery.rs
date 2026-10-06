@@ -230,6 +230,10 @@ impl PreparedIntent {
         }
     }
 
+    pub(super) fn id(&self) -> &StructuralIntentId {
+        &self.id
+    }
+
     /// Returns the sibling ID reserved for a non-root split.
     pub(super) fn nonroot_sibling(&self) -> Option<NodeId> {
         match (&self.intent.change, self.intent.is_root()) {

@@ -17,6 +17,7 @@ mod change;
 mod measurements;
 mod merge;
 mod nodes;
+mod paid_rate;
 mod reclamation;
 mod reconcile;
 mod recovery;

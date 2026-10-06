@@ -1,8 +1,9 @@
 use super::*;
 
 use glassdb_backend::middleware::HookOutcome;
+use glassdb_storage::{PaidChange, Payment};
 
-use crate::structural::rule::{ChangeRequest, LeafId};
+use crate::structural::rule::{ChangeRequest, LeafId, RuleRequest};
 
 // Leaves below four live entries are underfull, and a merged leaf may hold at
 // most four entries.
@@ -108,6 +109,131 @@ async fn merge_l0(sp: &Restructurer) -> Result<(), TransError> {
         cause: CandidateCause::Merge(MergeReason::Underfull),
     })
     .await
+}
+
+// Splits a leaf with `entries` at "m" for a topology rule, with a paid rate of
+// 1000 ms in each second, and returns its two halves.
+fn split_for_rule(entries: impl IntoIterator<Item = LeafEntry>) -> (Node, Node) {
+    let mut left = Node::leaf(LeafBody::from_entries(entries));
+    let paid = Payment {
+        per_second: Duration::from_secs(1),
+        intent: test_intent_id("paid"),
+    };
+    let (right, _) = left
+        .split_leaf_at(test_node_id("L1"), b"m", Some(paid))
+        .unwrap();
+    (left, right)
+}
+
+// L0 and L1 as a split for a topology rule left them.
+async fn seed_split_leaves(s: &TestStore) {
+    let (left, right) = split_for_rule([live(b"a"), live(b"b"), live(b"m"), live(b"n")]);
+    seed_leaves(s, left, right).await;
+}
+
+// L0 with no live entries and L1, as a split for a topology rule left them.
+async fn seed_split_leaves_with_empty_left(s: &TestStore) {
+    let deleted = tombstone(b"a", tx_id(b"deleter"));
+    let (left, right) = split_for_rule([deleted, live(b"m"), live(b"n")]);
+    seed_leaves(s, left, right).await;
+}
+
+// A restructurer whose leaves merge only when a topology rule asks.
+fn rule_restructurer(s: &TestStore, bg: &Arc<Background>) -> Restructurer {
+    let candidates = MaintenanceCandidates::for_topology_rule(mergeable(), InlinePolicy::default());
+    restructurer_with_candidates(s, bg, candidates)
+}
+
+async fn demand_merge_l0(sp: &Restructurer, rate: Duration) -> Result<(), TransError> {
+    sp.process_candidate(&MaintenanceCandidate {
+        path: node_path("L0"),
+        priority: TxId::new_at(rt::system_now()),
+        cause: CandidateCause::Merge(MergeReason::Demand { rate }),
+    })
+    .await
+}
+
+// ADR-076: the leaves of a split that a topology rule asked for keep its paid
+// rate. A merge that a rule asks for must pay more than 1.5 times it, and the
+// leaf that receives the entries keeps the paid rate of the merge.
+#[tokio::test(start_paused = true)]
+async fn a_demand_merge_must_pay_more_than_the_paid_rate_of_the_split() {
+    let s = store();
+    seed_split_leaves(&s).await;
+    let bg = Arc::new(Background::new());
+    let sp = rule_restructurer(&s, &bg);
+
+    demand_merge_l0(&sp, Duration::from_millis(1500))
+        .await
+        .unwrap();
+    assert_not_merged(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
+
+    demand_merge_l0(&sp, Duration::from_millis(1600))
+        .await
+        .unwrap();
+    assert_merged(&s).await;
+    let kept = current_node(&s, "L1").await.paid_rate().cloned().unwrap();
+    assert_eq!(
+        (kept.change, kept.per_second),
+        (PaidChange::Merge, Duration::from_millis(1600))
+    );
+}
+
+// ADR-076: a paid rate halves each minute after this database instance first
+// compared a request with it, so that a change of the load can change the
+// topology again.
+#[tokio::test(start_paused = true)]
+async fn a_paid_rate_holds_less_as_it_gets_older() {
+    let s = store();
+    seed_split_leaves(&s).await;
+    let bg = Arc::new(Background::new());
+    let sp = rule_restructurer(&s, &bg);
+
+    demand_merge_l0(&sp, Duration::from_millis(1000))
+        .await
+        .unwrap();
+    assert_not_merged(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
+
+    tokio::time::advance(Duration::from_secs(60)).await;
+    demand_merge_l0(&sp, Duration::from_millis(1000))
+        .await
+        .unwrap();
+    assert_merged(&s).await;
+}
+
+// A paid rate holds only the changes that a topology rule asks for. A leaf
+// with no live entries still merges, and the merged leaf keeps no paid rate.
+#[tokio::test(start_paused = true)]
+async fn a_paid_rate_does_not_hold_the_merge_of_an_empty_leaf() {
+    let s = store();
+    seed_split_leaves_with_empty_left(&s).await;
+    let bg = Arc::new(Background::new());
+    let sp = rule_restructurer(&s, &bg);
+
+    merge_l0(&sp).await.unwrap();
+
+    let merged = current_node(&s, "L1").await;
+    assert_eq!(keys(&merged), [b"m", b"n"]);
+    assert_eq!(merged.paid_rate(), None);
+}
+
+// Regression: a merge that a topology rule asked for, and that went ahead
+// only because its source had no live entries, kept its rate as a paid rate,
+// although that rate did not pay for it.
+#[tokio::test(start_paused = true)]
+async fn a_demand_merge_of_an_empty_leaf_keeps_no_paid_rate() {
+    let s = store();
+    seed_split_leaves_with_empty_left(&s).await;
+    let bg = Arc::new(Background::new());
+    let sp = rule_restructurer(&s, &bg);
+
+    demand_merge_l0(&sp, Duration::from_millis(10))
+        .await
+        .unwrap();
+
+    let merged = current_node(&s, "L1").await;
+    assert_eq!(keys(&merged), [b"m", b"n"]);
+    assert_eq!(merged.paid_rate(), None);
 }
 
 #[tokio::test]
@@ -437,8 +563,10 @@ async fn the_time_before_a_merge_holds_its_gate_is_not_its_typical_time() {
         })
     });
 
-    sp.candidates
-        .push_request(ChangeRequest::Merge(LeafId::new(node_path("L0"))));
+    sp.candidates.push_request(RuleRequest {
+        change: ChangeRequest::Merge(LeafId::new(node_path("L0"))),
+        rate: Duration::from_secs(1),
+    });
     sp.run_once().await;
 
     assert_merged(&s).await;
@@ -728,7 +856,7 @@ async fn seed_interrupted_merge(s: &TestStore, sp: &Restructurer, crash: MergeCr
         return generation;
     }
 
-    right.absorb(&left, intent_id).unwrap();
+    right.absorb(&left, intent_id, None).unwrap();
     assert!(
         s.store_node(COLL, "L1", &right, Some(&observed))
             .await

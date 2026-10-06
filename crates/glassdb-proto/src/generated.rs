@@ -295,6 +295,10 @@ pub struct Node {
     /// older than a merge (ADR-073).
     #[prost(bytes = "vec", tag = "11")]
     pub low_key: ::prost::alloc::vec::Vec<u8>,
+    /// The paid rate of the last split or merge of this leaf that a topology
+    /// rule asked for (ADR-076). Absent after other changes.
+    #[prost(message, optional, tag = "12")]
+    pub paid_rate: ::core::option::Option<PaidRate>,
     #[prost(oneof = "node::Body", tags = "3, 4")]
     pub body: ::core::option::Option<node::Body>,
 }
@@ -308,6 +312,50 @@ pub mod node {
         /// An index node: separator keys mapping ranges to child nodes.
         #[prost(message, tag = "4")]
         Index(super::IndexNode),
+    }
+}
+/// The rate of avoidable time that paid for one split or merge (ADR-076).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PaidRate {
+    #[prost(enumeration = "paid_rate::Change", tag = "1")]
+    pub change: i32,
+    /// Nanoseconds of avoidable time in each second.
+    #[prost(uint64, tag = "2")]
+    pub nanos_per_second: u64,
+    /// The structural intent ID of the change, which identifies the paid rate.
+    #[prost(bytes = "vec", tag = "3")]
+    pub intent: ::prost::alloc::vec::Vec<u8>,
+}
+/// Nested message and enum types in `PaidRate`.
+pub mod paid_rate {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Change {
+        Unspecified = 0,
+        Split = 1,
+        Merge = 2,
+    }
+    impl Change {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Unspecified => "CHANGE_UNSPECIFIED",
+                Self::Split => "SPLIT",
+                Self::Merge => "MERGE",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "CHANGE_UNSPECIFIED" => Some(Self::Unspecified),
+                "SPLIT" => Some(Self::Split),
+                "MERGE" => Some(Self::Merge),
+                _ => None,
+            }
+        }
     }
 }
 /// A structural intent for one split or merge. It lives at

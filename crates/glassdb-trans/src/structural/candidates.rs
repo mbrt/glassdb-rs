@@ -14,7 +14,8 @@ use crate::leaf_coord::StructuralHinter;
 
 use super::measurements::{ChangeKind, TopologyMeasurements};
 use super::merge::MergeReason;
-use super::rule::ChangeRequest;
+use super::paid_rate::PaidRates;
+use super::rule::{ChangeRequest, RuleRequest};
 use super::split::SplitReason;
 
 /// Interval of the sweep when no new candidate arrives. Such a sweep retries
@@ -47,6 +48,7 @@ pub(super) struct MaintenanceCandidates {
     // Present only when a topology rule decides the leaf changes, because
     // nothing else takes its windows.
     measurements: Option<Arc<TopologyMeasurements>>,
+    paid_rates: Arc<PaidRates>,
 }
 
 /// Lightweight producer handle for structural hints decided outside the leaf
@@ -192,6 +194,11 @@ impl MaintenanceCandidates {
         self.measurements.as_deref()
     }
 
+    /// The paid rates that the changes of this database instance saw.
+    pub(super) fn paid_rates(&self) -> &PaidRates {
+        &self.paid_rates
+    }
+
     /// The node size policy shared by the feed and the restructurer.
     pub(super) fn policy(&self) -> &NodeSizePolicy {
         &self.policy
@@ -288,17 +295,23 @@ impl MaintenanceCandidates {
     }
 
     /// Queues one leaf change that a topology rule asked for.
-    pub(super) fn push_request(&self, request: ChangeRequest) {
-        let (leaf, cause) = match request {
+    pub(super) fn push_request(&self, request: RuleRequest) {
+        let rate = request.rate;
+        let (leaf, cause) = match request.change {
             ChangeRequest::Split(leaf) => (
                 leaf,
-                CandidateCause::Split(SplitReason::Demand { at: None }),
+                CandidateCause::Split(SplitReason::Demand { at: None, rate }),
             ),
             ChangeRequest::SplitAt(leaf, key) => (
                 leaf,
-                CandidateCause::Split(SplitReason::Demand { at: Some(key) }),
+                CandidateCause::Split(SplitReason::Demand {
+                    at: Some(key),
+                    rate,
+                }),
             ),
-            ChangeRequest::Merge(leaf) => (leaf, CandidateCause::Merge(MergeReason::Demand)),
+            ChangeRequest::Merge(leaf) => {
+                (leaf, CandidateCause::Merge(MergeReason::Demand { rate }))
+            }
         };
         self.push(MaintenanceCandidate {
             path: leaf.into_path(),
@@ -336,6 +349,7 @@ impl MaintenanceCandidates {
             queue: Arc::new(Mutex::new(VecDeque::new())),
             queued: Arc::new(Notify::new()),
             measurements,
+            paid_rates: Arc::new(PaidRates::default()),
         }
     }
 
@@ -352,8 +366,9 @@ impl MaintenanceCandidates {
 impl MaintenanceCandidate {
     /// Coalesces same-path, same-cause observations of `other`, which is newer,
     /// without sacrificing the oldest structural priority or the largest
-    /// requested headroom. A demand split keeps the newest split key, because
-    /// the leaf changes after each measurement.
+    /// requested headroom. A demand change keeps the newest rate, and a demand
+    /// split the newest split key, because the leaf changes after each
+    /// measurement.
     fn coalesce(&mut self, other: MaintenanceCandidate) {
         if other.priority.older(&self.priority) {
             self.priority = other.priority;
@@ -370,9 +385,21 @@ impl MaintenanceCandidate {
                 *value_len = other_len;
             }
             (
-                CandidateCause::Split(SplitReason::Demand { at }),
-                CandidateCause::Split(SplitReason::Demand { at: Some(other_at) }),
-            ) => *at = Some(other_at),
+                CandidateCause::Split(SplitReason::Demand { at, rate }),
+                CandidateCause::Split(SplitReason::Demand {
+                    at: other_at,
+                    rate: other_rate,
+                }),
+            ) => {
+                if other_at.is_some() {
+                    *at = other_at;
+                }
+                *rate = other_rate;
+            }
+            (
+                CandidateCause::Merge(MergeReason::Demand { rate }),
+                CandidateCause::Merge(MergeReason::Demand { rate: other_rate }),
+            ) => *rate = other_rate,
             _ => {}
         }
     }

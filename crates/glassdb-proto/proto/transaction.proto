@@ -159,6 +159,24 @@ message Node {
     // first node at its level. A copy with a low key above a routed key is
     // older than a merge (ADR-073).
     bytes low_key = 11;
+    // The paid rate of the last split or merge of this leaf that a topology
+    // rule asked for (ADR-076). Absent after other changes.
+    PaidRate paid_rate = 12;
+}
+
+// The rate of avoidable time that paid for one split or merge (ADR-076).
+message PaidRate {
+    enum Change {
+        CHANGE_UNSPECIFIED = 0;
+        SPLIT = 1;
+        MERGE = 2;
+    }
+
+    Change change = 1;
+    // Nanoseconds of avoidable time in each second.
+    uint64 nanos_per_second = 2;
+    // The structural intent ID of the change, which identifies the paid rate.
+    bytes intent = 3;
 }
 
 // A structural intent for one split or merge. It lives at

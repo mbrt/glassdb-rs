@@ -73,6 +73,9 @@ pub(super) enum StructuralTopology<'a> {
 }
 
 /// The result of checking a change again while its source is gated.
+// One value exists for each structural change, and only while it runs, so the
+// size of its largest variant costs nothing.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum Prepared<P> {
     /// The change is not necessary, or the check failed.
     Cancel(Result<(), TransError>),

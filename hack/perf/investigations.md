@@ -11,8 +11,9 @@ This file is evidence, not a record of accepted behavior:
 
 ## 2026-10-05: database instances that split and merge the same leaf
 
-Status: reproduced by the perfbench `split-merge-fight` scenario. Two
-measurement errors are fixed. The fight is not fixed yet.
+Status: reproduced by the perfbench `split-merge-fight` scenario. Paid rates
+(ADR-076) slow the fight from about 25 to about 3 splits and merges in 60 s.
+The merge side still measures about one fifth of its cost.
 
 ADR-074 records that each database instance decides on its own transactions,
 so one instance can split a leaf while another merges it. In the `mixed` hi
@@ -290,6 +291,21 @@ kept two leaves for 0.94 of the time, because the merge side measured about 4
 times too little. With the merge side multiplied by 3 or more, it kept one
 leaf. With the rate of one instance instead of the sum, it also kept two
 leaves.
+
+### Paid rates
+
+ADR-076 implements option A with the mean rate since the last change, the
+rate of one instance, a margin of 1.5, and a half-life of 60 s. In
+`split-merge-fight` on S3, 3 runs of 60 s against `43a7187f1`:
+
+| Version | Splits / merges | Writers (tx/s) | Merger (scans/s) |
+| --- | --- | ---: | ---: |
+| `43a7187f1` | 29/29, 24/24, 22/22 | `12.0` to `12.9` | `80` to `88` |
+| Paid rates | 2/2, 4/3, 3/2 | `13.0` to `15.1` | `71` to `83` |
+
+The leaves stayed split for most of the time, as the offline replay
+predicted. `mixed` on S3 (1 and 8 databases, affinities 0 and 100, 2 runs) had
+`1.00` in lo mode and `0.98` in hi mode, against `43a7187f1`.
 
 ## 2026-09-26: ADR-074 splits in the mixed hi mode
 

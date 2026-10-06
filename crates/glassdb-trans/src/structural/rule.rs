@@ -35,6 +35,10 @@ const HALF_LIFE: Duration = Duration::from_secs(10);
 /// it.
 const NEGLIGIBLE_SECONDS: f64 = 1e-6;
 
+/// The windows with no measurement of a leaf or a pair after which the rule
+/// drops its mean rate.
+const STALE_MEAN_WINDOWS: u64 = 60;
+
 /// What decides the splits and merges of leaves that the hard caps do not
 /// force.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -61,7 +65,7 @@ pub enum TopologyPolicy {
 /// underfull threshold.
 pub(super) trait TopologyRule: Send {
     /// Returns the changes that the measurements of `window` call for.
-    fn decide(&mut self, window: &TopologyWindow) -> Vec<ChangeRequest>;
+    fn decide(&mut self, window: &TopologyWindow) -> Vec<RuleRequest>;
 }
 
 /// The measurements of one database instance in one window.
@@ -123,6 +127,17 @@ pub(super) struct PairWindow {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct LeafId(ObjectPath);
 
+/// One structural change that a rule asks for, with the rate of avoidable
+/// time that pays for it. The leaves of the change keep this rate as their
+/// paid rate, and the opposite change of these leaves must pay more
+/// (ADR-076).
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct RuleRequest {
+    pub(super) change: ChangeRequest,
+    /// The avoidable time in each second.
+    pub(super) rate: Duration,
+}
+
 /// One structural change of one leaf that a rule asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ChangeRequest {
@@ -155,6 +170,25 @@ pub(super) struct AvoidableTimeRule {
     /// The moving averages of the crossing conflict time of two adjacent
     /// leaves in one window, in seconds.
     crossing: BTreeMap<(LeafId, LeafId), f64>,
+    /// The mean net split-side time of each leaf since its last change that
+    /// this instance knows of. A leaf that receives a merge of another
+    /// instance keeps its ID, so its mean can include windows from before
+    /// that merge.
+    split_rates: BTreeMap<LeafId, MeanRate>,
+    /// The mean merge-side time of each pair since a change of its leaves
+    /// that this instance knows of.
+    merge_rates: BTreeMap<(LeafId, LeafId), MeanRate>,
+    /// The number of windows that the rule decided.
+    windows: u64,
+}
+
+/// The mean time in each window since one window, in seconds. A window with
+/// no time counts as zero.
+#[derive(Debug)]
+struct MeanRate {
+    since: u64,
+    last: u64,
+    sum: f64,
 }
 
 /// The moving averages of the split-side time of one leaf in one window, less
@@ -185,6 +219,18 @@ impl LeafWindow {
     fn avoidable_time(&self) -> Duration {
         self.delay_time + self.inline_pressure_time
     }
+
+    /// Returns the time that one split of the leaf can remove, less the time
+    /// that it would add, in seconds. It can be negative.
+    fn net_split_seconds(&self) -> f64 {
+        self.avoidable_time().as_secs_f64() - self.split_added_seconds()
+    }
+
+    /// Returns the estimate of the time that a split of the leaf would add to
+    /// the transactions that conflict on keys of both halves, in seconds.
+    fn split_added_seconds(&self) -> f64 {
+        DIVIDED_CONFLICT_WEIGHT * self.divided_conflict_time.as_secs_f64()
+    }
 }
 
 impl LeafId {
@@ -205,9 +251,15 @@ impl AvoidableTimeRule {
         window: &TopologyWindow,
         decay: f64,
         held: &mut BTreeSet<LeafId>,
-    ) -> Vec<ChangeRequest> {
+    ) -> Vec<RuleRequest> {
         let split_time = window.split_time.mul_f64(SPLIT_THRESHOLD).as_secs_f64();
-        let leaves = &mut self.leaves;
+        let Self {
+            leaves,
+            split_rates,
+            windows,
+            ..
+        } = self;
+        let windows = *windows;
         leaves.retain(|id, net| {
             net.decay(decay);
             window.leaves.contains_key(id) || !net.is_negligible()
@@ -217,7 +269,12 @@ impl AvoidableTimeRule {
             // The measurements start again at each change of the leaf.
             if leaf.split_recently || leaf.merged_recently {
                 leaves.remove(id);
+                split_rates.remove(id);
             }
+            split_rates
+                .entry(id.clone())
+                .or_insert_with(|| MeanRate::new(windows))
+                .add(windows, leaf.net_split_seconds());
             let net = leaves.entry(id.clone()).or_default();
             net.add(leaf, 1.0 - decay);
             if leaf.merged_recently || net.total <= split_time {
@@ -235,7 +292,11 @@ impl AvoidableTimeRule {
             // stays, the next window asks for a second split of the same
             // leaf. The engine retries a deferred split itself.
             leaves.remove(id);
-            requests.push(request);
+            let rate = split_rates[id].mean(windows);
+            requests.push(RuleRequest {
+                change: request,
+                rate,
+            });
             held.insert(id.clone());
         }
         requests
@@ -248,9 +309,15 @@ impl AvoidableTimeRule {
         window: &TopologyWindow,
         decay: f64,
         held: &mut BTreeSet<LeafId>,
-    ) -> Vec<ChangeRequest> {
+    ) -> Vec<RuleRequest> {
         let merge_time = window.merge_time.mul_f64(MERGE_THRESHOLD);
-        let crossing = &mut self.crossing;
+        let Self {
+            crossing,
+            merge_rates,
+            windows,
+            ..
+        } = self;
+        let windows = *windows;
         let changed = |id: &LeafId| {
             window
                 .leaves
@@ -262,6 +329,14 @@ impl AvoidableTimeRule {
             // The measurements start again at each change of the leaves.
             !changed(left) && !changed(right) && *time >= NEGLIGIBLE_SECONDS
         });
+        merge_rates.retain(|(left, right), _| !changed(left) && !changed(right));
+        for pair in &window.pairs {
+            let time = pair.avoidable_time + pair.crossing_conflict_time;
+            merge_rates
+                .entry((pair.left.clone(), pair.right.clone()))
+                .or_insert_with(|| MeanRate::new(windows))
+                .add(windows, time.as_secs_f64());
+        }
         // The other merge causes are of one window, because the leaves that
         // scans cross have them only in some windows, and their average stays
         // below the time of these windows.
@@ -297,7 +372,21 @@ impl AvoidableTimeRule {
             if merge_side <= merge_time + split_side(&left) + split_side(&right) {
                 continue;
             }
-            requests.push(ChangeRequest::Merge(left.clone()));
+            let rate = self
+                .merge_rates
+                .get(&(left.clone(), right.clone()))
+                .map_or_else(
+                    || {
+                        Duration::from_secs_f64(
+                            merge_side.as_secs_f64() / TOPOLOGY_WINDOW.as_secs_f64(),
+                        )
+                    },
+                    |mean| mean.mean(windows),
+                );
+            requests.push(RuleRequest {
+                change: ChangeRequest::Merge(left.clone()),
+                rate,
+            });
             held.insert(left.clone());
             held.insert(right.clone());
             // A merge can take more than one window to land, and after it the
@@ -309,7 +398,7 @@ impl AvoidableTimeRule {
 }
 
 impl TopologyRule for AvoidableTimeRule {
-    fn decide(&mut self, window: &TopologyWindow) -> Vec<ChangeRequest> {
+    fn decide(&mut self, window: &TopologyWindow) -> Vec<RuleRequest> {
         // The engine asks for a decision once in each window.
         let decay = 0.5_f64.powf(TOPOLOGY_WINDOW.as_secs_f64() / HALF_LIFE.as_secs_f64());
         // Leaves that split recently, or that take part in a change of this
@@ -322,7 +411,41 @@ impl TopologyRule for AvoidableTimeRule {
             .collect();
         let mut requests = self.splits(window, decay, &mut held);
         requests.extend(self.merges(window, decay, &mut held));
+        let windows = self.windows;
+        self.split_rates.retain(|_, mean| !mean.is_stale(windows));
+        self.merge_rates.retain(|_, mean| !mean.is_stale(windows));
+        self.windows += 1;
         requests
+    }
+}
+
+impl MeanRate {
+    fn new(window: u64) -> Self {
+        Self {
+            since: window,
+            last: window,
+            sum: 0.0,
+        }
+    }
+
+    /// Adds the time of the window `window`, in seconds.
+    fn add(&mut self, window: u64, seconds: f64) {
+        self.sum += seconds;
+        self.last = window;
+    }
+
+    /// Returns the mean time in each window up to `window`, but not less
+    /// than zero.
+    fn mean(&self, window: u64) -> Duration {
+        let windows = (window - self.since + 1) as f64;
+        let seconds = (self.sum / windows) / TOPOLOGY_WINDOW.as_secs_f64();
+        Duration::from_secs_f64(seconds.max(0.0))
+    }
+
+    /// Reports whether the leaf or pair had no measurement for so long that a
+    /// mean of it measures a load that is gone.
+    fn is_stale(&self, window: u64) -> bool {
+        window - self.last > STALE_MEAN_WINDOWS
     }
 }
 
@@ -330,9 +453,8 @@ impl NetSplitTime {
     /// Adds the measurements of `leaf` in one window with `weight`, less the
     /// time that a split would have added.
     fn add(&mut self, leaf: &LeafWindow, weight: f64) {
-        let added = DIVIDED_CONFLICT_WEIGHT * leaf.divided_conflict_time.as_secs_f64();
-        self.total += weight * (leaf.avoidable_time().as_secs_f64() - added);
-        self.delays += weight * (leaf.delay_time.as_secs_f64() - added);
+        self.total += weight * leaf.net_split_seconds();
+        self.delays += weight * (leaf.delay_time.as_secs_f64() - leaf.split_added_seconds());
         if leaf.split_key.is_some() {
             self.split_key.clone_from(&leaf.split_key);
         }

@@ -612,6 +612,14 @@ burst of writes. A deferred candidate waits for the next sweep, which comes at
 most a fixed interval later, so a busy node cannot cause a tight retry loop. A
 merge defers while a live transaction holds a lock on its source or target.
 
+Each database instance decides on its own transactions, so instances can
+disagree on a leaf. A split or merge that a rule asks for keeps its paid rate
+in the leaves that it writes, and the opposite change of these leaves must pay
+more than 1.5 times the paid rate
+([ADR-076](adr/076-paid-rates-hold-the-topology.md)). The paid rate halves
+each minute, on the clock of each instance from when it first sees the paid
+rate, so that no instance compares its clock with another one.
+
 ### Fence on the recorded revision
 
 Recovery fences a source writer against the source revision that the Ready

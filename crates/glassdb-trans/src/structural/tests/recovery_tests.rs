@@ -874,7 +874,7 @@ async fn stage_recovery_split(
             .unwrap()
     );
     let (mut source, gated) = s.load_node(COLL, "L", Requirement::ANY).await.unwrap();
-    let (right, split_key) = source.split(test_node_id(sibling)).unwrap();
+    let (right, split_key) = source.split(test_node_id(sibling), None).unwrap();
     source.remove_structural_gate(worker);
     intent.source_revision = gated.revision().unwrap().serialize().to_string();
     if let StructuralChange::Split { split_key: key, .. } = &mut intent.change {
@@ -1608,7 +1608,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
         )
         .await
         .unwrap();
-    let (right, split_key) = shrunk.split(test_node_id("R")).unwrap();
+    let (right, split_key) = shrunk.split(test_node_id("R"), None).unwrap();
     shrunk.remove_structural_gate(&id);
     s.store_node(COLL, "R", &right, None).await.unwrap();
     let root = Node::index(IndexNode::from_children([(Vec::new(), test_node_id("L"))]));
