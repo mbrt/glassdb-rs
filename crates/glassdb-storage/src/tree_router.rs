@@ -538,8 +538,9 @@ impl<'a> DescentCursor<'a> {
             .nodes
             .load_node_at_state(&path, requirement)
             .await?;
+        // Only the reclamation of a dropped collection removes a node.
         if observation.is_absent() {
-            return Err(StorageError::other("tree node vanished during descent"));
+            return Err(StorageError::NotFound);
         }
         self.current = Located { path, observation };
         Ok(())
