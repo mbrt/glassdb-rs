@@ -33,7 +33,7 @@ means v2 has more of that quantity than v1:
 Two original use cases are both covered by this generic shape:
 
 * engine versions: ``--a out/v1 --label-a v1 --b out/v2 --label-b v2`` (see
-  ``compare-refs.sh``);
+  ``compare_refs.sh``);
 * fake vs real S3: ``--a out --label-a real --b out-fake --label-b fake``.
 
 It also writes overlay PNGs (``cmp-tx-throughput.png``, ``cmp-tx-latency.png``,
@@ -59,21 +59,15 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+import perfbench_results
+import plot_results
+
 # Backend-op columns that sum into total round-trips, in case a `stats.csv` from
 # an older run predates the explicit `backend-ops` total column. Engine versions
 # categorize ops differently (e.g. v1's tag/metadata ops vs v2 combining all
 # coordination into object reads/writes), so summing every class is what makes
 # the efficiency number comparable across versions.
 OP_COLS = ["obj-write", "obj-read", "obj-list", "meta-write", "meta-read"]
-
-
-def perfbench_body_replays(cell: dict) -> int:
-    # Older perfbench JSON used ``retries`` for body replay counts.
-    return cell.get("replays", cell.get("retries", 0))
-
-
-def perfbench_body_replays_per_tx(mapping: dict) -> float:
-    return mapping.get("replaysPerTx", mapping.get("retriesPerTx", 0))
 
 
 def with_num_replays(df: pd.DataFrame) -> pd.DataFrame:
@@ -125,110 +119,26 @@ def read_first_json(input_dir: Path, *names: str) -> Any | None:
     return None
 
 
+def scenario_paths(input_dir: Path, name: str) -> list[Path]:
+    """Result files of one scenario: the directory's own, else per-run copies."""
+    path = input_dir / name
+    if path.exists():
+        return [path]
+    return sorted(input_dir.glob(f"runs/*/{name}"))
+
+
 def perfbench_contention_frames(
     input_dir: Path,
 ) -> tuple[pd.DataFrame, pd.DataFrame] | None:
     """Convert a current contention envelope to the historical table shapes."""
-    paths = [input_dir / "contention.json"]
-    if not paths[0].exists():
-        paths = sorted(input_dir.glob("runs/*/contention.json"))
-    if not paths:
-        return None
-    samples, stats = [], []
-    external_run = 1
-    for path in paths:
-        report = json.loads(path.read_text())
-        if report.get("schemaVersion") != 1 or report.get("scenario") != "contention":
-            raise ValueError(f"{path}: incompatible perfbench schema")
-        for run in report.get("runs", []):
-            run_id = external_run if len(paths) > 1 else run["run"]
-            external_run += 1
-            for cell in run.get("cells", []):
-                if cell.get("failures") != 0:
-                    raise ValueError(
-                        f"{path}: contention cell did not complete cleanly"
-                    )
-                identity = {
-                    "run": run_id,
-                    "num-keys": cell["numKeys"],
-                    "overlap": cell["overlap"],
-                    "overlap-pct": cell["overlapPct"],
-                }
-                samples.extend(
-                    {**identity, "latency-ms": latency}
-                    for latency in cell.get("samplesMs", [])
-                )
-                stats.append(
-                    {
-                        **identity,
-                        "count": cell["committed"],
-                        "cell-duration-ms": cell["durationMs"],
-                        "tx-per-sec": cell["txPerSec"],
-                        "num-replays": perfbench_body_replays(cell),
-                        "direct-candidates": cell["directCandidates"],
-                        "direct-landed": cell["directLanded"],
-                        "worker-drain-ms": cell["workerDrainMs"],
-                    }
-                )
-    return pd.DataFrame(samples), pd.DataFrame(stats)
+    paths = scenario_paths(input_dir, "contention.json")
+    return perfbench_results.read_contention(paths) if paths else None
 
 
 def perfbench_inline_frame(input_dir: Path) -> pd.DataFrame | None:
     """Convert a current inline-pressure envelope to its historical table shape."""
-    paths = [input_dir / "inline-pressure.json"]
-    if not paths[0].exists():
-        paths = sorted(input_dir.glob("runs/*/inline-pressure.json"))
-    if not paths:
-        return None
-    rows = []
-    fields = {
-        "logicalTx": "logical-tx",
-        "wallMs": "wall-ms",
-        "txPerSec": "tx-per-sec",
-        "p50Ms": "p50-ms",
-        "p90Ms": "p90-ms",
-        "replays": "replays",
-        "lockCalls": "lock-calls",
-        "directCandidates": "direct-candidates",
-        "directLanded": "direct-landed",
-        "backendOps": "backend-ops",
-        "writeBytes": "write-bytes",
-        "splitCandidates": "split-candidates",
-        "splitCompleted": "split-completed",
-        "splitDeferred": "split-deferred",
-        "merges": "merges",
-        # Earlier perfbench versions counted the inline pressure splits of
-        # ADR-056 in fixed trigger and settle phases.
-        "pressureCandidates": "pressure-candidates",
-        "pressureCompleted": "pressure-completed",
-        "pressureDeferred": "pressure-deferred",
-        "pressureDiscarded": "pressure-discarded",
-    }
-    external_run = 1
-    for path in paths:
-        report = json.loads(path.read_text())
-        if (
-            report.get("schemaVersion") != 1
-            or report.get("scenario") != "inline-pressure"
-        ):
-            raise ValueError(f"{path}: incompatible perfbench schema")
-        for run in report.get("runs", []):
-            run_id = external_run if len(paths) > 1 else run["run"]
-            external_run += 1
-            for phase in run.get("phases", []):
-                row = {"run": run_id, "phase": phase["phase"]}
-                row.update(
-                    {
-                        legacy: (
-                            perfbench_body_replays(phase)
-                            if current == "replays"
-                            else phase.get(current)
-                        )
-                        for current, legacy in fields.items()
-                    }
-                )
-                rows.append(row)
-    return pd.DataFrame(rows)
+    paths = scenario_paths(input_dir, "inline-pressure.json")
+    return perfbench_results.read_inline_pressure(paths) if paths else None
 
 
 def normalize_rtbench_time(
@@ -718,19 +628,7 @@ def _mixed_cells(report: Any) -> list[dict]:
     """Flatten current perfbench runs while retaining legacy mixbench arrays."""
     if isinstance(report, list):
         return [{**cell, "run": cell.get("run", 1)} for cell in report]
-    if (
-        not isinstance(report, dict)
-        or report.get("schemaVersion") != 1
-        or report.get("scenario") != "mixed"
-    ):
-        raise ValueError("incompatible mixed-workload JSON schema")
-    cells = []
-    for run in report.get("runs", []):
-        for cell in run.get("cells", []):
-            if cell.get("failures") != 0:
-                raise ValueError("mixed-workload cell did not complete cleanly")
-            cells.append({**cell, "run": run["run"]})
-    return cells
+    return perfbench_results.mixed_cells(report, "mixed-workload report")
 
 
 def _indexed_mixed_cells(report: Any) -> dict:
@@ -747,7 +645,7 @@ def _indexed_mixed_cells(report: Any) -> dict:
         if key in indexed:
             raise ValueError(
                 "mixed-workload report contains multiple cells for one "
-                "mode/affinity; use the mixed-sweep plotter for worker or "
+                "mode/affinity; use plot_results.py for worker or "
                 "Database dimensions"
             )
         indexed[key] = cell
@@ -798,8 +696,8 @@ def mixed_shape_table(a: Any, b: Any) -> pd.DataFrame:
                     ),
                     "replays-ratio": (
                         _ratio(
-                            perfbench_body_replays_per_tx(oy),
-                            perfbench_body_replays_per_tx(ox),
+                            perfbench_results.body_replays_per_tx(oy),
+                            perfbench_results.body_replays_per_tx(ox),
                         )
                         if ox and oy
                         else float("nan")
@@ -841,8 +739,8 @@ def mixed_aggregate_table(a: Any, b: Any) -> pd.DataFrame:
                     ob.get("totalOpsPerTx", 0), oa.get("totalOpsPerTx", 0)
                 ),
                 "replays-ratio": _ratio(
-                    perfbench_body_replays_per_tx(ob),
-                    perfbench_body_replays_per_tx(oa),
+                    perfbench_results.body_replays_per_tx(ob),
+                    perfbench_results.body_replays_per_tx(oa),
                 ),
             }
         )
@@ -1062,6 +960,17 @@ def plot_overlay_contention(data, out_dir: Path) -> None:
     ax.set_xlabel("Contended keys (5 workers, 100% overlap)")
     ax.set_ylabel("Transaction latency (ms, log scale)")
     _save(fig, out_dir, "cmp-contention-latency.png")
+
+
+def plot_mixed_overlay(a: Path, b: Path, la: str, lb: str, out_dir: Path) -> None:
+    """Overlay current-format mixed reports; legacy `mixbench.json` has no plots."""
+    paths = {la: a / "mixed.json", lb: b / "mixed.json"}
+    if not all(path.exists() for path in paths.values()):
+        return
+    try:
+        plot_results.plot_overlay(paths, out_dir)
+    except perfbench_results.ReportError as error:
+        print(f"skipping mixed-workload plots: {error}")
 
 
 def _save(fig: plt.Figure, out_dir: Path, name: str) -> None:
@@ -1556,6 +1465,7 @@ def main() -> int:
             plot_overlay_replays(_tidy_replays(a_st, b_st, la, lb, cpd), out_dir)
         if a_dl is not None and b_dl is not None:
             plot_overlay_contention(_tidy_contention(a_dl, b_dl, la, lb), out_dir)
+        plot_mixed_overlay(args.a, args.b, la, lb, out_dir)
 
     return 0
 

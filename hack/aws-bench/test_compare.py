@@ -245,7 +245,7 @@ class CompareTest(unittest.TestCase):
             for database_limit in (1, 3)
         ]
 
-        with self.assertRaisesRegex(ValueError, "mixed-sweep plotter"):
+        with self.assertRaisesRegex(ValueError, "plot_results.py"):
             compare.mixed_shape_table(cells, cells)
 
     def test_perfbench_contention_envelope_converts_to_legacy_frames(self) -> None:
@@ -331,6 +331,12 @@ class CompareTest(unittest.TestCase):
 
         table = compare.mixed_aggregate_table(cells(0.5), cells(1.0))
         self.assertEqual(table.loc[0, "replays-ratio"], 2.0)
+
+    def test_mixed_overlay_is_skipped_without_current_format_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            compare.plot_mixed_overlay(directory, directory, "a", "b", directory)
+            self.assertEqual(list(directory.glob("*.png")), [])
 
     def test_inconsistent_common_cell_clock_is_rejected(self) -> None:
         rows = pd.DataFrame(

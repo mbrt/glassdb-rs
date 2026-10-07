@@ -1,23 +1,23 @@
-mixed: run=1 mode=lo affinity=0%
-  setup settled after 67.840596509s: 124 completed splits, 10s quiet
-mixed: run=1 mode=lo affinity=25%
-  setup settled after 64.311556354s: 124 completed splits, 10s quiet
-mixed: run=1 mode=lo affinity=50%
-  setup settled after 65.309064502s: 124 completed splits, 10s quiet
-mixed: run=1 mode=lo affinity=75%
-  setup settled after 63.562552444s: 116 completed splits, 10s quiet
-mixed: run=1 mode=lo affinity=100%
-  setup settled after 65.807217798s: 116 completed splits, 10s quiet
-mixed: run=1 mode=hi affinity=0%
-  setup settled after 10.048746341s: 0 completed splits, 10s quiet
-mixed: run=1 mode=hi affinity=25%
-  setup settled after 10.052268098s: 0 completed splits, 10s quiet
-mixed: run=1 mode=hi affinity=50%
-  setup settled after 10.050743615s: 0 completed splits, 10s quiet
-mixed: run=1 mode=hi affinity=75%
-  setup settled after 10.051438381s: 0 completed splits, 10s quiet
-mixed: run=1 mode=hi affinity=100%
-  setup settled after 10.050551124s: 0 completed splits, 10s quiet
+mixed: run=1 mode=lo affinity=0% databases=4/4 workers/shape=8
+  setup settled after 36.181431243s: 99 completed splits, 10s quiet
+mixed: run=1 mode=lo affinity=25% databases=4/4 workers/shape=8
+  setup settled after 40.693276834s: 108 completed splits, 10s quiet
+mixed: run=1 mode=lo affinity=50% databases=4/4 workers/shape=8
+  setup settled after 44.972830443s: 117 completed splits, 10s quiet
+mixed: run=1 mode=lo affinity=75% databases=4/4 workers/shape=8
+  setup settled after 36.174589046s: 97 completed splits, 10s quiet
+mixed: run=1 mode=lo affinity=100% databases=4/4 workers/shape=8
+  setup settled after 34.414391343s: 89 completed splits, 10s quiet
+mixed: run=1 mode=hi affinity=0% databases=4/4 workers/shape=8
+  setup settled after 10.048891726s: 0 completed splits, 10s quiet
+mixed: run=1 mode=hi affinity=25% databases=4/4 workers/shape=8
+  setup settled after 10.051319718s: 0 completed splits, 10s quiet
+mixed: run=1 mode=hi affinity=50% databases=4/4 workers/shape=8
+  setup settled after 10.048990047s: 0 completed splits, 10s quiet
+mixed: run=1 mode=hi affinity=75% databases=4/4 workers/shape=8
+  setup settled after 10.053811876s: 0 completed splits, 10s quiet
+mixed: run=1 mode=hi affinity=100% databases=4/4 workers/shape=8
+  setup settled after 10.048402537s: 0 completed splits, 10s quiet
 contention: run=1 keys=1 overlap=1
 contention: run=1 keys=2 overlap=1
 contention: run=1 keys=2 overlap=2

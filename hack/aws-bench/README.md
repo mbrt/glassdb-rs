@@ -84,14 +84,31 @@ target/release/perfbench \
   --databases=1,3,5,7 --workers-per-shape=20 \
   --duration=2s --max-duration=60s --target-ci=0.1
 
-uv run hack/aws-bench/plot-mixed-sweeps.py
+uv run hack/aws-bench/plot_results.py --canonical
 ```
 
-The plotter requires three clean, converged runs. Throughput is shown as the
+The canonical mode requires three clean, converged runs. Throughput is shown as the
 cross-run median line. Latency uses the cross-run median p50 as a line and the
 area from p50 through p90 as a band. Affinity figures put all transaction shapes
 on one panel per Database-instance count. The four figures are written under
 `hack/aws-bench/out-sweeps/`.
+
+### Plotting any result file
+
+`plot_results.py` also plots single result files, such as the ones in `out/`
+from a real S3 run. It picks the figures from the scenario in each file and
+writes them beside the file unless `--out` says otherwise:
+
+```bash
+uv run hack/aws-bench/plot_results.py hack/aws-bench/out/mixed.json \
+  hack/aws-bench/out/contention.json
+```
+
+A `mixed` file must sweep exactly one of affinity or workers; it gets one panel
+per mode. A `contention` file shows the 100% overlap cells by contended keys.
+Shapes that did not converge are plotted with a warning. Both `plot_results.py`
+and `compare.py` read result files through `perfbench_results.py`, which owns the
+JSON schema.
 
 ## Focused scenarios
 
@@ -146,7 +163,7 @@ scales are useful only as explicitly approximate probes.
 
 ## Comparing references
 
-`compare-refs.sh` uses the same comparison driver as CI. It copies the
+`compare_refs.sh` uses the same comparison driver as CI. It copies the
 candidate's benchmark sources into disposable snapshots of both revisions,
 then builds each against its own engine. The current source tree is not
 changed. Unsupported engine APIs fail the comparison; old workloads are not
@@ -154,15 +171,32 @@ silently substituted.
 
 ```bash
 # main against the current worktree
-hack/aws-bench/compare-refs.sh
+hack/aws-bench/compare_refs.sh
 
 # compatibility spelling for the same bounded comparison
-hack/aws-bench/compare-refs.sh --summary
+hack/aws-bench/compare_refs.sh --summary
 
 # explicit references
 BASE=main TARGET=my-branch OUT=/tmp/glassdb-comparison \
-  hack/aws-bench/compare-refs.sh
+  hack/aws-bench/compare_refs.sh
 ```
+
+### Comparing result directories
+
+To compare result files that already exist, such as a real S3 run against a
+local model run, call `compare.py` directly. Each directory holds
+`mixed.json`, `contention.json`, or `inline-pressure.json`; it compares the
+files that both directories have.
+
+```bash
+hack/aws-bench/compare.py --a out --label-a s3 --b out-fake --label-b model \
+  --out /tmp/cmp-plots --summary-out /tmp/cmp-plots/summary.md
+```
+
+It prints tables of the ratio b/a and a verdict for each metric, and draws one
+set of overlay figures per scenario: `cmp-mixed-*.png` and
+`cmp-contention-latency.png`. Draw the overlays alone with
+`plot_results.py --out DIR --series s3=out/mixed.json --series model=out-fake/mixed.json`.
 
 ## Real S3 runner
 
@@ -170,7 +204,7 @@ The AWS harness preserves a private execution environment: an EC2 instance in
 a VPC without Internet or NAT, an S3 gateway endpoint, SSM interface endpoints,
 an encrypted result bucket, and no inbound access. CloudFormation owns only
 that infrastructure and artifact bootstrap. `deploy.sh` owns workload choices
-by uploading the binary, `run-perfbench.sh`, and a shell-escaped configuration.
+by uploading the binary, `run_perfbench.sh`, and a shell-escaped configuration.
 
 Prerequisites are AWS credentials, AWS CLI v2, the Session Manager plugin for
 live logs, and a musl toolchain matching `RUST_TARGET`.
