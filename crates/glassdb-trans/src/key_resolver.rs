@@ -271,27 +271,18 @@ impl KeyResolver {
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
     ) -> Result<Vec<LeafCoverage>, StorageError> {
+        // Only the leaves are validation dependencies. The descent checks the
+        // leaf that a cached index node routes to, and moves right from it
+        // until the leaf covers the key (ADR-031, ADR-073). So a check of
+        // each index node only adds a backend read to each validation.
+        let mut leaf = self
+            .router
+            .route_key_with_requirements(collection, &range.start, Requirement::ANY, requirement)
+            .await
+            .map_err(|error| error.classify_collection_absence(collection))?;
         if range.is_empty() {
-            if self
-                .router
-                .first_leaf_at(collection, &range.start, requirement)
-                .await
-                .map_err(|error| error.classify_collection_absence(collection))?
-                .is_none()
-            {
-                return Err(StorageError::NotFound.classify_collection_absence(collection));
-            }
             return Ok(Vec::new());
         }
-
-        let Some(mut leaf) = self
-            .router
-            .first_leaf_at(collection, &range.start, requirement)
-            .await
-            .map_err(|error| error.classify_collection_absence(collection))?
-        else {
-            return Err(StorageError::NotFound.classify_collection_absence(collection));
-        };
         let mut covered = Vec::new();
         loop {
             covered.push(
@@ -1083,6 +1074,154 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(scan.keys(), [b"grape".to_vec(), b"pear".to_vec()]);
+    }
+
+    const LEFT_LEAF: NodeId = NodeId::from_bytes([1; 16]);
+    const RIGHT_LEAF: NodeId = NodeId::from_bytes([2; 16]);
+
+    // Writes the two leaves of a split at `m`, and returns a store over its
+    // own cache, so that the caches of the resolvers under test stay as they
+    // were.
+    async fn seed_split_leaves(backend: Arc<dyn Backend>) -> NodeStore {
+        let nodes = NodeStore::new(
+            CachedStore::new(backend, 1 << 20, Timeline::new(), None),
+            std::num::NonZeroUsize::MIN,
+        );
+        let leaves = [
+            (
+                &LEFT_LEAF,
+                Node::leaf(LeafBody::new())
+                    .with_high_key(Some(b"m".to_vec()))
+                    .with_right_sibling(Some(RIGHT_LEAF)),
+            ),
+            (&RIGHT_LEAF, Node::leaf(LeafBody::new())),
+        ];
+        for (node_id, node) in leaves {
+            nodes
+                .store_node(&collection(), node_id, &node, None)
+                .await
+                .unwrap();
+        }
+        nodes
+    }
+
+    fn split_root() -> Node {
+        Node::index(IndexNode::from_children([
+            (Vec::new(), LEFT_LEAF),
+            (b"m".to_vec(), RIGHT_LEAF),
+        ]))
+    }
+
+    async fn validated_coverage(
+        resolver: &KeyResolver,
+        timeline: &Timeline,
+    ) -> Result<Vec<LeafCoverage>, StorageError> {
+        resolver
+            .scan_coverage(
+                &collection(),
+                &ScanRange::all(),
+                None,
+                None,
+                Requirement::after(timeline.currentness_barrier()),
+            )
+            .await
+    }
+
+    // Regression: the validation of a scan over a split tree read the root
+    // index node from the backend each time, which is about one backend round
+    // trip for each scan validation.
+    #[tokio::test]
+    async fn scan_coverage_checks_the_leaves_but_not_the_cached_index_nodes() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let backend: Arc<dyn Backend> = Arc::new(recorder);
+        let nodes = seed_split_leaves(backend.clone()).await;
+        nodes
+            .create_root(&collection(), &split_root())
+            .await
+            .unwrap();
+        let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
+        resolver
+            .scan_keys(&collection(), &ScanRange::all(), &[], None, None)
+            .await
+            .unwrap();
+        log.lock().unwrap().clear();
+
+        let covered = validated_coverage(&resolver, &timeline).await.unwrap();
+
+        assert_eq!(covered.len(), 2);
+        let reads = log.lock().unwrap().clone();
+        assert!(
+            reads.iter().all(|read| !read.path.ends_with("/_r")),
+            "{reads:?}"
+        );
+        assert_eq!(count_leaf_reads(&log), 2);
+    }
+
+    // The cached root is still the leaf that the split rewrote into an index
+    // node, so only the check of the routed node finds both leaves.
+    #[tokio::test]
+    async fn scan_coverage_over_a_stale_index_finds_the_leaves_of_a_fresh_descent() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (stale, _mon, stale_timeline, _bg) = resolver_over(backend.clone()).await;
+        stale
+            .scan_keys(&collection(), &ScanRange::all(), &[], None, None)
+            .await
+            .unwrap();
+        let nodes = seed_split_leaves(backend.clone()).await;
+        let root = nodes
+            .load_node_at_state(&root_path(), Requirement::ANY)
+            .await
+            .unwrap();
+        nodes
+            .store_node_at(&root_path(), &split_root(), &root)
+            .await
+            .unwrap()
+            .unwrap();
+        let (fresh, _fresh_mon, fresh_timeline, _fresh_bg) = resolver_over(backend).await;
+
+        let from_stale = validated_coverage(&stale, &stale_timeline).await.unwrap();
+        let from_fresh = validated_coverage(&fresh, &fresh_timeline).await.unwrap();
+
+        let paths = |covered: &[LeafCoverage]| -> Vec<Arc<str>> {
+            covered
+                .iter()
+                .map(|coverage| coverage.path.clone())
+                .collect()
+        };
+        assert_eq!(from_stale.len(), 2);
+        assert_eq!(paths(&from_stale), paths(&from_fresh));
+    }
+
+    // Only the reclamation of a dropped collection removes a node, so a
+    // removed node reports a missing collection, also through a cached route.
+    #[tokio::test]
+    async fn scan_coverage_reports_a_removed_leaf_as_not_found() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let nodes = seed_split_leaves(backend.clone()).await;
+        nodes
+            .create_root(&collection(), &split_root())
+            .await
+            .unwrap();
+        let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
+        resolver
+            .scan_keys(&collection(), &ScanRange::all(), &[], None, None)
+            .await
+            .unwrap();
+        let left = ObjectPath::Node {
+            collection: collection(),
+            id: LEFT_LEAF,
+        };
+        let observed = nodes
+            .load_node_at_state(&left, Requirement::ANY)
+            .await
+            .unwrap();
+        nodes.delete_node(&observed).await.unwrap();
+
+        assert!(matches!(
+            validated_coverage(&resolver, &timeline).await,
+            Err(StorageError::NotFound)
+        ));
     }
 
     // A tombstone is equally authoritative: absence is decided from the leaf.

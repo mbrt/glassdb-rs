@@ -307,6 +307,47 @@ The leaves stayed split for most of the time, as the offline replay
 predicted. `mixed` on S3 (1 and 8 databases, affinities 0 and 100, 2 runs) had
 `1.00` in lo mode and `0.98` in hi mode, against `43a7187f1`.
 
+### The time of a merger scan over two leaves
+
+Temporary instrumentation (branch `merge-side-measure`, commit `dabe6f95c`)
+divided the time of each merger scan with `fixed-1` and `fixed-2`. There were
+no replays and no retries. Times are in model ms for each committed scan:
+
+| Part | `fixed-1` | `fixed-2` | Difference |
+| --- | ---: | ---: | ---: |
+| Total | `45.0` | `118.7` | `+73.7` |
+| Body: lock-holder resolves | `9.4` | `41.1` | `+31.7` |
+| Validation: check of the first leaf | `35.5` | `48.8` | `+13.3` |
+| Validation fallback: route to the first leaf | `0.0` | `14.0` | `+14.0` |
+| Validation: reads of the second leaf (scan crossing time) | `0` | `14.6` | `+14.6` |
+
+- The scan crossing time is all of the time that comes from the read of the
+  second leaf.
+- A resolve that reads the transaction record of a holder takes about 27 ms.
+  With `fixed-1`, 18% of the resolves did this, and with `fixed-2`, 80%. The
+  body of the scan uses `Requirement::ANY`, so the cause is not known yet. It
+  is not a crossing, so it is not merge-side time.
+- The physical check of the first leaf failed in 38% of the scans with
+  `fixed-1`, and in 79% with `fixed-2`. The logical fallback then validated
+  the scan.
+- The fallback routed to its first leaf at the validation barrier, so it read
+  the root index node from the backend in each validation. A merge does not
+  remove this read, because the root stays an index node (ADR-073).
+
+The fallback now routes through the cached index nodes and checks only the
+leaves, as point routes do (ADR-031). In `split-merge-fight` on S3, 2 runs
+against `83dcc16af`, in scans for each model second:
+
+| Policy | `83dcc16af` | Cached index nodes |
+| --- | ---: | ---: |
+| `fixed-1` | `165`–`178` | `164`–`176` |
+| `fixed-2` | `68` (p50 118 ms) | `91` (p50 87 ms) |
+| `avoidable` | `75`–`76` | `100`–`103` |
+
+The writers did not change. `mixed` on S3 (1 and 8 databases, affinities 0
+and 100, 2 runs) had `1.01` in lo mode and `1.01` in hi mode. Its lowest cell
+was 8 databases, affinity 0, and hi mode, with `0.95`.
+
 ## 2026-09-26: ADR-074 splits in the mixed hi mode
 
 Status: in the engine as `TopologyPolicy::AvoidableTime`, the default policy
