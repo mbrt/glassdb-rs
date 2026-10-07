@@ -33,7 +33,7 @@ glassdb-concurr = { version = "0.3.0", path = "../glassdb-concurr" }
 # burst of new connections cannot saturate tokio's blocking pool. hickory also
 # caches responses (honoring their TTL). Default features only (plaintext
 # UDP/TCP + system resolv.conf); no DoT/DoH/QUIC/DNSSEC.
-hickory-resolver = "0.26.1"
+hickory-resolver = "0.26.2"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["rt", "macros", "time"] }
 tracing = "0.1.44"
