@@ -10,7 +10,8 @@ use tokio::sync::Barrier;
 pub mod integration_support;
 
 use integration_support::{
-    ParentWriteControl, PauseControl, create_top, init_db, list_collections_of, mem,
+    ParentWriteControl, PauseControl, WriteBackHold, create_top, init_db, list_collections_of, mem,
+    open_top,
 };
 
 #[tokio::test(start_paused = true)]
@@ -459,4 +460,51 @@ async fn listing_a_missing_collection_is_not_found() {
             .await,
         Err(Error::NotFound)
     ));
+}
+
+// A transaction can commit a delete, and then a create in the same leaf can
+// end the membership lock of the delete before the delete is written back.
+// The leaf then keeps the deleted key with its earlier value, so a scan must
+// not decide its keys from the leaf alone.
+#[tokio::test(start_paused = true)]
+async fn a_scan_omits_a_committed_delete_whose_write_back_is_held() {
+    let hold = WriteBackHold::wrap(mem());
+    let deleter = init_db(hold.backend()).await;
+    let collection = create_top(&deleter, b"held-delete").await;
+    collection.write(b"deleted", b"v").await.unwrap();
+
+    let held = hold.hold_next_write_back();
+    tokio::spawn({
+        let deleter = deleter.clone();
+        let collection = collection.clone();
+        async move {
+            deleter
+                .tx(|tx| {
+                    let collection = collection.clone();
+                    async move {
+                        // The scan keeps the delete from a direct commit, so
+                        // the delete locks the key and the membership.
+                        tx.scan_keys(&collection, glassdb::KeyScan::all()).await?;
+                        tx.delete(&collection, b"deleted")
+                    }
+                })
+                .await
+        }
+    });
+    held.await.unwrap();
+
+    let creator = init_db(hold.backend()).await;
+    open_top(&creator, b"held-delete")
+        .await
+        .write(b"created", b"v")
+        .await
+        .unwrap();
+
+    let scanner = init_db(hold.backend()).await;
+    let scan = open_top(&scanner, b"held-delete")
+        .await
+        .scan_keys(glassdb::KeyScan::all())
+        .await
+        .unwrap();
+    assert_eq!(scan.keys(), [b"created".to_vec()]);
 }
