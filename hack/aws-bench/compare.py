@@ -60,6 +60,7 @@ import pandas as pd
 import seaborn as sns
 
 import perfbench_results
+import plot_results
 
 # Backend-op columns that sum into total round-trips, in case a `stats.csv` from
 # an older run predates the explicit `backend-ops` total column. Engine versions
@@ -961,6 +962,17 @@ def plot_overlay_contention(data, out_dir: Path) -> None:
     _save(fig, out_dir, "cmp-contention-latency.png")
 
 
+def plot_mixed_overlay(a: Path, b: Path, la: str, lb: str, out_dir: Path) -> None:
+    """Overlay current-format mixed reports; legacy `mixbench.json` has no plots."""
+    paths = {la: a / "mixed.json", lb: b / "mixed.json"}
+    if not all(path.exists() for path in paths.values()):
+        return
+    try:
+        plot_results.plot_overlay(paths, out_dir)
+    except perfbench_results.ReportError as error:
+        print(f"skipping mixed-workload plots: {error}")
+
+
 def _save(fig: plt.Figure, out_dir: Path, name: str) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / name
@@ -1453,6 +1465,7 @@ def main() -> int:
             plot_overlay_replays(_tidy_replays(a_st, b_st, la, lb, cpd), out_dir)
         if a_dl is not None and b_dl is not None:
             plot_overlay_contention(_tidy_contention(a_dl, b_dl, la, lb), out_dir)
+        plot_mixed_overlay(args.a, args.b, la, lb, out_dir)
 
     return 0
 

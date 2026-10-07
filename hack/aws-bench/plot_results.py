@@ -16,6 +16,9 @@ The scenario recorded in each file selects the figures:
   the one dimension that varies: affinity or workers per shape;
 * `contention`: throughput and latency by number of contended keys.
 
+`--series LABEL=FILE` (at least twice) overlays files of one scenario instead.
+Each scenario gets its own figures, named `cmp-<scenario>-*.png`.
+
 With several runs in a file, lines show the cross-run median. Pass `--canonical`
 to render the four fixed worker and affinity figures of the local S3 model
 instead; that mode insists on the complete grids described in the README.
@@ -27,7 +30,7 @@ import argparse
 import math
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import matplotlib
 
@@ -36,6 +39,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+from matplotlib.lines import Line2D
 
 import perfbench_results
 from perfbench_results import SHAPES, ReportError
@@ -54,6 +58,8 @@ EXPECTED_RUNS = (1, 2, 3)
 FIXED_AFFINITY_WORKERS = 20
 WORKER_DATABASE_LIMIT = 5
 METRICS = ("throughput", "p50_ms", "p90_ms")
+# One line style per overlaid source; shapes keep their colors.
+SOURCE_STYLES = ("-", "--", ":", "-.")
 # Dimensions that a generic mixed report may sweep along its x-axis.
 MIXED_AXES = {
     "affinity": "Home-collection affinity (%)",
@@ -142,6 +148,7 @@ def _plot_shape_lines(
     colors: dict[str, Any],
     *,
     labels: bool = True,
+    linestyle: str = "-",
 ) -> None:
     for shape in SHAPES:
         line = medians[medians["shape"] == shape].sort_values(x)
@@ -149,6 +156,7 @@ def _plot_shape_lines(
             line[x],
             line[metric],
             color=colors[shape],
+            linestyle=linestyle,
             label=SHAPE_LABELS[shape] if labels else None,
         )
 
@@ -297,6 +305,33 @@ def _mixed_axis(data: pd.DataFrame) -> str:
     return varying[0]
 
 
+def _source_legend(fig: plt.Figure, sources: list[str]) -> None:
+    """Legend for shape colors, plus line styles when sources are overlaid."""
+    colors = _shape_colors()
+    handles = [
+        Line2D([], [], color=colors[shape], label=SHAPE_LABELS[shape])
+        for shape in SHAPES
+    ]
+    if len(sources) > 1:
+        handles += [
+            Line2D(
+                [],
+                [],
+                color="black",
+                linestyle=SOURCE_STYLES[index % len(SOURCE_STYLES)],
+                label=source,
+            )
+            for index, source in enumerate(sources)
+        ]
+    fig.legend(
+        handles=handles,
+        title="Transaction shape" + (" / source" if len(sources) > 1 else ""),
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.94),
+        ncol=len(handles),
+    )
+
+
 def _plot_mode_panels(
     medians: pd.DataFrame,
     axis: str,
@@ -307,44 +342,66 @@ def _plot_mode_panels(
     out_dir: Path,
     name: str,
 ) -> Path:
-    """One panel per mode, sharing the y-axis so modes compare directly."""
+    """One panel per mode, sharing the y-axis so modes compare directly.
+
+    Overlaid sources are told apart by line style. Bands are drawn only for a
+    single source, where they stay readable.
+    """
     modes = sorted(medians["mode"].unique())
+    sources = list(dict.fromkeys(medians["source"]))
+    bands = bands and len(sources) == 1
     colors = _shape_colors()
     fig, axes = plt.subplots(
         1, len(modes), figsize=(max(7 * len(modes), 11), 6), sharey=True, squeeze=False
     )
-    for index, (ax, mode) in enumerate(zip(axes.flat, modes, strict=True)):
-        mode_medians = medians[medians["mode"] == mode]
-        if bands:
-            _plot_shape_latency_bands(ax, mode_medians, axis, colors, labels=index == 0)
-        else:
-            _plot_shape_lines(ax, mode_medians, axis, metric, colors, labels=index == 0)
+    for ax, mode in zip(axes.flat, modes, strict=True):
+        for index, source in enumerate(sources):
+            selected = medians[
+                (medians["mode"] == mode) & (medians["source"] == source)
+            ]
+            if bands:
+                _plot_shape_latency_bands(ax, selected, axis, colors, labels=False)
+            else:
+                _plot_shape_lines(
+                    ax,
+                    selected,
+                    axis,
+                    metric,
+                    colors,
+                    labels=False,
+                    linestyle=SOURCE_STYLES[index % len(SOURCE_STYLES)],
+                )
         ax.set_title(f"mode: {mode}")
         ax.set_xlabel(MIXED_AXES[axis])
-        ax.set_xticks(sorted(mode_medians[axis].unique()))
+        ax.set_xticks(sorted(medians[medians["mode"] == mode][axis].unique()))
         ax.tick_params(axis="x", labelrotation=45)
-    axes.flat[0].set_ylabel("Latency (ms)" if bands else "Transactions / sec")
+    axes.flat[0].set_ylabel("Latency (ms)" if "ms" in metric else "Transactions / sec")
     axes.flat[0].set_ylim(bottom=0)
     fig.suptitle(title)
-    fig.legend(
-        *axes.flat[0].get_legend_handles_labels(),
-        title="Transaction shape",
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.94),
-        ncol=len(SHAPES),
-    )
+    _source_legend(fig, sources)
     fig.tight_layout(rect=(0, 0, 1, 0.80))
     return _save(fig, out_dir, name)
 
 
-def plot_mixed_report(path: Path, out_dir: Path) -> list[Path]:
-    """Plot throughput and latency of a mixed report against its swept axis."""
-    _, data = perfbench_results.read_mixed(path, require_converged=False)
-    unconverged = int((~data["converged"]).sum())
-    if unconverged:
-        print(f"warning: {path}: {unconverged} shape points did not converge")
-    axis = _mixed_axis(data)
-    medians = median_rows(data, ["mode", axis])
+def plot_mixed_report(
+    series: Mapping[str, Path], out_dir: Path, stem: str
+) -> list[Path]:
+    """Plot throughput and latency of mixed reports against their swept axis."""
+    frames, axes = [], set()
+    for label, path in series.items():
+        _, data = perfbench_results.read_mixed(path, require_converged=False)
+        unconverged = int((~data["converged"]).sum())
+        if unconverged:
+            print(f"warning: {path}: {unconverged} shape points did not converge")
+        axes.add(_mixed_axis(data))
+        frames.append(data.assign(source=label))
+    if len(axes) != 1:
+        raise ReportError("mixed reports must sweep the same dimension to overlay")
+    axis = axes.pop()
+    medians = median_rows(
+        pd.concat(frames, ignore_index=True), ["source", "mode", axis]
+    )
+    overlay = len(series) > 1
     return [
         _plot_mode_panels(
             medians,
@@ -353,37 +410,48 @@ def plot_mixed_report(path: Path, out_dir: Path) -> list[Path]:
             title="Mixed-workload throughput",
             bands=False,
             out_dir=out_dir,
-            name=f"{path.stem}-throughput.png",
+            name=f"{stem}-throughput.png",
         ),
         _plot_mode_panels(
             medians,
             axis,
             "p50_ms",
-            title="Mixed-workload latency — p50 line; p50–p90 band",
+            title="Mixed-workload latency — "
+            + ("p50" if overlay else "p50 line; p50–p90 band"),
             bands=True,
             out_dir=out_dir,
-            name=f"{path.stem}-latency.png",
+            name=f"{stem}-latency.png",
         ),
     ]
 
 
-def plot_contention_report(path: Path, out_dir: Path) -> list[Path]:
-    """Plot throughput and latency of a contention report by contended keys.
+def plot_contention_report(
+    series: Mapping[str, Path], out_dir: Path, stem: str
+) -> list[Path]:
+    """Plot throughput and latency of contention reports by contended keys.
 
     Only full-overlap cells are drawn: partial overlaps form a second matrix
     dimension that would turn each figure into a dozen crossing lines.
     """
-    samples, stats = perfbench_results.read_contention([path])
-    if stats.empty or not (stats["overlap-pct"] == 100).any():
-        raise ReportError(f"{path}: report has no 100% overlap cells")
-    samples = samples[samples["overlap-pct"] == 100]
-    stats = stats[stats["overlap-pct"] == 100]
+    sample_frames, stat_frames = [], []
+    for label, path in series.items():
+        samples, stats = perfbench_results.read_contention([path])
+        if stats.empty or not (stats["overlap-pct"] == 100).any():
+            raise ReportError(f"{path}: report has no 100% overlap cells")
+        sample_frames.append(
+            samples[samples["overlap-pct"] == 100].assign(source=label)
+        )
+        stat_frames.append(stats[stats["overlap-pct"] == 100].assign(source=label))
+    samples = pd.concat(sample_frames, ignore_index=True)
+    stats = pd.concat(stat_frames, ignore_index=True)
+    style = "source" if len(series) > 1 else None
 
     latency, ax = plt.subplots(figsize=(8, 5))
     sns.lineplot(
         data=samples,
         x="num-keys",
         y="latency-ms",
+        style=style,
         estimator="median",
         errorbar=("pi", 80),
         marker="o",
@@ -399,6 +467,7 @@ def plot_contention_report(path: Path, out_dir: Path) -> list[Path]:
         data=stats,
         x="num-keys",
         y="tx-per-sec",
+        style=style,
         estimator="median",
         errorbar=None,
         marker="o",
@@ -409,8 +478,8 @@ def plot_contention_report(path: Path, out_dir: Path) -> list[Path]:
     ax.set_xlabel("Contended keys (100% overlap)")
     ax.set_ylabel("Transactions / sec")
     return [
-        _save(latency, out_dir, f"{path.stem}-latency.png"),
-        _save(throughput, out_dir, f"{path.stem}-throughput.png"),
+        _save(latency, out_dir, f"{stem}-latency.png"),
+        _save(throughput, out_dir, f"{stem}-throughput.png"),
     ]
 
 
@@ -422,11 +491,28 @@ PLOTTERS = {
 
 def plot_file(path: Path, out_dir: Path | None) -> list[Path]:
     """Plot one result file into `out_dir`, by default next to the file."""
-    scenario = perfbench_results.read_envelope(path)["scenario"]
+    return plot_series({path.stem: path}, out_dir or path.parent, path.stem)
+
+
+def plot_overlay(series: Mapping[str, Path], out_dir: Path) -> list[Path]:
+    """Overlay result files of one scenario, one set of figures per scenario."""
+    scenario = _scenario(next(iter(series.values())))
+    return plot_series(series, out_dir, f"cmp-{scenario}")
+
+
+def plot_series(series: Mapping[str, Path], out_dir: Path, stem: str) -> list[Path]:
+    scenarios = {_scenario(path) for path in series.values()}
+    if len(scenarios) != 1:
+        raise ReportError(f"cannot overlay different scenarios: {sorted(scenarios)}")
+    scenario = scenarios.pop()
     plotter = PLOTTERS.get(scenario)
     if plotter is None:
-        raise ReportError(f"{path}: no plots for scenario {scenario!r}")
-    return plotter(path, out_dir if out_dir is not None else path.parent)
+        raise ReportError(f"no plots for scenario {scenario!r}")
+    return plotter(series, out_dir, stem)
+
+
+def _scenario(path: Path) -> str:
+    return perfbench_results.read_envelope(path)["scenario"]
 
 
 def render(worker_path: Path, affinity_path: Path, out_dir: Path) -> list[Path]:
@@ -467,6 +553,13 @@ def main() -> int:
         help="figure directory (default: beside each result file, or out-sweeps)",
     )
     parser.add_argument(
+        "--series",
+        action="append",
+        default=[],
+        metavar="LABEL=FILE",
+        help="overlay result files of one scenario (repeat; needs --out)",
+    )
+    parser.add_argument(
         "--canonical",
         action="store_true",
         help="render the fixed worker and affinity figures instead of FILES",
@@ -474,16 +567,33 @@ def main() -> int:
     parser.add_argument("--workers", type=Path, default=sweeps / "workers.json")
     parser.add_argument("--affinity", type=Path, default=sweeps / "affinity.json")
     args = parser.parse_args()
-    if bool(args.files) == args.canonical:
-        parser.error("pass result files, or --canonical, but not both")
+    modes = [bool(args.files), bool(args.series), args.canonical]
+    if sum(modes) != 1:
+        parser.error("pass result files, or --series, or --canonical")
+    if args.series and (len(args.series) < 2 or args.out is None):
+        parser.error("--series needs at least two entries and --out")
 
     sns.set_theme(style="whitegrid", context="talk")
     if args.canonical:
         render(args.workers, args.affinity, args.out or sweeps)
+    elif args.series:
+        plot_overlay(_parse_series(parser, args.series), args.out)
     else:
         for path in args.files:
             plot_file(path, args.out)
     return 0
+
+
+def _parse_series(
+    parser: argparse.ArgumentParser, entries: list[str]
+) -> dict[str, Path]:
+    series: dict[str, Path] = {}
+    for entry in entries:
+        label, separator, path = entry.partition("=")
+        if not separator or not label or label in series:
+            parser.error(f"--series expects unique LABEL=FILE entries, got {entry!r}")
+        series[label] = Path(path)
+    return series
 
 
 def run() -> int:

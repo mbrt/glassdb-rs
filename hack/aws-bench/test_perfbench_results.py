@@ -105,6 +105,31 @@ class PerfbenchResultsTest(unittest.TestCase):
             with self.assertRaisesRegex(perfbench_results.ReportError, "duplicate"):
                 perfbench_results.read_contention([path])
 
+    def test_report_without_worker_counts_still_loads(self) -> None:
+        legacy_cell = {
+            "mode": "lo",
+            "affinityPct": 50,
+            "databases": 4,
+            "failures": 0,
+            "shapes": [
+                {"shape": shape, "txPerSec": 1, "p50Ms": 1, "p90Ms": 2}
+                for shape in perfbench_results.SHAPES
+            ],
+        }
+        report = {
+            "schemaVersion": 1,
+            "scenario": "mixed",
+            "backend": "s3",
+            "modelTimeSpeedup": 1.0,
+            "runs": [{"run": 1, "cells": [legacy_cell]}],
+        }
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write(Path(directory_name), "mixed.json", report)
+            _, frame = perfbench_results.read_mixed(path, require_converged=False)
+
+        self.assertEqual(frame["database_limit"].unique().tolist(), [4])
+        self.assertTrue(frame["workers"].isna().all())
+
     def test_several_single_run_files_are_numbered_as_consecutive_runs(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             directory = Path(directory_name)

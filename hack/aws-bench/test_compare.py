@@ -332,6 +332,12 @@ class CompareTest(unittest.TestCase):
         table = compare.mixed_aggregate_table(cells(0.5), cells(1.0))
         self.assertEqual(table.loc[0, "replays-ratio"], 2.0)
 
+    def test_mixed_overlay_is_skipped_without_current_format_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            compare.plot_mixed_overlay(directory, directory, "a", "b", directory)
+            self.assertEqual(list(directory.glob("*.png")), [])
+
     def test_inconsistent_common_cell_clock_is_rejected(self) -> None:
         rows = pd.DataFrame(
             [

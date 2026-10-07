@@ -181,6 +181,23 @@ BASE=main TARGET=my-branch OUT=/tmp/glassdb-comparison \
   hack/aws-bench/compare_refs.sh
 ```
 
+### Comparing result directories
+
+To compare result files that already exist, such as a real S3 run against a
+local model run, call `compare.py` directly. Each directory holds
+`mixed.json`, `contention.json`, or `inline-pressure.json`; it compares the
+files that both directories have.
+
+```bash
+hack/aws-bench/compare.py --a out --label-a s3 --b out-fake --label-b model \
+  --out /tmp/cmp-plots --summary-out /tmp/cmp-plots/summary.md
+```
+
+It prints tables of the ratio b/a and a verdict for each metric, and draws one
+set of overlay figures per scenario: `cmp-mixed-*.png` and
+`cmp-contention-latency.png`. Draw the overlays alone with
+`plot_results.py --out DIR --series s3=out/mixed.json --series model=out-fake/mixed.json`.
+
 ## Real S3 runner
 
 The AWS harness preserves a private execution environment: an EC2 instance in

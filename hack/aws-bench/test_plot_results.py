@@ -394,6 +394,61 @@ class GenericPlotterTest(unittest.TestCase):
             with self.assertRaisesRegex(plotter.ReportError, "100% overlap"):
                 plotter.plot_file(path, directory)
 
+    def test_overlay_writes_separate_figures_per_scenario(self) -> None:
+        cells = [cell(1, affinity, 4, 8) for affinity in (0, 100)]
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            mixed = self.write_report(
+                directory, "mixed.json", self.real_mixed_report(cells)
+            )
+            contention = self.write_report(
+                directory, "contention.json", self.contention_report([100])
+            )
+
+            mixed_outputs = plotter.plot_overlay({"a": mixed, "b": mixed}, directory)
+            contention_outputs = plotter.plot_overlay(
+                {"a": contention, "b": contention}, directory
+            )
+
+            self.assertEqual(
+                {output.name for output in mixed_outputs},
+                {"cmp-mixed-throughput.png", "cmp-mixed-latency.png"},
+            )
+            self.assertEqual(
+                {output.name for output in contention_outputs},
+                {"cmp-contention-throughput.png", "cmp-contention-latency.png"},
+            )
+
+    def test_overlay_rejects_different_scenarios(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            mixed = self.write_report(
+                directory,
+                "mixed.json",
+                self.real_mixed_report([cell(1, 0, 4, 8), cell(1, 100, 4, 8)]),
+            )
+            contention = self.write_report(
+                directory, "contention.json", self.contention_report([100])
+            )
+            with self.assertRaisesRegex(plotter.ReportError, "different scenarios"):
+                plotter.plot_overlay({"a": mixed, "b": contention}, directory)
+
+    def test_overlay_rejects_reports_sweeping_different_dimensions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            by_affinity = self.write_report(
+                directory,
+                "affinity.json",
+                self.real_mixed_report([cell(1, 0, 4, 8), cell(1, 100, 4, 8)]),
+            )
+            by_workers = self.write_report(
+                directory,
+                "workers.json",
+                self.real_mixed_report([cell(1, 100, 4, 4), cell(1, 100, 4, 8)]),
+            )
+            with self.assertRaisesRegex(plotter.ReportError, "same dimension"):
+                plotter.plot_overlay({"a": by_affinity, "b": by_workers}, directory)
+
     def test_bad_file_is_reported_as_one_line_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write_report(Path(directory_name), "bad.json", {"x": 1})

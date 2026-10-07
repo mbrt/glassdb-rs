@@ -127,14 +127,21 @@ def read_mixed(
         affinity = _integer(cell.get("affinityPct"), f"{label}.affinityPct")
         if affinity > 100:
             raise ReportError(f"{label}.affinityPct must not exceed 100")
-        database_limit = _integer(
-            cell.get("databaseLimit"), f"{label}.databaseLimit", minimum=1
-        )
         databases = _integer(cell.get("databases"), f"{label}.databases", minimum=1)
-        workers = _integer(
-            cell.get("workersPerShape"), f"{label}.workersPerShape", minimum=1
+        # Reports written before the Database limit and worker count were
+        # recorded omit both. Such a cell ran one Database per limit, and its
+        # worker count is unknown.
+        database_limit = (
+            _integer(cell["databaseLimit"], f"{label}.databaseLimit", minimum=1)
+            if "databaseLimit" in cell
+            else databases
         )
-        if databases != min(database_limit, workers):
+        workers = (
+            _integer(cell["workersPerShape"], f"{label}.workersPerShape", minimum=1)
+            if "workersPerShape" in cell
+            else None
+        )
+        if workers is not None and databases != min(database_limit, workers):
             raise ReportError(
                 f"{label}: databases={databases} does not equal "
                 f"min(databaseLimit={database_limit}, workersPerShape={workers})"
