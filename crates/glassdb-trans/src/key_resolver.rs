@@ -200,16 +200,17 @@ impl KeyResolver {
                                 let logical_key = LogicalKey::new(collection.clone(), &key);
                                 match leaf.lookup(&key) {
                                     None => false,
-                                    Some(entry) => self
-                                        .state
-                                        .resolve_effective(
-                                            &logical_key,
-                                            Some(entry),
-                                            own_lock_holder,
-                                            requirement,
-                                        )
-                                        .await?
-                                        .exists(),
+                                    Some(entry) => {
+                                        self.state
+                                            .key_exists(
+                                                &logical_key,
+                                                node,
+                                                entry,
+                                                own_lock_holder,
+                                                requirement,
+                                            )
+                                            .await?
+                                    }
                                 }
                             }
                         };

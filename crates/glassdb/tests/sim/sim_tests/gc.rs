@@ -5,6 +5,7 @@ use glassdb::backend::{BackendError, ListLimit, memory::MemoryBackend};
 use glassdb::middleware::{BackendOp, HookBackend};
 use glassdb::{Backend, Database, GcLimits, InlinePolicy};
 use glassdb_concurr::{exec, rt};
+use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_trans::ProtocolTiming;
 
 #[test]
@@ -264,5 +265,92 @@ fn gc_hint_limits_preserve_writes_and_scan_reclamation() {
             }
             db.shutdown().await;
         }
+    });
+}
+
+// GC releases the locks of a committed holder only after no key lock names it.
+// So it does not end the membership lock of a holder whose write-back has not
+// landed, and a scan still omits the key that the holder deleted (ADR-077).
+#[test]
+fn gc_keeps_the_membership_lock_of_a_committed_delete_before_its_write_back() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    exec::block_on(async {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let open = || {
+            Database::builder("held", backend.clone())
+                .protocol_timing(ProtocolTiming::simulation())
+                .open()
+        };
+        let deleter = open().await.unwrap();
+        let collection = deleter.root_collection();
+        collection.write(b"deleted", b"v").await.unwrap();
+
+        // Holds the first leaf write after the transaction record turns
+        // committed, which is the write-back of the delete.
+        let committed = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicBool::new(false));
+        backend.set_before({
+            let committed = committed.clone();
+            let held = held.clone();
+            move |op| {
+                let hold = match op {
+                    BackendOp::WriteIf { path, value, .. }
+                    | BackendOp::WriteIfNotExists { path, value }
+                        if path.contains("/_t/") =>
+                    {
+                        if glassdb_storage::txrecord::status(value)
+                            .is_ok_and(|status| status == TxCommitStatus::Committed)
+                        {
+                            committed.store(true, Ordering::SeqCst);
+                        }
+                        false
+                    }
+                    BackendOp::WriteIf { path, .. } if path.ends_with("/_r") => committed
+                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok(),
+                    _ => false,
+                };
+                if hold {
+                    held.store(true, Ordering::SeqCst);
+                }
+                Box::pin(async move {
+                    if hold {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(())
+                })
+            }
+        });
+        rt::spawn({
+            let deleter = deleter.clone();
+            async move {
+                // The scan keeps the delete from a direct commit, so the delete
+                // locks the key and the membership.
+                let _ = deleter
+                    .tx(|tx| async move {
+                        let root = tx.root_collection();
+                        tx.scan_keys(&root, glassdb::KeyScan::all()).await?;
+                        tx.delete(&root, b"deleted")
+                    })
+                    .await;
+            }
+        });
+        while !held.load(Ordering::SeqCst) {
+            rt::sleep(Duration::from_millis(1)).await;
+        }
+
+        let collector = open().await.unwrap();
+        rt::sleep(Duration::from_secs(5)).await;
+        let gc = collector.stats().gc;
+        assert!(gc.lists > 0, "{gc:?}");
+
+        let scanner = open().await.unwrap();
+        let scan = scanner
+            .root_collection()
+            .scan_keys(glassdb::KeyScan::all())
+            .await
+            .unwrap();
+        assert!(scan.keys().is_empty(), "{:?}", scan.keys());
     });
 }

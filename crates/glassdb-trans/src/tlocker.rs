@@ -50,7 +50,7 @@ use crate::leaf_coord::{
     MemberPolicy, ResolveCtx, StageAdmission, Step,
 };
 use crate::monitor::Monitor;
-use crate::node_locking::NodeLockReconciler;
+use crate::node_locking::{LeafState, NodeLockReconciler, leaf_collection};
 use crate::retry_timing::RetryTiming;
 use crate::wound_wait::{Reclaim, try_reclaim};
 
@@ -390,8 +390,14 @@ impl MemberPolicy for AcquireOperation {
         }
 
         if membership != LockType::None {
+            let collection = leaf_collection(&self.path)?;
+            let leaf = LeafState {
+                collection,
+                entries: staged,
+                requirement: ctx.requirement,
+            };
             if let Some(holder) = reconciler
-                .acquire_membership(&mut locks, membership)
+                .acquire_membership(&mut locks, membership, &leaf, &mut entries)
                 .await?
             {
                 return Ok(Step::Skip {
@@ -907,6 +913,16 @@ fn writeback_changes(
         }
         e.release_lock(id);
         changes.push((intent.raw_key.clone(), e));
+    }
+    // An earlier commit pass can lock keys that the transaction did not write
+    // in the end. Their locks go too, because a membership writer leaves the
+    // membership lock only with all of its key locks (ADR-077).
+    for (key, entry) in entries {
+        if entry.is_locked_by(id) && !changes.iter().any(|(changed, _)| changed == key) {
+            let mut entry = entry.clone();
+            entry.release_lock(id);
+            changes.push((key.clone(), entry));
+        }
     }
     WritebackStaged {
         changes,

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use glassdb_data::{CollectionAddress, LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
-use glassdb_storage::{LeafEntry, LeafObservation, LockType, NodeLocks, Requirement};
+use glassdb_storage::{CurrentState, LeafEntry, LeafObservation, LockType, NodeLocks, Requirement};
 
 use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
@@ -27,6 +27,13 @@ pub(crate) struct NodeLockReconciler<'a> {
     monitor: &'a Monitor,
     id: &'a TxId,
     acquisition: GateAcquisition,
+}
+
+/// The staged entries of one leaf, as seen by a mutation deciding on its locks.
+pub(crate) struct LeafState<'a> {
+    pub(crate) collection: &'a CollectionAddress,
+    pub(crate) entries: &'a BTreeMap<Vec<u8>, LeafEntry>,
+    pub(crate) requirement: Requirement,
 }
 
 /// How a structural operation treats live holders of the node it gates.
@@ -67,13 +74,44 @@ impl<'a> NodeLockReconciler<'a> {
         }
     }
 
+    /// Quiesces one node and closes its structural gate: help-forwards or
+    /// removes each foreign holder of its entries and node locks.
+    ///
+    /// The entries and the locks change together, because a membership writer
+    /// leaves the membership lock only with its key locks (ADR-077). `entries`
+    /// is `None` for an index node.
+    ///
+    /// The result is a candidate for CAS against the source observation, not
+    /// proof that the stored node is quiescent. With `ANY`, stale Pending or
+    /// Unknown status must lead to waiting or a durable wound; final decisions
+    /// are stable.
+    pub(crate) async fn gate_node(
+        &self,
+        leaf: Option<&LeafState<'_>>,
+        locks: &NodeLocks,
+    ) -> Result<GatedNode, TransError> {
+        let entries = match leaf {
+            Some(leaf) => match self
+                .quiesce_entries(leaf.collection, leaf.entries, leaf.requirement)
+                .await?
+            {
+                QuiescedEntries::Ready(entries) => Some(entries),
+                QuiescedEntries::Wait(holder) => {
+                    return Ok(GatedNode::Blocked(GateBlocker::Holder(holder)));
+                }
+            },
+            None => None,
+        };
+        let mut locks = locks.clone();
+        if let Some(blocker) = self.acquire_structural_gate(&mut locks).await? {
+            return Ok(GatedNode::Blocked(blocker));
+        }
+        Ok(GatedNode::Gated { entries, locks })
+    }
+
     /// Resolves every entry and removes holders this structural operation can
     /// reclaim before closing the node's structural gate.
-    ///
-    /// `Ready` is a candidate for CAS against the source observation, not proof
-    /// that the stored node is quiescent. With `ANY`, stale Pending or Unknown
-    /// status must lead to waiting or a durable wound; final decisions are stable.
-    pub(crate) async fn quiesce_entries(
+    async fn quiesce_entries(
         &self,
         collection: &CollectionAddress,
         entries: &BTreeMap<Vec<u8>, LeafEntry>,
@@ -136,12 +174,14 @@ impl<'a> NodeLockReconciler<'a> {
         Ok(Some(holder))
     }
 
-    /// Closes the structural gate after quiescing membership holders.
+    /// Closes the structural gate after quiescing membership holders. The
+    /// quiesced entries of [`Self::gate_node`] have no key lock of the
+    /// membership holders removed here.
     ///
     /// Returns what blocks the gate, or leaves both node-lock scopes free of
     /// foreign holders with a final status, with a structural gate installed
     /// for this operation.
-    pub(crate) async fn acquire_structural_gate(
+    async fn acquire_structural_gate(
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<GateBlocker>, TransError> {
@@ -215,10 +255,15 @@ impl<'a> NodeLockReconciler<'a> {
     }
 
     /// Acquires the requested membership lock, returning a holder to wait for.
+    ///
+    /// A membership writer that this removes appends the release of its key
+    /// locks to `changes` (see [`Self::remove_membership_writer`]).
     pub(crate) async fn acquire_membership(
         &self,
         locks: &mut NodeLocks,
         desired: LockType,
+        leaf: &LeafState<'_>,
+        changes: &mut Vec<(Vec<u8>, LeafEntry)>,
     ) -> Result<Option<TxId>, TransError> {
         let conflicts = match desired {
             LockType::Read => {
@@ -236,18 +281,16 @@ impl<'a> NodeLockReconciler<'a> {
                 if &holder == self.id {
                     continue;
                 }
-                match self.monitor.tx_status(&holder).await? {
-                    TxCommitStatus::Pending => {
-                        if matches!(self.reclaim(&holder).await?, Reclaim::Wait) {
-                            return Ok(Some(holder));
-                        }
-                    }
+                let status = match self.monitor.tx_status(&holder).await? {
+                    TxCommitStatus::Pending => match self.reclaim(&holder).await? {
+                        Reclaim::Wait => return Ok(Some(holder)),
+                        Reclaim::Wounded => TxCommitStatus::Wounded,
+                    },
                     TxCommitStatus::Unknown => return Ok(Some(holder)),
-                    TxCommitStatus::Committed
-                    | TxCommitStatus::Aborted
-                    | TxCommitStatus::Wounded => {}
-                }
-                locks.remove_membership_holder(&holder);
+                    status => status,
+                };
+                self.remove_membership_writer(&holder, status, locks, leaf, changes)
+                    .await?;
             }
         }
         match desired {
@@ -263,6 +306,72 @@ impl<'a> NodeLockReconciler<'a> {
             _ => {}
         }
         Ok(None)
+    }
+
+    /// Removes `holder`, which has a final status, from the membership lock in
+    /// `locks`, and appends to `changes` the release of its write locks and
+    /// create locks in `leaf`. A committed holder is help-forwarded on these
+    /// keys. Keys already in `changes` no longer name the holder.
+    ///
+    /// A holder leaves the membership write lock only together with these key
+    /// locks, so that a key lock outside the membership lock never changes the
+    /// key membership (ADR-077). The leaf write rejects any other removal.
+    pub(crate) async fn remove_membership_writer(
+        &self,
+        holder: &TxId,
+        status: TxCommitStatus,
+        locks: &mut NodeLocks,
+        leaf: &LeafState<'_>,
+        changes: &mut Vec<(Vec<u8>, LeafEntry)>,
+    ) -> Result<(), TransError> {
+        debug_assert!(status.is_final(), "{holder} is not final: {status:?}");
+        let exclusive = locks.membership().lock_type() == LockType::Write;
+        if exclusive {
+            for (key, entry) in leaf.entries {
+                if !matches!(entry.lock_type(), LockType::Write | LockType::Create)
+                    || !entry.is_locked_by(holder)
+                    || changes.iter().any(|(staged, _)| staged == key)
+                {
+                    continue;
+                }
+                let mut released = entry.clone();
+                if status == TxCommitStatus::Committed {
+                    released.current = self.committed_current(holder, key, entry, leaf).await?;
+                }
+                released.release_lock(holder);
+                changes.push((key.clone(), released));
+            }
+        }
+        locks.remove_membership_holder(holder);
+        Ok(())
+    }
+
+    /// Returns the current state that the committed `holder` leaves in `entry`.
+    async fn committed_current(
+        &self,
+        holder: &TxId,
+        key: &[u8],
+        entry: &LeafEntry,
+        leaf: &LeafState<'_>,
+    ) -> Result<CurrentState, TransError> {
+        let resolved = self
+            .key_state
+            .resolve_holders(
+                &LogicalKey::new(leaf.collection.clone(), key),
+                Some(entry),
+                Some(self.id),
+                leaf.requirement,
+            )
+            .await?;
+        // A committed status is final, so a pending result means the holder
+        // was not the one resolved. Releasing its lock then would lose its
+        // write.
+        if !resolved.pending.is_empty() {
+            return Err(TransError::other(format!(
+                "committed membership holder {holder} resolved as pending"
+            )));
+        }
+        Ok(resolved.resolved_current(Some(entry)))
     }
 
     /// Removes membership holders with a final status after their entry state was
@@ -318,43 +427,30 @@ impl MemberPolicy for StructuralGateOperation {
         staged: &BTreeMap<Vec<u8>, LeafEntry>,
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
-        let collection = match &self.path {
-            ObjectPath::TreeRoot { collection } | ObjectPath::Node { collection, .. } => {
-                collection.clone()
-            }
-            _ => return Err(TransError::other("structural gate target is not a leaf")),
-        };
         let reconciler = NodeLockReconciler::with_acquisition(
             ctx.key_state,
             ctx.tmon,
             &self.id,
             self.acquisition,
         );
-        let entries = match reconciler
-            .quiesce_entries(&collection, staged, ctx.requirement)
-            .await?
-        {
-            QuiescedEntries::Ready(entries) => entries,
-            QuiescedEntries::Wait(holder) => {
-                return Ok(Step::Skip {
-                    outcome: MemberOutcome::Wait(holder),
-                });
-            }
+        let leaf = LeafState {
+            collection: leaf_collection(&self.path)?,
+            entries: staged,
+            requirement: ctx.requirement,
         };
-        let mut locks = staged_locks.clone();
-        match reconciler.acquire_structural_gate(&mut locks).await? {
-            None => {}
-            Some(GateBlocker::Holder(holder)) => {
+        let (entries, locks) = match reconciler.gate_node(Some(&leaf), staged_locks).await? {
+            GatedNode::Gated { entries, locks } => (entries.unwrap_or_default(), locks),
+            GatedNode::Blocked(GateBlocker::Holder(holder)) => {
                 return Ok(Step::Skip {
                     outcome: MemberOutcome::Wait(holder),
                 });
             }
-            Some(GateBlocker::MergeReservation) => {
+            GatedNode::Blocked(GateBlocker::MergeReservation) => {
                 return Ok(Step::Skip {
                     outcome: MemberOutcome::Conflict,
                 });
             }
-        }
+        };
         let entries = entries
             .into_iter()
             .filter(|(key, entry)| staged.get(key) != Some(entry))
@@ -417,8 +513,27 @@ impl LeafOperation for StructuralGateOperation {
     }
 }
 
+/// Returns the collection of a leaf path.
+pub(crate) fn leaf_collection(path: &ObjectPath) -> Result<&CollectionAddress, TransError> {
+    match path {
+        ObjectPath::TreeRoot { collection } | ObjectPath::Node { collection, .. } => Ok(collection),
+        _ => Err(TransError::other("lock target is not a leaf")),
+    }
+}
+
 /// Result of reconciling all entry holders before gate installation.
-pub(crate) enum QuiescedEntries {
+enum QuiescedEntries {
     Ready(BTreeMap<Vec<u8>, LeafEntry>),
     Wait(TxId),
+}
+
+/// A node state with a structural gate, ready for one CAS.
+pub(crate) enum GatedNode {
+    /// The quiesced entries of a leaf (`None` for an index node) and the
+    /// node locks with the gate. They must land together.
+    Gated {
+        entries: Option<BTreeMap<Vec<u8>, LeafEntry>>,
+        locks: NodeLocks,
+    },
+    Blocked(GateBlocker),
 }

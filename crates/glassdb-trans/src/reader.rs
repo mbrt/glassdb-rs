@@ -241,11 +241,13 @@ mod tests {
             } else {
                 entry.current = CurrentState::External { writer: old };
             }
-            local
-                .nodes
-                .create_root(&collection, &Node::leaf(LeafBody::from_entries([entry])))
-                .await
-                .unwrap();
+            let mut leaf = Node::leaf(LeafBody::from_entries([entry]));
+            if held {
+                // A committed writer of a key that can change the existence
+                // of the key holds the membership lock too.
+                leaf.set_membership_writer(old);
+            }
+            local.nodes.create_root(&collection, &leaf).await.unwrap();
             let resolver = KeyResolver::new(
                 TreeRouter::new(local.nodes.clone(), NonZeroUsize::MIN),
                 KeyStateResolver::new(local.monitor.clone()),

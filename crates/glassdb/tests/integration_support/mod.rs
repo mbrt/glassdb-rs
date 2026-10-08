@@ -590,6 +590,95 @@ impl RetirementFailureControl {
     }
 }
 
+/// Holds the first leaf write after a transaction record turns committed, which
+/// is the write-back of that transaction, until the test ends. It also counts
+/// the reads of transaction records.
+pub struct WriteBackHold {
+    backend: Arc<HookBackend>,
+    state: Arc<Mutex<WriteBackHoldState>>,
+    record_reads: Arc<AtomicUsize>,
+}
+
+#[derive(Default)]
+struct WriteBackHoldState {
+    armed: bool,
+    committed: bool,
+    held: Option<oneshot::Sender<()>>,
+}
+
+impl WriteBackHold {
+    pub fn wrap(inner: Arc<dyn Backend>) -> Self {
+        let state = Arc::new(Mutex::new(WriteBackHoldState::default()));
+        let record_reads = Arc::new(AtomicUsize::new(0));
+        let backend = HookBackend::new(inner);
+        backend.set_before({
+            let state = state.clone();
+            let record_reads = record_reads.clone();
+            move |op| {
+                if let BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. } = op
+                    && path.contains("/_t/")
+                {
+                    record_reads.fetch_add(1, Ordering::Relaxed);
+                }
+                let held = {
+                    let mut state = state.lock().unwrap();
+                    match op {
+                        BackendOp::WriteIf { path, value, .. }
+                        | BackendOp::WriteIfNotExists { path, value }
+                            if state.armed && path.contains("/_t/") =>
+                        {
+                            state.committed |= is_committed_tx_record(value);
+                            None
+                        }
+                        BackendOp::WriteIf { path, .. }
+                            if state.committed && is_leaf_path(path) =>
+                        {
+                            state.armed = false;
+                            state.committed = false;
+                            state.held.take()
+                        }
+                        _ => None,
+                    }
+                };
+                let future: HookFuture = Box::pin(async move {
+                    if let Some(held) = held {
+                        let _ = held.send(());
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+        Self {
+            backend,
+            state,
+            record_reads,
+        }
+    }
+
+    /// Returns the reads of transaction records since the hold was made.
+    pub fn record_reads(&self) -> usize {
+        self.record_reads.load(Ordering::Relaxed)
+    }
+
+    pub fn backend(&self) -> Arc<dyn Backend> {
+        self.backend.clone()
+    }
+
+    /// Holds the write-back of the next transaction that commits with a
+    /// transaction record. The receiver fires when the write-back is held.
+    pub fn hold_next_write_back(&self) -> oneshot::Receiver<()> {
+        let (held, receiver) = oneshot::channel();
+        *self.state.lock().unwrap() = WriteBackHoldState {
+            armed: true,
+            committed: false,
+            held: Some(held),
+        };
+        receiver
+    }
+}
+
 /// Reports whether `path` addresses a coordination leaf: a small collection's
 /// root (`_r`) or a standalone node (`_n`).
 fn is_leaf_path(path: &str) -> bool {
@@ -605,6 +694,10 @@ fn is_abort_side_tx_record(body: &[u8]) -> bool {
 
 fn is_aborted_tx_record(body: &[u8]) -> bool {
     glassdb_storage::txrecord::status(body).is_ok_and(|status| status == TxCommitStatus::Aborted)
+}
+
+fn is_committed_tx_record(body: &[u8]) -> bool {
+    glassdb_storage::txrecord::status(body).is_ok_and(|status| status == TxCommitStatus::Committed)
 }
 
 /// Reports whether `body` is a pinned wound.
