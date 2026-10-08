@@ -13,7 +13,10 @@ This file is evidence, not a record of accepted behavior:
 
 Status: reproduced by the perfbench `split-merge-fight` scenario. Paid rates
 (ADR-076) slow the fight from about 25 to about 3 splits and merges in 60 s.
-The merge side still measures about one fifth of its cost.
+The merge side measures the time that a merge removes, but most of the cost
+of two leaves was in other parts of the scan. Two of them are fixed: the
+validation fallback reads no index node, and scans read no transaction
+record of an overwrite (ADR-077).
 
 ADR-074 records that each database instance decides on its own transactions,
 so one instance can split a leaf while another merges it. In the `mixed` hi
@@ -309,8 +312,9 @@ predicted. `mixed` on S3 (1 and 8 databases, affinities 0 and 100, 2 runs) had
 
 ### The time of a merger scan over two leaves
 
-Temporary instrumentation (branch `merge-side-measure`, commit `dabe6f95c`)
-divided the time of each merger scan with `fixed-1` and `fixed-2`. There were
+Temporary instrumentation, with global atomic sums of the time in each part
+of the transactions that scan, divided the time of each merger scan with
+`fixed-1` and `fixed-2`. There were
 no replays and no retries. Times are in model ms for each committed scan:
 
 | Part | `fixed-1` | `fixed-2` | Difference |
@@ -325,8 +329,8 @@ no replays and no retries. Times are in model ms for each committed scan:
   second leaf.
 - A resolve that reads the transaction record of a holder takes about 27 ms.
   With `fixed-1`, 18% of the resolves did this, and with `fixed-2`, 80%. The
-  body of the scan uses `Requirement::ANY`, so the cause is not known yet. It
-  is not a crossing, so it is not merge-side time.
+  body of the scan uses `Requirement::ANY`. The next section has the cause.
+  It is not a crossing, so it is not merge-side time.
 - The physical check of the first leaf failed in 38% of the scans with
   `fixed-1`, and in 79% with `fixed-2`. The logical fallback then validated
   the scan.
@@ -347,6 +351,81 @@ against `83dcc16af`, in scans for each model second:
 The writers did not change. `mixed` on S3 (1 and 8 databases, affinities 0
 and 100, 2 runs) had `1.01` in lo mode and `1.01` in hi mode. Its lowest cell
 was 8 databases, affinity 0, and hi mode, with `0.95`.
+
+### Reads of the transaction records of new lock holders
+
+Temporary instrumentation sorted each lock-holder resolve of the scan bodies
+by its path, in runs of 30 s:
+
+| | `fixed-1` | `fixed-2` |
+| --- | ---: | ---: |
+| Writer commits | `2538` | `4677` |
+| Backend reads of transaction records, for each writer commit | `0.96` | `0.85` |
+| Slow resolves (2 ms or more), for each writer commit | `7.3` | `6.6` |
+| Slow resolves that joined a read of another worker | `87%` | `86%` |
+
+Each commit of a writer makes a new holder. No worker of the merger instance
+has seen it, so the first resolve must read its record, and the cache cannot
+help. All 8 workers come to the new lock at about the same time, and they wait
+for one shared read of about 27 ms. The holder was never pending at this read:
+its record was missing, because its lock was in the leaf before the record, or
+it was committed. There were no reads again at a stricter requirement, no
+wounds, and no evictions.
+
+An experiment did not read a record that was not in the cache. The merger then
+had 277 instead of 177 scans each second with `fixed-1`, and 108 instead of 68
+with `fixed-2`. The time of the bodies fell to about 0.1 ms. The validation
+time and the writers did not change, because validation already resolves the
+holders again after its barrier. The experiment depends on the cache of an
+instance, and it is not correct: a create or a direct commit in the same leaf
+could end the membership lock of a committed delete before its write-back.
+The deleted key then stayed in the leaf with its earlier value, as after an
+overwrite (test `a_scan_omits_a_committed_delete_whose_write_back_is_held`).
+
+ADR-077 removes the read for the holders of key locks that hold no membership
+lock, and makes each membership writer leave with its key locks. On S3, 2 runs
+against `5c2660468`, in scans for each model second:
+
+| Policy | Merger before | Merger after | Writers before | Writers after |
+| --- | ---: | ---: | ---: | ---: |
+| `fixed-1` | `177`–`179` | `281`–`283` | `8.4`–`8.5` | `8.4`–`8.6` |
+| `fixed-2` | `91` (p50 87 ms) | `139`–`140` (p50 55 ms) | `15.9`–`16.1` | `15.7`–`16.1` |
+| `avoidable` | `102`–`105` | `177`–`199` | `14.8`–`15.1` | `12.3`–`13.6` |
+
+With `avoidable`, the writers committed less because the tree kept one leaf
+longer, not because of a cost on the writers. A prototype study rebuilt the
+topology from the timeline of each run: the tree had two leaves for 82% to 95%
+of the time before, and for 23% to 67% after. The writers committed about 8.4
+transactions each second with one leaf and 15.9 with two, in both builds. The
+faster scans measured a merge-side rate of about 2.0 instead of 1.06 seconds
+each second, so the paid rates of ADR-076 held one leaf longer. A base build
+with 16 merger workers had the same shift, and a build with ADR-077 and 4
+merger workers had none. So the cause is the speed of the scans. Which
+topology is cheaper for this load is not measured again.
+
+`mixed` on S3 (1 and 8 databases, affinities 0 and 100, 2 runs) had `1.00` in
+lo mode and `1.02` in hi mode. It has no range scans, so the changed paths do
+not run in it. Its cell with 8 databases, affinity 0, and hi mode has two
+modes in both builds. In about 1 of 4 runs, `rwMany` almost stops and
+`roSingle` gets faster. In 20 runs of each build, no shape was significantly
+different (Mann-Whitney, |z| below 1.2).
+
+The perfbench `membership-churn` scenario measures the cost on creates and
+deletes, 12 runs before and 8 after:
+
+| Role | Before (tx/s) | After (tx/s) | t |
+| --- | ---: | ---: | ---: |
+| Direct churner | `7.4` | `8.0` | `+0.6` |
+| Locked churner | `0.40` | `0.37` | `-1.1` |
+| Scanner | `14.3` | `14.8` | `+0.3` |
+
+No difference is above the noise. In a prototype, the release of the key
+locks of a membership writer by another transaction occurred in about 2% of
+the direct commits, in a leaf CAS that it already made. With 4 locked churn
+workers, 1 of 12 runs after ADR-077 failed, because a transaction did not end
+in the drain timeout of 30 s of wall time. The 12 runs before had no failure,
+and one failure cannot show a difference. The cause is not known. The default
+is now 2 locked workers.
 
 ## 2026-09-26: ADR-074 splits in the mixed hi mode
 
