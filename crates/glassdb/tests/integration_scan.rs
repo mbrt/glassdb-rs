@@ -473,25 +473,7 @@ async fn a_scan_omits_a_committed_delete_whose_write_back_is_held() {
     let collection = create_top(&deleter, b"held-delete").await;
     collection.write(b"deleted", b"v").await.unwrap();
 
-    let held = hold.hold_next_write_back();
-    tokio::spawn({
-        let deleter = deleter.clone();
-        let collection = collection.clone();
-        async move {
-            deleter
-                .tx(|tx| {
-                    let collection = collection.clone();
-                    async move {
-                        // The scan keeps the delete from a direct commit, so
-                        // the delete locks the key and the membership.
-                        tx.scan_keys(&collection, glassdb::KeyScan::all()).await?;
-                        tx.delete(&collection, b"deleted")
-                    }
-                })
-                .await
-        }
-    });
-    held.await.unwrap();
+    commit_with_held_write_back(&hold, &deleter, &collection, Some(b"deleted"), None).await;
 
     let creator = init_db(hold.backend()).await;
     open_top(&creator, b"held-delete")
@@ -507,4 +489,145 @@ async fn a_scan_omits_a_committed_delete_whose_write_back_is_held() {
         .await
         .unwrap();
     assert_eq!(scan.keys(), [b"created".to_vec()]);
+}
+
+// Starts a transaction that commits `delete` and `write`, and holds its
+// write-back. A scan in the body keeps the commit from being a direct commit,
+// so the writes lock their keys, and a create or delete also locks the
+// membership.
+async fn commit_with_held_write_back(
+    hold: &WriteBackHold,
+    db: &Database,
+    collection: &glassdb::Collection,
+    delete: Option<&'static [u8]>,
+    write: Option<&'static [u8]>,
+) {
+    let held = hold.hold_next_write_back();
+    tokio::spawn({
+        let db = db.clone();
+        let collection = collection.clone();
+        async move {
+            db.tx(|tx| {
+                let collection = collection.clone();
+                async move {
+                    tx.scan_keys(&collection, glassdb::KeyScan::all()).await?;
+                    if let Some(key) = delete {
+                        tx.delete(&collection, key)?;
+                    }
+                    if let Some(key) = write {
+                        tx.write(&collection, key, b"v")?;
+                    }
+                    Ok(())
+                }
+            })
+            .await
+        }
+    });
+    held.await.unwrap();
+}
+
+// The creation of a key by a committed transaction and a later create that
+// ends the membership lock of the first, in a transaction that locks.
+#[tokio::test(start_paused = true)]
+async fn a_scan_sees_a_committed_create_whose_write_back_is_held() {
+    let hold = WriteBackHold::wrap(mem());
+    let first = init_db(hold.backend()).await;
+    let collection = create_top(&first, b"held-create").await;
+    commit_with_held_write_back(&hold, &first, &collection, None, Some(b"first")).await;
+
+    let second = init_db(hold.backend()).await;
+    let collection = open_top(&second, b"held-create").await;
+    second
+        .tx(|tx| {
+            let collection = collection.clone();
+            async move {
+                tx.scan_keys(&collection, glassdb::KeyScan::all()).await?;
+                tx.write(&collection, b"second", b"v")
+            }
+        })
+        .await
+        .unwrap();
+
+    let scanner = init_db(hold.backend()).await;
+    let scan = open_top(&scanner, b"held-create")
+        .await
+        .scan_keys(glassdb::KeyScan::all())
+        .await
+        .unwrap();
+    assert_eq!(scan.keys(), [b"first".to_vec(), b"second".to_vec()]);
+}
+
+// The same, with a create that commits directly.
+#[tokio::test(start_paused = true)]
+async fn a_scan_sees_a_committed_create_after_a_direct_create_ends_its_membership() {
+    let hold = WriteBackHold::wrap(mem());
+    let first = init_db(hold.backend()).await;
+    let collection = create_top(&first, b"held-create-direct").await;
+    commit_with_held_write_back(&hold, &first, &collection, None, Some(b"first")).await;
+
+    let second = init_db(hold.backend()).await;
+    open_top(&second, b"held-create-direct")
+        .await
+        .write(b"second", b"v")
+        .await
+        .unwrap();
+
+    let scanner = init_db(hold.backend()).await;
+    let scan = open_top(&scanner, b"held-create-direct")
+        .await
+        .scan_keys(glassdb::KeyScan::all())
+        .await
+        .unwrap();
+    assert_eq!(scan.keys(), [b"first".to_vec(), b"second".to_vec()]);
+}
+
+// The delete of a key by a committed transaction and a later create that ends
+// the membership lock of the delete, in a transaction that locks.
+#[tokio::test(start_paused = true)]
+async fn a_scan_omits_a_committed_delete_after_a_locking_create_ends_its_membership() {
+    let hold = WriteBackHold::wrap(mem());
+    let deleter = init_db(hold.backend()).await;
+    let collection = create_top(&deleter, b"held-delete-locking").await;
+    collection.write(b"deleted", b"v").await.unwrap();
+    commit_with_held_write_back(&hold, &deleter, &collection, Some(b"deleted"), None).await;
+
+    let creator = init_db(hold.backend()).await;
+    let collection = open_top(&creator, b"held-delete-locking").await;
+    creator
+        .tx(|tx| {
+            let collection = collection.clone();
+            async move {
+                tx.scan_keys(&collection, glassdb::KeyScan::all()).await?;
+                tx.write(&collection, b"created", b"v")
+            }
+        })
+        .await
+        .unwrap();
+
+    let scanner = init_db(hold.backend()).await;
+    let scan = open_top(&scanner, b"held-delete-locking")
+        .await
+        .scan_keys(glassdb::KeyScan::all())
+        .await
+        .unwrap();
+    assert_eq!(scan.keys(), [b"created".to_vec()]);
+}
+
+// ADR-077: an overwrite cannot change the key membership, so a scan does not
+// read the transaction record of its holder, also before its write-back.
+#[tokio::test(start_paused = true)]
+async fn a_scan_reads_no_record_of_a_committed_overwrite() {
+    let hold = WriteBackHold::wrap(mem());
+    let writer = init_db(hold.backend()).await;
+    let collection = create_top(&writer, b"held-overwrite").await;
+    collection.write(b"kept", b"v").await.unwrap();
+    commit_with_held_write_back(&hold, &writer, &collection, None, Some(b"kept")).await;
+
+    let scanner = init_db(hold.backend()).await;
+    let collection = open_top(&scanner, b"held-overwrite").await;
+    let before = hold.record_reads();
+    let scan = collection.scan_keys(glassdb::KeyScan::all()).await.unwrap();
+
+    assert_eq!(scan.keys(), [b"kept".to_vec()]);
+    assert_eq!(hold.record_reads() - before, 0);
 }

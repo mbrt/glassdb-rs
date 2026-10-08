@@ -50,7 +50,7 @@ use crate::leaf_coord::{
     MemberPolicy, ResolveCtx, StageAdmission, Step,
 };
 use crate::monitor::Monitor;
-use crate::node_locking::NodeLockReconciler;
+use crate::node_locking::{LeafState, NodeLockReconciler, leaf_collection};
 use crate::retry_timing::RetryTiming;
 use crate::wound_wait::{Reclaim, try_reclaim};
 
@@ -390,8 +390,14 @@ impl MemberPolicy for AcquireOperation {
         }
 
         if membership != LockType::None {
+            let collection = leaf_collection(&self.path)?;
+            let leaf = LeafState {
+                collection,
+                entries: staged,
+                requirement: ctx.requirement,
+            };
             if let Some(holder) = reconciler
-                .acquire_membership(&mut locks, membership)
+                .acquire_membership(&mut locks, membership, &leaf, &mut entries)
                 .await?
             {
                 return Ok(Step::Skip {

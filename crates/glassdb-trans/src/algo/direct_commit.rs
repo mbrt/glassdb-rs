@@ -9,7 +9,7 @@ use glassdb_concurr::rt;
 use glassdb_data::{LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CurrentState, InlinePolicy, LeafEntry, Node, NodeLocks, Requirement, RoutedLeafGroup,
+    CurrentState, InlinePolicy, LeafEntry, LockType, Node, NodeLocks, Requirement, RoutedLeafGroup,
     StorageError, TreeRouter,
 };
 
@@ -22,6 +22,7 @@ use crate::leaf_coord::{
     CoordinatedOutcome, LeafCoordinator, LeafOperation, MemberOutcome, MemberPolicy, ReloadCause,
     ResolveCtx, StageAdmission, Step,
 };
+use crate::node_locking::{LeafState, NodeLockReconciler, leaf_collection};
 use crate::structural::{StructuralHintSink, TypicalTime};
 
 /// Direct same-leaf commit coverage for one snapshot or accumulated interval.
@@ -372,11 +373,16 @@ impl DirectCommitOperation {
     }
 
     /// Validates node-level coordination for a direct publication.
+    ///
+    /// The removal of a committed membership writer appends its help-forward
+    /// to `published` (ADR-077).
     async fn reconcile_node_blockers(
         &self,
         ctx: &ResolveCtx<'_>,
+        staged: &BTreeMap<Vec<u8>, LeafEntry>,
         locks: &mut NodeLocks,
         changes_membership: bool,
+        published: &mut Vec<(Vec<u8>, LeafEntry)>,
     ) -> Result<bool, TransError> {
         // Pruning only the staged copy keeps this outside the lock lifecycle:
         // removals of holders with a final status become durable iff the
@@ -401,11 +407,23 @@ impl DirectCommitOperation {
         }
 
         if changes_membership {
+            let exclusive = locks.membership().lock_type() == LockType::Write;
+            let leaf = LeafState {
+                collection: leaf_collection(&self.leaf_path)?,
+                entries: staged,
+                requirement: ctx.requirement,
+            };
+            let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id);
             for holder in locks.membership().holders().to_vec() {
                 match ctx.tmon.tx_status(&holder).await? {
-                    TxCommitStatus::Committed
+                    status @ (TxCommitStatus::Committed
                     | TxCommitStatus::Aborted
-                    | TxCommitStatus::Wounded => {
+                    | TxCommitStatus::Wounded) => {
+                        if exclusive && status == TxCommitStatus::Committed {
+                            reconciler
+                                .publish_committed_entries(&holder, &leaf, published)
+                                .await?;
+                        }
                         locks.remove_membership_holder(&holder);
                     }
                     TxCommitStatus::Pending | TxCommitStatus::Unknown => return Ok(true),
@@ -436,8 +454,9 @@ impl DirectCommitOperation {
             });
 
         let mut locks = staged_locks.clone();
+        let mut published = Vec::new();
         if self
-            .reconcile_node_blockers(ctx, &mut locks, changes_membership)
+            .reconcile_node_blockers(ctx, staged, &mut locks, changes_membership, &mut published)
             .await?
         {
             return Ok(Step::Skip {
@@ -504,7 +523,10 @@ impl DirectCommitOperation {
             });
         }
 
-        let mut entries = Vec::with_capacity(self.member.writes);
+        // The outputs replace any entry of the same key, held or not.
+        let mut entries = published;
+        entries.retain(|(key, _)| !output_keys.contains(key.as_slice()));
+        entries.reserve(self.member.writes);
         let mut predecessors = BTreeMap::new();
         let mut adds_key = false;
         for (key, state) in self.member.keys.iter().zip(resolutions) {

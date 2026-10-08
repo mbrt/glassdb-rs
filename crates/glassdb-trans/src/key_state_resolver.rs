@@ -213,6 +213,35 @@ impl KeyStateResolver {
         Ok(resolved.into_holders())
     }
 
+    /// Reports whether the key of `entry` is in the key membership of `node`.
+    ///
+    /// Only a holder of the membership lock can create or delete a key, and
+    /// the removal of a committed holder from that lock help-forwards it
+    /// (ADR-077). So the transaction record of any other holder cannot change
+    /// the answer, and scans do not wait for its read.
+    pub(crate) async fn key_exists(
+        &self,
+        key: &LogicalKey,
+        node: &Node,
+        entry: &LeafEntry,
+        own_lock_holder: Option<&TxId>,
+        requirement: Requirement,
+    ) -> Result<bool, TransError> {
+        let membership = node.membership_lock();
+        let holds_membership = membership.lock_type() == LockType::Write
+            && entry
+                .lock_holders()
+                .iter()
+                .any(|holder| membership.contains(holder));
+        if !holds_membership {
+            return Ok(entry.current.exists());
+        }
+        Ok(self
+            .resolve_effective(key, Some(entry), own_lock_holder, requirement)
+            .await?
+            .exists())
+    }
+
     /// Resolves the effective committed state represented by one loaded entry.
     pub(crate) async fn resolve_effective(
         &self,

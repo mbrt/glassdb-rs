@@ -350,6 +350,12 @@ its structural gate, before its final split decision. If that removes the
 pressure, it cancels the split
 ([ADR-062](adr/062-splitter-driven-tombstone-reclamation.md)).
 
+Only a holder of the membership lock of a leaf can create or delete its keys.
+A transaction that removes a committed holder from that lock help-forwards the
+holder in the same CAS. So a range scan reads the transaction record of a key
+holder only when that holder holds the membership lock
+([ADR-077](adr/077-scans-decide-key-membership-from-the-leaf.md)).
+
 A create that reaches the leaf content limit releases its partial locks and
 retries, so the restructurer can make room. The first capacity result starts one
 bounded wait. Leaf revisions, reroutes, and other full leaves do not reset it.

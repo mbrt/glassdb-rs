@@ -29,6 +29,13 @@ pub(crate) struct NodeLockReconciler<'a> {
     acquisition: GateAcquisition,
 }
 
+/// The staged entries of one leaf, as seen by a mutation deciding on its locks.
+pub(crate) struct LeafState<'a> {
+    pub(crate) collection: &'a CollectionAddress,
+    pub(crate) entries: &'a BTreeMap<Vec<u8>, LeafEntry>,
+    pub(crate) requirement: Requirement,
+}
+
 /// How a structural operation treats live holders of the node it gates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GateAcquisition {
@@ -138,6 +145,10 @@ impl<'a> NodeLockReconciler<'a> {
 
     /// Closes the structural gate after quiescing membership holders.
     ///
+    /// The caller stages the result of [`Self::quiesce_entries`] in the same
+    /// CAS, which help-forwards the membership holders removed here
+    /// (ADR-077).
+    ///
     /// Returns what blocks the gate, or leaves both node-lock scopes free of
     /// foreign holders with a final status, with a structural gate installed
     /// for this operation.
@@ -215,10 +226,15 @@ impl<'a> NodeLockReconciler<'a> {
     }
 
     /// Acquires the requested membership lock, returning a holder to wait for.
+    ///
+    /// The removal of a committed membership writer appends its help-forward
+    /// to `changes` (see [`Self::publish_committed_entries`]).
     pub(crate) async fn acquire_membership(
         &self,
         locks: &mut NodeLocks,
         desired: LockType,
+        leaf: &LeafState<'_>,
+        changes: &mut Vec<(Vec<u8>, LeafEntry)>,
     ) -> Result<Option<TxId>, TransError> {
         let conflicts = match desired {
             LockType::Read => {
@@ -232,6 +248,7 @@ impl<'a> NodeLockReconciler<'a> {
             _ => false,
         };
         if conflicts {
+            let exclusive = locks.membership().lock_type() == LockType::Write;
             for holder in locks.membership().holders().to_vec() {
                 if &holder == self.id {
                     continue;
@@ -243,6 +260,10 @@ impl<'a> NodeLockReconciler<'a> {
                         }
                     }
                     TxCommitStatus::Unknown => return Ok(Some(holder)),
+                    TxCommitStatus::Committed if exclusive => {
+                        self.publish_committed_entries(&holder, leaf, changes)
+                            .await?;
+                    }
                     TxCommitStatus::Committed
                     | TxCommitStatus::Aborted
                     | TxCommitStatus::Wounded => {}
@@ -263,6 +284,50 @@ impl<'a> NodeLockReconciler<'a> {
             _ => {}
         }
         Ok(None)
+    }
+
+    /// Help-forwards the committed `holder` on the keys of `leaf` that it
+    /// still locks, except the keys in `changes`, which no longer name it.
+    ///
+    /// A leaf CAS that removes a committed holder from a membership write
+    /// lock must stage this result, so that no key lock outside the
+    /// membership lock can change the key membership (ADR-077).
+    pub(crate) async fn publish_committed_entries(
+        &self,
+        holder: &TxId,
+        leaf: &LeafState<'_>,
+        changes: &mut Vec<(Vec<u8>, LeafEntry)>,
+    ) -> Result<(), TransError> {
+        for (key, entry) in leaf.entries {
+            if !matches!(entry.lock_type(), LockType::Write | LockType::Create)
+                || !entry.is_locked_by(holder)
+                || changes.iter().any(|(staged, _)| staged == key)
+            {
+                continue;
+            }
+            let resolved = self
+                .key_state
+                .resolve_holders(
+                    &LogicalKey::new(leaf.collection.clone(), key),
+                    Some(entry),
+                    Some(self.id),
+                    leaf.requirement,
+                )
+                .await?;
+            // A committed status is final, so a pending result means the
+            // holder was not the one resolved. Releasing its lock then would
+            // lose its write.
+            if !resolved.pending.is_empty() {
+                return Err(TransError::other(
+                    "committed membership holder resolved as pending",
+                ));
+            }
+            let mut published = entry.clone();
+            published.current = resolved.resolved_current(Some(entry));
+            published.release_lock(holder);
+            changes.push((key.clone(), published));
+        }
+        Ok(())
     }
 
     /// Removes membership holders with a final status after their entry state was
@@ -318,12 +383,7 @@ impl MemberPolicy for StructuralGateOperation {
         staged: &BTreeMap<Vec<u8>, LeafEntry>,
         staged_locks: &NodeLocks,
     ) -> Result<Step, TransError> {
-        let collection = match &self.path {
-            ObjectPath::TreeRoot { collection } | ObjectPath::Node { collection, .. } => {
-                collection.clone()
-            }
-            _ => return Err(TransError::other("structural gate target is not a leaf")),
-        };
+        let collection = leaf_collection(&self.path)?;
         let reconciler = NodeLockReconciler::with_acquisition(
             ctx.key_state,
             ctx.tmon,
@@ -331,7 +391,7 @@ impl MemberPolicy for StructuralGateOperation {
             self.acquisition,
         );
         let entries = match reconciler
-            .quiesce_entries(&collection, staged, ctx.requirement)
+            .quiesce_entries(collection, staged, ctx.requirement)
             .await?
         {
             QuiescedEntries::Ready(entries) => entries,
@@ -414,6 +474,14 @@ impl LeafOperation for StructuralGateOperation {
         let evidence =
             evidence.ok_or_else(|| TransError::other("acquired gate has no evidence"))?;
         Ok(StructuralGateOutcome::Acquired(evidence.into_observation()))
+    }
+}
+
+/// Returns the collection of a leaf path.
+pub(crate) fn leaf_collection(path: &ObjectPath) -> Result<&CollectionAddress, TransError> {
+    match path {
+        ObjectPath::TreeRoot { collection } | ObjectPath::Node { collection, .. } => Ok(collection),
+        _ => Err(TransError::other("lock target is not a leaf")),
     }
 }
 

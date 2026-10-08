@@ -591,10 +591,12 @@ impl RetirementFailureControl {
 }
 
 /// Holds the first leaf write after a transaction record turns committed, which
-/// is the write-back of that transaction, until the test ends.
+/// is the write-back of that transaction, until the test ends. It also counts
+/// the reads of transaction records.
 pub struct WriteBackHold {
     backend: Arc<HookBackend>,
     state: Arc<Mutex<WriteBackHoldState>>,
+    record_reads: Arc<AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -607,10 +609,17 @@ struct WriteBackHoldState {
 impl WriteBackHold {
     pub fn wrap(inner: Arc<dyn Backend>) -> Self {
         let state = Arc::new(Mutex::new(WriteBackHoldState::default()));
+        let record_reads = Arc::new(AtomicUsize::new(0));
         let backend = HookBackend::new(inner);
         backend.set_before({
             let state = state.clone();
+            let record_reads = record_reads.clone();
             move |op| {
+                if let BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. } = op
+                    && path.contains("/_t/")
+                {
+                    record_reads.fetch_add(1, Ordering::Relaxed);
+                }
                 let held = {
                     let mut state = state.lock().unwrap();
                     match op {
@@ -641,7 +650,16 @@ impl WriteBackHold {
                 future
             }
         });
-        Self { backend, state }
+        Self {
+            backend,
+            state,
+            record_reads,
+        }
+    }
+
+    /// Returns the reads of transaction records since the hold was made.
+    pub fn record_reads(&self) -> usize {
+        self.record_reads.load(Ordering::Relaxed)
     }
 
     pub fn backend(&self) -> Arc<dyn Backend> {
