@@ -9,6 +9,7 @@ perfbench mixed
 perfbench contention
 perfbench inline-pressure
 perfbench split-merge-fight
+perfbench membership-churn
 ```
 
 Raw backend latency remains in `backendbench`. Criterion owns controlled
@@ -151,6 +152,20 @@ topology without structural changes.
 cargo run --release -p glassdb-bench-scale --bin perfbench -- \
   --backend=memory --delays=s3 --delay-scale=0.2 --runs=3 \
   --output=/tmp/split-merge-fight.json split-merge-fight
+```
+
+`membership-churn` changes the key membership of one leaf while other
+transactions scan it. Each role runs in its own database instance. A direct
+churner creates and deletes keys with single-key transactions, which commit
+direct. A locked churner does the same after a scan in the same transaction,
+so it takes key locks and the membership lock of the leaf. A scanner scans the
+whole collection. Each role can have zero workers, to measure the others
+alone. The results vary much from run to run, so compare at least 4 runs.
+
+```bash
+cargo run --release -p glassdb-bench-scale --bin perfbench -- \
+  --backend=memory --delays=s3 --delay-scale=0.2 --runs=4 \
+  --output=/tmp/membership-churn.json membership-churn
 ```
 
 All subcommands support `--backend=memory|fakes3|s3|gcs`. Real S3 and GCS use

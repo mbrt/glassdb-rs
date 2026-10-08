@@ -3,6 +3,7 @@
 mod backend;
 mod contention;
 mod inline_pressure;
+mod membership_churn;
 mod mixed;
 mod split_merge_fight;
 
@@ -54,6 +55,9 @@ enum Command {
     /// Measure database instances whose topology policies split and merge
     /// the same leaf under a stable load.
     SplitMergeFight(split_merge_fight::Options),
+    /// Measure creates and deletes that change the key membership of one leaf
+    /// while other transactions scan it.
+    MembershipChurn(membership_churn::Options),
 }
 
 #[derive(Serialize)]
@@ -113,10 +117,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::SplitMergeFight(options) => serde_json::to_value(Report {
             schema_version: SCHEMA_VERSION,
             scenario: "split-merge-fight",
-            backend,
+            backend: backend.clone(),
             model_time_speedup,
             latency_jitter: cli.backend.latency_jitter,
             runs: split_merge_fight::run(handle, &factory, options, execution)?,
+        })?,
+        Command::MembershipChurn(options) => serde_json::to_value(Report {
+            schema_version: SCHEMA_VERSION,
+            scenario: "membership-churn",
+            backend,
+            model_time_speedup,
+            latency_jitter: cli.backend.latency_jitter,
+            runs: membership_churn::run(handle, &factory, options, execution)?,
         })?,
     };
     write_json(cli.output, &value)
