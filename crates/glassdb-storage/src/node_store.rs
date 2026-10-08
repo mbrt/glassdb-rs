@@ -9,13 +9,14 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use glassdb_backend as backend;
-use glassdb_data::{CollectionAddress, NodeId, ObjectPath};
+use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 
 use crate::cached_store::{
     CachedStore, CasResult, Codec, Observation, ObservationCheck, Requirement,
 };
 use crate::error::StorageError;
 use crate::leaf::LeafBody;
+use crate::lock::LockType;
 use crate::node::{Node, NodeLocks};
 
 const NODE_LIST_PAGE_SIZE: usize = 128;
@@ -302,6 +303,7 @@ impl NodeStore {
         };
         let res = match expected {
             Some(observed) if observed.path() == &path => {
+                debug_assert!(no_key_lock_outlives_membership(observed, node));
                 self.nodes.replace(observed, Arc::new(node.clone())).await
             }
             Some(_) => return Err(StorageError::other("node observation path changed")),
@@ -330,6 +332,7 @@ impl NodeStore {
         if expected.path() != path {
             return Err(StorageError::other("node observation path changed"));
         }
+        debug_assert!(no_key_lock_outlives_membership(expected, node));
         match self.nodes.replace(expected, Arc::new(node.clone())).await {
             Ok(CasResult::Applied(receipt)) => Ok(Some(receipt.into_installed())),
             Ok(CasResult::Rejected) | Err(StorageError::NotFound) => Ok(None),
@@ -433,6 +436,7 @@ impl NodeStore {
     /// Compare-and-swaps a leaf edit, retaining proof of the successful mutation.
     pub async fn commit_leaf(&self, edit: LeafEdit) -> Result<CasResult<Node>, StorageError> {
         let LeafEdit { observation, node } = edit;
+        debug_assert!(no_key_lock_outlives_membership(&observation, &node));
         let result = self.nodes.replace(&observation, Arc::new(node)).await;
         match result {
             Ok(result) => Ok(result),
@@ -515,6 +519,33 @@ impl NodeStore {
     pub async fn delete_root(&self, expected: &Observation<Node>) -> Result<(), StorageError> {
         self.delete_node(expected).await
     }
+}
+
+/// Tells whether no holder left the membership write lock of the replaced node
+/// while it still holds a write lock or create lock in the new leaf.
+///
+/// Range scans decide the key membership from the leaf for a key holder that
+/// holds no membership lock (ADR-077), so such a write would hide a committed
+/// create or delete from them. Only an engine bug can break the rule, so callers
+/// run the check inside `debug_assert!`, which the tests use.
+fn no_key_lock_outlives_membership(expected: &LeafObservation, node: &Node) -> bool {
+    let (Some(old), Some(leaf)) = (expected.value(), node.as_leaf()) else {
+        return true;
+    };
+    let before = old.membership_lock();
+    if before.lock_type() != LockType::Write {
+        return true;
+    }
+    let after = node.membership_lock();
+    let left: Vec<&TxId> = before
+        .holders()
+        .iter()
+        .filter(|holder| !(after.lock_type() == LockType::Write && after.contains(holder)))
+        .collect();
+    !leaf.entries().any(|entry| {
+        matches!(entry.lock_type(), LockType::Write | LockType::Create)
+            && left.iter().any(|holder| entry.is_locked_by(holder))
+    })
 }
 
 fn validate_node_path(path: &ObjectPath) -> Result<(), StorageError> {
@@ -972,5 +1003,61 @@ mod tests {
         for id in expected {
             assert!(listed.iter().any(|(listed, _)| listed == &id));
         }
+    }
+
+    // A leaf whose only membership writer holds a write lock on its key.
+    async fn leaf_with_membership_writer(store: &TestStore, writer: TxId) -> LeafEntry {
+        let mut held = LeafEntry::new(b"deleted".to_vec());
+        held.replace_write_lock(writer);
+        let mut node = Node::leaf(LeafBody::from_entries([held.clone()]));
+        node.set_membership_writer(writer);
+        assert!(
+            store
+                .store_node(&collection(), &node_id(1), &node, None)
+                .await
+                .unwrap()
+        );
+        held
+    }
+
+    // ADR-077: a holder leaves the membership write lock of a leaf only with
+    // its write locks and create locks in that leaf, because scans decide the
+    // key membership from the leaf for the other key holders.
+    #[tokio::test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no_key_lock_outlives_membership")]
+    async fn a_membership_writer_cannot_leave_without_its_key_locks() {
+        let store = store_over(Arc::new(MemoryBackend::new()));
+        let writer = TxId::with_priority(1, b"writer");
+        leaf_with_membership_writer(&store, writer).await;
+        let mut edit = store
+            .load_leaf(&node_path(1), Requirement::ANY)
+            .await
+            .unwrap()
+            .into_edit();
+        let mut locks = edit.locks().clone();
+        locks.remove_membership_holder(&writer);
+        edit.set_locks(locks);
+
+        let _ = store.commit_leaf(edit).await;
+    }
+
+    #[tokio::test]
+    async fn a_membership_writer_leaves_with_its_key_locks() {
+        let store = store_over(Arc::new(MemoryBackend::new()));
+        let writer = TxId::with_priority(1, b"writer");
+        let mut released = leaf_with_membership_writer(&store, writer).await;
+        let mut edit = store
+            .load_leaf(&node_path(1), Requirement::ANY)
+            .await
+            .unwrap()
+            .into_edit();
+        let mut locks = edit.locks().clone();
+        locks.remove_membership_holder(&writer);
+        released.release_lock(&writer);
+        edit.set_entries(LeafBody::from_entries([released]));
+        edit.set_locks(locks);
+
+        assert!(store.commit_leaf(edit).await.unwrap().is_applied());
     }
 }

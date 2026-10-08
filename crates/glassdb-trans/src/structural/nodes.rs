@@ -14,7 +14,7 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::Monitor;
 use crate::node_locking::{
-    GateAcquisition, NodeLockReconciler, QuiescedEntries, StructuralGateOperation,
+    GateAcquisition, GatedNode, LeafState, NodeLockReconciler, StructuralGateOperation,
     StructuralGateOutcome,
 };
 
@@ -293,32 +293,25 @@ impl StructuralNodeAccess {
                 return Ok(Some((node, observation)));
             }
 
-            let entries: BTreeMap<Vec<u8>, _> = node
-                .as_leaf()
-                .into_iter()
-                .flat_map(LeafBody::entries)
-                .cloned()
-                .map(|entry| (entry.key.clone(), entry))
-                .collect();
+            let entries: Option<BTreeMap<Vec<u8>, _>> = node.as_leaf().map(|leaf| {
+                leaf.entries()
+                    .cloned()
+                    .map(|entry| (entry.key.clone(), entry))
+                    .collect()
+            });
+            let leaf = entries.as_ref().map(|entries| LeafState {
+                collection,
+                entries,
+                requirement: Requirement::ANY,
+            });
             let reconciler =
                 NodeLockReconciler::with_acquisition(&self.key_state, &self.mon, id, acquisition);
-            let entries = match reconciler
-                .quiesce_entries(collection, &entries, Requirement::ANY)
-                .await?
-            {
-                QuiescedEntries::Ready(entries) => entries,
-                QuiescedEntries::Wait(_) => return Ok(None),
-            };
-            let mut locks = node.locks().clone();
-            if reconciler
-                .acquire_structural_gate(&mut locks)
-                .await?
-                .is_some()
-            {
+            let GatedNode::Gated { entries, locks } =
+                reconciler.gate_node(leaf.as_ref(), node.locks()).await?
+            else {
                 return Ok(None);
-            }
-
-            if node.as_leaf().is_some() {
+            };
+            if let Some(entries) = entries {
                 node.set_leaf(LeafBody::from_entries(entries.into_values()))?;
             }
             node.set_locks(locks);

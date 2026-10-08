@@ -914,6 +914,16 @@ fn writeback_changes(
         e.release_lock(id);
         changes.push((intent.raw_key.clone(), e));
     }
+    // An earlier commit pass can lock keys that the transaction did not write
+    // in the end. Their locks go too, because a membership writer leaves the
+    // membership lock only with all of its key locks (ADR-077).
+    for (key, entry) in entries {
+        if entry.is_locked_by(id) && !changes.iter().any(|(changed, _)| changed == key) {
+            let mut entry = entry.clone();
+            entry.release_lock(id);
+            changes.push((key.clone(), entry));
+        }
+    }
     WritebackStaged {
         changes,
         superseded,

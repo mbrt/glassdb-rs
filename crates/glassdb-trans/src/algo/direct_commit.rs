@@ -9,7 +9,7 @@ use glassdb_concurr::rt;
 use glassdb_data::{LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CurrentState, InlinePolicy, LeafEntry, LockType, Node, NodeLocks, Requirement, RoutedLeafGroup,
+    CurrentState, InlinePolicy, LeafEntry, Node, NodeLocks, Requirement, RoutedLeafGroup,
     StorageError, TreeRouter,
 };
 
@@ -374,8 +374,8 @@ impl DirectCommitOperation {
 
     /// Validates node-level coordination for a direct publication.
     ///
-    /// The removal of a committed membership writer appends its help-forward
-    /// to `published` (ADR-077).
+    /// A membership writer that this removes appends the release of its key
+    /// locks to `published` (ADR-077).
     async fn reconcile_node_blockers(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -407,7 +407,6 @@ impl DirectCommitOperation {
         }
 
         if changes_membership {
-            let exclusive = locks.membership().lock_type() == LockType::Write;
             let leaf = LeafState {
                 collection: leaf_collection(&self.leaf_path)?,
                 entries: staged,
@@ -416,17 +415,12 @@ impl DirectCommitOperation {
             let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id);
             for holder in locks.membership().holders().to_vec() {
                 match ctx.tmon.tx_status(&holder).await? {
-                    status @ (TxCommitStatus::Committed
-                    | TxCommitStatus::Aborted
-                    | TxCommitStatus::Wounded) => {
-                        if exclusive && status == TxCommitStatus::Committed {
-                            reconciler
-                                .publish_committed_entries(&holder, &leaf, published)
-                                .await?;
-                        }
-                        locks.remove_membership_holder(&holder);
-                    }
                     TxCommitStatus::Pending | TxCommitStatus::Unknown => return Ok(true),
+                    status => {
+                        reconciler
+                            .remove_membership_writer(&holder, status, locks, &leaf, published)
+                            .await?;
+                    }
                 }
             }
         }
