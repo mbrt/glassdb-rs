@@ -473,7 +473,7 @@ async fn a_scan_omits_a_committed_delete_whose_write_back_is_held() {
     let collection = create_top(&deleter, b"held-delete").await;
     collection.write(b"deleted", b"v").await.unwrap();
 
-    commit_with_held_write_back(&hold, &deleter, &collection, Some(b"deleted"), None).await;
+    commit_with_held_write_back(&hold, &deleter, &collection, &[b"deleted"], &[]).await;
 
     let creator = init_db(hold.backend()).await;
     open_top(&creator, b"held-delete")
@@ -491,16 +491,16 @@ async fn a_scan_omits_a_committed_delete_whose_write_back_is_held() {
     assert_eq!(scan.keys(), [b"created".to_vec()]);
 }
 
-// Starts a transaction that commits `delete` and `write`, and holds its
-// write-back. A scan in the body keeps the commit from being a direct commit,
-// so the writes lock their keys, and a create or delete also locks the
-// membership.
+// Starts a transaction that deletes `deletes` and writes `writes`, and holds
+// its write-back. A scan in the body keeps the commit from being a direct
+// commit, so the writes lock their keys, and the creates and deletes also lock
+// the membership.
 async fn commit_with_held_write_back(
     hold: &WriteBackHold,
     db: &Database,
     collection: &glassdb::Collection,
-    delete: Option<&'static [u8]>,
-    write: Option<&'static [u8]>,
+    deletes: &'static [&'static [u8]],
+    writes: &'static [&'static [u8]],
 ) {
     let held = hold.hold_next_write_back();
     tokio::spawn({
@@ -511,10 +511,10 @@ async fn commit_with_held_write_back(
                 let collection = collection.clone();
                 async move {
                     tx.scan_keys(&collection, glassdb::KeyScan::all()).await?;
-                    if let Some(key) = delete {
+                    for key in deletes {
                         tx.delete(&collection, key)?;
                     }
-                    if let Some(key) = write {
+                    for key in writes {
                         tx.write(&collection, key, b"v")?;
                     }
                     Ok(())
@@ -526,6 +526,16 @@ async fn commit_with_held_write_back(
     held.await.unwrap();
 }
 
+async fn scan_from_new_instance(hold: &WriteBackHold, name: &[u8]) -> Vec<Vec<u8>> {
+    let scanner = init_db(hold.backend()).await;
+    open_top(&scanner, name)
+        .await
+        .scan_keys(glassdb::KeyScan::all())
+        .await
+        .unwrap()
+        .into_keys()
+}
+
 // The creation of a key by a committed transaction and a later create that
 // ends the membership lock of the first, in a transaction that locks.
 #[tokio::test(start_paused = true)]
@@ -533,7 +543,7 @@ async fn a_scan_sees_a_committed_create_whose_write_back_is_held() {
     let hold = WriteBackHold::wrap(mem());
     let first = init_db(hold.backend()).await;
     let collection = create_top(&first, b"held-create").await;
-    commit_with_held_write_back(&hold, &first, &collection, None, Some(b"first")).await;
+    commit_with_held_write_back(&hold, &first, &collection, &[], &[b"first"]).await;
 
     let second = init_db(hold.backend()).await;
     let collection = open_top(&second, b"held-create").await;
@@ -563,7 +573,7 @@ async fn a_scan_sees_a_committed_create_after_a_direct_create_ends_its_membershi
     let hold = WriteBackHold::wrap(mem());
     let first = init_db(hold.backend()).await;
     let collection = create_top(&first, b"held-create-direct").await;
-    commit_with_held_write_back(&hold, &first, &collection, None, Some(b"first")).await;
+    commit_with_held_write_back(&hold, &first, &collection, &[], &[b"first"]).await;
 
     let second = init_db(hold.backend()).await;
     open_top(&second, b"held-create-direct")
@@ -589,7 +599,7 @@ async fn a_scan_omits_a_committed_delete_after_a_locking_create_ends_its_members
     let deleter = init_db(hold.backend()).await;
     let collection = create_top(&deleter, b"held-delete-locking").await;
     collection.write(b"deleted", b"v").await.unwrap();
-    commit_with_held_write_back(&hold, &deleter, &collection, Some(b"deleted"), None).await;
+    commit_with_held_write_back(&hold, &deleter, &collection, &[b"deleted"], &[]).await;
 
     let creator = init_db(hold.backend()).await;
     let collection = open_top(&creator, b"held-delete-locking").await;
@@ -621,7 +631,7 @@ async fn a_scan_reads_no_record_of_a_committed_overwrite() {
     let writer = init_db(hold.backend()).await;
     let collection = create_top(&writer, b"held-overwrite").await;
     collection.write(b"kept", b"v").await.unwrap();
-    commit_with_held_write_back(&hold, &writer, &collection, None, Some(b"kept")).await;
+    commit_with_held_write_back(&hold, &writer, &collection, &[], &[b"kept"]).await;
 
     let scanner = init_db(hold.backend()).await;
     let collection = open_top(&scanner, b"held-overwrite").await;
@@ -630,4 +640,80 @@ async fn a_scan_reads_no_record_of_a_committed_overwrite() {
 
     assert_eq!(scan.keys(), [b"kept".to_vec()]);
     assert_eq!(hold.record_reads() - before, 0);
+}
+
+// One committed holder deletes some keys, creates others, and overwrites one,
+// and a create of another instance ends its membership lock. Each key keeps
+// the effect of the holder.
+#[tokio::test(start_paused = true)]
+async fn a_scan_sees_each_key_of_a_holder_whose_membership_lock_ended() {
+    let hold = WriteBackHold::wrap(mem());
+    let first = init_db(hold.backend()).await;
+    let collection = create_top(&first, b"held-many").await;
+    for key in [b"deleted-1".as_slice(), b"deleted-2", b"kept"] {
+        collection.write(key, b"v").await.unwrap();
+    }
+    commit_with_held_write_back(
+        &hold,
+        &first,
+        &collection,
+        &[b"deleted-1", b"deleted-2"],
+        &[b"created-1", b"created-2", b"kept"],
+    )
+    .await;
+
+    let second = init_db(hold.backend()).await;
+    open_top(&second, b"held-many")
+        .await
+        .write(b"second", b"v")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        scan_from_new_instance(&hold, b"held-many").await,
+        [
+            b"created-1".to_vec(),
+            b"created-2".to_vec(),
+            b"kept".to_vec(),
+            b"second".to_vec()
+        ]
+    );
+}
+
+// A split gates the leaf and help-forwards each holder before it removes the
+// membership lock of a committed holder (ADR-044).
+#[tokio::test(start_paused = true)]
+async fn a_scan_omits_a_committed_delete_after_a_split_ends_its_membership() {
+    let hold = WriteBackHold::wrap(mem());
+    let deleter = init_db(hold.backend()).await;
+    let collection = create_top(&deleter, b"held-split").await;
+    for key in [b"a".as_slice(), b"b", b"c", b"deleted"] {
+        collection.write(key, b"v").await.unwrap();
+    }
+    commit_with_held_write_back(&hold, &deleter, &collection, &[b"deleted"], &[]).await;
+
+    let splitter = glassdb::Database::builder("example", hold.backend())
+        .node_size_policy(
+            glassdb::NodeSizePolicy::builder()
+                .leaf_max_entries(2)
+                .build()
+                .unwrap(),
+        )
+        .open()
+        .await
+        .unwrap();
+    let collection = open_top(&splitter, b"held-split").await;
+    collection.write(b"a", b"w").await.unwrap();
+    for _ in 0..100 {
+        if splitter.stats().restructurer.splits > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(splitter.stats().restructurer.splits > 0);
+
+    assert_eq!(
+        scan_from_new_instance(&hold, b"held-split").await,
+        [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]
+    );
 }

@@ -37,8 +37,10 @@ pub(super) struct Options {
     /// Workers of the direct churner instance. Zero leaves it idle.
     #[arg(long, default_value_t = 4)]
     direct_workers: usize,
-    /// Workers of the locked churner instance. Zero leaves it idle.
-    #[arg(long, default_value_t = 4)]
+    /// Workers of the locked churner instance. Zero leaves it idle. Locked
+    /// churn transactions wait for each other on the membership lock, so with
+    /// more workers one can take longer than the drain timeout.
+    #[arg(long, default_value_t = 2)]
     locked_workers: usize,
     /// Workers of the scanner instance. Zero leaves it idle.
     #[arg(long, default_value_t = 8)]
