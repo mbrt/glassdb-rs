@@ -7,7 +7,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_concurr::rt;
 use glassdb_data::{LogicalKey, ObjectPath, TxId};
-use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
     CurrentState, InlinePolicy, LeafEntry, Node, NodeLocks, Requirement, RoutedLeafGroup,
     StorageError, TreeRouter,
@@ -22,7 +21,7 @@ use crate::leaf_coord::{
     CoordinatedOutcome, LeafCoordinator, LeafOperation, MemberOutcome, MemberPolicy, ReloadCause,
     ResolveCtx, StageAdmission, Step,
 };
-use crate::node_locking::{LeafState, NodeLockReconciler, leaf_collection};
+use crate::node_locking::{GateAcquisition, LeafState, NodeLockReconciler, leaf_collection};
 use crate::structural::{StructuralHintSink, TypicalTime};
 
 /// Direct same-leaf commit coverage for one snapshot or accumulated interval.
@@ -372,10 +371,8 @@ impl DirectCommitOperation {
         Ok(resolutions)
     }
 
-    /// Validates node-level coordination for a direct publication.
-    ///
-    /// A membership writer that this removes appends the release of its key
-    /// locks to `published` (ADR-077).
+    /// Admits a direct publication over the node locks, reporting whether a
+    /// live holder blocks it. A direct commit never waits or wounds.
     async fn reconcile_node_blockers(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -387,44 +384,21 @@ impl DirectCommitOperation {
         // Pruning only the staged copy keeps this outside the lock lifecycle:
         // removals of holders with a final status become durable iff the
         // publication CAS lands.
-        if let Some(holder) = locks.drop_intent().cloned() {
-            match ctx.tmon.tx_status(&holder).await? {
-                TxCommitStatus::Committed => return Err(TransError::StaleCollection),
-                TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
-                    locks.remove_drop_intent(&holder);
-                }
-                TxCommitStatus::Pending | TxCommitStatus::Unknown => return Ok(true),
-            }
-        }
-
-        for holder in locks.structural_gate().holders().to_vec() {
-            match ctx.tmon.tx_status(&holder).await? {
-                TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
-                    locks.remove_structural_gate(&holder);
-                }
-                TxCommitStatus::Pending | TxCommitStatus::Unknown => return Ok(true),
-            }
-        }
-
-        if changes_membership {
-            let leaf = LeafState {
-                collection: leaf_collection(&self.leaf_path)?,
-                entries: staged,
-                requirement: ctx.requirement,
-            };
-            let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id);
-            for holder in locks.membership().holders().to_vec() {
-                match ctx.tmon.tx_status(&holder).await? {
-                    TxCommitStatus::Pending | TxCommitStatus::Unknown => return Ok(true),
-                    status => {
-                        reconciler
-                            .remove_membership_writer(&holder, status, locks, &leaf, published)
-                            .await?;
-                    }
-                }
-            }
-        }
-        Ok(false)
+        let leaf = LeafState {
+            collection: leaf_collection(&self.leaf_path)?,
+            entries: staged,
+            requirement: ctx.requirement,
+        };
+        let reconciler = NodeLockReconciler::with_acquisition(
+            ctx.key_state,
+            ctx.tmon,
+            &self.id,
+            GateAcquisition::Polite,
+        );
+        Ok(reconciler
+            .admit_publication(locks, &leaf, changes_membership, published)
+            .await?
+            .is_some())
     }
 
     /// Produces the ordinary policy decision after an in-doubt CAS, if any, has

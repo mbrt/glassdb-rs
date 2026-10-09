@@ -356,6 +356,12 @@ holder in the same CAS. So a range scan reads the transaction record of a key
 holder only when that holder holds the membership lock
 ([ADR-077](adr/077-scans-decide-key-membership-from-the-leaf.md)).
 
+Readers of the membership lock stay in it after their transaction ends, until a
+membership writer removes them. A wounded scan that replays can leave many of
+them. A writer reads their transaction records in parallel, with a bound, and a
+new reader removes in its own CAS the holders whose final status its database
+instance already knows.
+
 A create that reaches the leaf content limit releases its partial locks and
 retries, so the restructurer can make room. The first capacity result starts one
 bounded wait. Leaf revisions, reroutes, and other full leaves do not reset it.
@@ -765,7 +771,9 @@ The cache and the coordinator depend on, and keep, these properties:
 A transaction body can use cached state freely, because validation checks every
 dependency at the validation barrier. Committed and aborted statuses never
 change, so the cache can keep them forever. `Wounded` can still change to
-`Aborted`, so it is checked again. A cached committed status can outlive the
+`Aborted`, so the object cache checks it again. The final-status cache of the
+monitor keeps `Wounded` as well, because both mean that the identity never
+commits. Owner acknowledgement and GC read the durable record. A cached committed status can outlive the
 cached record body. If the body is missing, the module that owns the referring
 observation reloads at a newer bound and retries. A missing historical body
 never becomes a missing key or a missing collection.

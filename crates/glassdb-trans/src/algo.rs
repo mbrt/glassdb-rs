@@ -647,7 +647,10 @@ impl Algo {
         // one leaf CAS with no transaction record (ADR-061). It writes nothing
         // unless it commits, so a non-landing direct commit is classified rather
         // than failed (ADR-053).
-        if tx.collections.accesses().reads.is_empty()
+        // An engaged identity holds locks and has a pending record, which only
+        // a locked commit releases and finalizes.
+        if !tx.needs_abort()
+            && tx.collections.accesses().reads.is_empty()
             && tx.collections.accesses().changes.is_empty()
         {
             match self
@@ -1929,6 +1932,65 @@ mod tests {
         assert_eq!(e.lock_holders(), std::slice::from_ref(h.id()));
 
         tm.end(&mut h).await.unwrap();
+    }
+
+    // A locked replay keeps the key locks and the membership lock of its
+    // identity. A replayed body that fits a direct commit must still use the
+    // locked commit: a direct commit cannot release those locks, and the
+    // committed handle would never retire its pending record.
+    #[tokio::test]
+    async fn a_locked_replay_never_commits_direct() {
+        let (tm, tctx) = new_algo().await;
+        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
+        let ka = logical_key(b"k");
+        let kb = logical_key(b"new");
+        let kc = logical_key(b"other");
+        commit_writes(&tm2, vec![wa(&ka, b"v1")]).await;
+        let ra = do_read(&tctx, &ka).await;
+        commit_writes(&tm2, vec![wa(&ka, b"v2")]).await;
+
+        // The over-inline-budget create takes key locks and the membership lock.
+        let external = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
+        let mut h = begin_accesses(
+            &tm,
+            AccessSet::new(vec![ra], vec![wa(&kb, &external)], Vec::new()),
+        );
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
+        let replayed = *h.id();
+
+        // The replayed body creates another key in the same leaf.
+        tm.reset(
+            &mut h,
+            AccessSet::new(Vec::new(), vec![wa(&kc, b"v")], Vec::new()),
+        );
+        assert_eq!(
+            tm.commit(&mut h).await.unwrap(),
+            BodyDecision::ReturnOutcome
+        );
+        tm.end(&mut h).await.unwrap();
+
+        assert_eq!(*h.id(), replayed);
+        assert_eq!(
+            tctx.tmon.tx_status(&replayed).await.unwrap(),
+            TxCommitStatus::Committed
+        );
+        let membership = tctx
+            .nodes
+            .load_leaf(
+                &test_root_path(),
+                Requirement::after(tctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap()
+            .locks()
+            .membership()
+            .clone();
+        assert!(!membership.contains(&replayed));
+        for key in [b"new".as_slice(), b"other"] {
+            if let Some(entry) = entry(&tctx, key).await {
+                assert!(!entry.is_locked_by(&replayed));
+            }
+        }
     }
 
     #[tokio::test]
