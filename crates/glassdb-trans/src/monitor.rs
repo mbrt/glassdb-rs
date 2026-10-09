@@ -29,7 +29,8 @@ const FINAL_STATUS_CACHE_SIZE: usize = 16384;
 /// bypass this cache and do not count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MonitorStats {
-    /// Final-status cache lookups that found a committed or aborted status.
+    /// Final-status cache lookups that found a committed, wounded, or aborted
+    /// status.
     pub final_status_hits: u64,
     /// Final-status cache lookups that found no status.
     pub final_status_misses: u64,
@@ -408,10 +409,12 @@ struct PendingWrite {
     expected: Option<Observation<TxRecord>>,
 }
 
-/// A durable status that can no longer change, even after owner acknowledgement.
+/// A durable final status. Only owner acknowledgement can change it, from
+/// wounded to aborted, and both mean that the identity never commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinalStatus {
     Committed,
+    Wounded,
     Aborted,
 }
 
@@ -419,14 +422,16 @@ impl FinalStatus {
     fn from_status(status: TxCommitStatus) -> Option<Self> {
         match status {
             TxCommitStatus::Committed => Some(Self::Committed),
+            TxCommitStatus::Wounded => Some(Self::Wounded),
             TxCommitStatus::Aborted => Some(Self::Aborted),
-            TxCommitStatus::Unknown | TxCommitStatus::Pending | TxCommitStatus::Wounded => None,
+            TxCommitStatus::Unknown | TxCommitStatus::Pending => None,
         }
     }
 
     fn status(self) -> TxCommitStatus {
         match self {
             Self::Committed => TxCommitStatus::Committed,
+            Self::Wounded => TxCommitStatus::Wounded,
             Self::Aborted => TxCommitStatus::Aborted,
         }
     }
@@ -458,6 +463,11 @@ impl FinalStatusCache {
     }
 
     fn insert(&mut self, tid: TxId, status: FinalStatus) {
+        // An older observation of an acknowledged wound must not hide the
+        // acknowledgement.
+        if status == FinalStatus::Wounded && self.entries.get(&tid) == Some(&FinalStatus::Aborted) {
+            return;
+        }
         self.entries.insert(tid, status);
         while self.entries.len() > self.capacity {
             self.entries.pop_front();
@@ -955,6 +965,21 @@ impl Monitor {
         requirement: Requirement,
     ) -> Result<TxCommitStatus, TransError> {
         Ok(self.resolve_tx_status_at(tid, requirement).await?.status())
+    }
+
+    /// Returns the final status of `tid` if this database instance already
+    /// knows it, without backend I/O. `None` does not mean that the identity
+    /// is live.
+    pub(crate) fn known_final_status(&self, tid: &TxId) -> Option<TxCommitStatus> {
+        match self.owned_status_evidence(tid) {
+            Ok(Some(evidence)) => {
+                let status = evidence.status();
+                return status.is_final().then_some(status);
+            }
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        self.cached_final_status(tid)
     }
 
     /// Checks for a durable wound that local owner state may not yet reflect.
@@ -1598,9 +1623,8 @@ impl Monitor {
         self.inner.final_status.lock().unwrap().insert(*tid, status);
     }
 
-    /// Records an exact durable observation in local owner state. Wounded is
-    /// deliberately not put in the immutable final-status cache: its owner may
-    /// still acknowledge it as aborted.
+    /// Records an exact durable observation in local owner state and in the
+    /// final-status cache.
     fn record_durable_observation(&self, tid: &TxId, observed: &Observation<TxRecord>) {
         let Some(stored) = observed.value() else {
             return;
@@ -2361,17 +2385,30 @@ mod tests {
     }
 
     #[test]
-    fn final_status_rejects_statuses_that_can_change() {
-        for status in [
-            TxCommitStatus::Unknown,
-            TxCommitStatus::Pending,
-            TxCommitStatus::Wounded,
-        ] {
+    fn final_status_rejects_statuses_that_are_not_final() {
+        for status in [TxCommitStatus::Unknown, TxCommitStatus::Pending] {
             assert_eq!(FinalStatus::from_status(status), None);
         }
-        for status in [TxCommitStatus::Committed, TxCommitStatus::Aborted] {
+        for status in [
+            TxCommitStatus::Committed,
+            TxCommitStatus::Wounded,
+            TxCommitStatus::Aborted,
+        ] {
             assert_eq!(FinalStatus::from_status(status).unwrap().status(), status);
         }
+    }
+
+    // Owner acknowledgement changes a wound to aborted, never the other way.
+    #[test]
+    fn final_status_cache_keeps_an_acknowledged_wound() {
+        let mut cache = FinalStatusCache::new(2);
+        let tid = tx_id(b"wounded");
+
+        cache.insert(tid, FinalStatus::Wounded);
+        cache.insert(tid, FinalStatus::Aborted);
+        cache.insert(tid, FinalStatus::Wounded);
+
+        assert_eq!(cache.get(&tid), Some(FinalStatus::Aborted));
     }
 
     #[test]
@@ -2435,7 +2472,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stats_exclude_local_owner_state_and_do_not_cache_mutable_statuses() {
+    async fn stats_exclude_local_owner_state_and_do_not_cache_pending_statuses() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let (owner, owner_ctx) = new_test_monitor(backend.clone());
         let (reader, _reader_ctx) = new_test_monitor(backend);
@@ -2447,27 +2484,53 @@ mod tests {
         );
         assert_eq!(owner.stats_and_reset(), MonitorStats::default());
 
-        for (id, status) in [
-            (b"pending".as_slice(), TxCommitStatus::Pending),
-            (b"wounded", TxCommitStatus::Wounded),
-        ] {
-            let tid = tx_id(id);
-            owner_ctx
-                .tx_records
-                .set(&TxRecord::new(tid, status))
-                .await
-                .unwrap();
-            for _ in 0..2 {
-                assert_eq!(reader.tx_status(&tid).await.unwrap(), status);
-            }
+        let pending = tx_id(b"pending");
+        owner_ctx
+            .tx_records
+            .set(&TxRecord::new(pending, TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        for _ in 0..2 {
             assert_eq!(
-                reader.stats_and_reset(),
-                MonitorStats {
-                    final_status_hits: 0,
-                    final_status_misses: 2,
-                }
+                reader.tx_status(&pending).await.unwrap(),
+                TxCommitStatus::Pending
             );
         }
+        assert_eq!(
+            reader.stats_and_reset(),
+            MonitorStats {
+                final_status_hits: 0,
+                final_status_misses: 2,
+            }
+        );
+    }
+
+    // Lock resolution treats a wound as an abort, so a peer that saw it once
+    // does not read the record again. The owner can still acknowledge it.
+    #[tokio::test]
+    async fn a_peer_caches_a_wound_until_it_sees_the_acknowledgement() {
+        let recorded = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let operations = recorded.log();
+        let (owner, _owner_ctx) = new_test_monitor(recorded.clone());
+        let (peer, _peer_ctx) = new_test_monitor(recorded);
+        let tid = tx_id(b"wounded");
+        let operation = owner.begin_owner_operation(&tid).unwrap();
+        owner.begin_tx(&tid);
+        assert_eq!(peer.preempt_tx(&tid).await.unwrap(), TxFinalStatus::Aborted);
+        operations.lock().unwrap().clear();
+
+        assert_eq!(peer.known_final_status(&tid), Some(TxCommitStatus::Wounded));
+        assert_eq!(peer.tx_status(&tid).await.unwrap(), TxCommitStatus::Wounded);
+        assert!(operations.lock().unwrap().is_empty());
+
+        operation.complete();
+        assert_eq!(
+            owner.abort_owned_tx(&tid).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+        // A durable read of the acknowledged record replaces the cached wound.
+        assert!(peer.has_durable_wound(&tid).await.unwrap());
+        assert_eq!(peer.known_final_status(&tid), Some(TxCommitStatus::Aborted));
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use glassdb_backend::{Backend, memory::MemoryBackend};
 use glassdb_data::{CollectionAddress, CollectionId};
 use glassdb_storage::transaction::{TxCommitStatus, TxRecord};
 use glassdb_storage::{
-    CollectionRecord, CurrentState, IndexNode, LeafBody, LeafEntry, Node, NodeLocks,
+    CollectionRecord, CurrentState, IndexNode, LeafBody, LeafEntry, LockType, Node, NodeLocks,
 };
 
 /// Evaluates one policy and retains its proposed decision.
@@ -793,6 +793,66 @@ async fn direct_membership_change_neither_waits_for_nor_wounds_a_live_holder() {
         tctx.tmon.tx_status(&holder).await.unwrap(),
         TxCommitStatus::Pending,
         "direct commit delegates waiting and wounding to locked commit"
+    );
+}
+
+// An overwrite does not change the key membership, so it leaves the
+// membership lock to its holders. Its CAS still removes the readers known to
+// be final, as the locked commit does when it takes the lock.
+#[tokio::test]
+async fn direct_overwrite_removes_membership_readers_known_to_be_final() {
+    let (tm, tctx) = new_algo().await;
+    let aborted = TxId::with_priority(8, b"aborted");
+    let live = TxId::with_priority(9, b"live");
+    for holder in [aborted, live] {
+        tctx.tmon.begin_tx(&holder);
+    }
+    tctx.tmon.abort_owned_tx(&aborted).await.unwrap();
+    let key = logical_key(b"key");
+    let staged = BTreeMap::from([(
+        b"key".to_vec(),
+        LeafEntry::new(b"key".to_vec()).with_current(CurrentState::External {
+            writer: TxId::with_priority(1, b"seed"),
+        }),
+    )]);
+    let mut locks = NodeLocks::default();
+    locks.add_membership_reader(aborted);
+    locks.add_membership_reader(live);
+    let direct = put_policy(&tm, TxId::with_priority(2, b"direct"), key, None, b"new");
+
+    let Step::Stage { locks, .. } =
+        resolve_step(&direct, &tctx, ReloadCause::Fresh, &staged, &locks).await
+    else {
+        panic!("an overwrite with a live reader must stage");
+    };
+    assert_eq!(locks.membership().holders(), &[live]);
+    assert_eq!(locks.membership().lock_type(), LockType::Read);
+    // An absence read compares the generation, which readers never change.
+    assert_eq!(locks.membership_generation(), 0);
+}
+
+#[tokio::test]
+async fn direct_commit_neither_waits_for_nor_wounds_a_live_drop_intent() {
+    let (tm, tctx) = new_algo().await;
+    let dropper = TxId::with_priority(9, b"dropper");
+    tctx.tmon.begin_tx(&dropper);
+    let direct = put_policy(
+        &tm,
+        TxId::with_priority(1, b"direct"),
+        logical_key(b"key"),
+        None,
+        b"value",
+    );
+    let mut locks = NodeLocks::default();
+    locks.set_drop_intent(dropper);
+
+    let outcome =
+        resolve_outcome(&direct, &tctx, ReloadCause::Fresh, &BTreeMap::new(), &locks).await;
+
+    assert!(matches!(outcome, MemberOutcome::Moved));
+    assert_eq!(
+        tctx.tmon.tx_status(&dropper).await.unwrap(),
+        TxCommitStatus::Pending
     );
 }
 

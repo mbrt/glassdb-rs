@@ -4112,4 +4112,175 @@ mod tests {
             std::slice::from_ref(&other)
         );
     }
+
+    /// Stores the root leaf with `holders` as membership readers, and their
+    /// records with `status` through a store that the locker's monitor does
+    /// not share, so that the monitor knows none of these statuses.
+    async fn seed_membership_readers(
+        ctx: &TlCtx,
+        backend: Arc<dyn Backend>,
+        holders: &[TxId],
+        status: TxCommitStatus,
+    ) {
+        use glassdb_storage::transaction::TxRecord;
+        let peer = AssemblyFixture::new(
+            backend,
+            DbPrefix::try_from("test").unwrap(),
+            &EngineConfig::default(),
+        );
+        let mut root = Node::leaf(LeafBody::new());
+        for holder in holders {
+            root.add_membership_reader(*holder);
+            peer.tx_records
+                .set(&TxRecord::new(*holder, status))
+                .await
+                .unwrap();
+        }
+        replace_root(ctx, &root).await;
+    }
+
+    fn reader_ids(count: u64) -> Vec<TxId> {
+        (0..count)
+            .map(|index| mk_tid(10 + index, &format!("r{index}")))
+            .collect()
+    }
+
+    fn tx_record_reads(log: &OpLog) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|op| op.op == "read" && op.path.contains("/_t/"))
+            .count()
+    }
+
+    // Scans that are wounded and replay leave their old identities as
+    // membership readers. A membership writer must give each one a final
+    // status before its CAS, so it reads their records in parallel, with a
+    // bound. Read sequentially, hundreds of them made the CAS lose to new
+    // readers every time.
+    #[tokio::test]
+    async fn a_membership_writer_resolves_stale_readers_in_bounded_waves() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let hooked = HookBackend::new(memory.clone());
+        let gate = BatchGate::install(&hooked, GateKind::Read);
+        let (locker, ctx) = new_test_locker(hooked).await;
+        let readers = reader_ids(40);
+        seed_membership_readers(&ctx, memory, &readers, TxCommitStatus::Wounded).await;
+        let writer = mk_tid(1, "writer");
+        ctx.monitor.begin_tx(&writer);
+
+        gate.arm();
+        let groups = group_of(b"new", put_intent(b"new"));
+        let (outcome, widths) = operation_widths(
+            locker
+                .keys()
+                .lock_leaves_at(&writer, &groups, false, Requirement::ANY),
+            &gate,
+        )
+        .await;
+
+        gate.armed.store(false, Ordering::SeqCst);
+
+        assert!(matches!(outcome.unwrap(), LeafSetOutcome::Locked(_)));
+        assert_eq!(widths, vec![16, 16, 8]);
+        let loaded = ctx
+            .nodes
+            .load_leaf(
+                &root_path(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(loaded.node().membership_lock().holders(), &[writer]);
+    }
+
+    // The holders of a membership read lock leave it only when a membership
+    // writer removes them. A new reader removes the ones that it already
+    // knows to be final in its own CAS, without a record read, so that the
+    // lock does not grow while no writer gets in.
+    #[tokio::test]
+    async fn a_new_membership_reader_removes_holders_known_to_be_final() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+        let log = recorder.log();
+        let (locker, ctx) = new_test_locker(recorder).await;
+        let stale = reader_ids(3);
+        let live = mk_tid(20, "live");
+        let mut holders = stale.clone();
+        holders.push(live);
+        seed_membership_readers(&ctx, memory, &stale, TxCommitStatus::Wounded).await;
+        let mut root = Node::leaf(LeafBody::new());
+        for holder in &holders {
+            root.add_membership_reader(*holder);
+        }
+        replace_root(&ctx, &root).await;
+        for holder in &stale {
+            assert!(ctx.monitor.tx_status(holder).await.unwrap().is_final());
+        }
+        let reader = mk_tid(1, "reader");
+        ctx.monitor.begin_tx(&reader);
+        log.lock().unwrap().clear();
+
+        let mut groups = group_of_intents(Vec::new());
+        groups.get_mut(&root_path()).unwrap().membership = LockType::Read;
+        lock_ok(&locker, &reader, &groups).await;
+
+        assert_eq!(tx_record_reads(&log), 0);
+        let loaded = ctx
+            .nodes
+            .load_leaf(
+                &root_path(),
+                Requirement::after(ctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        let mut expected = vec![live, reader];
+        expected.sort();
+        assert_eq!(loaded.node().membership_lock().holders(), expected);
+    }
+
+    // While a membership writer must wait for an older reader, wounding a
+    // younger reader gains nothing: the wait makes the writer resolve all
+    // readers again, and the younger one can finish in the meantime.
+    #[tokio::test(start_paused = true)]
+    async fn a_membership_writer_that_must_wait_wounds_no_reader() {
+        let (locker, ctx) = init_tl_test().await;
+        let older = mk_tid(1, "older");
+        let writer = mk_tid(2, "writer");
+        let younger = mk_tid(3, "younger");
+        for id in [older, writer, younger] {
+            ctx.monitor.begin_tx(&id);
+        }
+        let mut scan = group_of_intents(Vec::new());
+        scan.get_mut(&root_path()).unwrap().membership = LockType::Read;
+        lock_ok(&locker, &older, &scan).await;
+        lock_ok(&locker, &younger, &scan).await;
+
+        let waiting = tokio::spawn({
+            let locker = locker.clone();
+            let groups = group_of(b"new", put_intent(b"new"));
+            async move {
+                locker
+                    .keys()
+                    .lock_leaves_at(&writer, &groups, false, Requirement::ANY)
+                    .await
+            }
+        });
+        rt::sleep(Duration::from_millis(50)).await;
+
+        assert!(!waiting.is_finished());
+        assert_eq!(
+            ctx.monitor.tx_status(&younger).await.unwrap(),
+            TxCommitStatus::Pending
+        );
+        ctx.monitor.abort_owned_tx(&older).await.unwrap();
+        assert!(matches!(
+            waiting.await.unwrap().unwrap(),
+            LeafSetOutcome::Locked(_)
+        ));
+        assert_eq!(
+            ctx.monitor.tx_status(&younger).await.unwrap(),
+            TxCommitStatus::Wounded
+        );
+    }
 }

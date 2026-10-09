@@ -710,14 +710,10 @@ mod tests {
             .unwrap();
 
         // Wounded and acknowledged-aborted holders take the same abort-side
-        // branch. Start wounded so repeated status reads can bound a broken
-        // loop; cached immutable Aborted status could otherwise hide it.
-        let status_path = ObjectPath::Transaction {
-            db_prefix: DbPrefix::try_from("db").unwrap(),
-            id: first,
-        }
-        .to_string();
-        let status_reads = AtomicUsize::new(0);
+        // branch. A cached final status makes later status reads local, so
+        // repeated node reads bound a broken loop instead.
+        let node_paths: Vec<String> = paths.iter().map(ToString::to_string).collect();
+        let node_reads = AtomicUsize::new(0);
         let reclamation_armed = AtomicBool::new(reclamation_races);
         let contested_path = paths.last().unwrap().to_string();
         hooks.set_before({
@@ -726,11 +722,11 @@ mod tests {
             let collection = collection.clone();
             let contested_path = contested_path.clone();
             move |op| {
-                let status_read = matches!(
+                let node_read = matches!(
                     op,
                     BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
-                ) && op.path() == status_path;
-                let repeated = status_read && status_reads.fetch_add(1, Ordering::SeqCst) >= 7;
+                ) && node_paths.iter().any(|path| op.path() == path);
+                let repeated = node_read && node_reads.fetch_add(1, Ordering::SeqCst) >= 16;
                 let reclamation = matches!(op, BackendOp::WriteIf { .. })
                     && op.path() == contested_path
                     && reclamation_armed.swap(false, Ordering::SeqCst);

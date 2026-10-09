@@ -6,8 +6,10 @@
 //! structural gate.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 
 use async_trait::async_trait;
+use glassdb_concurr::map_all_bounded;
 use glassdb_data::{CollectionAddress, LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{CurrentState, LeafEntry, LeafObservation, LockType, NodeLocks, Requirement};
@@ -20,6 +22,11 @@ use crate::leaf_coord::{
 };
 use crate::monitor::Monitor;
 use crate::wound_wait::{Reclaim, try_reclaim};
+
+/// The maximum concurrent transaction-record operations to resolve the
+/// holders of one node lock. A membership read lock can collect many holders
+/// with a final status, and they are resolved while a leaf CAS waits.
+const HOLDER_RESOLUTION_PARALLELISM: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 
 /// Wound-wait policy over one node's structural gate and membership lock.
 pub(crate) struct NodeLockReconciler<'a> {
@@ -36,13 +43,14 @@ pub(crate) struct LeafState<'a> {
     pub(crate) requirement: Requirement,
 }
 
-/// How a structural operation treats live holders of the node it gates.
+/// How an operation treats live holders of the node locks that block it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GateAcquisition {
     /// Wounds younger holders and waits for older ones (ADR-044).
     WoundWait,
     /// Neither waits nor wounds: any live holder stops the operation. Merges
-    /// are optional maintenance and must not abort transactions (ADR-073).
+    /// are optional maintenance and must not abort transactions (ADR-073). A
+    /// direct commit leaves live holders to the locked commit (ADR-061).
     Polite,
 }
 
@@ -207,21 +215,13 @@ impl<'a> NodeLockReconciler<'a> {
             }
             locks.remove_structural_gate(&holder);
         }
-        for holder in locks.membership().holders().to_vec() {
-            if &holder == self.id {
-                locks.remove_membership_holder(&holder);
-                continue;
-            }
-            match self.monitor.tx_status(&holder).await? {
-                TxCommitStatus::Pending => {
-                    if matches!(self.reclaim(&holder).await?, Reclaim::Wait) {
-                        return Ok(Some(GateBlocker::Holder(holder)));
-                    }
-                }
-                TxCommitStatus::Unknown => return Ok(Some(GateBlocker::Holder(holder))),
-                TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
-            }
-            locks.remove_membership_holder(&holder);
+        locks.remove_membership_holder(self.id);
+        let holders = self.foreign_membership_holders(locks);
+        if let Reclaimed::Wait(holder) = self.reclaim_holders(&holders).await? {
+            return Ok(Some(GateBlocker::Holder(holder)));
+        }
+        for holder in &holders {
+            locks.remove_membership_holder(holder);
         }
         locks.set_structural_gate(*self.id);
         Ok(None)
@@ -276,25 +276,12 @@ impl<'a> NodeLockReconciler<'a> {
             }
             _ => false,
         };
-        if conflicts {
-            for holder in locks.membership().holders().to_vec() {
-                if &holder == self.id {
-                    continue;
-                }
-                let status = match self.monitor.tx_status(&holder).await? {
-                    TxCommitStatus::Pending => match self.reclaim(&holder).await? {
-                        Reclaim::Wait => return Ok(Some(holder)),
-                        Reclaim::Wounded => TxCommitStatus::Wounded,
-                    },
-                    TxCommitStatus::Unknown => return Ok(Some(holder)),
-                    status => status,
-                };
-                self.remove_membership_writer(&holder, status, locks, leaf, changes)
-                    .await?;
-            }
+        if conflicts && let Some(holder) = self.clear_membership(locks, leaf, changes).await? {
+            return Ok(Some(holder));
         }
         match desired {
             LockType::Read if locks.membership().lock_type() != LockType::Write => {
+                self.prune_known_final_readers(locks);
                 locks.add_membership_reader(*self.id);
             }
             LockType::Write
@@ -308,6 +295,32 @@ impl<'a> NodeLockReconciler<'a> {
         Ok(None)
     }
 
+    /// Admits a publication that takes no node lock, returning a holder that
+    /// blocks it.
+    ///
+    /// It removes holders with a final status from the node locks. When the
+    /// publication changes the key membership, the membership lock must have
+    /// no live holder, and a membership writer that this removes appends the
+    /// release of its key locks to `changes`. Otherwise, the publication does
+    /// not wait for readers, and its own CAS removes the ones known to be
+    /// final.
+    pub(crate) async fn admit_publication(
+        &self,
+        locks: &mut NodeLocks,
+        leaf: &LeafState<'_>,
+        changes_membership: bool,
+        changes: &mut Vec<(Vec<u8>, LeafEntry)>,
+    ) -> Result<Option<TxId>, TransError> {
+        if let Some(holder) = self.admit_non_structural(locks).await? {
+            return Ok(Some(holder));
+        }
+        if changes_membership {
+            return self.clear_membership(locks, leaf, changes).await;
+        }
+        self.prune_known_final_readers(locks);
+        Ok(None)
+    }
+
     /// Removes `holder`, which has a final status, from the membership lock in
     /// `locks`, and appends to `changes` the release of its write locks and
     /// create locks in `leaf`. A committed holder is help-forwarded on these
@@ -316,7 +329,7 @@ impl<'a> NodeLockReconciler<'a> {
     /// A holder leaves the membership write lock only together with these key
     /// locks, so that a key lock outside the membership lock never changes the
     /// key membership (ADR-077). The leaf write rejects any other removal.
-    pub(crate) async fn remove_membership_writer(
+    async fn remove_membership_writer(
         &self,
         holder: &TxId,
         status: TxCommitStatus,
@@ -344,6 +357,19 @@ impl<'a> NodeLockReconciler<'a> {
         }
         locks.remove_membership_holder(holder);
         Ok(())
+    }
+
+    /// Reads the status of each holder, in order, with bounded parallelism.
+    async fn holder_statuses(&self, holders: &[TxId]) -> Result<Vec<TxCommitStatus>, TransError> {
+        let monitor = self.monitor;
+        map_all_bounded(
+            holders.iter().copied(),
+            HOLDER_RESOLUTION_PARALLELISM,
+            |holder| async move { monitor.tx_status(&holder).await },
+        )
+        .await
+        .into_iter()
+        .collect()
     }
 
     /// Returns the current state that the committed `holder` leaves in `entry`.
@@ -378,12 +404,98 @@ impl<'a> NodeLockReconciler<'a> {
     /// reconciled. Unknown holders remain live until the monitor classifies
     /// them through its missing-transaction grace period.
     async fn prune_final_membership(&self, locks: &mut NodeLocks) -> Result<(), TransError> {
-        for holder in locks.membership().holders().to_vec() {
-            if &holder != self.id && self.monitor.tx_status(&holder).await?.is_final() {
-                locks.remove_membership_holder(&holder);
+        let holders = self.foreign_membership_holders(locks);
+        let statuses = self.holder_statuses(&holders).await?;
+        for (holder, status) in holders.iter().zip(statuses) {
+            if status.is_final() {
+                locks.remove_membership_holder(holder);
             }
         }
         Ok(())
+    }
+
+    /// Removes the shared membership holders whose final status this database
+    /// instance already knows, without backend I/O. A shared holder cannot
+    /// change the key membership, so its removal needs no help-forward. The
+    /// holders stay otherwise, so that a reader does not resolve the holders of
+    /// other readers, but the CAS that adds this reader also removes stale ones.
+    fn prune_known_final_readers(&self, locks: &mut NodeLocks) {
+        if locks.membership().lock_type() != LockType::Read {
+            return;
+        }
+        for holder in self.foreign_membership_holders(locks) {
+            if self.monitor.known_final_status(&holder).is_some() {
+                locks.remove_membership_holder(&holder);
+            }
+        }
+    }
+
+    fn foreign_membership_holders(&self, locks: &NodeLocks) -> Vec<TxId> {
+        locks
+            .membership()
+            .holders()
+            .iter()
+            .filter(|holder| *holder != self.id)
+            .copied()
+            .collect()
+    }
+
+    /// Removes every foreign membership holder, reclaiming live ones under
+    /// [`GateAcquisition`], or returns a holder to wait for.
+    async fn clear_membership(
+        &self,
+        locks: &mut NodeLocks,
+        leaf: &LeafState<'_>,
+        changes: &mut Vec<(Vec<u8>, LeafEntry)>,
+    ) -> Result<Option<TxId>, TransError> {
+        let holders = self.foreign_membership_holders(locks);
+        let statuses = match self.reclaim_holders(&holders).await? {
+            Reclaimed::Final(statuses) => statuses,
+            Reclaimed::Wait(holder) => return Ok(Some(holder)),
+        };
+        for (holder, status) in holders.iter().zip(statuses) {
+            self.remove_membership_writer(holder, status, locks, leaf, changes)
+                .await?;
+        }
+        Ok(None)
+    }
+
+    /// Gives every holder a final status, or returns a holder to wait for.
+    ///
+    /// It does not wound live holders when it must wait for another one,
+    /// because the wait makes the caller resolve all holders again. A status
+    /// read can still wound a holder whose lease expired.
+    async fn reclaim_holders(&self, holders: &[TxId]) -> Result<Reclaimed, TransError> {
+        let mut statuses = self.holder_statuses(holders).await?;
+        let mut pending = Vec::new();
+        for (index, (holder, status)) in holders.iter().zip(&statuses).enumerate() {
+            match status {
+                TxCommitStatus::Unknown => return Ok(Reclaimed::Wait(*holder)),
+                TxCommitStatus::Pending if !self.may_wound(holder) => {
+                    return Ok(Reclaimed::Wait(*holder));
+                }
+                TxCommitStatus::Pending => pending.push((index, *holder)),
+                TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
+            }
+        }
+        let reclaimed = map_all_bounded(
+            pending,
+            HOLDER_RESOLUTION_PARALLELISM,
+            |(index, holder)| async move { (index, holder, self.reclaim(&holder).await) },
+        )
+        .await;
+        for (index, holder, reclaimed) in reclaimed {
+            match reclaimed? {
+                // The holder committed before the wound landed.
+                Reclaim::Wait => return Ok(Reclaimed::Wait(holder)),
+                Reclaim::Wounded => statuses[index] = TxCommitStatus::Wounded,
+            }
+        }
+        Ok(Reclaimed::Final(statuses))
+    }
+
+    fn may_wound(&self, holder: &TxId) -> bool {
+        self.acquisition == GateAcquisition::WoundWait && self.id.older(holder)
     }
 
     async fn reclaim(&self, holder: &TxId) -> Result<Reclaim, TransError> {
@@ -519,6 +631,14 @@ pub(crate) fn leaf_collection(path: &ObjectPath) -> Result<&CollectionAddress, T
         ObjectPath::TreeRoot { collection } | ObjectPath::Node { collection, .. } => Ok(collection),
         _ => Err(TransError::other("lock target is not a leaf")),
     }
+}
+
+/// Result of giving every holder of a node lock a final status.
+enum Reclaimed {
+    /// The final status of each holder, in order.
+    Final(Vec<TxCommitStatus>),
+    /// A live holder that the operation must wait for.
+    Wait(TxId),
 }
 
 /// Result of reconciling all entry holders before gate installation.
