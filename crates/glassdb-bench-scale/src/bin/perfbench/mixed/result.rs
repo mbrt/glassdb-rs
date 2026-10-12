@@ -6,6 +6,7 @@ use glassdb::Stats;
 use glassdb_bench_scale::bench::Results;
 
 use super::options::CellDimension;
+use super::workload::KeySelection;
 
 /// One shape's fixed timing observations for a cell report.
 pub(super) struct ShapeMeasurement {
@@ -29,6 +30,7 @@ pub(super) struct CellMetadata {
     workers_per_shape: usize,
     setup_splits: u64,
     split_settle_elapsed: Duration,
+    shared_pct: Option<u8>,
 }
 
 impl CellMetadata {
@@ -50,7 +52,17 @@ impl CellMetadata {
             workers_per_shape,
             setup_splits,
             split_settle_elapsed,
+            shared_pct: None,
         }
+    }
+
+    /// Records how workers chose keys in the cell.
+    pub(super) fn with_key_selection(mut self, keys: KeySelection) -> Self {
+        self.shared_pct = match keys {
+            KeySelection::Shared => None,
+            KeySelection::Stripes { shared_pct } => Some(shared_pct),
+        };
+        self
     }
 }
 
@@ -76,6 +88,10 @@ pub(super) struct CellResult {
     database_limit: usize,
     databases: usize,
     workers_per_shape: usize,
+    /// Percentage of transactions that draw keys outside their worker's
+    /// stripe. Absent when workers do not use stripes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared_pct: Option<u8>,
     setup_splits: u64,
     split_settle_wall_ms: u64,
     failures: u64,
@@ -116,6 +132,7 @@ impl CellResult {
             database_limit: metadata.database_limit,
             databases: metadata.databases,
             workers_per_shape: metadata.workers_per_shape,
+            shared_pct: metadata.shared_pct,
             setup_splits: metadata.setup_splits,
             split_settle_wall_ms: metadata
                 .split_settle_elapsed
@@ -407,7 +424,8 @@ mod tests {
             3,
         );
         let empty_cell = CellResult::summarize(
-            CellMetadata::new("lo", 0, 0, 0, 0, 0, Duration::ZERO),
+            CellMetadata::new("lo", 0, 0, 0, 0, 0, Duration::ZERO)
+                .with_key_selection(KeySelection::Stripes { shared_pct: 1 }),
             std::iter::empty(),
             &[],
             3,
@@ -494,6 +512,7 @@ mod tests {
       "mode": "lo",
       "setupSplits": 0,
       "shapes": [],
+      "sharedPct": 1,
       "splitSettleWallMs": 0,
       "workersPerShape": 0
     }

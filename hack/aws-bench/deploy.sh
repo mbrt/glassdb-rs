@@ -43,7 +43,11 @@
 #   MIX_AFFINITIES   home-affinity percentages       (default: 0,25,50,75,100)
 #   MIX_DATABASES    clients and home collections    (default: 4)
 #   MIX_WORKERS      workers per transaction shape   (default: 8)
-#   MIX_NUM_KEYS     keys per low-contention home    (default: 5000)
+#   MIX_NUM_KEYS     keys per low-contention home    (default: 5000); each
+#                    worker draws from a stripe, so it must be at least
+#                    4 x max MIX_WORKERS x MIX_MULTI_KEYS
+#   MIX_SHARED_PCT   low-contention transactions outside their stripe
+#                    (default: 1)
 #   MIX_HOT_KEYS     keys per high-contention home   (default: 8)
 #   MIX_MULTI_KEYS   keys per multi-key transaction  (default: 10)
 #   MIX_DURATION     minimum measured cell window    (default: 5s)
@@ -86,6 +90,7 @@ MIX_AFFINITIES="${MIX_AFFINITIES:-0,25,50,75,100}"
 MIX_DATABASES="${MIX_DATABASES:-4}"
 MIX_WORKERS="${MIX_WORKERS:-8}"
 MIX_NUM_KEYS="${MIX_NUM_KEYS:-5000}"
+MIX_SHARED_PCT="${MIX_SHARED_PCT:-1}"
 MIX_HOT_KEYS="${MIX_HOT_KEYS:-8}"
 MIX_MULTI_KEYS="${MIX_MULTI_KEYS:-10}"
 MIX_DURATION="${MIX_DURATION:-5s}"
@@ -115,7 +120,7 @@ write_config() {
   : >"$path"
   for name in \
     RUNS RUN_COOLDOWN DRAIN_TIMEOUT MIX_MODES MIX_AFFINITIES MIX_DATABASES \
-    MIX_WORKERS MIX_NUM_KEYS MIX_HOT_KEYS MIX_MULTI_KEYS MIX_DURATION \
+    MIX_WORKERS MIX_NUM_KEYS MIX_SHARED_PCT MIX_HOT_KEYS MIX_MULTI_KEYS MIX_DURATION \
     MIX_MAX_DURATION MIX_TARGET_CI MIX_SPLIT_QUIET MIX_SPLIT_SETTLE_TIMEOUT \
     CONTENTION_KEYS CONTENTION_DURATION RUN_INLINE_PRESSURE \
     INLINE_PRESSURE_SETTLE_TIMEOUT; do

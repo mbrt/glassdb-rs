@@ -9,6 +9,64 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-10-12: multi-key writes stop scaling in the mixed lo mode
+
+Status: the cause is key overlap in the benchmark, not a coordinator or backend
+limit. The `lo` mode now gives each worker its own stripe of keys, except for
+`--shared-pct` of transactions.
+
+### Symptom
+
+In the worker sweep (5 instances, 100% affinity, 5,000 keys, 10 keys per
+multi-key transaction), `rwMany` went from 82 tx/s at 30 workers per shape to
+about 160 tx/s from 120 workers, and stayed there. Body replays per transaction
+went from 0.023 to 0.080. The process used about 1.1 of 22 cores. The backend
+did about 3,500 operations per second over separate prefixes. Coordinator CAS
+retries were about 0.0003 per transaction, and members per round increased with
+load. Each instance did 15 to 19 splits and no merges during measurement.
+
+### Cause
+
+All workers drew keys from the whole pool. At 150 workers per shape, about 150
+to 200 keys of each collection were locked at a time, about 3 to 4% of the pool.
+A 10-key transaction then touches a locked key with a probability of about
+1 - 0.96^10 = 33%. A younger writer waits and keeps its other locks (ADR-024),
+so it blocks more transactions. A multi-key read of a write-locked key fails
+optimistic validation and takes read locks, which also block writers.
+
+### Variants
+
+Single runs at 150 workers per shape, the S3 model, `delay-scale=0.2`, and
+`prefix-depth=3`:
+
+| Variant | `rwMany` | `roMulti` | `roMulti` p90 | Replays/tx |
+| --- | ---: | ---: | ---: | ---: |
+| Whole pool (before) | 167 tx/s | 718 tx/s | 371 ms | 0.072 |
+| Stripes for writers only | 206 tx/s | 696 tx/s | 418 ms | 0.046 |
+| Stripes for writers only, no shared draws | 207 tx/s | 705 tx/s | 412 ms | 0.044 |
+| Stripes in each database instance, no shared draws, 5,000 keys | 321 tx/s | 1,198 tx/s | 142 ms | 0.002 |
+| Stripes for all workers, 1% shared, 20,000 keys | 358 tx/s | 1,142 tx/s | 170 ms | 0.001 |
+
+The row with stripes in each database instance used temporary instrumentation.
+Each instance divided the pool among its own 120 workers, so stripes had about
+41 keys, and workers of different instances used the same stripes. With 100%
+affinity, each instance used only its home collection, so no two workers drew
+from the same stripe of one collection.
+
+Stripes for writers only remove writer conflicts, but readers of written keys
+still block writers. With stripes for all workers, `rwMany` scales from
+123 tx/s at 30 workers to 410 tx/s at 200 workers (20,000 keys). Its throughput
+per worker still decreases, because larger shared leaf rounds take longer.
+
+At 200 workers per shape, a cell has 800 workers. With 5,000 keys, a stripe
+then has 6 keys, fewer than one multi-key transaction. The benchmark rejects
+such a configuration, and the canonical worker grid uses 20,000 keys.
+
+A pool of 50,000 keys without stripes gave 227 tx/s at 150 workers. That pool
+needs about 1,370 splits and 2 minutes of setup for each cell, and the topology
+changes with the pool size. Stripes keep the conflict rate independent of the
+pool size.
+
 ## 2026-10-05: database instances that split and merge the same leaf
 
 Status: reproduced by the perfbench `split-merge-fight` scenario. Paid rates

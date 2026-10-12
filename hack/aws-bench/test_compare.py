@@ -204,6 +204,14 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(shapes.loc[0, "tps-ratio"], 1.5)
         self.assertEqual(aggregate.loc[0, "ops-ratio"], 0.75)
 
+        striped = [{**cells(15, 3)[0], "sharedPct": 1}]
+        for table in (compare.mixed_shape_table, compare.mixed_aggregate_table):
+            with self.assertRaisesRegex(ValueError, "sharedPct=None in a"):
+                table(cells(10, 4), striped)
+        self.assertEqual(
+            compare.mixed_shape_table(striped, striped).loc[0, "tps-ratio"], 1.0
+        )
+
     def test_perfbench_mixed_envelope_preserves_run_identity(self) -> None:
         cell = {
             "mode": "hi",

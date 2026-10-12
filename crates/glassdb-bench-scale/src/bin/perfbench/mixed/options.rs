@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use clap::Args;
 
+use super::workload::{KeySelection, SHAPE_COUNT};
+
 #[derive(Clone, Args)]
 pub(crate) struct Options {
     /// Minimum measured window per cell. The cell keeps running all shapes
@@ -34,11 +36,16 @@ pub(crate) struct Options {
     /// the pool size in the `hi` mode.
     #[arg(long, default_value_t = 10)]
     pub(super) multi_keys: usize,
-    /// Key-pool size per collection for the `lo` (spread) mode. A few thousand
-    /// keys already make same-key overlap rare; larger pools add seeding cost
-    /// without materially lowering contention further.
+    /// Key-pool size per collection for the `lo` (spread) mode. Each worker
+    /// draws from its own stripe of the pool, so the pool must give every
+    /// stripe at least `--multi-keys` keys.
     #[arg(long, default_value_t = 5000)]
     pub(super) num_keys: usize,
+    /// Percentage of `lo`-mode transactions that draw keys from the whole
+    /// pool instead of from their worker's stripe. Only these transactions
+    /// can conflict with the transactions of another worker.
+    #[arg(long, default_value_t = 1)]
+    pub(super) shared_pct: u8,
     /// Key-pool size for the `hi` (hot) mode.
     #[arg(long, default_value_t = 8)]
     pub(super) hot_keys: usize,
@@ -64,6 +71,9 @@ impl Options {
     pub(super) fn cell_dimensions(&self) -> Result<Vec<CellDimension>, Box<dyn Error>> {
         self.validate()?;
         let modes = parse_modes(&self.modes)?;
+        if modes.contains(&Mode::Lo) {
+            self.validate_stripes()?;
+        }
         let mut dimensions = Vec::new();
         for mode in modes {
             for &affinity_pct in &self.affinities {
@@ -93,11 +103,31 @@ impl Options {
         if self.affinities.is_empty() || self.affinities.iter().any(|&a| a > 100) {
             return Err("--affinities must contain percentages from 0 through 100".into());
         }
+        if self.shared_pct > 100 {
+            return Err("--shared-pct must be a percentage from 0 through 100".into());
+        }
         if self.split_quiet.is_zero() {
             return Err("--split-quiet must be greater than zero".into());
         }
         if self.split_settle_timeout < self.split_quiet {
             return Err("--split-settle-timeout must be at least --split-quiet".into());
+        }
+        Ok(())
+    }
+
+    /// Rejects a `lo` cell whose stripes are smaller than a multi-key
+    /// transaction, which would silently shrink its transactions.
+    fn validate_stripes(&self) -> Result<(), Box<dyn Error>> {
+        let max_workers = self.workers_per_shape.iter().copied().max().unwrap_or(1);
+        let workers = SHAPE_COUNT * max_workers;
+        let stripe = self.num_keys / workers;
+        if stripe < self.multi_keys {
+            return Err(format!(
+                "--num-keys={} gives {workers} workers stripes of {stripe} keys, \
+                 fewer than --multi-keys={}",
+                self.num_keys, self.multi_keys
+            )
+            .into());
         }
         Ok(())
     }
@@ -131,6 +161,16 @@ impl Mode {
         match self {
             Mode::Lo => options.num_keys.max(1),
             Mode::Hi => options.hot_keys.max(1),
+        }
+    }
+
+    /// Returns how workers choose keys in this contention mode.
+    pub(super) fn key_selection(self, options: &Options) -> KeySelection {
+        match self {
+            Mode::Lo => KeySelection::Stripes {
+                shared_pct: options.shared_pct,
+            },
+            Mode::Hi => KeySelection::Shared,
         }
     }
 }
@@ -215,6 +255,18 @@ mod tests {
                  lo:100:limit3:db1:w1\n\
                  lo:100:limit3:db3:w5",
             ),
+            (
+                &[
+                    "perfbench",
+                    "--modes",
+                    "hi",
+                    "--affinities",
+                    "100",
+                    "--workers-per-shape",
+                    "126",
+                ],
+                "hi:100:limit4:db4:w126",
+            ),
         ];
 
         for (args, expected) in cases {
@@ -237,6 +289,15 @@ mod tests {
             (
                 &["perfbench", "--affinities", "101"],
                 "--affinities must contain percentages from 0 through 100",
+            ),
+            (
+                &["perfbench", "--shared-pct", "101"],
+                "--shared-pct must be a percentage from 0 through 100",
+            ),
+            (
+                &["perfbench", "--workers-per-shape", "10,126"],
+                "--num-keys=5000 gives 504 workers stripes of 9 keys, \
+                 fewer than --multi-keys=10",
             ),
             (
                 &["perfbench", "--split-quiet", "0s"],

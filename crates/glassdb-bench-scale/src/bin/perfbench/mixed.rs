@@ -3,9 +3,10 @@
 //! Runs all four transaction shapes (`rwSingle`, `rwMany`, `roSingle`,
 //! `roMulti`) concurrently over one selected storage backend, sweeping:
 //!
-//! - contention **mode** (`lo` = keys drawn from a large pool so overlaps are
-//!   rare; `hi` = keys drawn from a small hot pool so they collide on the same
-//!   leaves), and
+//! - contention **mode** (`lo` = each worker draws from its own stripe of a
+//!   large pool, except for `--shared-pct` of its transactions, so transactions
+//!   rarely conflict but still share leaves; `hi` = keys drawn from a small hot
+//!   pool so they collide on the same leaves), and
 //! - home-collection **affinity** (`0` = each `Database` chooses uniformly
 //!   among every collection; `100` = each uses only its own collection).
 //! - client-`Database` limits and workers per shape. Each cell opens no more
@@ -133,11 +134,13 @@ fn run_cell(
 
     let stop = Arc::new(AtomicBool::new(false));
     let target = samples_for_rel_ci(options.target_ci);
+    let key_selection = dimension.mode.key_selection(options);
     let ctx = workload::WorkerCtx::new(
         stop.clone(),
         pool_size,
         options.multi_keys,
         dimension.affinity_pct,
+        key_selection,
     );
     let (drive, run, deadline) = handle.block_on(async {
         let handles =
@@ -177,7 +180,8 @@ fn run_cell(
             dimension.workers_per_shape,
             completed.setup_splits,
             completed.split_settle_elapsed,
-        ),
+        )
+        .with_key_selection(key_selection),
         workload::measurements(&plans),
         &completed.deltas,
         target,

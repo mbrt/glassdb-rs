@@ -30,6 +30,16 @@ otherwise it chooses uniformly among all collections. The default
 `0,25,50,75,100%` sweep ranges from no instance-specific preference to complete
 instance isolation. The separate `lo` and `hi` modes vary the key pool within a
 collection, keeping key contention independent from collection affinity.
+
+In the `lo` mode, each worker of the cell has its own stripe of the key pool:
+the keys whose index modulo the worker count is the worker's index. A
+transaction draws its keys from its stripe, except for `--shared-pct` percent
+of transactions (default 1), which draw from the whole pool. Only those
+transactions can conflict with another worker. The stripes interleave, so a
+multi-key transaction still touches many leaves, and all workers share leaves,
+coordinator rounds, and splits. The pool must give each stripe at least
+`--multi-keys` keys. The `hi` mode draws every transaction from a small shared
+pool.
 `--workers-per-shape` and `--databases` also accept comma-separated sweeps.
 The Database value is a limit: each cell opens the smaller of that limit and
 its worker count, ensuring that every open database instance runs every shape.
@@ -63,8 +73,10 @@ direct-path coverage, all derived from the public `Database::stats()` counters.
 The canonical scale plots use the low-contention mixed workload and the local
 S3 model. `--prefix-depth=3` gives each physical collection subtree
 (`db/_c/<collection-id>`) an independent simulated S3 request-rate bucket;
-database-wide transaction-record shards remain separate prefixes. Build once and
-run the two grids:
+database-wide transaction-record shards remain separate prefixes. The worker
+grid uses 20,000 keys per collection, so that each of the 800 workers at 200
+workers per shape has a stripe of 25 keys. The larger pool takes about
+75 seconds of setup for each cell. Build once and run the two grids:
 
 ```bash
 cargo build --release -p glassdb-bench-scale --bin perfbench
@@ -74,7 +86,8 @@ target/release/perfbench \
   --runs=3 --drain-timeout=90s \
   --output=hack/aws-bench/out-sweeps/workers.json \
   mixed --modes=lo --affinities=100 --databases=5 \
-  --workers-per-shape="1,$(seq -s, 10 10 200)" \
+  --workers-per-shape="1,$(seq -s, 10 10 200)" --num-keys=20000 \
+  --split-settle-timeout=180s \
   --duration=2s --max-duration=60s --target-ci=0.1
 
 target/release/perfbench \
