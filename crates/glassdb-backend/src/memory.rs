@@ -25,6 +25,7 @@ impl Object {
     }
 }
 
+#[derive(Clone)]
 struct State {
     objects: HashMap<String, Object>,
     next_gen: i64,
@@ -43,6 +44,14 @@ impl MemoryBackend {
                 objects: HashMap::new(),
                 next_gen: 1,
             }),
+        }
+    }
+
+    /// Returns an independent backend that starts with the current objects and
+    /// revisions of this one.
+    pub fn fork(&self) -> Self {
+        MemoryBackend {
+            state: Mutex::new(self.state.lock().unwrap().clone()),
         }
     }
 }
@@ -201,6 +210,32 @@ mod tests {
     #[tokio::test]
     async fn backend_conformance() {
         crate::implementation::assert_backend_conformance(&MemoryBackend::new()).await;
+    }
+
+    #[tokio::test]
+    async fn fork_keeps_revisions_and_diverges() {
+        let original = MemoryBackend::new();
+        let kept = original
+            .write_if_not_exists("a", b"1".to_vec())
+            .await
+            .unwrap();
+        let fork = original.fork();
+
+        // Conditional writes that the original allowed are allowed on the fork.
+        let read = fork.read("a").await.unwrap();
+        assert_eq!(read.contents, b"1");
+        assert_eq!(read.revision, kept);
+        let forked = fork.write_if("a", b"2".to_vec(), &kept).await.unwrap();
+        fork.write_if_not_exists("b", b"3".to_vec()).await.unwrap();
+
+        // Neither backend sees the changes of the other.
+        assert_eq!(original.read("a").await.unwrap().contents, b"1");
+        assert!(matches!(
+            original.read("b").await,
+            Err(BackendError::NotFound)
+        ));
+        original.write_if("a", b"4".to_vec(), &kept).await.unwrap();
+        assert_eq!(fork.read("a").await.unwrap().revision, forked);
     }
 
     #[tokio::test]

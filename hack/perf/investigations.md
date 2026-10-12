@@ -9,6 +9,122 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-10-12: leaves split for minutes under the mixed lo load
+
+Status: the cause is the measured queue wait, which the avoidable time policy
+(ADR-074) removes as designed. The tree converges, but each database instance
+does one split at a time, so the convergence takes more than 10 minutes. A
+conditioning load before the cells did not help, because of the garbage
+collection work that it leaves. The `mixed` scenario now forks one seed for
+each cell, and records the splits and merges of each warm-up. Faster
+convergence and garbage collection under load are engine questions.
+
+### Symptom
+
+A warm-up under load that waited for splits to stop for 3 seconds did not end.
+At 100 workers per shape (5 instances, 100% affinity, 20,000 keys, stripes,
+1% shared), the instances did about 20 splits per second for 240 seconds and
+no merges. The 5 collections went from about 590 leaves after the seed to about
+5,400. At 200 workers, the warm-up did 1,924 splits in 120 seconds.
+
+### Measurement
+
+Temporary counters in the leaf coordinator, the rule, and the splitter counted
+each split cause, each split reason, and the leaf entries after each split.
+Single runs at 100 workers per shape:
+
+- All splits under load were `Demand` splits at a measured split key. Soft cap,
+  capacity, and inline pressure splits did not occur.
+- The split cause was queue wait for other keys: 40 to 80 seconds of wait in
+  each second, over all instances. Lost CAS time was zero, slow leaf CAS time
+  was about 0.2 seconds in each second, and the divided conflict time that
+  counts against a split was near zero.
+- A leaf that the rule split had about 180 ms of delay in its window. The split
+  threshold is 0.05 of the typical split time of about 190 ms, so about 9.5 ms.
+- The rule asked for 1,200 to 2,800 splits in each 10 seconds, but about 210
+  landed. Each instance does one split at a time, so the split rate is the
+  split capacity of about 5 splits per second for each instance.
+
+| Time under load | Splits/s | Entries of a new leaf | Queue wait (s/s) |
+| --- | ---: | ---: | ---: |
+| 10 s | 23 | about 400 | 77 |
+| 2 to 3 min | 20 | about 9 | 30 to 40 |
+| 6 to 9 min | 3 to 6 | 8 to 10 | 3 to 4 |
+
+At 50 workers per shape, the rate went from 25 splits per second to 4 to 5
+after 6 minutes, with about 3 seconds of queue wait in each second.
+
+### Cause
+
+The queue wait of a leaf grows with the square of its round submissions. A
+split halves the submissions of each half. A 10-key transaction in a 20,000-key
+pool touches about 10 leaves before and after a split, so a split adds almost
+no divided conflict time. So the rule splits until each leaf has about one
+round at a time, which under this load is a leaf of 5 to 20 keys. This is the
+designed behavior of ADR-074. The splits are worth their cost: after a 120
+second warm-up at 100 workers, `rwMany` had 449 tx/s and a p50 of 208 ms. The
+sweep before this entry, which measured the tree of the seed, had about
+240 tx/s and about 290 ms.
+
+So each cell of the earlier sweeps measured a tree that was still splitting,
+at a different point of its convergence.
+
+### Variants
+
+- A lower leaf soft cap during the seed and warm-up did not help. The seed then
+  splits at about 11 to 12 splits per second. With a cap of 16 it did 6,743
+  splits in 532 seconds and did not finish. The cap moves the convergence time
+  from the warm-up into the seed, and gives a tree that depends on the cap.
+- A warm-up per worker count costs 6 to 10 minutes per cell, so more than six
+  hours for the canonical worker sweep.
+
+### Conditioning the tree before the cells
+
+A variant ran the cell with the most workers unmeasured on the seed, and gave
+each cell a fork of the result. Single runs at 5 instances and 20,000 keys:
+
+| Variant | `rwMany` at 200 workers | Busy workers per shape | Writes/tx | Warm-up |
+| --- | ---: | ---: | ---: | --- |
+| Fork of the seed, no conditioning | 598 tx/s | 197 | 0.94 | not quiet in 120 s |
+| 600 s conditioning, garbage collection not waited for | 308 tx/s | 126 | 2.01 | 701 splits, not quiet |
+| 120 s conditioning, garbage collection waited for | 632 tx/s | 196 | 1.59 | 2,126 splits, 0 merges, not quiet |
+
+Busy workers come from Little's law. Without the wait, every fork carried the
+garbage collection backlog of the load, and each cell did that work while it
+measured. With the wait, the result is the same as without conditioning, and
+the tree still splits at about the split capacity. At 50 and 100 workers, the
+warm-ups on a tree conditioned at 200 workers did 1,680 and 1,918 splits in
+120 seconds, and no merges.
+
+### Garbage collection after a load
+
+Temporary instrumentation counted the transaction records in the memory
+backend every 10 seconds after a 120 second conditioning load at 200 workers per
+shape. Four extra database instances with a GC parallelism of 64 helped the
+5 clients.
+
+| Time after the load | Records | Records deleted in each second |
+| --- | ---: | ---: |
+| 16 s | 327,834 | |
+| 16 to 450 s | 328k to 244k | about 190 |
+| 450 to 520 s | 244k to 172k | about 1,000 |
+| 520 to 600 s | 172k to 31k | about 1,800 |
+| 638 s | quiet | |
+
+- The load created about 2,800 records in each second. The GC hint queues
+  dropped 1.4 million candidates during the load, so GC found most records by
+  LIST scans.
+- GC made 2.8 progress events for each deleted record.
+- GC LIST requests went from about 0.7 to about 4 in each second when deletions
+  became fast. This agrees with the adaptive scan cadence, but the cause is not
+  confirmed.
+- After a 600 second load, GC did not become quiet within 30 minutes.
+
+The `mixed` scenario therefore waits for garbage collection only after the
+seed. There it waits until no candidate is left, because a hinted candidate is
+first checked after the lease and the clock skew allowance, which is longer
+than a short quiet period.
+
 ## 2026-10-12: multi-key writes stop scaling in the mixed lo mode
 
 Status: the cause is key overlap in the benchmark, not a coordinator or backend
@@ -56,7 +172,8 @@ from the same stripe of one collection.
 Stripes for writers only remove writer conflicts, but readers of written keys
 still block writers. With stripes for all workers, `rwMany` scales from
 123 tx/s at 30 workers to 410 tx/s at 200 workers (20,000 keys). Its throughput
-per worker still decreases, because larger shared leaf rounds take longer.
+per worker still decreases. The next entry shows that this decrease is queue
+wait in leaves that are still splitting, and not a cost of shared rounds.
 
 At 200 workers per shape, a cell has 800 workers. With 5,000 keys, a stripe
 then has 6 keys, fewer than one multi-key transaction. The benchmark rejects

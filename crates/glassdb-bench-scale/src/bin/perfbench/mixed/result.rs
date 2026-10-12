@@ -6,6 +6,7 @@ use glassdb::Stats;
 use glassdb_bench_scale::bench::Results;
 
 use super::options::CellDimension;
+use super::setup::Warmup;
 use super::workload::KeySelection;
 
 /// One shape's fixed timing observations for a cell report.
@@ -31,6 +32,7 @@ pub(super) struct CellMetadata {
     setup_splits: u64,
     split_settle_elapsed: Duration,
     shared_pct: Option<u8>,
+    warmup: Option<Warmup>,
 }
 
 impl CellMetadata {
@@ -53,7 +55,14 @@ impl CellMetadata {
             setup_splits,
             split_settle_elapsed,
             shared_pct: None,
+            warmup: None,
         }
+    }
+
+    /// Records the cell's warm-up before the measurement.
+    pub(super) fn with_warmup(mut self, warmup: Warmup) -> Self {
+        self.warmup = Some(warmup);
+        self
     }
 
     /// Records how workers chose keys in the cell.
@@ -94,6 +103,8 @@ pub(super) struct CellResult {
     shared_pct: Option<u8>,
     setup_splits: u64,
     split_settle_wall_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warmup: Option<WarmupResult>,
     failures: u64,
     shapes: Vec<ShapeResult>,
     aggregate_ops: OpsPerTx,
@@ -139,6 +150,7 @@ impl CellResult {
                 .as_millis()
                 .try_into()
                 .unwrap_or(u64::MAX),
+            warmup: metadata.warmup.map(WarmupResult::from),
             failures: 0,
             shapes,
             aggregate_ops: raw_ops.per_tx(logical_txn),
@@ -151,6 +163,27 @@ impl CellResult {
 pub(super) fn cell_started(run: usize, dimension: CellDimension) -> String {
     format!(
         "mixed: run={run} mode={} affinity={}% databases={}/{} workers/shape={}",
+        dimension.mode.label(),
+        dimension.affinity_pct,
+        dimension.databases,
+        dimension.database_limit,
+        dimension.workers_per_shape,
+    )
+}
+
+/// Formats the warm-up summary emitted after a cell.
+pub(super) fn cell_warmed_up(warmup: &Warmup) -> String {
+    format!(
+        "  warm-up took {:?}: {} splits and {} merges",
+        warmup.elapsed, warmup.splits, warmup.merges
+    )
+}
+
+/// Formats the warning emitted when a cell's warm-up does not become quiet.
+pub(super) fn warmup_capped(dimension: CellDimension, timeout: Duration) -> String {
+    format!(
+        "  note: mode={} affinity={}% databases={}/{} workers/shape={} measured after \
+         --warmup-timeout={timeout:?} with splits or merges still in progress",
         dimension.mode.label(),
         dimension.affinity_pct,
         dimension.databases,
@@ -175,6 +208,30 @@ pub(super) fn cell_capped(dimension: CellDimension, target_ci: f64) -> String {
 /// Formats the setup-settlement summary emitted before measurement.
 pub(super) fn setup_settled(elapsed: Duration, completed: u64, quiet: Duration) -> String {
     format!("  setup settled after {elapsed:?}: {completed} completed splits, {quiet:?} quiet")
+}
+
+/// The structural changes and wall time of a cell's warm-up.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WarmupResult {
+    /// Splits and merges of the measurement database instances during the
+    /// warm-up.
+    splits: u64,
+    merges: u64,
+    wall_ms: u64,
+    /// Whether the splits and merges stopped before the warm-up timeout.
+    quiet: bool,
+}
+
+impl From<Warmup> for WarmupResult {
+    fn from(warmup: Warmup) -> Self {
+        Self {
+            splits: warmup.splits,
+            merges: warmup.merges,
+            wall_ms: warmup.elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+            quiet: warmup.quiet,
+        }
+    }
 }
 
 /// Backend-op counters normalized per transaction.
@@ -425,7 +482,13 @@ mod tests {
         );
         let empty_cell = CellResult::summarize(
             CellMetadata::new("lo", 0, 0, 0, 0, 0, Duration::ZERO)
-                .with_key_selection(KeySelection::Stripes { shared_pct: 1 }),
+                .with_key_selection(KeySelection::Stripes { shared_pct: 1 })
+                .with_warmup(Warmup {
+                    splits: 5,
+                    merges: 2,
+                    elapsed: Duration::from_millis(2500),
+                    quiet: false,
+                }),
             std::iter::empty(),
             &[],
             3,
@@ -514,6 +577,12 @@ mod tests {
       "shapes": [],
       "sharedPct": 1,
       "splitSettleWallMs": 0,
+      "warmup": {
+        "merges": 2,
+        "quiet": false,
+        "splits": 5,
+        "wallMs": 2500
+      },
       "workersPerShape": 0
     }
   ],

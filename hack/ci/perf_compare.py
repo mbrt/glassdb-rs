@@ -56,8 +56,9 @@ MIXED_ARGS = [
     "--duration=10s",
     "--max-duration=10s",
     "--target-ci=0",
-    "--split-quiet=250ms",
-    "--split-settle-timeout=5s",
+    "--quiet-period=250ms",
+    "--seed-timeout=5s",
+    "--warmup-timeout=5s",
 ]
 
 

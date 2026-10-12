@@ -56,14 +56,24 @@ pub(crate) struct Options {
     /// uniformly from every collection. At 100%, it always uses its own.
     #[arg(long, value_delimiter = ',', default_value = "0,25,50,75,100")]
     affinities: Vec<u8>,
-    /// Required time with no change to the setup Database's completed-split
-    /// counter before measurement clients are opened. This is real wall time;
-    /// model-time acceleration also compresses the background split cadence.
+    /// Wall time without topology changes that makes a state settled: without
+    /// splits, merges, and garbage collection progress after the seed, and
+    /// without splits and merges at the end of a cell's warm-up. Model-time
+    /// acceleration also compresses the background cadence of these changes.
     #[arg(long, default_value = "10s", value_parser = glassdb_bench_scale::parse_duration)]
-    pub(super) split_quiet: Duration,
-    /// Maximum wall time allowed for setup splits to become quiet.
+    pub(super) quiet_period: Duration,
+    /// Maximum wall time for the seed to settle. The run fails after it.
+    #[arg(long, default_value = "180s", value_parser = glassdb_bench_scale::parse_duration)]
+    pub(super) seed_timeout: Duration,
+    /// Maximum wall time of a cell's warm-up. The cell measures after it, also
+    /// when topology changes continue, and its result says so.
     #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
-    pub(super) split_settle_timeout: Duration,
+    pub(super) warmup_timeout: Duration,
+    /// Minimum model time of each cell's warm-up, before its quiet period can
+    /// end it. The topology policy decides on windows of 1 s of model time,
+    /// so a shorter warm-up can end before a load causes its first split.
+    #[arg(long, default_value = "5s", value_parser = glassdb_bench_scale::parse_duration)]
+    pub(super) warmup_minimum: Duration,
 }
 
 impl Options {
@@ -106,11 +116,11 @@ impl Options {
         if self.shared_pct > 100 {
             return Err("--shared-pct must be a percentage from 0 through 100".into());
         }
-        if self.split_quiet.is_zero() {
-            return Err("--split-quiet must be greater than zero".into());
+        if self.quiet_period.is_zero() {
+            return Err("--quiet-period must be greater than zero".into());
         }
-        if self.split_settle_timeout < self.split_quiet {
-            return Err("--split-settle-timeout must be at least --split-quiet".into());
+        if self.seed_timeout < self.quiet_period {
+            return Err("--seed-timeout must be at least --quiet-period".into());
         }
         Ok(())
     }
@@ -300,18 +310,12 @@ mod tests {
                  fewer than --multi-keys=10",
             ),
             (
-                &["perfbench", "--split-quiet", "0s"],
-                "--split-quiet must be greater than zero",
+                &["perfbench", "--quiet-period", "0s"],
+                "--quiet-period must be greater than zero",
             ),
             (
-                &[
-                    "perfbench",
-                    "--split-quiet",
-                    "2s",
-                    "--split-settle-timeout",
-                    "1s",
-                ],
-                "--split-settle-timeout must be at least --split-quiet",
+                &["perfbench", "--quiet-period", "2s", "--seed-timeout", "1s"],
+                "--seed-timeout must be at least --quiet-period",
             ),
             (
                 &["perfbench", "--modes", "medium"],

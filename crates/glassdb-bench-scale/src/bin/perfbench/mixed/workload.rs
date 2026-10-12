@@ -114,6 +114,75 @@ pub(super) fn measurements(plans: &[ShapePlan]) -> impl Iterator<Item = ShapeMea
         .map(|plan| ShapeMeasurement::new(plan.shape.name(), plan.bench.results()))
 }
 
+/// A gate between the transactions of all workers of a cell.
+///
+/// The warm-up and the measurement share the workers, and a transaction that
+/// runs while the measurement starts would count work of the warm-up. Closing
+/// the gate lets each worker finish its transaction and wait, so that the
+/// measurement starts with no transaction in flight.
+#[derive(Default)]
+pub(super) struct Pause {
+    state: std::sync::Mutex<PauseState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct PauseState {
+    closed: bool,
+    waiting: usize,
+}
+
+impl Pause {
+    /// Closes the gate and waits until `workers` wait at it, or until `stop`
+    /// is set.
+    pub(super) async fn close_and_wait(&self, workers: usize, stop: &AtomicBool) {
+        self.state.lock().unwrap().closed = true;
+        loop {
+            let changed = self.changed.notified();
+            if self.state.lock().unwrap().waiting >= workers || stop.load(Ordering::Relaxed) {
+                return;
+            }
+            // A worker that stops with an error sets `stop` and never waits.
+            tokio::select! {
+                () = changed => {}
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    }
+
+    /// Opens the gate, so that the waiting workers continue.
+    pub(super) fn open(&self) {
+        self.state.lock().unwrap().closed = false;
+        self.changed.notify_waiters();
+    }
+
+    /// Waits while the gate is closed, unless `stop` is set.
+    async fn pass(&self, stop: &AtomicBool) {
+        let mut counted = false;
+        loop {
+            let changed = self.changed.notified();
+            {
+                let mut state = self.state.lock().unwrap();
+                if !state.closed || stop.load(Ordering::Relaxed) {
+                    if counted {
+                        state.waiting -= 1;
+                    }
+                    return;
+                }
+                if !counted {
+                    state.waiting += 1;
+                    counted = true;
+                    self.changed.notify_waiters();
+                }
+            }
+            tokio::select! {
+                () = changed => {}
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    }
+}
+
 /// How workers choose keys from the pool.
 #[derive(Clone, Copy)]
 pub(super) enum KeySelection {
@@ -129,6 +198,7 @@ pub(super) enum KeySelection {
 pub(super) struct WorkerCtx {
     /// Set by [`drive_to_significance`] to stop all shapes at once.
     stop: Arc<AtomicBool>,
+    pause: Arc<Pause>,
     pool_size: usize,
     multi_keys: usize,
     affinity_pct: u8,
@@ -148,12 +218,18 @@ impl WorkerCtx {
     ) -> Self {
         Self {
             stop,
+            pause: Arc::new(Pause::default()),
             pool_size,
             multi_keys,
             affinity_pct,
             key_selection,
             stripe: Stripe::WHOLE_POOL,
         }
+    }
+
+    /// Returns the gate between the transactions of the workers.
+    pub(super) fn pause(&self) -> &Pause {
+        &self.pause
     }
 
     fn for_stripe(&self, stripe: Stripe) -> Self {
@@ -315,6 +391,10 @@ async fn worker(
     let mut rng = StdRng::seed_from_u64(seed);
     let key_count = shape.key_count(ctx.multi_keys, ctx.pool_size);
     while !ctx.stop.load(Ordering::Relaxed) && !bench.is_finished() {
+        ctx.pause.pass(&ctx.stop).await;
+        if ctx.stop.load(Ordering::Relaxed) {
+            break;
+        }
         let result = execute_once(
             &db,
             &collections,
@@ -622,6 +702,47 @@ mod tests {
                 .iter()
                 .all(|keys| keys.len() > stripe_len)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn closed_pause_waits_for_running_operations_to_end() {
+        use std::sync::atomic::AtomicUsize;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(Pause::default());
+        let running = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let (stop, pause, running) = (stop.clone(), pause.clone(), running.clone());
+                tokio::spawn(async move {
+                    let mut operations = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        pause.pass(&stop).await;
+                        running.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(3)).await;
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        operations += 1;
+                    }
+                    operations
+                })
+            })
+            .collect();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        pause.close_and_wait(workers.len(), &stop).await;
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+
+        pause.open();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stop.store(true, Ordering::Relaxed);
+        for worker in workers {
+            assert!(
+                worker.await.unwrap() > 1,
+                "workers continue after the pause"
+            );
+        }
     }
 
     #[test]

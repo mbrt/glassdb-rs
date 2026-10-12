@@ -53,8 +53,11 @@
 #   MIX_DURATION     minimum measured cell window    (default: 5s)
 #   MIX_MAX_DURATION maximum measured cell window    (default: 120s)
 #   MIX_TARGET_CI    throughput CI relative half-width (default: 0.1)
-#   MIX_SPLIT_QUIET  required stable split interval  (default: 10s)
-#   MIX_SPLIT_SETTLE_TIMEOUT setup convergence limit (default: 120s)
+#   MIX_QUIET_PERIOD time without topology changes that settles the seed
+#                    and ends a cell's warm-up        (default: 10s)
+#   MIX_SEED_TIMEOUT limit of the seed settlement; each cell seeds again on
+#                    S3                               (default: 120s)
+#   MIX_WARMUP_TIMEOUT limit of each cell's warm-up   (default: 120s)
 #
 # Focused scenarios:
 #   CONTENTION_KEYS     key counts to sweep           (default: 1,2,3,4,5,6)
@@ -96,8 +99,9 @@ MIX_MULTI_KEYS="${MIX_MULTI_KEYS:-10}"
 MIX_DURATION="${MIX_DURATION:-5s}"
 MIX_MAX_DURATION="${MIX_MAX_DURATION:-120s}"
 MIX_TARGET_CI="${MIX_TARGET_CI:-0.1}"
-MIX_SPLIT_QUIET="${MIX_SPLIT_QUIET:-10s}"
-MIX_SPLIT_SETTLE_TIMEOUT="${MIX_SPLIT_SETTLE_TIMEOUT:-120s}"
+MIX_QUIET_PERIOD="${MIX_QUIET_PERIOD:-10s}"
+MIX_SEED_TIMEOUT="${MIX_SEED_TIMEOUT:-120s}"
+MIX_WARMUP_TIMEOUT="${MIX_WARMUP_TIMEOUT:-120s}"
 CONTENTION_KEYS="${CONTENTION_KEYS:-1,2,3,4,5,6}"
 CONTENTION_DURATION="${CONTENTION_DURATION:-20s}"
 RUN_INLINE_PRESSURE="${RUN_INLINE_PRESSURE:-false}"
@@ -121,7 +125,8 @@ write_config() {
   for name in \
     RUNS RUN_COOLDOWN DRAIN_TIMEOUT MIX_MODES MIX_AFFINITIES MIX_DATABASES \
     MIX_WORKERS MIX_NUM_KEYS MIX_SHARED_PCT MIX_HOT_KEYS MIX_MULTI_KEYS MIX_DURATION \
-    MIX_MAX_DURATION MIX_TARGET_CI MIX_SPLIT_QUIET MIX_SPLIT_SETTLE_TIMEOUT \
+    MIX_MAX_DURATION MIX_TARGET_CI MIX_QUIET_PERIOD MIX_SEED_TIMEOUT \
+    MIX_WARMUP_TIMEOUT \
     CONTENTION_KEYS CONTENTION_DURATION RUN_INLINE_PRESSURE \
     INLINE_PRESSURE_SETTLE_TIMEOUT; do
     printf '%s=%q\n' "$name" "${!name}" >>"$path"
