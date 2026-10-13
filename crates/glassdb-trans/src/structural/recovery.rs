@@ -17,9 +17,7 @@ use crate::monitor::Monitor;
 
 use super::NODE_CAS_ATTEMPTS;
 use super::nodes::StructuralNodeAccess;
-use super::reconcile::{
-    ParentReconciler, ParentReconciliation, ParentSplitContinuation, ReconciliationOutcome,
-};
+use super::reconcile::{ParentReconciler, ParentReconciliation, ReconciliationOutcome};
 use super::split::SplitReason;
 use super::topology::TopologyMembership;
 
@@ -832,14 +830,9 @@ impl StructuralRecovery {
                         recovery.phase = IntentRecoveryPhase::Delete;
                     }
                     ReconciliationOutcome::ParentRequiresSplit(action) => {
-                        let path = action.path;
-                        let participant = *participant;
-                        if action.continuation == ParentSplitContinuation::CompleteReconciliation {
-                            recovery.phase = IntentRecoveryPhase::Delete;
-                        }
                         return Ok(IntentRecoveryStep::SplitParent {
-                            path,
-                            participant,
+                            path: action.path,
+                            participant: *participant,
                             reason: action.reason,
                         });
                     }
@@ -1045,7 +1038,7 @@ impl StructuralRecovery {
             return Ok(IntentRecoveryPhase::Reconcile {
                 reconciliation: self
                     .reconciler
-                    .begin(collection, split_key, &created_node_ids[0]),
+                    .begin(collection, [(split_key.to_vec(), created_node_ids[0])]),
                 participant: intent.participant_id,
             });
         }
@@ -1099,7 +1092,7 @@ impl StructuralRecovery {
         Ok(IntentRecoveryPhase::Reconcile {
             reconciliation: self
                 .reconciler
-                .begin(collection, &target.boundary, &target.node_id),
+                .begin(collection, [(target.boundary.clone(), target.node_id)]),
             participant: intent.participant_id,
         })
     }

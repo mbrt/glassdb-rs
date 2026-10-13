@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{Background, ScanCadence, join_all_bounded, rt};
-use glassdb_data::{CollectionAddress, DbPrefix, ObjectPath, TxId};
+use glassdb_data::{CollectionAddress, DbPrefix, NodeId, ObjectPath, TxId};
 use glassdb_storage::{
     InlinePolicy, NodeSizePolicy, NodeStore, StructuralIntentStore, Timeline, TreeRouter,
 };
@@ -339,15 +339,22 @@ impl Restructurer {
         // Re-drive reconciliations a previous cycle could not land, so parents
         // eventually agree with their children and descent stops relying on
         // right-links.
-        for pending in self.reconciler.drain_pending() {
-            if let Err(e) = self
+        let mut pending = BTreeMap::<CollectionAddress, Vec<(Vec<u8>, NodeId)>>::new();
+        for route in self.reconciler.drain_pending() {
+            pending
+                .entry(route.collection)
+                .or_default()
+                .push((route.key, route.target));
+        }
+        for (collection, routes) in pending {
+            if let Err(failed) = self
                 .changes
-                .reconcile_parent(&pending.collection, &pending.key, &pending.target, None)
+                .reconcile_parents(&collection, routes, None)
                 .await
             {
                 tracing::debug!(
                     target: "glassdb::restructurer",
-                    error = %e,
+                    error = %failed.error,
                     "parent reconciliation deferred"
                 );
             }

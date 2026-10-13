@@ -630,6 +630,13 @@ same time, in batches of a fixed size. Each split keeps its own topology
 participant, but the participants of one collection share one CAS. Merges happen
 one at a time, after splits.
 
+The splits of one batch often have the same parent. A batch makes the node
+writes of its splits first, and then reconciles the parent of each collection
+once for all of them, with one gate and one CAS. The sweep, the deferred
+reconciliations, and structural recovery of one database instance take turns
+for each collection. Without the turns, they lose the gates of the parents to
+each other, and each loss sends changes to recovery.
+
 Each database instance decides on its own transactions, so instances can
 disagree on a leaf. A split or merge that a rule asks for keeps its paid rate
 in the leaves that it writes, and the opposite change of these leaves must pay

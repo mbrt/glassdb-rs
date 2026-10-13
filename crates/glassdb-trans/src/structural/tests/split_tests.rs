@@ -940,10 +940,16 @@ async fn separator_capacity_splits_parent_during_reconciliation_and_recovery() {
                 .is_empty()
             );
         } else {
-            sp.changes
-                .reconcile_parent(&collection(), b"h", &test_node_id("L7"), None)
-                .await
-                .unwrap();
+            assert!(
+                sp.changes
+                    .reconcile_parents(
+                        &collection(),
+                        vec![(b"h".to_vec(), test_node_id("L7"))],
+                        None
+                    )
+                    .await
+                    .is_ok()
+            );
         }
 
         let (root, _) = s
@@ -1973,6 +1979,71 @@ async fn one_sweep_of_splits_writes_the_collection_record_twice() {
         .await
         .unwrap();
     assert_eq!(leaves.len(), 2 * LEAVES);
+}
+
+// The sibling splits of one batch have the same parent. When each of them
+// gates the parent to add its own separator, they lose the gate to each other,
+// and under load many of them run out of tries and end in recovery.
+#[tokio::test]
+async fn sibling_splits_of_one_batch_reconcile_their_parent_together() {
+    const LEAVES: usize = 8;
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let s = store_with_backend(backend.clone() as Arc<dyn Backend>);
+    seed_sibling_leaves(&s, LEAVES).await;
+    let root_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    backend.set_before({
+        let root = ObjectPath::TreeRoot {
+            collection: collection(),
+        }
+        .to_string();
+        let root_writes = root_writes.clone();
+        move |op| {
+            if matches!(op, BackendOp::WriteIf { .. }) && op.path() == root {
+                root_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let future: HookFuture = Box::pin(async { Ok(()) });
+            future
+        }
+    });
+    let bg = Arc::new(Background::new());
+    let policy = NodeSizePolicy::builder()
+        .leaf_max_entries(2)
+        .node_soft_max_bytes(1 << 20)
+        .index_max_children(100)
+        .build()
+        .unwrap();
+    let candidates = MaintenanceCandidates::with_policy(policy);
+    push_soft_cap_splits(&candidates, LEAVES);
+    let sp = restructurer_with_candidates(&s, &bg, candidates);
+
+    sp.run_once().await;
+    backend.clear_before();
+
+    let stats = sp.stats_and_reset();
+    assert_eq!((stats.splits, stats.deferred), (LEAVES as u64, 0));
+    // One write gates the root, one adds the separators of all the splits
+    // and opens the gate.
+    assert_eq!(root_writes.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let (root, _) = s
+        .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    assert_eq!(root.as_index().unwrap().len(), 2 * LEAVES);
+    let (record, _) = s
+        .records
+        .load_record(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(record.topology_participants().count(), 0);
+    assert!(
+        s.discover_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 // When the participants of a batch cannot join the collection record, each
