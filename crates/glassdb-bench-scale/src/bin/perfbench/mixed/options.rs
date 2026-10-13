@@ -7,21 +7,23 @@ use super::workload::{KeySelection, SHAPE_COUNT};
 
 #[derive(Clone, Args)]
 pub(crate) struct Options {
-    /// Minimum measured window per cell. The cell keeps running all shapes
-    /// concurrently past this until every shape's throughput estimate reaches
-    /// `--target-ci`, or `--max-duration` is hit.
+    /// Minimum measured interval per cell. The cell keeps running all shapes
+    /// concurrently past this until every shape reaches `--window-commits`,
+    /// or `--max-duration` is hit.
     #[arg(long, default_value = "2s", value_parser = glassdb_bench_scale::parse_duration)]
     pub(super) duration: Duration,
-    /// Upper bound on a cell's measured window: the cell stops here even if a
-    /// shape (typically a heavily-contended write shape) has not yet reached
-    /// `--target-ci`; such a shape's result is flagged not-converged.
+    /// Upper bound on a cell's measured interval: the cell stops here even if
+    /// a shape (typically a heavily-contended write shape) has not yet reached
+    /// `--window-commits`; such a shape's result is flagged not-converged.
     #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
     pub(super) max_duration: Duration,
-    /// Target relative half-width of each shape's throughput 95% confidence
-    /// interval (`0.1` = +/-10%). The cell runs until every shape reaches it or
-    /// `--max-duration`. `0` disables adaptivity: run exactly `--duration`.
-    #[arg(long, default_value_t = 0.1)]
-    pub(super) target_ci: f64,
+    /// Mean commits per throughput window that every shape must reach. The
+    /// cell runs until each shape commits this many times the window count, or
+    /// until `--max-duration`. The counting noise of one window has a standard
+    /// deviation of about `1/sqrt(n)`, so about 14% with the default. `0`
+    /// disables adaptivity: run exactly `--duration`.
+    #[arg(long, default_value_t = 50)]
+    pub(super) window_commits: u64,
     /// Total concurrent workers per shape, split as evenly as possible across
     /// the Databases. A comma-separated list sweeps several worker counts.
     #[arg(long, value_delimiter = ',', default_value = "8")]

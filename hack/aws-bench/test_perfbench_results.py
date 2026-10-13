@@ -130,6 +130,46 @@ class PerfbenchResultsTest(unittest.TestCase):
         self.assertEqual(frame["database_limit"].unique().tolist(), [4])
         self.assertTrue(frame["workers"].isna().all())
 
+    def test_throughput_band_comes_from_window_percentiles(self) -> None:
+        shapes = [
+            {"shape": shape, "txPerSec": 1, "p50Ms": 1, "p90Ms": 2}
+            for shape in perfbench_results.SHAPES
+        ]
+        # Windows of 500 ms with 1 to 11 commits: 2 to 22 tx/s.
+        shapes[0].update(windowMs=500, windowCounts=list(range(1, 12)))
+        shapes[1].update(windowMs=0, windowCounts=[])
+        report = {
+            "schemaVersion": 1,
+            "scenario": "mixed",
+            "backend": "s3",
+            "modelTimeSpeedup": 1.0,
+            "runs": [
+                {
+                    "run": 1,
+                    "cells": [
+                        {
+                            "mode": "lo",
+                            "affinityPct": 50,
+                            "databases": 4,
+                            "failures": 0,
+                            "shapes": shapes,
+                        }
+                    ],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write(Path(directory_name), "mixed.json", report)
+            _, frame = perfbench_results.read_mixed(path, require_converged=False)
+
+        by_shape = frame.set_index("shape")
+        self.assertAlmostEqual(by_shape.loc["rwSingle", "throughput_p50"], 12.0)
+        self.assertAlmostEqual(by_shape.loc["rwSingle", "throughput_p90"], 20.0)
+        # Without windows, the line is the shape's throughput and there is no
+        # band.
+        self.assertTrue((by_shape.loc["rwMany":, "throughput_p50"] == 1).all())
+        self.assertTrue(by_shape.loc["rwMany":, "throughput_p90"].isna().all())
+
     def test_several_single_run_files_are_numbered_as_consecutive_runs(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             directory = Path(directory_name)

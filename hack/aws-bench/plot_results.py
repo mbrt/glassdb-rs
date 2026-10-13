@@ -19,7 +19,9 @@ The scenario recorded in each file selects the figures:
 `--series LABEL=FILE` (at least twice) overlays files of one scenario instead.
 Each scenario gets its own figures, named `cmp-<scenario>-*.png`.
 
-With several runs in a file, lines show the cross-run median. Pass `--canonical`
+Lines show the p50 and bands the p50 to p90 range: of a shape's throughput
+windows for throughput, and of its transaction latencies for latency. With
+several runs in a file, lines and band edges show the cross-run median. Pass `--canonical`
 to render the four fixed worker and affinity figures of the local S3 model
 instead; that mode insists on the complete grids described in the README.
 """
@@ -57,7 +59,11 @@ AFFINITY_DATABASES = (1, 3, 5, 7)
 EXPECTED_RUNS = (1, 2, 3)
 FIXED_AFFINITY_WORKERS = 20
 WORKER_DATABASE_LIMIT = 5
-METRICS = ("throughput", "p50_ms", "p90_ms")
+METRICS = ("throughput", "throughput_p50", "throughput_p90", "p50_ms", "p90_ms")
+# The line and band edges of each metric: (line, band low, band high).
+THROUGHPUT_BAND = ("throughput_p50", "throughput_p50", "throughput_p90")
+LATENCY_BAND = ("p50_ms", "p50_ms", "p90_ms")
+BAND_TITLE = "p50 line; p90 band"
 # One line style per overlaid source; shapes keep their colors.
 SOURCE_STYLES = ("-", "--", ":", "-.")
 # Dimensions that a generic mixed report may sweep along its x-axis.
@@ -161,30 +167,28 @@ def _plot_shape_lines(
         )
 
 
-def _plot_shape_latency_bands(
+def _plot_shape_bands(
     ax: plt.Axes,
     medians: pd.DataFrame,
     x: str,
+    band: tuple[str, str, str],
     colors: dict[str, Any],
     *,
     labels: bool = True,
 ) -> None:
+    line_column, low_column, high_column = band
     for shape in SHAPES:
         line = medians[medians["shape"] == shape].sort_values(x)
         x_values = line[x].to_numpy()
-        p50_values = line["p50_ms"].to_numpy()
-        p90_values = line["p90_ms"].to_numpy()
-        ax.fill_between(
-            x_values,
-            p50_values,
-            p90_values,
-            color=colors[shape],
-            alpha=0.15,
-            linewidth=0,
-        )
+        low, high = line[low_column].to_numpy(), line[high_column].to_numpy()
+        # Reports written before the throughput windows have no band.
+        if not pd.isna(high).all():
+            ax.fill_between(
+                x_values, low, high, color=colors[shape], alpha=0.15, linewidth=0
+            )
         ax.plot(
             x_values,
-            p50_values,
+            line[line_column].to_numpy(),
             color=colors[shape],
             label=SHAPE_LABELS[shape] if labels else None,
         )
@@ -194,8 +198,10 @@ def plot_worker_throughput(data: pd.DataFrame, out_dir: Path) -> Path:
     medians = median_rows(data, ["workers"])
     colors = _shape_colors()
     fig, ax = plt.subplots(figsize=(14, 6))
-    _plot_shape_lines(ax, medians, "workers", "throughput", colors)
-    ax.set_title("Mixed-workload throughput with isolated collections")
+    _plot_shape_bands(ax, medians, "workers", THROUGHPUT_BAND, colors)
+    ax.set_title(
+        f"Mixed-workload throughput with isolated collections\n{BAND_TITLE}"
+    )
     ax.set_xlabel("Concurrent workers per shape")
     ax.set_ylabel("Transactions / sec")
     ax.set_xticks(WORKER_TICKS)
@@ -209,9 +215,9 @@ def plot_worker_latency(data: pd.DataFrame, out_dir: Path) -> Path:
     medians = median_rows(data, ["workers"])
     colors = _shape_colors()
     fig, ax = plt.subplots(figsize=(14, 6))
-    _plot_shape_latency_bands(ax, medians, "workers", colors)
+    _plot_shape_bands(ax, medians, "workers", LATENCY_BAND, colors)
     ax.set_title(
-        "Mixed-workload latency with isolated collections\np50 line; p50–p90 band"
+        f"Mixed-workload latency with isolated collections\n{BAND_TITLE}"
     )
     ax.set_xlabel("Concurrent workers per shape")
     ax.set_ylabel("Latency (ms)")
@@ -235,11 +241,11 @@ def plot_affinity_throughput(data: pd.DataFrame, out_dir: Path) -> Path:
         zip(axes.flat, AFFINITY_DATABASES, strict=True)
     ):
         database_medians = medians[medians["database_limit"] == databases]
-        _plot_shape_lines(
+        _plot_shape_bands(
             ax,
             database_medians,
             "affinity",
-            "throughput",
+            THROUGHPUT_BAND,
             colors,
             labels=index == 0,
         )
@@ -248,7 +254,9 @@ def plot_affinity_throughput(data: pd.DataFrame, out_dir: Path) -> Path:
         ax.set_ylabel("Transactions / sec")
         ax.set_xticks(AFFINITY_POINTS)
     handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.suptitle("Throughput by home-collection affinity", y=0.99)
+    fig.suptitle(
+        f"Throughput by home-collection affinity — {BAND_TITLE}", y=0.99
+    )
     fig.legend(
         handles,
         labels,
@@ -269,10 +277,11 @@ def plot_affinity_latency(data: pd.DataFrame, out_dir: Path) -> Path:
         zip(axes.flat, AFFINITY_DATABASES, strict=True)
     ):
         database_medians = medians[medians["database_limit"] == databases]
-        _plot_shape_latency_bands(
+        _plot_shape_bands(
             ax,
             database_medians,
             "affinity",
+            LATENCY_BAND,
             colors,
             labels=index == 0,
         )
@@ -281,7 +290,7 @@ def plot_affinity_latency(data: pd.DataFrame, out_dir: Path) -> Path:
         ax.set_ylabel("Latency (ms)")
         ax.set_xticks(AFFINITY_POINTS)
     handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.suptitle("Latency by home-collection affinity — p50 line; p50–p90 band", y=0.99)
+    fig.suptitle(f"Latency by home-collection affinity — {BAND_TITLE}", y=0.99)
     fig.legend(
         handles,
         labels,
@@ -335,10 +344,9 @@ def _source_legend(fig: plt.Figure, sources: list[str]) -> None:
 def _plot_mode_panels(
     medians: pd.DataFrame,
     axis: str,
-    metric: str,
+    band: tuple[str, str, str],
     *,
     title: str,
-    bands: bool,
     out_dir: Path,
     name: str,
 ) -> Path:
@@ -349,7 +357,7 @@ def _plot_mode_panels(
     """
     modes = sorted(medians["mode"].unique())
     sources = list(dict.fromkeys(medians["source"]))
-    bands = bands and len(sources) == 1
+    bands = len(sources) == 1
     colors = _shape_colors()
     fig, axes = plt.subplots(
         1, len(modes), figsize=(max(7 * len(modes), 11), 6), sharey=True, squeeze=False
@@ -360,13 +368,13 @@ def _plot_mode_panels(
                 (medians["mode"] == mode) & (medians["source"] == source)
             ]
             if bands:
-                _plot_shape_latency_bands(ax, selected, axis, colors, labels=False)
+                _plot_shape_bands(ax, selected, axis, band, colors, labels=False)
             else:
                 _plot_shape_lines(
                     ax,
                     selected,
                     axis,
-                    metric,
+                    band[0],
                     colors,
                     labels=False,
                     linestyle=SOURCE_STYLES[index % len(SOURCE_STYLES)],
@@ -375,7 +383,9 @@ def _plot_mode_panels(
         ax.set_xlabel(MIXED_AXES[axis])
         ax.set_xticks(sorted(medians[medians["mode"] == mode][axis].unique()))
         ax.tick_params(axis="x", labelrotation=45)
-    axes.flat[0].set_ylabel("Latency (ms)" if "ms" in metric else "Transactions / sec")
+    axes.flat[0].set_ylabel(
+        "Latency (ms)" if band == LATENCY_BAND else "Transactions / sec"
+    )
     axes.flat[0].set_ylim(bottom=0)
     fig.suptitle(title)
     _source_legend(fig, sources)
@@ -406,19 +416,18 @@ def plot_mixed_report(
         _plot_mode_panels(
             medians,
             axis,
-            "throughput",
-            title="Mixed-workload throughput",
-            bands=False,
+            THROUGHPUT_BAND,
+            title="Mixed-workload throughput"
+            + ("" if overlay else f" — {BAND_TITLE}"),
             out_dir=out_dir,
             name=f"{stem}-throughput.png",
         ),
         _plot_mode_panels(
             medians,
             axis,
-            "p50_ms",
+            LATENCY_BAND,
             title="Mixed-workload latency — "
-            + ("p50" if overlay else "p50 line; p50–p90 band"),
-            bands=True,
+            + ("p50" if overlay else BAND_TITLE),
             out_dir=out_dir,
             name=f"{stem}-latency.png",
         ),

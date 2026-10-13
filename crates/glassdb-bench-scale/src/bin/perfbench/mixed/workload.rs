@@ -378,7 +378,10 @@ fn split_workers(workers: usize, databases: usize) -> Vec<usize> {
         .collect()
 }
 
-/// Runs one worker until the cell or its shape reaches its stopping condition.
+/// Runs one worker until the cell stops.
+///
+/// Only the cell stops the workers: if one shape stopped first, the windows
+/// would end with an idle tail that lowers the last window.
 async fn worker(
     db: Database,
     collections: Arc<[Collection]>,
@@ -390,7 +393,7 @@ async fn worker(
 ) -> Result<(), GError> {
     let mut rng = StdRng::seed_from_u64(seed);
     let key_count = shape.key_count(ctx.multi_keys, ctx.pool_size);
-    while !ctx.stop.load(Ordering::Relaxed) && !bench.is_finished() {
+    while !ctx.stop.load(Ordering::Relaxed) {
         ctx.pause.pass(&ctx.stop).await;
         if ctx.stop.load(Ordering::Relaxed) {
             break;

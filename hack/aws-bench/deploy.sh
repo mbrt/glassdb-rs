@@ -52,7 +52,7 @@
 #   MIX_MULTI_KEYS   keys per multi-key transaction  (default: 10)
 #   MIX_DURATION     minimum measured cell window    (default: 5s)
 #   MIX_MAX_DURATION maximum measured cell window    (default: 120s)
-#   MIX_TARGET_CI    throughput CI relative half-width (default: 0.1)
+#   MIX_WINDOW_COMMITS mean commits per throughput window (default: 50)
 #   MIX_QUIET_PERIOD time without topology changes that settles the seed
 #                    and ends a cell's warm-up        (default: 10s)
 #   MIX_SEED_TIMEOUT limit of the seed settlement; each cell seeds again on
@@ -98,7 +98,7 @@ MIX_HOT_KEYS="${MIX_HOT_KEYS:-8}"
 MIX_MULTI_KEYS="${MIX_MULTI_KEYS:-10}"
 MIX_DURATION="${MIX_DURATION:-5s}"
 MIX_MAX_DURATION="${MIX_MAX_DURATION:-120s}"
-MIX_TARGET_CI="${MIX_TARGET_CI:-0.1}"
+MIX_WINDOW_COMMITS="${MIX_WINDOW_COMMITS:-50}"
 MIX_QUIET_PERIOD="${MIX_QUIET_PERIOD:-10s}"
 MIX_SEED_TIMEOUT="${MIX_SEED_TIMEOUT:-120s}"
 MIX_WARMUP_TIMEOUT="${MIX_WARMUP_TIMEOUT:-120s}"
@@ -125,7 +125,7 @@ write_config() {
   for name in \
     RUNS RUN_COOLDOWN DRAIN_TIMEOUT MIX_MODES MIX_AFFINITIES MIX_DATABASES \
     MIX_WORKERS MIX_NUM_KEYS MIX_SHARED_PCT MIX_HOT_KEYS MIX_MULTI_KEYS MIX_DURATION \
-    MIX_MAX_DURATION MIX_TARGET_CI MIX_QUIET_PERIOD MIX_SEED_TIMEOUT \
+    MIX_MAX_DURATION MIX_WINDOW_COMMITS MIX_QUIET_PERIOD MIX_SEED_TIMEOUT \
     MIX_WARMUP_TIMEOUT \
     CONTENTION_KEYS CONTENTION_DURATION RUN_INLINE_PRESSURE \
     INLINE_PRESSURE_SETTLE_TIMEOUT; do

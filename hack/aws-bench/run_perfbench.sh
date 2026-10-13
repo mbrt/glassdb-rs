@@ -20,7 +20,7 @@ common=(
   --num-keys="$MIX_NUM_KEYS" --shared-pct="$MIX_SHARED_PCT" \
   --hot-keys="$MIX_HOT_KEYS" \
   --multi-keys="$MIX_MULTI_KEYS" --duration="$MIX_DURATION" \
-  --max-duration="$MIX_MAX_DURATION" --target-ci="$MIX_TARGET_CI" \
+  --max-duration="$MIX_MAX_DURATION" --window-commits="$MIX_WINDOW_COMMITS" \
   --quiet-period="$MIX_QUIET_PERIOD" --seed-timeout="$MIX_SEED_TIMEOUT" \
   --warmup-timeout="$MIX_WARMUP_TIMEOUT"
 

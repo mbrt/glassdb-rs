@@ -321,10 +321,7 @@ impl Measured {
             return;
         };
         match &mut self.results {
-            Some(results) => {
-                results.samples.extend(other.samples);
-                results.tot_duration += other.tot_duration;
-            }
+            Some(results) => results.append(other),
             None => self.results = Some(other),
         }
     }

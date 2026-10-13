@@ -192,8 +192,9 @@ def _geomean(s: pd.Series) -> float:
 # Fallback only: for mixbench JSON that predates sequential sampling (no
 # per-shape `converged` flag), an aggregated cell below this many committed
 # transactions is too small to trust and its ratio is flagged `[low-sample]`.
-# Current mixed runs to a target CI instead, flagging `[unconverged]` when the
-# time cap is hit first, so this floor is not consulted for fresh results.
+# Current mixed runs to a target number of commits per throughput window
+# instead, flagging `[unconverged]` when the time cap is hit first, so this
+# floor is not consulted for fresh results.
 LOW_SAMPLE_FLOOR = 1000
 
 # Ratios within +/- this of 1.0 are called `~same` rather than better/worse, so
@@ -696,7 +697,7 @@ def mixed_shape_table(a: Any, b: Any) -> pd.DataFrame:
                     "committed_a": x.get("committed", float("nan")),
                     "committed_b": y.get("committed", float("nan")),
                     # Mixed sequential sampling: True once the shape's
-                    # throughput CI met --target-ci. Absent (None) for legacy
+                    # throughput windows met --window-commits. Absent (None) for legacy
                     # JSON, in which case the digest falls back to a sample floor.
                     "converged_a": x.get("converged"),
                     "converged_b": y.get("converged"),
@@ -727,7 +728,7 @@ def mixed_shape_table(a: Any, b: Any) -> pd.DataFrame:
 
 
 def _paired_converged(grp: pd.DataFrame) -> pd.Series | None:
-    """A cell's combined convergence (both sides reached `--target-ci`) for a
+    """A cell's combined convergence (both sides reached `--window-commits`) for a
     group of paired mixed-workload rows, or `None` when the JSON predates
     sequential sampling (so the digest falls back to the sample-count floor). A missing
     per-side flag is treated as converged so legacy-vs-new mixes never spuriously
@@ -845,8 +846,9 @@ def append_summary(path: Path, title: str, summaries: list[str]) -> None:
     one compact, trackable digest per run. Each line carries its own polarity
     verdict (`=> better/WORSE/~same`) and, where relevant, a sample-size note and
     a `[noisy]`/`[unconverged]` tag.
-    Mixed cells run to a target CI (flagged `[unconverged]` if the time cap is
-    hit first), and the contention section is indicative only."""
+    Mixed cells run to a target number of commits per window (flagged
+    `[unconverged]` if the time cap is hit first), and the contention section
+    is indicative only."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"## {title or 'comparison'}", ""]
     if summaries:
@@ -1394,9 +1396,9 @@ def main() -> int:
             ]
             print_table(f"Mixed workload per-shape ({lb}/{la})", tbl[cols])
             # Throughput ratio per shape (geomean aggregates mode/affinity cells).
-            # The mixed scenario runs each cell until its throughput
-            # CI meets --target-ci, so a converged tps ratio is significant; a cell
-            # that hit the time cap first is flagged [unconverged] (see
+            # The mixed scenario runs each cell until its throughput windows
+            # meet --window-commits, so a converged tps ratio is significant; a
+            # cell that hit the time cap first is flagged [unconverged] (see
             # `_paired_converged`).
             for shape, grp in tbl.groupby("shape"):
                 summaries.append(
@@ -1452,7 +1454,7 @@ def main() -> int:
         "\n## Summary (ratio = b/a; throughput >1 good, latency/ops/cost <1 good; "
         "=> tag reads the right direction per metric; [noisy] = run-to-run "
         "variable, [unconverged] = mixed workload hit its time cap before reaching "
-        "--target-ci so read as indicative, [low-sample] = legacy fallback)\n"
+        "--window-commits so read as indicative, [low-sample] = legacy fallback)\n"
     )
     for s in summaries:
         print(f"- {s}")

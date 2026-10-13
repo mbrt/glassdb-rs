@@ -29,11 +29,12 @@
 //! outside the measured interval.
 //!
 //! Each cell uses **sequential (adaptive) sampling**: all shapes run
-//! concurrently until every shape has committed enough transactions for its
-//! throughput 95% confidence interval to reach `--target-ci` (or `--max-duration`
-//! caps the run). Heavily-contended write shapes therefore run longer to earn
-//! significance instead of returning a noisy fixed-window number, while cheap
-//! read shapes stop being the reason the cell keeps going once they are precise.
+//! concurrently until every shape has committed `--window-commits` per
+//! throughput window on average (or `--max-duration` caps the run). The
+//! measured interval is split into equal windows, and the commit counts of the
+//! windows give the throughput distribution of each shape. Heavily-contended
+//! write shapes therefore run longer to earn a stable distribution instead of
+//! returning a noisy fixed-interval number.
 //!
 mod options;
 mod result;
@@ -48,7 +49,6 @@ use std::time::SystemTime;
 use tokio::runtime::Handle;
 
 use glassdb_backend::Backend;
-use glassdb_bench_scale::bench::samples_for_rel_ci;
 use glassdb_bench_scale::run::join_tasks_until;
 
 use super::backend;
@@ -219,7 +219,7 @@ fn run_cell(
     );
 
     let stop = Arc::new(AtomicBool::new(false));
-    let target = samples_for_rel_ci(options.target_ci);
+    let target = options.window_commits * result::THROUGHPUT_WINDOWS as u64;
     let key_selection = dimension.mode.key_selection(options);
     let ctx = workload::WorkerCtx::new(
         stop.clone(),
@@ -255,12 +255,14 @@ fn run_cell(
             options.max_duration,
         )
         .await;
+        // The windows end when the workers stop, so the drain of the
+        // transactions in flight does not lower the last window.
+        workload::end_measurement(&plans);
         let deadline = tokio::time::Instant::now() + execution.drain_timeout;
         let run = join_tasks_until(handles, deadline).await;
         (warmup, drive, active, run, deadline)
     });
 
-    workload::end_measurement(&plans);
     let completed = active.teardown(handle, deadline, run)?;
     let cell_converged = match drive {
         DriveOutcome::Converged => true,
@@ -277,7 +279,7 @@ fn run_cell(
         );
     }
     if !cell_converged {
-        eprintln!("{}", result::cell_capped(dimension, options.target_ci));
+        eprintln!("{}", result::cell_capped(dimension, options.window_commits));
     }
 
     Ok(CellResult::summarize(
