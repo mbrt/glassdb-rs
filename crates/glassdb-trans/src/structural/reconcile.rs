@@ -3,11 +3,13 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use glassdb_concurr::shard;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::{
     CurrentnessBarrier, IndexNode, LeafObservation, Node, Requirement, StorageError, Timeline,
     TreeRouter,
 };
+use tokio::sync::Semaphore;
 
 use crate::error::TransError;
 
@@ -19,6 +21,11 @@ use super::split::SplitReason;
 /// full is safe: its parent still routes correctly through right links, only
 /// with extra hops.
 pub(super) const DEFERRED_RECONCILIATION_CAP: usize = 4096;
+
+/// The groups of collections whose reconciliations in this database instance
+/// take turns. Collections of one group also take turns with each other,
+/// which only delays them. Must be a power of two.
+const COLLECTION_TURNS: usize = 16;
 
 /// Bounded attempts to reconcile a contended parent before deferring it to a
 /// later sweep. Descent works meanwhile through right links.
@@ -41,27 +48,34 @@ pub(super) struct PendingReconciliation {
     pub(super) target: NodeId,
 }
 
+/// The reconciliation of the parents of one or more routes of one collection.
 pub(super) struct ParentReconciliation {
-    pending: PendingReconciliation,
+    collection: CollectionAddress,
+    // The routes whose parents do not agree with them yet, as the key and
+    // the node that covers it after the structural change.
+    routes: Vec<(Vec<u8>, NodeId)>,
     pub(super) start: CurrentnessBarrier,
     retries_remaining: usize,
 }
 
 pub(super) enum ReconciliationOutcome {
     Reconciled,
+    /// The parent must split before the reconciliation can continue. The
+    /// caller splits it, and then continues the reconciliation.
     ParentRequiresSplit(ParentRequiresSplit),
 }
 
 pub(super) struct ParentRequiresSplit {
     pub(super) path: ObjectPath,
     pub(super) reason: SplitReason,
-    pub(super) continuation: ParentSplitContinuation,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ParentSplitContinuation {
-    ResumeReconciliation,
-    CompleteReconciliation,
+impl ParentReconciliation {
+    /// Returns the keys of the routes whose parents do not agree with them
+    /// yet.
+    pub(super) fn unresolved_keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.routes.iter().map(|(key, _)| key.as_slice())
+    }
 }
 
 /// Makes parents agree with the right-link chains of their children, and owns
@@ -73,6 +87,10 @@ pub(super) struct ParentReconciler {
     timeline: Timeline,
     candidates: MaintenanceCandidates,
     pending: Arc<Mutex<VecDeque<PendingReconciliation>>>,
+    // The sweep, the deferred reconciliations, and structural recovery
+    // reconcile the same parents. Without turns, they lose the gates of the
+    // parents to each other, and each loss sends changes to recovery.
+    collection_turns: Arc<[Semaphore]>,
 }
 
 impl ParentReconciler {
@@ -88,6 +106,7 @@ impl ParentReconciler {
             timeline,
             candidates,
             pending: Arc::new(Mutex::new(VecDeque::new())),
+            collection_turns: (0..COLLECTION_TURNS).map(|_| Semaphore::new(1)).collect(),
         }
     }
 
@@ -106,62 +125,67 @@ impl ParentReconciler {
         self.pending.lock().unwrap().drain(..).collect()
     }
 
-    /// Starts the reconciliation of the parent that routes `key` to `target`,
-    /// after a structural change that `target` now covers `key` for.
+    /// Starts the reconciliation of the parents that route each key of
+    /// `routes` to its node, after the structural changes that made the node
+    /// cover the key.
     pub(super) fn begin(
         &self,
         collection: &CollectionAddress,
-        key: &[u8],
-        target: &NodeId,
+        routes: impl IntoIterator<Item = (Vec<u8>, NodeId)>,
     ) -> ParentReconciliation {
         ParentReconciliation {
-            pending: PendingReconciliation {
-                collection: collection.clone(),
-                key: key.to_vec(),
-                target: *target,
-            },
+            collection: collection.clone(),
+            routes: routes.into_iter().collect(),
             start: self.timeline.currentness_barrier(),
             retries_remaining: PARENT_RETRIES,
         }
     }
 
-    /// Makes the parent agree with the chain of its children through the key,
-    /// or requests the parent split needed to continue safely.
+    /// Makes the parents agree with the chains of their children through
+    /// the keys, or requests the parent split needed to continue safely.
+    ///
+    /// The routes of one parent change it with one gate and one CAS. The
+    /// sibling splits of one sweep have the same parent, and they otherwise
+    /// lose the gate of the parent to each other. The reconciliations of one
+    /// collection in this database instance take turns for the same reason.
+    /// A turn ends before the parent split that the outcome can request, so
+    /// that the reconciliation of that split can take its own turn.
     pub(super) async fn reconcile(
         &self,
         reconciliation: &mut ParentReconciliation,
     ) -> Result<ReconciliationOutcome, TransError> {
-        while reconciliation.retries_remaining > 0 {
+        let turns = shard::index(
+            reconciliation.collection.physical_prefix().as_bytes(),
+            COLLECTION_TURNS,
+        );
+        let _turn = self.collection_turns[turns]
+            .acquire()
+            .await
+            .map_err(|_| TransError::other("reconciliation turns are closed"))?;
+        while !reconciliation.routes.is_empty() && reconciliation.retries_remaining > 0 {
             reconciliation.retries_remaining -= 1;
-            let pending = &reconciliation.pending;
-            let Some(parent) = self
-                .router
-                .parent_of(
-                    &pending.collection,
-                    &pending.key,
-                    &pending.target,
-                    Requirement::after(reconciliation.start),
-                )
-                .await?
-            else {
-                return Ok(ReconciliationOutcome::Reconciled);
+            let Some((parent, keys)) = self.next_parent(reconciliation).await? else {
+                continue;
             };
-            let parent_id = match &parent.path {
+            let parent_id = match &parent {
                 ObjectPath::TreeRoot { .. } => None,
                 ObjectPath::Node { id, .. } => Some(*id),
                 _ => return Err(TransError::other("router returned a non-node parent path")),
             };
+            let collection = &reconciliation.collection;
             let Some((lock_id, locked_parent, observation)) = self
                 .structure
-                .begin_gated_worker(&pending.collection, parent_id.as_ref())
+                .begin_gated_worker(collection, parent_id.as_ref())
                 .await?
             else {
                 continue;
             };
+            let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
             let reconciled = self
                 .reconcile_gated_parent(
-                    pending,
-                    &parent.path,
+                    collection,
+                    &key_refs,
+                    &parent,
                     &locked_parent,
                     &observation,
                     &lock_id,
@@ -170,21 +194,36 @@ impl ParentReconciler {
                 .await;
             let released = self
                 .structure
-                .finish_gated_worker(&pending.collection, parent_id.as_ref(), &lock_id)
+                .finish_gated_worker(collection, parent_id.as_ref(), &lock_id)
                 .await;
-            match reconciled? {
-                Some(outcome) => {
-                    released?;
-                    return Ok(outcome);
+            let Some(gated) = reconciled? else {
+                let _ = released;
+                continue;
+            };
+            released?;
+            match gated {
+                GatedOutcome::Landed(outcome) => {
+                    reconciliation.routes.retain(|(key, _)| !keys.contains(key));
+                    reconciliation.retries_remaining = PARENT_RETRIES;
+                    if let Some(split) = outcome {
+                        return Ok(ReconciliationOutcome::ParentRequiresSplit(split));
+                    }
                 }
-                None => {
-                    let _ = released;
-                    continue;
+                GatedOutcome::SplitFirst(split) => {
+                    return Ok(ReconciliationOutcome::ParentRequiresSplit(split));
                 }
             }
         }
-
-        self.defer(reconciliation.pending.clone());
+        if reconciliation.routes.is_empty() {
+            return Ok(ReconciliationOutcome::Reconciled);
+        }
+        for (key, target) in &reconciliation.routes {
+            self.defer(PendingReconciliation {
+                collection: reconciliation.collection.clone(),
+                key: key.clone(),
+                target: *target,
+            });
+        }
         Err(TransError::Retry)
     }
 
@@ -222,31 +261,65 @@ impl ParentReconciler {
         ))
     }
 
-    /// Reconciles the gated parent with the chain of its children through the
-    /// key.
+    /// Returns a parent of the routes, and the keys of the routes that it is
+    /// the parent of. Removes the routes that no parent routes to their node
+    /// any more. `None` reports that no route remains.
+    async fn next_parent(
+        &self,
+        reconciliation: &mut ParentReconciliation,
+    ) -> Result<Option<(ObjectPath, Vec<Vec<u8>>)>, TransError> {
+        let requirement = Requirement::after(reconciliation.start);
+        let mut parents = Vec::with_capacity(reconciliation.routes.len());
+        for (key, target) in &reconciliation.routes {
+            let parent = self
+                .router
+                .parent_of(&reconciliation.collection, key, target, requirement)
+                .await?;
+            parents.push(parent.map(|parent| parent.path));
+        }
+        let mut parents = parents.into_iter();
+        let mut first = None;
+        let mut keys = Vec::new();
+        reconciliation.routes.retain(|(key, _)| {
+            let Some(parent) = parents.next().flatten() else {
+                return false;
+            };
+            let first = first.get_or_insert_with(|| parent.clone());
+            if *first == parent {
+                keys.push(key.clone());
+            }
+            true
+        });
+        Ok(first.map(|first| (first, keys)))
+    }
+
+    /// Reconciles the gated parent with the chains of its children through
+    /// each of `keys`.
     ///
     /// `None` reports a lost CAS, which the caller retries. The gate stays
     /// installed on every path, because the caller releases it once.
+    #[allow(clippy::too_many_arguments)]
     async fn reconcile_gated_parent(
         &self,
-        pending: &PendingReconciliation,
+        collection: &CollectionAddress,
+        keys: &[&[u8]],
         parent_path: &ObjectPath,
         parent: &Node,
         observation: &LeafObservation,
         lock_id: &TxId,
         barrier: CurrentnessBarrier,
-    ) -> Result<Option<ReconciliationOutcome>, TransError> {
+    ) -> Result<Option<GatedOutcome>, TransError> {
         let Some(index) = parent.as_index() else {
-            return Ok(Some(ReconciliationOutcome::Reconciled));
+            return Ok(Some(GatedOutcome::Landed(None)));
         };
-        let chain = self
-            .child_chain(&pending.collection, index, &pending.key, barrier)
-            .await?;
-        let path: Vec<(NodeId, &Node)> = chain.iter().map(|(id, node)| (*id, node)).collect();
         let mut new_index = index.clone();
-        new_index.reconcile(&path);
+        for key in keys {
+            let chain = self.child_chain(collection, index, key, barrier).await?;
+            let path: Vec<(NodeId, &Node)> = chain.iter().map(|(id, node)| (*id, node)).collect();
+            new_index.reconcile(&path);
+        }
         if new_index == *index {
-            return Ok(Some(ReconciliationOutcome::Reconciled));
+            return Ok(Some(GatedOutcome::Landed(None)));
         }
         let mut updated = parent.clone();
         updated.set_index(new_index)?;
@@ -255,13 +328,10 @@ impl ParentReconciler {
             || updated.encoded_len() > policy.node_max_bytes()
         {
             if index.len() >= 2 {
-                return Ok(Some(ReconciliationOutcome::ParentRequiresSplit(
-                    ParentRequiresSplit {
-                        path: parent_path.clone(),
-                        reason: SplitReason::Capacity,
-                        continuation: ParentSplitContinuation::ResumeReconciliation,
-                    },
-                )));
+                return Ok(Some(GatedOutcome::SplitFirst(ParentRequiresSplit {
+                    path: parent_path.clone(),
+                    reason: SplitReason::Capacity,
+                })));
             }
             return Err(TransError::InvalidInput(
                 "separator exceeds the coordination node size limit".into(),
@@ -278,15 +348,21 @@ impl ParentReconciler {
             return Ok(None);
         }
         if updated.over_soft_cap(policy) {
-            return Ok(Some(ReconciliationOutcome::ParentRequiresSplit(
-                ParentRequiresSplit {
-                    path: parent_path.clone(),
-                    reason: SplitReason::SoftCap,
-                    continuation: ParentSplitContinuation::CompleteReconciliation,
-                },
-            )));
+            return Ok(Some(GatedOutcome::Landed(Some(ParentRequiresSplit {
+                path: parent_path.clone(),
+                reason: SplitReason::SoftCap,
+            }))));
         }
         self.candidates.observe_index(parent_path, &updated);
-        Ok(Some(ReconciliationOutcome::Reconciled))
+        Ok(Some(GatedOutcome::Landed(None)))
     }
+}
+
+/// The result of one reconciliation of a gated parent.
+enum GatedOutcome {
+    /// The parent agrees with the routes. It must split after, if it holds a
+    /// split request.
+    Landed(Option<ParentRequiresSplit>),
+    /// The parent must split before it can agree with the routes.
+    SplitFirst(ParentRequiresSplit),
 }

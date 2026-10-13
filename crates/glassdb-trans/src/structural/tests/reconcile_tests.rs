@@ -57,7 +57,8 @@ async fn reconciler(s: &TestStore, bg: &Arc<Background>) -> ParentReconciler {
 async fn reconciled_root(s: &TestStore, key: &[u8], target: &str) -> IndexNode {
     let bg = Arc::new(Background::new());
     let reconciler = reconciler(s, &bg).await;
-    let mut reconciliation = reconciler.begin(&collection(), key, &test_node_id(target));
+    let mut reconciliation =
+        reconciler.begin(&collection(), [(key.to_vec(), test_node_id(target))]);
     assert!(matches!(
         reconciler.reconcile(&mut reconciliation).await.unwrap(),
         ReconciliationOutcome::Reconciled
@@ -134,7 +135,7 @@ async fn reconciliation_rechecks_a_child_read_started_before_the_split() {
     )
     .await
     .unwrap();
-    let mut reconciliation = reconciler.begin(&collection(), b"m", &test_node_id("L1"));
+    let mut reconciliation = reconciler.begin(&collection(), [(b"m".to_vec(), test_node_id("L1"))]);
     hook.clear_after();
     release.notify_one();
     let (old_child, old_observation) = pending.await.unwrap().unwrap();
@@ -271,4 +272,56 @@ async fn parent_reconciliation_fails_on_a_right_link_cycle() {
         error.to_string().contains("right-link hop bound"),
         "unexpected reconciliation error: {error}"
     );
+}
+
+// The sweep, the deferred reconciliations, and structural recovery reconcile
+// the same parents. When two of them gate one parent at the same time, one
+// loses the gate, and its changes end in recovery. The first gate write here
+// waits until the second reconciliation has started.
+#[tokio::test]
+async fn reconciliations_of_one_collection_take_turns() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let s = store_with_backend(backend.clone() as Arc<dyn Backend>);
+    seed_unpublished_leaf_chain(&s, &[(b"", "L0")]).await;
+    let bg = Arc::new(Background::new());
+    let reconciler = reconciler(&s, &bg).await;
+    let second_started = Arc::new(tokio::sync::Notify::new());
+    let gate_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    backend.set_before({
+        let root = root_path().to_string();
+        let second_started = second_started.clone();
+        let gate_writes = gate_writes.clone();
+        move |op| {
+            let first = matches!(op, BackendOp::WriteIf { .. })
+                && op.path() == root
+                && gate_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            let second_started = second_started.clone();
+            let future: HookFuture = Box::pin(async move {
+                if first {
+                    // Leaves time for the second reconciliation to gate the
+                    // parent, if it does not wait for its turn.
+                    second_started.notified().await;
+                    for _ in 0..100 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Ok(())
+            });
+            future
+        }
+    });
+
+    let mut first = reconciler.begin(&collection(), [(b"m".to_vec(), test_node_id("L1"))]);
+    let mut second = reconciler.begin(&collection(), [(b"t".to_vec(), test_node_id("L4"))]);
+    let (first, second) = tokio::join!(reconciler.reconcile(&mut first), async {
+        second_started.notify_one();
+        reconciler.reconcile(&mut second).await
+    });
+    backend.clear_before();
+
+    assert!(matches!(first, Ok(ReconciliationOutcome::Reconciled)));
+    assert!(matches!(second, Ok(ReconciliationOutcome::Reconciled)));
+    assert!(reconciler.drain_pending().is_empty());
+    // Each reconciliation gates the parent once and changes it once.
+    assert_eq!(gate_writes.load(std::sync::atomic::Ordering::SeqCst), 4);
 }

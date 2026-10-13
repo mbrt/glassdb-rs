@@ -8,10 +8,12 @@
 //! the intent when the change completes, discards it when the change stops
 //! before `Ready`, and leaves it to recovery otherwise.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use glassdb_concurr::rt;
+use glassdb_concurr::{join_all_bounded, rt};
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::{LeafObservation, Node, Requirement};
 use tokio::sync::Notify;
@@ -24,7 +26,7 @@ use super::measurements;
 use super::merge::{MergeReason, Merger};
 use super::nodes::StructuralNodeAccess;
 use super::reclamation::ReclamationReporter;
-use super::reconcile::{ParentReconciler, ParentSplitContinuation, ReconciliationOutcome};
+use super::reconcile::{ParentReconciler, ParentReconciliation, ReconciliationOutcome};
 use super::recovery::{
     ChangeKind, PreparedIntent, PreparedIntentCancellation, ReadyChange, ReadyIntent,
     ReadyIntentCompletion, ReadyIntentTransition, StructuralRecovery,
@@ -126,6 +128,67 @@ struct StructuralChangeAttempt<'a> {
     worker: &'a TxId,
 }
 
+/// The parents that a reconciliation could not make agree with their routes.
+pub(super) struct UnreconciledParents {
+    pub(super) error: TransError,
+    /// The keys of the routes whose parents can disagree with them. `None`
+    /// reports that a parent split failed beneath the participant of another
+    /// change, which then can have an intent left.
+    pub(super) keys: Option<BTreeSet<Vec<u8>>>,
+}
+
+/// The change of an owned participant after its node writes, with the
+/// witness that can still discard its Preparing intent.
+struct Written {
+    coordinated: Coordinated,
+    cancellation: PreparedIntentCancellation,
+}
+
+/// The state of a change after its node writes.
+// One value exists for each change of a batch, and only while it runs, so
+// the size of its largest variant costs nothing.
+#[allow(clippy::large_enum_variant)]
+enum Coordinated {
+    /// The change ended, or left its Ready intent to recovery.
+    Ended(ChangeAttemptOutcome),
+    /// The node writes of the change landed. Its parent must agree with its
+    /// route before its Ready intent completes.
+    Landed(LandedChange),
+}
+
+impl Coordinated {
+    /// Returns the route that the parent of a change must hold, after its
+    /// node writes landed.
+    fn route(&self) -> Option<&ParentRoute> {
+        match self {
+            Coordinated::Landed(landed) => landed.route.as_ref(),
+            Coordinated::Ended(_) => None,
+        }
+    }
+}
+
+impl UnreconciledParents {
+    /// Reports whether the parent of the route for `key` can disagree with
+    /// it.
+    fn includes(&self, key: &[u8]) -> bool {
+        self.keys.as_ref().is_none_or(|keys| keys.contains(key))
+    }
+}
+
+/// A change whose node writes landed.
+struct LandedChange {
+    ready: ReadyIntent,
+    route: Option<ParentRoute>,
+    /// The time that a change of a leaf held the gate.
+    gate_time: Option<Duration>,
+}
+
+/// One change of a sweep, which owns its topology participant `worker`.
+pub(super) struct SweepChange<'a> {
+    pub(super) change: PlannedChange<'a>,
+    pub(super) worker: TxId,
+}
+
 impl ChangeLifecycle {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
@@ -160,13 +223,113 @@ impl ChangeLifecycle {
         worker: TxId,
         topology: StructuralTopology<'_>,
     ) -> Result<(), TransError> {
-        StructuralChangeAttempt {
-            lifecycle: self,
-            change,
-            worker: &worker,
+        match topology {
+            StructuralTopology::Owned => self
+                .run_sweep(vec![&SweepChange { change, worker }], NonZeroUsize::MIN)
+                .await
+                .pop()
+                .expect("a sweep returns one result for each change"),
+            StructuralTopology::Joined(participant) => {
+                StructuralChangeAttempt {
+                    lifecycle: self,
+                    change,
+                    worker: &worker,
+                }
+                .run_joined(participant)
+                .await
+            }
         }
-        .run(topology)
-        .await
+    }
+
+    /// Makes the `changes` of one sweep, at most `parallelism` at a time,
+    /// and returns the result of each one. Each change completes, or leaves
+    /// its Ready intent to recovery.
+    ///
+    /// Each change has its own topology participant, but the participants of
+    /// one collection join and leave its record with one CAS. Concurrent
+    /// changes of one collection otherwise lose most of their record CASes to
+    /// each other, and back off for longer than the changes take.
+    pub(super) async fn run_sweep(
+        &self,
+        changes: Vec<&SweepChange<'_>>,
+        parallelism: NonZeroUsize,
+    ) -> Vec<Result<(), TransError>> {
+        // The futures are collected before they run, because an iterator of
+        // closures over borrowed state held across an await is not `Send`.
+        let attempts: Vec<_> = changes
+            .into_iter()
+            .map(|change| StructuralChangeAttempt {
+                lifecycle: self,
+                change: change.change,
+                worker: &change.worker,
+            })
+            .collect();
+        let preparing: Vec<_> = attempts
+            .iter()
+            .map(|attempt| attempt.prepare_owned())
+            .collect();
+        let prepared = join_all_bounded(preparing, parallelism).await;
+
+        let mut joining = Participants::default();
+        for (attempt, prepared) in attempts.iter().zip(&prepared) {
+            if prepared.is_ok() {
+                joining.add(attempt);
+            }
+        }
+        let joined = joining.join(&self.topology, parallelism).await;
+
+        let writing: Vec<_> = attempts
+            .iter()
+            .zip(prepared)
+            .map(|(attempt, prepared)| attempt.write_admitted(prepared, &joined))
+            .collect();
+        let written = join_all_bounded(writing, parallelism).await;
+
+        // The sibling changes of one batch have the same parent, so their
+        // routes reconcile together. They otherwise lose the gate of the
+        // parent to each other, and end in recovery.
+        let mut routes = BTreeMap::<&CollectionAddress, Vec<(Vec<u8>, NodeId)>>::new();
+        for (attempt, written) in attempts.iter().zip(&written) {
+            if let Some(route) = written.as_ref().ok().and_then(|w| w.coordinated.route()) {
+                routes
+                    .entry(attempt.change.collection())
+                    .or_default()
+                    .push((route.key.clone(), route.target));
+            }
+        }
+        let reconciling: Vec<_> = routes
+            .iter()
+            .map(|(collection, routes)| self.reconcile_parents(collection, routes.clone(), None))
+            .collect();
+        let reconciled = join_all_bounded(reconciling, parallelism).await;
+        let reconciled: BTreeMap<_, _> = routes.keys().copied().zip(reconciled).collect();
+
+        let settling: Vec<_> = attempts
+            .iter()
+            .zip(written)
+            .map(|(attempt, written)| {
+                attempt.settle_written(written, reconciled.get(attempt.change.collection()))
+            })
+            .collect();
+        let settled = join_all_bounded(settling, parallelism).await;
+
+        let mut leaving = Participants::default();
+        for (attempt, (_, departs)) in attempts.iter().zip(&settled) {
+            if *departs {
+                leaving.add(attempt);
+            }
+        }
+        let left = leaving.leave(&self.topology, parallelism).await;
+
+        let finalizing: Vec<_> = attempts
+            .iter()
+            .zip(settled)
+            .map(|(attempt, (result, departs))| {
+                let departed = departs.then(|| &left[attempt.change.collection()]);
+                attempt.finalize_owned(result, departed)
+            })
+            .collect();
+        join_all_bounded(finalizing, parallelism).await
     }
 
     /// Splits the node at `path` when `reason` still calls for it.
@@ -185,35 +348,48 @@ impl ChangeLifecycle {
             .await
     }
 
-    /// Makes the parent that routes `key` to `target` agree with the right-link
-    /// chain of its children through `key`, so later descents route directly
-    /// instead of walking right-links (ADR-073).
+    /// Makes the parents that route the keys of `routes` to their nodes agree
+    /// with the right-link chains of their children through the keys, so
+    /// later descents route directly instead of walking right-links
+    /// (ADR-073).
     ///
     /// This also heals a cascade: splitting a sibling whose own separator was
     /// never added still adds every intermediate separator, so the parent never
     /// grows unboundedly reliant on right-link walks. Idempotent and
-    /// re-drivable: a lost CAS is re-queued for a later sweep. On a successful
-    /// change that overflows the parent, recurses to split it.
-    pub(super) async fn reconcile_parent(
+    /// re-drivable: a lost CAS is re-queued for a later sweep. A parent that
+    /// overflows splits beneath `topology_participant`, or beneath its own
+    /// participant without one.
+    pub(super) async fn reconcile_parents(
         &self,
         collection: &CollectionAddress,
-        key: &[u8],
-        target: &NodeId,
+        routes: Vec<(Vec<u8>, NodeId)>,
         topology_participant: Option<&TxId>,
-    ) -> Result<(), TransError> {
+    ) -> Result<(), UnreconciledParents> {
         let topology = match topology_participant {
             Some(id) => StructuralTopology::Joined(id),
             None => StructuralTopology::Owned,
         };
-        let mut reconciliation = self.reconciler.begin(collection, key, target);
+        let mut reconciliation = self.reconciler.begin(collection, routes);
         loop {
-            match self.reconciler.reconcile(&mut reconciliation).await? {
-                ReconciliationOutcome::Reconciled => return Ok(()),
-                ReconciliationOutcome::ParentRequiresSplit(action) => {
-                    Box::pin(self.split_path(&action.path, &action.reason, topology)).await?;
-                    if action.continuation == ParentSplitContinuation::CompleteReconciliation {
-                        return Ok(());
+            match self.reconciler.reconcile(&mut reconciliation).await {
+                Ok(ReconciliationOutcome::Reconciled) => return Ok(()),
+                Ok(ReconciliationOutcome::ParentRequiresSplit(action)) => {
+                    let split = Box::pin(self.split_path(&action.path, &action.reason, topology));
+                    if let Err(error) = split.await {
+                        // A split beneath the participant of another change
+                        // can leave its intent to that participant.
+                        let keys = match topology {
+                            StructuralTopology::Joined(_) => None,
+                            StructuralTopology::Owned => Some(unresolved(&reconciliation)),
+                        };
+                        return Err(UnreconciledParents { error, keys });
                     }
+                }
+                Err(error) => {
+                    return Err(UnreconciledParents {
+                        error,
+                        keys: Some(unresolved(&reconciliation)),
+                    });
                 }
             }
         }
@@ -306,46 +482,117 @@ impl ChangeAttemptOutcome {
 }
 
 impl StructuralChangeAttempt<'_> {
-    async fn run(&self, topology: StructuralTopology<'_>) -> Result<(), TransError> {
+    /// Makes the change beneath the topology participant of another change.
+    async fn run_joined(&self, participant: &TxId) -> Result<(), TransError> {
         let lifecycle = self.lifecycle;
-        let collection = self.change.collection();
-        let result = match topology {
-            StructuralTopology::Owned => {
-                match lifecycle.topology.begin(collection, self.worker).await {
-                    Ok(()) => self.run_prepared(topology).await,
-                    Err(error) => Err(error),
-                }
+        lifecycle.structural_nodes.begin_worker(self.worker);
+        let result = match self.prepare_intent(participant).await {
+            Ok(prepared) => {
+                let cancellation = prepared.cancellation_witness();
+                let outcome = self.coordinate(prepared).await;
+                self.settle(outcome, &cancellation).await.0
             }
-            StructuralTopology::Joined(_) => {
-                lifecycle.structural_nodes.begin_worker(self.worker);
-                self.run_prepared(topology).await
-            }
+            Err(error) => Err(error),
         };
-
-        match topology {
-            StructuralTopology::Owned => {
-                lifecycle.topology.finalize(collection, self.worker).await;
-            }
-            StructuralTopology::Joined(_) => {
-                lifecycle
-                    .structural_nodes
-                    .finalize_worker(self.worker)
-                    .await;
-            }
-        }
+        lifecycle
+            .structural_nodes
+            .finalize_worker(self.worker)
+            .await;
         if result.is_err() {
             lifecycle.recovery_wake.notify_one();
         }
         result
     }
 
-    async fn run_prepared(&self, topology: StructuralTopology<'_>) -> Result<(), TransError> {
-        let participant = match topology {
-            StructuralTopology::Owned => self.worker,
-            StructuralTopology::Joined(participant) => participant,
+    /// Persists the recovery manifest of the owned topology participant, and
+    /// writes the Preparing intent of the change beneath it.
+    async fn prepare_owned(
+        &self,
+    ) -> Result<(PreparedIntent, PreparedIntentCancellation), TransError> {
+        self.lifecycle
+            .topology
+            .begin(self.change.collection(), self.worker)
+            .await?;
+        let prepared = self.prepare_intent(self.worker).await?;
+        let cancellation = prepared.cancellation_witness();
+        Ok((prepared, cancellation))
+    }
+
+    /// Makes the node writes of the change of an owned participant, after
+    /// its collection admission in `joined`.
+    async fn write_admitted(
+        &self,
+        prepared: Result<(PreparedIntent, PreparedIntentCancellation), TransError>,
+        joined: &RecordResults<'_>,
+    ) -> Result<Written, TransError> {
+        let (prepared, cancellation) = prepared?;
+        let coordinated = match &joined[self.change.collection()] {
+            Ok(()) => self.write_nodes(prepared).await,
+            Err(error) => {
+                Coordinated::Ended(ChangeAttemptOutcome::retry_cleanly(Err(error.clone())))
+            }
         };
-        let prepared = self
-            .lifecycle
+        Ok(Written {
+            coordinated,
+            cancellation,
+        })
+    }
+
+    /// Completes the change of an owned participant after `reconciled`, the
+    /// reconciliation of the parents of its batch, and settles its intent.
+    /// Returns the result of the change, and whether its participant can
+    /// leave the topology.
+    async fn settle_written(
+        &self,
+        written: Result<Written, TransError>,
+        reconciled: Option<&Result<(), UnreconciledParents>>,
+    ) -> (Result<(), TransError>, bool) {
+        let Written {
+            coordinated,
+            cancellation,
+        } = match written {
+            Ok(written) => written,
+            Err(error) => return (Err(error), false),
+        };
+        let outcome = match coordinated {
+            Coordinated::Ended(outcome) => outcome,
+            Coordinated::Landed(landed) => {
+                let reconciled = match (reconciled, &landed.route) {
+                    (Some(Err(failed)), Some(route)) if failed.includes(&route.key) => {
+                        Err(failed.error.clone())
+                    }
+                    _ => Ok(()),
+                };
+                self.complete(landed, reconciled).await
+            }
+        };
+        self.settle(outcome, &cancellation).await
+    }
+
+    /// Gives the owned participant its final status, after its departure
+    /// `departed`, if it could depart.
+    async fn finalize_owned(
+        &self,
+        result: Result<(), TransError>,
+        departed: Option<&Result<(), TransError>>,
+    ) -> Result<(), TransError> {
+        let lifecycle = self.lifecycle;
+        // One departure CAS removes all the participants of a collection, so
+        // its error does not fail the changes that landed. Garbage collection
+        // removes a participant with a final status and no intents.
+        let departure_failed = departed.is_some_and(|departed| departed.is_err());
+        lifecycle
+            .topology
+            .finalize(self.change.collection(), self.worker)
+            .await;
+        if result.is_err() || departure_failed {
+            lifecycle.recovery_wake.notify_one();
+        }
+        result
+    }
+
+    async fn prepare_intent(&self, participant: &TxId) -> Result<PreparedIntent, TransError> {
+        self.lifecycle
             .recovery
             .prepare_intent(
                 self.change.collection(),
@@ -353,26 +600,35 @@ impl StructuralChangeAttempt<'_> {
                 self.change.kind(),
                 participant,
             )
-            .await?;
-        let cancellation = prepared.cancellation_witness();
-        let outcome = match topology {
-            StructuralTopology::Owned => {
-                match self
-                    .lifecycle
-                    .topology
-                    .join(self.change.collection(), self.worker)
-                    .await
-                {
-                    Ok(()) => self.coordinate(prepared).await,
-                    Err(error) => ChangeAttemptOutcome::retry_cleanly(Err(error)),
-                }
-            }
-            StructuralTopology::Joined(_) => self.coordinate(prepared).await,
-        };
-        self.finish(outcome, &cancellation, topology).await
+            .await
     }
 
+    /// Makes the change alone: its node writes, the reconciliation of its
+    /// parent, and the completion of its intent.
     async fn coordinate(&self, prepared: PreparedIntent) -> ChangeAttemptOutcome {
+        match self.write_nodes(prepared).await {
+            Coordinated::Ended(outcome) => outcome,
+            Coordinated::Landed(landed) => {
+                let reconciled = match &landed.route {
+                    Some(ParentRoute { key, target }) => {
+                        self.lifecycle
+                            .reconcile_parents(
+                                self.change.collection(),
+                                vec![(key.clone(), *target)],
+                                Some(landed.ready.participant()),
+                            )
+                            .await
+                    }
+                    None => Ok(()),
+                };
+                self.complete(landed, reconciled.map_err(|failed| failed.error))
+                    .await
+            }
+        }
+    }
+
+    /// Gates the source of the change and makes its node writes.
+    async fn write_nodes(&self, prepared: PreparedIntent) -> Coordinated {
         let lifecycle = self.lifecycle;
         let collection = self.change.collection();
         debug_assert!(prepared.targets(collection, self.change.source_node_id()));
@@ -393,8 +649,14 @@ impl StructuralChangeAttempt<'_> {
             .await
         {
             Ok(Some(acquired)) => acquired,
-            Ok(None) => return ChangeAttemptOutcome::retry_cleanly(Err(TransError::Retry)),
-            Err(error) => return ChangeAttemptOutcome::retry_cleanly(Err(error)),
+            Ok(None) => {
+                return Coordinated::Ended(ChangeAttemptOutcome::retry_cleanly(Err(
+                    TransError::Retry,
+                )));
+            }
+            Err(error) => {
+                return Coordinated::Ended(ChangeAttemptOutcome::retry_cleanly(Err(error)));
+            }
         };
         // The time of a leaf change is the time that it holds the gate, until
         // the node writes land. Only then do the transactions of the leaf
@@ -402,7 +664,7 @@ impl StructuralChangeAttempt<'_> {
         // of the leaf instead.
         let gated = rt::Instant::now();
         let leaf = node.as_leaf().is_some();
-        match self.change {
+        let (ready, applied) = match self.change {
             PlannedChange::Split { target, reason, .. } => {
                 let planned =
                     lifecycle
@@ -410,28 +672,36 @@ impl StructuralChangeAttempt<'_> {
                         .prepare(target, reason, self.worker, node, &prepared);
                 let (ready, plan) = match self.mark_ready(planned, prepared, &observation).await {
                     Ok(ready) => ready,
-                    Err(outcome) => return outcome,
+                    Err(outcome) => return Coordinated::Ended(outcome),
                 };
                 let applied = lifecycle
                     .splitter
                     .apply(collection, reason, &observation, plan)
                     .await;
-                self.complete(ready, applied, leaf.then(|| gated.elapsed()))
-                    .await
+                (ready, applied)
             }
             PlannedChange::Merge { source, reason, .. } => {
                 let planned = lifecycle.merger.prepare(collection, node, reason).await;
                 let (ready, plan) = match self.mark_ready(planned, prepared, &observation).await {
                     Ok(ready) => ready,
-                    Err(outcome) => return outcome,
+                    Err(outcome) => return Coordinated::Ended(outcome),
                 };
                 let applied = lifecycle
                     .merger
                     .apply(collection, source, &observation, ready.id(), plan)
                     .await;
-                self.complete(ready, applied, leaf.then(|| gated.elapsed()))
-                    .await
+                (ready, applied)
             }
+        };
+        let gate_time = leaf.then(|| gated.elapsed());
+        match applied {
+            Ok(Applied::Landed(route)) => Coordinated::Landed(LandedChange {
+                ready,
+                route,
+                gate_time,
+            }),
+            Ok(Applied::Stopped) => Coordinated::Ended(self.stop_ready(ready).await),
+            Err(error) => Coordinated::Ended(ChangeAttemptOutcome::recovery_required(ready, error)),
         }
     }
 
@@ -469,43 +739,28 @@ impl StructuralChangeAttempt<'_> {
         }
     }
 
-    /// Reconciles the parent of a change that took effect, and deletes its
-    /// Ready intent. `gate_time` is the time that a change of a leaf held
-    /// the gate.
+    /// Deletes the Ready intent of a change whose node writes landed, once
+    /// `reconciled` reports that its parent agrees with its route.
     async fn complete(
         &self,
-        ready: ReadyIntent,
-        applied: Result<Applied, TransError>,
-        gate_time: Option<Duration>,
+        landed: LandedChange,
+        reconciled: Result<(), TransError>,
     ) -> ChangeAttemptOutcome {
-        match applied {
-            Ok(Applied::Landed(route)) => {
-                if let Some(ParentRoute { key, target }) = route
-                    && let Err(error) = self
-                        .lifecycle
-                        .reconcile_parent(
-                            self.change.collection(),
-                            &key,
-                            &target,
-                            Some(ready.participant()),
-                        )
-                        .await
-                {
-                    return ChangeAttemptOutcome::recovery_required(ready, error);
-                }
-                let outcome = self.finish_ready(ready).await;
-                if let Some(time) = gate_time
-                    && outcome.result.is_ok()
-                {
-                    self.lifecycle
-                        .candidates
-                        .observe_change_time(self.change.measured_kind(), time);
-                }
-                outcome
-            }
-            Ok(Applied::Stopped) => self.stop_ready(ready).await,
-            Err(error) => ChangeAttemptOutcome::recovery_required(ready, error),
+        let LandedChange {
+            ready, gate_time, ..
+        } = landed;
+        if let Err(error) = reconciled {
+            return ChangeAttemptOutcome::recovery_required(ready, error);
         }
+        let outcome = self.finish_ready(ready).await;
+        if let Some(time) = gate_time
+            && outcome.result.is_ok()
+        {
+            self.lifecycle
+                .candidates
+                .observe_change_time(self.change.measured_kind(), time);
+        }
+        outcome
     }
 
     /// Releases the source gate of a Ready change that did not take effect,
@@ -576,40 +831,85 @@ impl StructuralChangeAttempt<'_> {
             .await
     }
 
-    async fn finish(
+    /// Discards the Preparing intent of a change that stopped cleanly.
+    /// Returns the result of the change, and whether its participant can
+    /// leave the topology, because the participant has no intent left.
+    async fn settle(
         &self,
         outcome: ChangeAttemptOutcome,
         prepared: &PreparedIntentCancellation,
-        topology: StructuralTopology<'_>,
-    ) -> Result<(), TransError> {
+    ) -> (Result<(), TransError>, bool) {
         let ChangeAttemptOutcome { result, state } = outcome;
         match state {
-            ChangeAttemptResult::Completed => match topology {
-                StructuralTopology::Owned => result.and(self.leave_topology().await),
-                StructuralTopology::Joined(_) => result,
-            },
+            ChangeAttemptResult::Completed => (result, true),
             ChangeAttemptResult::RetryCleanly => {
-                let cleanup = match self.lifecycle.recovery.discard_prepared(prepared).await {
-                    Ok(()) => match topology {
-                        StructuralTopology::Owned => self.leave_topology().await,
-                        StructuralTopology::Joined(_) => Ok(()),
-                    },
-                    Err(error) => Err(error),
-                };
-                result.and(cleanup)
+                match self.lifecycle.recovery.discard_prepared(prepared).await {
+                    Ok(()) => (result, true),
+                    Err(error) => (result.and(Err(error)), false),
+                }
             }
-            ChangeAttemptResult::RecoveryRequired(_ready) => result,
+            ChangeAttemptResult::RecoveryRequired(_ready) => (result, false),
         }
     }
+}
 
-    /// Removes the owned topology participant, which this database instance
-    /// admitted.
-    async fn leave_topology(&self) -> Result<(), TransError> {
-        // The local admission permits any record observation.
-        self.lifecycle
-            .topology
-            .leave(self.change.collection(), self.worker, Requirement::ANY)
-            .await?;
-        Ok(())
+/// The owned topology participants of one sweep, grouped by collection.
+#[derive(Default)]
+struct Participants<'a> {
+    by_collection: BTreeMap<&'a CollectionAddress, Vec<TxId>>,
+}
+
+/// The result of one CAS on the record of each collection.
+type RecordResults<'a> = BTreeMap<&'a CollectionAddress, Result<(), TransError>>;
+
+impl<'a> Participants<'a> {
+    fn add(&mut self, attempt: &StructuralChangeAttempt<'a>) {
+        self.by_collection
+            .entry(attempt.change.collection())
+            .or_default()
+            .push(*attempt.worker);
     }
+
+    /// Admits the participants of each collection with one CAS.
+    async fn join(
+        self,
+        topology: &TopologyMembership,
+        parallelism: NonZeroUsize,
+    ) -> RecordResults<'a> {
+        let joins: Vec<_> = self
+            .by_collection
+            .iter()
+            .map(|(collection, ids)| topology.join(collection, ids))
+            .collect();
+        let results = join_all_bounded(joins, parallelism).await;
+        self.by_collection.into_keys().zip(results).collect()
+    }
+
+    /// Removes the participants of each collection with one CAS.
+    async fn leave(
+        self,
+        topology: &TopologyMembership,
+        parallelism: NonZeroUsize,
+    ) -> RecordResults<'a> {
+        // The local admission permits any record observation.
+        let leaves: Vec<_> = self
+            .by_collection
+            .iter()
+            .map(|(collection, ids)| topology.leave(collection, ids, Requirement::ANY))
+            .collect();
+        let results = join_all_bounded(leaves, parallelism).await;
+        self.by_collection
+            .into_keys()
+            .zip(results.into_iter().map(|left| left.map(|_| ())))
+            .collect()
+    }
+}
+
+/// Returns the keys of the routes of `reconciliation` whose parents do not
+/// agree with them yet.
+fn unresolved(reconciliation: &ParentReconciliation) -> BTreeSet<Vec<u8>> {
+    reconciliation
+        .unresolved_keys()
+        .map(<[u8]>::to_vec)
+        .collect()
 }

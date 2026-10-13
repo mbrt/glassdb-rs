@@ -9,6 +9,145 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-10-13: concurrent splits, and a tree that still does not settle
+
+Status: the restructurer now splits up to 16 nodes of one sweep at the same
+time (`df17a7576`), and reconciles the parents of one batch together
+(`85d7d03d8`). The seed settles in 25 to 29 s instead of 44 to 47 s. The
+warm-up at 200 workers per shape still does not become quiet in 300 s. The
+split time grows because of the simulated write throttle, but the warm-up does
+not become quiet without the throttle either. Smaller leaves share fewer rounds
+of the leaf coordinator, so under the throttle each split adds write load that
+the rule does not see. Whether the rule should count it is an ADR-074
+question.
+
+This settles the open question of the 2026-10-12 entry: one split at a time no
+longer limits the convergence of the tree.
+
+All runs used one cell of the `mixed` scenario: the memory backend, the s3
+delay profile, 5 instances, 100% affinity, 20,000 keys, lo mode, and 200
+workers per shape:
+
+```console
+perfbench --backend memory --delays s3 mixed --modes lo --affinities 100 \
+  --databases 5 --workers-per-shape 200 --num-keys 20000 \
+  --quiet-period 10s --warmup-timeout 300s --duration 10s --max-duration 20s
+```
+
+Each variant ran once or twice, and a range gives the runs. Run-to-run
+variance is large: the same commit became quiet after 119 s in one run and
+after 280 s in another. Temporary counters
+measured the restructurer and the backend, and were removed after the runs.
+
+### Splits one at a time
+
+Before `df17a7576`, a sweep of the restructurer made one split at a time. A
+split took about 1.3 s of model time from start to end. Model time runs 5
+times faster than wall time, so each instance made about 4 splits per second
+of wall time. The rule asked for many more (see the 2026-10-12 entry).
+
+### Concurrent splits and the collection record
+
+A first variant ran the full lifecycle of up to 16 splits at the same time.
+Each split joined and left the collection record with its own CAS, so the
+splits lost most of these CASes to each other:
+
+| Variant | Splits in a 90 s warm-up | Mean time of one split | Lost record CASes in 10 s |
+| --- | ---: | ---: | ---: |
+| One at a time | 1,336 | about 1.3 s | about 2 |
+| 16 at a time, a record CAS for each split | 893 | about 35 s | about 2,700 |
+| 16 at a time, a record CAS for each round | 1,353, quiet after 37 s | not measured | about 10 |
+
+The times are model time. The warm-ups in this table used a quiet period of
+3 s, which ends a warm-up at a pause in the splits. The later runs used 10 s.
+
+`df17a7576` keeps one topology participant for each split (ADR-049), but the
+participants of one collection in a batch join and leave the record with one
+CAS.
+
+### Parent reconciliation
+
+After `df17a7576`, the sibling splits of one batch lost the gate of their
+parent to each other. In the seed, about 9,100 parent gates were lost, and
+about 470 splits ended in recovery. `85d7d03d8` makes the node writes of a
+batch first, and then reconciles the routes of one parent with one gate and
+one CAS. The reconciliations of the sweep, of the deferred queue, and of
+structural recovery also take turns for each collection in one instance. Then
+the seed lost no parent gate.
+
+In the warm-up, about 8,400 parent gates were still lost in 300 s, and about
+1,200 changes ended in recovery. 67% of the lost gates were in structural
+recovery. Each instance lists the structural intents of the whole database, so
+the recovery of one instance can reconcile a parent that the sweep of another
+instance reconciles. This cause was not measured.
+
+### Seed and warm-up
+
+| Commit | Seed settled after | Warm-up splits in 300 s | Warm-up quiet |
+| --- | ---: | ---: | --- |
+| `df17a7576` | 44 to 47 s | 2,911 to 5,508 | after 119 to 280 s |
+| `85d7d03d8` without the turns | 25 s | 7,524 to 7,732 | no |
+| `85d7d03d8` | 28 to 29 s | 7,565 to 7,578 | no |
+
+`85d7d03d8` lands more splits in the same time, so its tree is larger when
+the warm-up ends: about 8,100 leaves against about 3,500 to 6,000. Over the
+warm-up, the rule asked for fewer splits in each window: in one run from about
+6,600 to about 90 in 30 s.
+
+### The split time grows with the write throttle
+
+The typical split time is the time that a split holds the gate of its source.
+It grew from about 180 ms in the seed to about 1,400 ms after 300 s. Of that
+time, only the create of the new node and the CAS of the source grew, each
+from about 60 ms to about 650 ms. The CAS of the structural intent stayed at
+about 63 ms. The writes to all node paths grew the same way, from 59 ms to
+665 ms. Almost all of the growth was wait in the write throttle of the memory
+backend. The backend write rate stayed at about 17,500 to 20,000 writes per
+second of wall time, and the garbage collection backlog stayed at 28,000 to 30,000
+candidates.
+
+With `--enable-throttling=false`, the write latency stayed at 73 to 83 ms, and
+the typical split time at 90 to 175 ms. The warm-up still did 8,198 splits in
+300 s and did not become quiet.
+
+A higher split time raises the split threshold of the rule (0.05 of the
+typical split time). So the throttle slows the convergence, but it does not
+cause the splits.
+
+### Write load of smaller leaves
+
+A temporary sampler summed `Database::stats()` of the 5 instances every 10 s
+of wall time in the warm-up of `85d7d03d8`. Leaves are 567 plus the splits of
+the warm-up. A transaction is any committed transaction, also a read-only one.
+The rates are for each second of wall time, and each row is the mean of one
+30 s bucket, with the leaves at its end.
+
+| Throttle | Leaves | Tx/s | Writes/tx | Rounds/tx | Members/round |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| on | 2,768 | 27,801 | 0.725 | 0.635 | 2.75 |
+| on | 5,941 | 21,108 | 0.905 | 0.842 | 1.48 |
+| on | 8,270 | 17,852 | 1.048 | 0.986 | 1.24 |
+| off | 3,537 | 35,218 | 0.832 | 0.739 | 2.45 |
+| off | 6,273 | 36,364 | 1.637 | 1.536 | 1.44 |
+| off | 8,848 | 36,720 | 1.883 | 1.780 | 1.28 |
+
+As the leaves get smaller, fewer transactions share one round of the leaf
+coordinator, so each transaction needs more backend writes. With the
+throttle, the backend did about 18,700 to 20,100 writes per second for the
+whole warm-up. From the first to the last row, writes for each transaction
+rose by 45%, and transactions per second fell by 36%. Without the throttle, the writes per second rose from
+about 29,000 to about 69,000, and transactions per second did not fall.
+
+So under a write budget, the splits that the rule asks for to remove queue
+wait in the leaf coordinator add write load to every transaction. The rule
+does not see the time that this load adds in the throttle. Without the
+throttle, rounds for each transaction rose above 1. Sharing of rounds alone
+cannot explain that, and its cause was not measured.
+
+The rule (ADR-074) could count the write load of a split against it, or the
+`mixed` scenario could stop waiting for a quiet tree under this load. Neither
+was tried.
+
 ## 2026-10-12: leaves split for minutes under the mixed lo load
 
 Status: the cause is the measured queue wait, which the avoidable time policy

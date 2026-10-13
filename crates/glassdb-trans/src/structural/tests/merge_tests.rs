@@ -103,11 +103,14 @@ async fn assert_merged(s: &TestStore) {
 }
 
 async fn merge_l0(sp: &Restructurer) -> Result<(), TransError> {
-    sp.process_candidate(&MaintenanceCandidate {
-        path: node_path("L0"),
-        priority: TxId::new_at(rt::system_now()),
-        cause: CandidateCause::Merge(MergeReason::Underfull),
-    })
+    sp.merge(
+        &MaintenanceCandidate {
+            path: node_path("L0"),
+            priority: TxId::new_at(rt::system_now()),
+            cause: CandidateCause::Merge(MergeReason::Underfull),
+        },
+        MergeReason::Underfull,
+    )
     .await
 }
 
@@ -145,11 +148,14 @@ fn rule_restructurer(s: &TestStore, bg: &Arc<Background>) -> Restructurer {
 }
 
 async fn demand_merge_l0(sp: &Restructurer, rate: Duration) -> Result<(), TransError> {
-    sp.process_candidate(&MaintenanceCandidate {
-        path: node_path("L0"),
-        priority: TxId::new_at(rt::system_now()),
-        cause: CandidateCause::Merge(MergeReason::Demand { rate }),
-    })
+    sp.merge(
+        &MaintenanceCandidate {
+            path: node_path("L0"),
+            priority: TxId::new_at(rt::system_now()),
+            cause: CandidateCause::Merge(MergeReason::Demand { rate }),
+        },
+        MergeReason::Demand { rate },
+    )
     .await
 }
 

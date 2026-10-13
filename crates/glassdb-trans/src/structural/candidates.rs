@@ -1,5 +1,6 @@
 //! The feed of nodes that may need a structural change.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -225,7 +226,10 @@ impl MaintenanceCandidates {
     }
 
     /// Drains every queued candidate, de-duplicated by path and cause, for one
-    /// sweep cycle. Splits come before merges (ADR-073).
+    /// sweep cycle. Splits come before merges (ADR-073). The splits that a
+    /// size cause asks for come first, and then the demand splits with the
+    /// highest rate, so that while the queue is long the splits that remove
+    /// the most avoidable time land first.
     pub(super) fn drain(&self) -> Vec<MaintenanceCandidate> {
         let mut q = self.queue.lock().unwrap();
         let mut by_path = BTreeMap::<(ObjectPath, u8), MaintenanceCandidate>::new();
@@ -239,7 +243,11 @@ impl MaintenanceCandidates {
             }
         }
         let mut candidates: Vec<_> = by_path.into_values().collect();
-        candidates.sort_by_key(|candidate| matches!(candidate.cause, CandidateCause::Merge(_)));
+        candidates.sort_by_key(|candidate| match &candidate.cause {
+            CandidateCause::Split(SplitReason::Demand { rate, .. }) => (false, Reverse(*rate)),
+            CandidateCause::Split(_) => (false, Reverse(Duration::MAX)),
+            CandidateCause::Merge(_) => (true, Reverse(Duration::ZERO)),
+        });
         candidates
     }
 
