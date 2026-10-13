@@ -31,6 +31,7 @@ struct Inner {
     model_start: Option<rt::Instant>,
     tot_duration: Duration,
     samples: Vec<Duration>,
+    completions: Vec<Duration>,
 }
 
 impl Bench {
@@ -49,6 +50,7 @@ impl Bench {
                 model_start: None,
                 tot_duration: Duration::ZERO,
                 samples: Vec::new(),
+                completions: Vec::new(),
             }),
         }
     }
@@ -138,6 +140,7 @@ impl Bench {
         let g = self.inner.lock().unwrap();
         Results {
             samples: g.samples.clone(),
+            completions: g.completions.clone(),
             tot_duration: g.tot_duration,
         }
     }
@@ -147,16 +150,21 @@ impl Bench {
     /// system without becoming part of the results.
     fn record(&self, latency: Duration) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.model_start.is_some() {
+        if let Some(start) = inner.model_start {
             inner.samples.push(latency);
+            inner.completions.push(start.elapsed());
         }
     }
 }
 
-/// The collected timing samples and total duration of a benchmark run.
+/// The collected timing samples, completion times, and total duration of a
+/// benchmark run.
 #[derive(Debug, Clone, Default)]
 pub struct Results {
     pub samples: Vec<Duration>,
+    /// Model time from [`Bench::start`] to the end of each sample, in
+    /// completion order.
+    pub completions: Vec<Duration>,
     pub tot_duration: Duration,
 }
 
@@ -194,40 +202,35 @@ impl Results {
         Duration::from_secs_f64(secs)
     }
 
-    /// Relative half-width of this run's throughput 95% confidence interval,
-    /// derived from the sample count (see [`rate_rel_ci`]). Smaller is tighter.
-    pub fn rate_rel_ci(&self) -> f64 {
-        rate_rel_ci(self.samples.len())
+    /// Adds the samples of `other` as if its run continued this one.
+    pub fn append(&mut self, other: Results) {
+        let offset = self.tot_duration;
+        self.samples.extend(other.samples);
+        self.completions
+            .extend(other.completions.into_iter().map(|at| at + offset));
+        self.tot_duration += other.tot_duration;
     }
-}
 
-/// z for a two-sided 95% confidence interval (the standard-normal quantile).
-pub const Z_95: f64 = 1.96;
-
-/// Sample count a rate/throughput estimate needs for its 95% confidence interval
-/// to reach `target_rel_ci` relative half-width, under the independent-arrivals
-/// (Poisson) approximation `rel-CI ~= z / sqrt(n)`, so `n ~= (z / target_ci)^2`.
-///
-/// Returns 0 when `target_rel_ci <= 0` (meaning "no target"). Real contention
-/// correlates arrivals, so the true interval is a touch wider — this is the
-/// standard rate-estimate bound, not an exact guarantee. Enables sequential
-/// (adaptive) sampling: run until [`Bench::sample_count`] reaches this value.
-pub fn samples_for_rel_ci(target_rel_ci: f64) -> u64 {
-    if target_rel_ci > 0.0 {
-        (Z_95 / target_rel_ci).powi(2).ceil() as u64
-    } else {
-        0
-    }
-}
-
-/// Achieved relative half-width of a rate/throughput 95% confidence interval
-/// from `n` samples (`z / sqrt(n)`, the [`samples_for_rel_ci`] inverse). Returns
-/// a large finite sentinel for `n == 0` so callers can serialize it.
-pub fn rate_rel_ci(n: usize) -> f64 {
-    if n == 0 {
-        99.0
-    } else {
-        Z_95 / (n as f64).sqrt()
+    /// Counts the samples that complete in each of `windows` equal parts of
+    /// the benchmark's duration.
+    ///
+    /// Samples that complete after [`Bench::end`] are in no window. Returns no
+    /// windows when the duration is zero.
+    pub fn window_counts(&self, windows: usize) -> Vec<u64> {
+        if windows == 0 || self.tot_duration.is_zero() {
+            return Vec::new();
+        }
+        let mut counts = vec![0; windows];
+        let width = self.tot_duration.as_secs_f64() / windows as f64;
+        for &completion in &self.completions {
+            if completion >= self.tot_duration {
+                continue;
+            }
+            // Rounding can put the last instant just past the final window.
+            let index = (completion.as_secs_f64() / width) as usize;
+            counts[index.min(windows - 1)] += 1;
+        }
+        counts
     }
 }
 
@@ -239,7 +242,7 @@ mod tests {
     fn percentile_endpoints_and_median() {
         let r = Results {
             samples: (1..=10).map(|i| Duration::from_millis(i * 10)).collect(),
-            tot_duration: Duration::ZERO,
+            ..Default::default()
         };
         // The min/max percentiles clamp to the smallest/largest sample.
         assert_eq!(r.percentile(0.0), Duration::from_millis(10));
@@ -267,42 +270,68 @@ mod tests {
                 Duration::from_millis(20),
                 Duration::from_millis(30),
             ],
-            tot_duration: Duration::ZERO,
+            ..Default::default()
         };
         assert_eq!(r.avg(), Duration::from_millis(20));
     }
 
     #[test]
-    fn samples_for_rel_ci_inverts_rate_rel_ci() {
-        // The target count is the smallest n whose achieved CI meets the target.
-        for target in [0.05, 0.1, 0.15, 0.2] {
-            let n = samples_for_rel_ci(target);
-            assert!(n > 0);
-            assert!(
-                rate_rel_ci(n as usize) <= target,
-                "n={n} should meet target={target}, got {}",
-                rate_rel_ci(n as usize)
-            );
-            assert!(
-                rate_rel_ci(n as usize - 1) > target,
-                "n-1={} should miss target={target}",
-                n - 1
-            );
-        }
+    fn window_counts_split_the_duration_into_equal_parts() {
+        let r = Results {
+            completions: [0, 249, 250, 650, 999, 1000, 1200]
+                .map(Duration::from_millis)
+                .to_vec(),
+            tot_duration: Duration::from_secs(1),
+            ..Default::default()
+        };
+        // Windows of 250 ms. Completions at and after the end of the
+        // benchmark are in no window.
+        assert_eq!(r.window_counts(4), [2, 1, 1, 1]);
+        assert_eq!(r.window_counts(0), [] as [u64; 0]);
+        assert_eq!(Results::default().window_counts(4), [] as [u64; 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completions_are_offsets_from_the_start_and_end_bounds_the_windows() {
+        let bench = Bench::new(Duration::from_secs(1));
+        let sleep = |millis| {
+            move || async move {
+                rt::sleep(Duration::from_millis(millis)).await;
+                Ok::<_, ()>(())
+            }
+        };
+        bench.measure_once(sleep(1000)).await.unwrap();
+        bench.start();
+        bench.measure_once(sleep(100)).await.unwrap();
+        bench.measure_once(sleep(300)).await.unwrap();
+        bench.end();
+        // A transaction that completes while the workers drain.
+        bench.measure_once(sleep(50)).await.unwrap();
+
+        let results = bench.results();
+        assert_eq!(
+            results.completions,
+            [100, 400, 450].map(Duration::from_millis)
+        );
+        assert_eq!(results.tot_duration, Duration::from_millis(400));
+        assert_eq!(results.samples.len(), 3);
+        assert_eq!(results.window_counts(2), [1, 0]);
     }
 
     #[test]
-    fn samples_for_rel_ci_zero_disables_target() {
-        for off in [0.0, -0.1, f64::NAN] {
-            assert_eq!(samples_for_rel_ci(off), 0);
-        }
-    }
+    fn appended_results_continue_the_timeline() {
+        let run = |completions: [u64; 2], millis| Results {
+            samples: vec![Duration::from_millis(10); 2],
+            completions: completions.map(Duration::from_millis).to_vec(),
+            tot_duration: Duration::from_millis(millis),
+        };
+        let mut results = run([100, 900], 1000);
+        results.append(run([0, 400], 1000));
 
-    #[test]
-    fn rate_rel_ci_of_empty_is_large_and_finite() {
-        let ci = rate_rel_ci(0);
-        assert!(ci.is_finite() && ci > 1.0);
-        assert_eq!(Results::default().rate_rel_ci(), ci);
+        assert_eq!(results.samples.len(), 4);
+        assert_eq!(results.tot_duration, Duration::from_secs(2));
+        assert_eq!(results.window_counts(2), [2, 2]);
+        assert_eq!(results.window_counts(4), [1, 1, 2, 0]);
     }
 
     #[tokio::test]

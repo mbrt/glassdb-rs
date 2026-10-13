@@ -47,7 +47,7 @@ cargo run --release -p glassdb-bench-scale --bin perfbench -- \
   --drain-timeout=90s --output=/tmp/mixed.json mixed \
   --modes=lo,hi --affinities=0,25,50,75,100 \
   --databases=4 --workers-per-shape=8 \
-  --duration=2s --max-duration=60s --target-ci=0.1
+  --duration=2s --max-duration=60s --window-commits=50
 ```
 
 Run `perfbench mixed --help` for all options and their defaults.
@@ -67,11 +67,15 @@ loaded cell usually measures after the timeout. The cell result records the
 splits and merges of the warm-up. `hack/perf/investigations.md` explains why the
 splits continue.
 
-The measurement runs for at least `--duration`. It ends when the throughput of
-every shape reaches the confidence interval `--target-ci`, or at
-`--max-duration`. A shape that reaches `--max-duration` first is marked
-unconverged. The result of each cell also includes backend operations and
-coordinator counters.
+The measurement runs for at least `--duration`. perfbench splits it into 20
+equal throughput windows. The measurement ends when every shape has committed
+`--window-commits` per window on average, or at `--max-duration`. A shape that
+reaches `--max-duration` first is marked unconverged. Its windows have fewer
+commits, so its throughput distribution is noisier. The commits of the
+transactions that finish after the measurement are not in a window. Each shape
+reports its window counts, and `relCi` is the throughput 95% confidence interval
+from their batch means. The result of each cell also includes backend operations
+and coordinator counters.
 
 ### Worker and affinity sweep plots
 
@@ -90,7 +94,7 @@ target/release/perfbench \
   mixed --modes=lo --affinities=100 --databases=5 \
   --workers-per-shape="1,$(seq -s, 10 10 200)" --num-keys=20000 \
   --quiet-period=5s --warmup-timeout=180s \
-  --duration=2s --max-duration=60s --target-ci=0.1
+  --duration=2s --max-duration=60s --window-commits=50
 
 target/release/perfbench \
   --backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3 \
@@ -98,15 +102,16 @@ target/release/perfbench \
   --output=hack/aws-bench/out-sweeps/affinity.json \
   mixed --modes=lo --affinities=0,25,50,75,100 \
   --databases=1,3,5,7 --workers-per-shape=20 \
-  --duration=2s --max-duration=60s --target-ci=0.1
+  --duration=2s --max-duration=60s --window-commits=50
 
 uv run hack/aws-bench/plot_results.py --canonical
 ```
 
-The canonical mode needs three clean, converged runs. Throughput is the median
-over the runs. Latency shows the median p50 as a line and the p50 to p90 range
-as a band. Each affinity figure has one panel for each database instance count,
-with all shapes. The four figures go to `hack/aws-bench/out-sweeps/`.
+The canonical mode needs three clean, converged runs. Throughput shows the p50
+of the throughput windows as a line and their p50 to p90 range as a band.
+Latency shows the p50 as a line and the p50 to p90 range as a band. Both use the
+median over the runs. Each affinity figure has one panel for each database
+instance count, with all shapes. The four figures go to `hack/aws-bench/out-sweeps/`.
 
 ### Plotting any result file
 

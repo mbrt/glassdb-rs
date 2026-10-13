@@ -111,7 +111,12 @@ def read_mixed(
     """Load a mixed report into one row per run, cell, and shape.
 
     With `require_converged`, a shape that hit its time cap before reaching the
-    target confidence interval is an error instead of a plotted point.
+    target commits per window is an error instead of a plotted point.
+
+    `throughput_p50` and `throughput_p90` are percentiles of the shape's
+    throughput windows. Reports written before the windows existed have no
+    distribution: their `throughput_p50` is the shape's throughput, and their
+    `throughput_p90` is NaN.
     """
     source = str(path)
     report = check_envelope(_load(path), source, "mixed")
@@ -161,6 +166,12 @@ def read_mixed(
                 raise ReportError(
                     f"{label}.{name}: p90Ms={p90_ms} is below p50Ms={p50_ms}"
                 )
+            throughput = _number(shape.get("txPerSec"), f"{label}.{name}.txPerSec")
+            throughput_p50, throughput_p90 = _window_percentiles(
+                shape, f"{label}.{name}"
+            )
+            if math.isnan(throughput_p50):
+                throughput_p50 = throughput
             rows.append(
                 {
                     "run": run_id,
@@ -170,9 +181,9 @@ def read_mixed(
                     "databases": databases,
                     "workers": workers,
                     "shape": name,
-                    "throughput": _number(
-                        shape.get("txPerSec"), f"{label}.{name}.txPerSec"
-                    ),
+                    "throughput": throughput,
+                    "throughput_p50": throughput_p50,
+                    "throughput_p90": throughput_p90,
                     "p50_ms": p50_ms,
                     "p90_ms": p90_ms,
                     "converged": shape.get("converged") is True,
@@ -311,6 +322,21 @@ def _cell_shapes(
             f"{label}: shapes are {sorted(shapes)}; expected {sorted(SHAPES)}"
         )
     return shapes
+
+
+def _window_percentiles(shape: dict[str, Any], label: str) -> tuple[float, float]:
+    """Return the p50 and p90 of a shape's window throughputs, in tx/s."""
+    if "windowCounts" not in shape:
+        return math.nan, math.nan
+    counts = [
+        _integer(count, f"{label}.windowCounts")
+        for count in _array(shape["windowCounts"], f"{label}.windowCounts")
+    ]
+    window_ms = _number(shape.get("windowMs"), f"{label}.windowMs")
+    if not counts or window_ms == 0:
+        return math.nan, math.nan
+    rates = pd.Series(counts, dtype=float) / (window_ms / 1000)
+    return float(rates.quantile(0.5)), float(rates.quantile(0.9))
 
 
 def _load(path: Path) -> Any:

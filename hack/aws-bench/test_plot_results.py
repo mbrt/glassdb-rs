@@ -39,6 +39,10 @@ def shape_rows(run: int, affinity: int, databases: int, workers: int) -> list[di
                 "p50Ms": float(value * 2),
                 "p90Ms": float(value * 4),
                 "relCi": 0.08,
+                # Ten windows of 100 ms with `value - 1`, `value`, and
+                # `value + 1` commits per 100 ms.
+                "windowMs": 100.0,
+                "windowCounts": [value - 1] * 3 + [value] * 4 + [value + 1] * 3,
                 "converged": True,
             }
         )
@@ -132,6 +136,8 @@ class MixedSweepPlotterTest(unittest.TestCase):
             (medians["workers"] == 1) & (medians["shape"] == "rwSingle")
         ].iloc[0]
         self.assertEqual(row["throughput"], 122.0)
+        self.assertAlmostEqual(row["throughput_p50"], 1220.0)
+        self.assertAlmostEqual(row["throughput_p90"], 1230.0)
         self.assertEqual(row["p50_ms"], 244.0)
         self.assertEqual(row["p90_ms"], 488.0)
         self.assertEqual(plotter.WORKER_POINTS, (1, *range(10, 201, 10)))
@@ -162,7 +168,7 @@ class MixedSweepPlotterTest(unittest.TestCase):
             with self.assertRaisesRegex(plotter.ReportError, "below p50Ms"):
                 read_canonical(path)
 
-    def test_series_use_plain_lines_and_latency_bands(self) -> None:
+    def test_series_use_plain_lines_and_metric_bands(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write_report(
                 Path(directory_name), "workers.json", worker_report()
@@ -178,12 +184,36 @@ class MixedSweepPlotterTest(unittest.TestCase):
         self.assertTrue(all(line.get_marker() == "None" for line in line_axis.lines))
         plotter.plt.close(line_figure)
 
-        band_figure, band_axis = plotter.plt.subplots()
-        plotter._plot_shape_latency_bands(band_axis, medians, "workers", colors)
-        self.assertEqual(len(band_axis.lines), len(plotter.SHAPES))
-        self.assertEqual(len(band_axis.collections), len(plotter.SHAPES))
-        self.assertTrue(all(line.get_marker() == "None" for line in band_axis.lines))
-        plotter.plt.close(band_figure)
+        for band in (plotter.THROUGHPUT_BAND, plotter.LATENCY_BAND):
+            band_figure, band_axis = plotter.plt.subplots()
+            plotter._plot_shape_bands(band_axis, medians, "workers", band, colors)
+            self.assertEqual(len(band_axis.lines), len(plotter.SHAPES))
+            self.assertEqual(len(band_axis.collections), len(plotter.SHAPES))
+            self.assertTrue(
+                all(line.get_marker() == "None" for line in band_axis.lines)
+            )
+            plotter.plt.close(band_figure)
+
+    def test_reports_without_throughput_windows_have_no_throughput_band(
+        self,
+    ) -> None:
+        legacy = worker_report()
+        for run in legacy["runs"]:
+            for value in run["cells"]:
+                for shape in value["shapes"]:
+                    del shape["windowMs"], shape["windowCounts"]
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(Path(directory_name), "legacy.json", legacy)
+            _, workers = read_canonical(path)
+        medians = plotter.median_rows(workers, ["workers"])
+
+        figure, axis = plotter.plt.subplots()
+        plotter._plot_shape_bands(
+            axis, medians, "workers", plotter.THROUGHPUT_BAND, plotter._shape_colors()
+        )
+        self.assertEqual(len(axis.lines), len(plotter.SHAPES))
+        self.assertEqual(len(axis.collections), 0)
+        plotter.plt.close(figure)
 
     def test_affinity_figures_are_faceted_by_database_count(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
@@ -216,6 +246,12 @@ class MixedSweepPlotterTest(unittest.TestCase):
         self.assertEqual([axis.get_title() for axis in latency.axes], expected_titles)
         self.assertTrue(
             all(len(axis.lines) == len(plotter.SHAPES) for axis in throughput.axes)
+        )
+        self.assertTrue(
+            all(
+                len(axis.collections) == len(plotter.SHAPES)
+                for axis in throughput.axes
+            )
         )
         self.assertTrue(
             all(len(axis.lines) == len(plotter.SHAPES) for axis in latency.axes)

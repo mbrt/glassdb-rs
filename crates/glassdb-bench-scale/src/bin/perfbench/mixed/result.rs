@@ -9,6 +9,20 @@ use super::options::CellDimension;
 use super::setup::Warmup;
 use super::workload::KeySelection;
 
+/// Number of equal windows that split each cell's measured interval. Their
+/// commit counts give each shape's throughput distribution. With 20 windows,
+/// the 90th percentile does not depend on only one or two windows.
+///
+/// All workers start the measurement with no transaction in flight, so the
+/// first window usually has fewer commits than the others. The p50 and p90 of
+/// the windows do not change much because of one low window.
+pub(super) const THROUGHPUT_WINDOWS: usize = 20;
+
+/// Two-sided 95% Student-t quantile for the batch means of the windows.
+const T_95_WINDOWS: f64 = t_95(THROUGHPUT_WINDOWS - 1);
+// Below 4 degrees of freedom, `t_95` is more than 0.03% off.
+const _: () = assert!(THROUGHPUT_WINDOWS >= 5);
+
 /// One shape's fixed timing observations for a cell report.
 pub(super) struct ShapeMeasurement {
     shape: &'static str,
@@ -192,11 +206,11 @@ pub(super) fn warmup_capped(dimension: CellDimension, timeout: Duration) -> Stri
     )
 }
 
-/// Formats the warning emitted when a cell misses its confidence target.
-pub(super) fn cell_capped(dimension: CellDimension, target_ci: f64) -> String {
+/// Formats the warning emitted when a cell misses its sampling target.
+pub(super) fn cell_capped(dimension: CellDimension, window_commits: u64) -> String {
     format!(
         "  note: mode={} affinity={}% databases={}/{} workers/shape={} hit --max-duration before \
-         every shape reached --target-ci={target_ci}",
+         every shape reached --window-commits={window_commits}",
         dimension.mode.label(),
         dimension.affinity_pct,
         dimension.databases,
@@ -266,23 +280,34 @@ struct ProtocolPerTx {
 #[serde(rename_all = "camelCase")]
 struct ShapeResult {
     shape: String,
+    /// Transactions with a latency sample, including the ones that complete
+    /// while the workers drain after the measured interval.
     committed: usize,
+    /// Commits in the throughput windows per second of the measured interval.
     tx_per_sec: f64,
     mean_ms: f64,
     p50_ms: f64,
     p90_ms: f64,
-    /// Achieved relative half-width of the throughput 95% CI (`z/sqrt(committed)`,
-    /// Poisson approximation); smaller is tighter.
+    /// Relative half-width of the throughput 95% CI, from the batch means of
+    /// the windows. Unlike a Poisson bound, it includes stalls and correlated
+    /// commits. Smaller is tighter.
     rel_ci: f64,
-    /// Whether `rel_ci` met the run's `--target-ci`. `false` means the cell hit
-    /// `--max-duration` first, so read this shape's throughput as indicative.
+    /// Model-time width of each throughput window.
+    window_ms: f64,
+    /// Commits in each of the equal windows of the measured interval.
+    window_counts: Vec<u64>,
+    /// Whether the windows reached the run's `--window-commits`. `false` means
+    /// the cell hit `--max-duration` first, so read this shape's throughput as
+    /// indicative and its distribution as noisier.
     converged: bool,
 }
 
 impl ShapeResult {
     fn summarize(measurement: ShapeMeasurement, target: u64) -> Self {
         let count = measurement.results.samples.len();
-        let secs = measurement.results.tot_duration.as_secs_f64();
+        let duration = measurement.results.tot_duration;
+        let window_counts = measurement.results.window_counts(THROUGHPUT_WINDOWS);
+        let windowed: u64 = window_counts.iter().sum();
         let (p50_ms, p90_ms) = if count > 0 {
             (
                 measurement.results.percentile(0.5).as_secs_f64() * 1000.0,
@@ -295,14 +320,57 @@ impl ShapeResult {
         Self {
             shape: measurement.shape.to_string(),
             committed: count,
-            tx_per_sec: if secs > 0.0 { count as f64 / secs } else { 0.0 },
+            tx_per_sec: if duration.is_zero() {
+                0.0
+            } else {
+                windowed as f64 / duration.as_secs_f64()
+            },
             mean_ms: measurement.results.avg().as_secs_f64() * 1000.0,
             p50_ms,
             p90_ms,
-            rel_ci: measurement.results.rate_rel_ci(),
-            converged: target == 0 || count as u64 >= target,
+            rel_ci: batch_means_rel_ci(&window_counts),
+            window_ms: duration.as_secs_f64() * 1000.0 / THROUGHPUT_WINDOWS as f64,
+            converged: target == 0 || windowed >= target,
+            window_counts,
         }
     }
+}
+
+/// Returns the two-sided 95% Student-t quantile for `degrees` of freedom.
+///
+/// This is the Cornish-Fisher expansion of Abramowitz and Stegun (26.7.5).
+/// The crate has no statistics dependency, and the expansion lets the
+/// quantile follow `THROUGHPUT_WINDOWS` at compile time.
+const fn t_95(degrees: usize) -> f64 {
+    // The two-sided 95% quantile of the standard normal distribution.
+    const Z: f64 = 1.959_963_984_540_054;
+    let v = degrees as f64;
+    let z2 = Z * Z;
+    let g1 = (z2 + 1.0) / 4.0;
+    let g2 = (5.0 * z2 * z2 + 16.0 * z2 + 3.0) / 96.0;
+    let g3 = (3.0 * z2 * z2 * z2 + 19.0 * z2 * z2 + 17.0 * z2 - 15.0) / 384.0;
+    let g4 =
+        (79.0 * z2 * z2 * z2 * z2 + 776.0 * z2 * z2 * z2 + 1482.0 * z2 * z2 - 1920.0 * z2 - 945.0)
+            / 92160.0;
+    Z * (1.0 + g1 / v + g2 / (v * v) + g3 / (v * v * v) + g4 / (v * v * v * v))
+}
+
+/// Returns the relative half-width of the 95% CI of the mean window count.
+///
+/// Returns a large finite sentinel when no window has a commit, so that
+/// callers can serialize it.
+fn batch_means_rel_ci(counts: &[u64]) -> f64 {
+    let n = counts.len() as f64;
+    let mean = counts.iter().sum::<u64>() as f64 / n;
+    if counts.len() < 2 || mean == 0.0 {
+        return 99.0;
+    }
+    let variance = counts
+        .iter()
+        .map(|&count| (count as f64 - mean).powi(2))
+        .sum::<f64>()
+        / (n - 1.0);
+    T_95_WINDOWS * variance.sqrt() / (mean * n.sqrt())
 }
 
 /// Raw backend and transaction deltas summed across a cell's Databases.
@@ -413,6 +481,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn t_95_matches_student_t_tables() {
+        // Exact quantiles from statistical tables, to five decimals.
+        for (degrees, expected) in [
+            (4, 2.77645),
+            (9, 2.26216),
+            (19, 2.09302),
+            (29, 2.04523),
+            (99, 1.98422),
+        ] {
+            let actual = t_95(degrees);
+            assert!(
+                (actual - expected).abs() / expected < 3.5e-4,
+                "t_95({degrees}) = {actual}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn fixed_samples_preserve_serialized_metrics() {
         let measurements = vec![
             ShapeMeasurement::new(
@@ -423,6 +509,8 @@ mod tests {
                         Duration::from_millis(20),
                         Duration::from_millis(30),
                     ],
+                    // The last transaction completes while the workers drain.
+                    completions: [50, 1050, 2100].map(Duration::from_millis).to_vec(),
                     tot_duration: Duration::from_secs(2),
                 },
             ),
@@ -478,7 +566,7 @@ mod tests {
             CellMetadata::new("hi", 25, 2, 2, 8, 4, Duration::from_millis(1500)),
             measurements,
             &deltas,
-            3,
+            2,
         );
         let empty_cell = CellResult::summarize(
             CellMetadata::new("lo", 0, 0, 0, 0, 0, Duration::ZERO)
@@ -531,9 +619,32 @@ mod tests {
           "meanMs": 20.0,
           "p50Ms": 20.0,
           "p90Ms": 30.0,
-          "relCi": 1.1316065276116665,
+          "relCi": 1.4405177354239902,
           "shape": "rwSingle",
-          "txPerSec": 1.5
+          "txPerSec": 1.0,
+          "windowCounts": [
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "windowMs": 100.0
         },
         {
           "committed": 0,
@@ -543,7 +654,9 @@ mod tests {
           "p90Ms": 0.0,
           "relCi": 99.0,
           "shape": "roMulti",
-          "txPerSec": 0.0
+          "txPerSec": 0.0,
+          "windowCounts": [],
+          "windowMs": 0.0
         }
       ],
       "splitSettleWallMs": 1500,
