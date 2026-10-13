@@ -24,7 +24,10 @@ enum Shape {
     RoMulti,
 }
 
-const SHAPES: [Shape; 4] = [
+/// Number of transaction shapes, each with `--workers-per-shape` workers.
+pub(super) const SHAPE_COUNT: usize = 4;
+
+const SHAPES: [Shape; SHAPE_COUNT] = [
     Shape::RwSingle,
     Shape::RwMany,
     Shape::RoSingle,
@@ -67,6 +70,7 @@ struct WorkerSpec<'a> {
     shape: Shape,
     bench: &'a Arc<Bench>,
     seed: u64,
+    stripe: Stripe,
 }
 
 /// Builds all worker plans in their stable shape, database, and worker order.
@@ -110,14 +114,97 @@ pub(super) fn measurements(plans: &[ShapePlan]) -> impl Iterator<Item = ShapeMea
         .map(|plan| ShapeMeasurement::new(plan.shape.name(), plan.bench.results()))
 }
 
+/// A gate between the transactions of all workers of a cell.
+///
+/// The warm-up and the measurement share the workers, and a transaction that
+/// runs while the measurement starts would count work of the warm-up. Closing
+/// the gate lets each worker finish its transaction and wait, so that the
+/// measurement starts with no transaction in flight.
+#[derive(Default)]
+pub(super) struct Pause {
+    state: std::sync::Mutex<PauseState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct PauseState {
+    closed: bool,
+    waiting: usize,
+}
+
+impl Pause {
+    /// Closes the gate and waits until `workers` wait at it, or until `stop`
+    /// is set.
+    pub(super) async fn close_and_wait(&self, workers: usize, stop: &AtomicBool) {
+        self.state.lock().unwrap().closed = true;
+        loop {
+            let changed = self.changed.notified();
+            if self.state.lock().unwrap().waiting >= workers || stop.load(Ordering::Relaxed) {
+                return;
+            }
+            // A worker that stops with an error sets `stop` and never waits.
+            tokio::select! {
+                () = changed => {}
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    }
+
+    /// Opens the gate, so that the waiting workers continue.
+    pub(super) fn open(&self) {
+        self.state.lock().unwrap().closed = false;
+        self.changed.notify_waiters();
+    }
+
+    /// Waits while the gate is closed, unless `stop` is set.
+    async fn pass(&self, stop: &AtomicBool) {
+        let mut counted = false;
+        loop {
+            let changed = self.changed.notified();
+            {
+                let mut state = self.state.lock().unwrap();
+                if !state.closed || stop.load(Ordering::Relaxed) {
+                    if counted {
+                        state.waiting -= 1;
+                    }
+                    return;
+                }
+                if !counted {
+                    state.waiting += 1;
+                    counted = true;
+                    self.changed.notify_waiters();
+                }
+            }
+            tokio::select! {
+                () = changed => {}
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    }
+}
+
+/// How workers choose keys from the pool.
+#[derive(Clone, Copy)]
+pub(super) enum KeySelection {
+    /// Every transaction draws from the whole pool.
+    Shared,
+    /// A transaction draws from its worker's stripe, except with probability
+    /// `shared_pct` percent, when it draws from the whole pool.
+    Stripes { shared_pct: u8 },
+}
+
 /// Cell-wide context shared by every worker.
 #[derive(Clone)]
 pub(super) struct WorkerCtx {
     /// Set by [`drive_to_significance`] to stop all shapes at once.
     stop: Arc<AtomicBool>,
+    pause: Arc<Pause>,
     pool_size: usize,
     multi_keys: usize,
     affinity_pct: u8,
+    key_selection: KeySelection,
+    /// The worker's own stripe. The cell-wide context holds the whole pool.
+    stripe: Stripe,
 }
 
 impl WorkerCtx {
@@ -127,12 +214,28 @@ impl WorkerCtx {
         pool_size: usize,
         multi_keys: usize,
         affinity_pct: u8,
+        key_selection: KeySelection,
     ) -> Self {
         Self {
             stop,
+            pause: Arc::new(Pause::default()),
             pool_size,
             multi_keys,
             affinity_pct,
+            key_selection,
+            stripe: Stripe::WHOLE_POOL,
+        }
+    }
+
+    /// Returns the gate between the transactions of the workers.
+    pub(super) fn pause(&self) -> &Pause {
+        &self.pause
+    }
+
+    fn for_stripe(&self, stripe: Stripe) -> Self {
+        Self {
+            stripe,
+            ..self.clone()
         }
     }
 }
@@ -149,7 +252,7 @@ pub(super) fn spawn_workers(
         let db = dbs[spec.database].clone();
         let collections = collections[spec.database].clone();
         let bench = spec.bench.clone();
-        let ctx = ctx.clone();
+        let ctx = ctx.for_stripe(spec.stripe);
         handles.push(tokio::spawn(worker(
             db,
             collections,
@@ -163,7 +266,40 @@ pub(super) fn spawn_workers(
     handles
 }
 
+/// The pool indices `index` for which `index % count == offset`.
+///
+/// Each worker of the cell owns a distinct stripe, so that two transactions
+/// conflict only when one of them draws from the whole pool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stripe {
+    offset: usize,
+    count: usize,
+}
+
+impl Stripe {
+    const WHOLE_POOL: Stripe = Stripe {
+        offset: 0,
+        count: 1,
+    };
+
+    /// Returns the number of pool indices in the stripe.
+    fn len(self, pool_size: usize) -> usize {
+        pool_size.saturating_sub(self.offset).div_ceil(self.count)
+    }
+
+    /// Returns the pool index of the stripe's `position`th member.
+    fn index(self, position: usize) -> usize {
+        position * self.count + self.offset
+    }
+}
+
 fn worker_specs(plans: &[ShapePlan]) -> impl Iterator<Item = WorkerSpec<'_>> + '_ {
+    // Workers can use any collection, so stripes are distinct across all
+    // workers of the cell, not only within one database.
+    let workers = plans
+        .iter()
+        .map(|plan| plan.slots.iter().map(|&(_, count)| count).sum::<usize>())
+        .sum::<usize>();
     plans
         .iter()
         .flat_map(|plan| {
@@ -171,15 +307,21 @@ fn worker_specs(plans: &[ShapePlan]) -> impl Iterator<Item = WorkerSpec<'_>> + '
                 std::iter::repeat_n((plan.shape, &plan.bench, database), count)
             })
         })
+        .enumerate()
         .scan(
             0x9E37_79B9_7F4A_7C15_u64,
-            |seed, (shape, bench, database)| {
+            move |seed, (offset, (shape, bench, database))| {
                 *seed = seed.wrapping_add(0x1000_0000_0000_0001);
+                let stripe = Stripe {
+                    offset,
+                    count: workers,
+                };
                 Some(WorkerSpec {
                     database,
                     shape,
                     bench,
                     seed: *seed,
+                    stripe,
                 })
             },
         )
@@ -249,6 +391,10 @@ async fn worker(
     let mut rng = StdRng::seed_from_u64(seed);
     let key_count = shape.key_count(ctx.multi_keys, ctx.pool_size);
     while !ctx.stop.load(Ordering::Relaxed) && !bench.is_finished() {
+        ctx.pause.pass(&ctx.stop).await;
+        if ctx.stop.load(Ordering::Relaxed) {
+            break;
+        }
         let result = execute_once(
             &db,
             &collections,
@@ -303,10 +449,18 @@ fn select_inputs(
     ctx: &WorkerCtx,
     key_count: usize,
 ) -> (usize, Vec<usize>) {
-    (
-        pick_collection(rng, home, collections, ctx.affinity_pct),
-        pick_keys(rng, ctx.pool_size, key_count),
-    )
+    let collection = pick_collection(rng, home, collections, ctx.affinity_pct);
+    let stripe = match ctx.key_selection {
+        KeySelection::Shared => Stripe::WHOLE_POOL,
+        KeySelection::Stripes { shared_pct } => {
+            if rng.random_range(0..100u8) < shared_pct {
+                Stripe::WHOLE_POOL
+            } else {
+                ctx.stripe
+            }
+        }
+    };
+    (collection, pick_keys(rng, ctx.pool_size, stripe, key_count))
 }
 
 /// Selects the home collection with the configured affinity.
@@ -319,17 +473,25 @@ fn pick_collection(rng: &mut StdRng, home: usize, collections: usize, affinity_p
     if choose_home { home } else { uniform }
 }
 
-/// Picks distinct pool indices in stable ascending order.
-fn pick_keys(rng: &mut StdRng, pool_size: usize, count: usize) -> Vec<usize> {
-    let count = count.min(pool_size).max(1);
-    if count >= pool_size {
-        return (0..pool_size).collect();
+/// Picks distinct pool indices of `stripe` in stable ascending order.
+///
+/// A stripe with fewer members than `count` gives all its members.
+fn pick_keys(rng: &mut StdRng, pool_size: usize, stripe: Stripe, count: usize) -> Vec<usize> {
+    let members = stripe.len(pool_size);
+    let count = count.min(members).max(1);
+    if count >= members {
+        return (0..members)
+            .map(|position| stripe.index(position))
+            .collect();
     }
     let mut selected = HashSet::with_capacity(count);
     while selected.len() < count {
-        selected.insert(rng.random_range(0..pool_size));
+        selected.insert(rng.random_range(0..members));
     }
-    let mut selected: Vec<_> = selected.into_iter().collect();
+    let mut selected: Vec<_> = selected
+        .into_iter()
+        .map(|position| stripe.index(position))
+        .collect();
     selected.sort_unstable();
     selected
 }
@@ -389,9 +551,21 @@ mod tests {
         let selected: Vec<_> = worker_specs(&worker_plans)
             .map(|spec| {
                 let mut rng = StdRng::seed_from_u64(spec.seed);
-                let ctx = WorkerCtx::new(Arc::new(AtomicBool::new(false)), 17, 3, 60);
+                let ctx = WorkerCtx::new(
+                    Arc::new(AtomicBool::new(false)),
+                    17,
+                    3,
+                    60,
+                    KeySelection::Shared,
+                );
                 let count = spec.shape.key_count(ctx.multi_keys, ctx.pool_size);
-                let (collection, keys) = select_inputs(&mut rng, spec.database, 2, &ctx, count);
+                let (collection, keys) = select_inputs(
+                    &mut rng,
+                    spec.database,
+                    2,
+                    &ctx.for_stripe(spec.stripe),
+                    count,
+                );
                 (
                     spec.shape.name(),
                     spec.shape.is_write(),
@@ -468,5 +642,121 @@ mod tests {
         pick_collection(&mut no_affinity, 2, 4, 0);
         pick_collection(&mut full_affinity, 2, 4, 100);
         assert_eq!(no_affinity.random::<u64>(), full_affinity.random::<u64>());
+    }
+
+    /// Draws `draws` key sets for every worker of a cell, by shape.
+    fn drawn_keys(
+        keys: KeySelection,
+        pool_size: usize,
+        draws: usize,
+    ) -> Vec<(Shape, Vec<HashSet<usize>>)> {
+        let worker_plans = plans(4, 2, Duration::from_secs(1));
+        let ctx = WorkerCtx::new(Arc::new(AtomicBool::new(false)), pool_size, 3, 100, keys);
+        worker_specs(&worker_plans)
+            .map(|spec| {
+                let mut rng = StdRng::seed_from_u64(spec.seed);
+                let count = spec.shape.key_count(ctx.multi_keys, ctx.pool_size);
+                let sets = (0..draws)
+                    .map(|_| {
+                        let (_, keys) = select_inputs(
+                            &mut rng,
+                            spec.database,
+                            2,
+                            &ctx.for_stripe(spec.stripe),
+                            count,
+                        );
+                        assert_eq!(keys.len(), count);
+                        assert!(keys.iter().all(|&key| key < pool_size));
+                        keys.into_iter().collect()
+                    })
+                    .collect();
+                (spec.shape, sets)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stripes_keep_workers_apart_unless_shared() {
+        let pool_size = 161;
+        let keys_by_worker = |shared_pct| -> Vec<HashSet<usize>> {
+            drawn_keys(KeySelection::Stripes { shared_pct }, pool_size, 200)
+                .into_iter()
+                .map(|(_, sets)| sets.into_iter().flatten().collect())
+                .collect()
+        };
+
+        let striped = keys_by_worker(0);
+        assert_eq!(striped.len(), 16);
+        for (index, keys) in striped.iter().enumerate() {
+            for other in &striped[index + 1..] {
+                assert!(keys.is_disjoint(other));
+            }
+        }
+        let covered: HashSet<usize> = striped.iter().flatten().copied().collect();
+        assert_eq!(covered.len(), pool_size);
+
+        // Shared transactions reach keys outside the worker's stripe.
+        let stripe_len = pool_size.div_ceil(16);
+        assert!(
+            keys_by_worker(100)
+                .iter()
+                .all(|keys| keys.len() > stripe_len)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn closed_pause_waits_for_running_operations_to_end() {
+        use std::sync::atomic::AtomicUsize;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(Pause::default());
+        let running = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let (stop, pause, running) = (stop.clone(), pause.clone(), running.clone());
+                tokio::spawn(async move {
+                    let mut operations = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        pause.pass(&stop).await;
+                        running.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(3)).await;
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        operations += 1;
+                    }
+                    operations
+                })
+            })
+            .collect();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        pause.close_and_wait(workers.len(), &stop).await;
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+
+        pause.open();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stop.store(true, Ordering::Relaxed);
+        for worker in workers {
+            assert!(
+                worker.await.unwrap() > 1,
+                "workers continue after the pause"
+            );
+        }
+    }
+
+    #[test]
+    fn small_stripes_give_all_their_members() {
+        let stripe = Stripe {
+            offset: 2,
+            count: 4,
+        };
+        assert_eq!(stripe.len(11), 3);
+        let mut rng = StdRng::seed_from_u64(3);
+        assert_eq!(pick_keys(&mut rng, 11, stripe, 5), vec![2, 6, 10]);
+        assert_eq!(pick_keys(&mut rng, 11, stripe, 3), vec![2, 6, 10]);
+        let keys = pick_keys(&mut rng, 11, stripe, 2);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().all(|key| key % 4 == 2));
     }
 }

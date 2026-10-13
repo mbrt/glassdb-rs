@@ -1,10 +1,12 @@
 use std::error::Error;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use glassdb::{Collection, CollectionPath, Database, Error as GError, Stats};
+use glassdb::{Collection, CollectionPath, Database, Error as GError, RestructurerStats, Stats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::run::shutdown_databases_until;
+use glassdb_concurr::rt;
 use tokio::runtime::Handle;
 
 use super::result;
@@ -12,20 +14,74 @@ use super::{key_bytes, value};
 
 const COLLECTION_PREFIX: &str = "mix";
 
-/// Inputs that determine a cell's storage setup and cleanup bounds.
-pub(super) struct CellConfig {
-    pub(super) databases: usize,
+/// Inputs that determine how storage is seeded and settled.
+pub(super) struct SeedConfig {
+    pub(super) collections: usize,
     pub(super) pool_size: usize,
-    pub(super) split_quiet: Duration,
-    pub(super) split_settle_timeout: Duration,
+    pub(super) quiet_period: Duration,
+    pub(super) timeout: Duration,
     pub(super) drain_timeout: Duration,
+}
+
+/// A database with seeded collections whose structural changes are complete.
+pub(super) struct Seed {
+    backend: Arc<dyn Backend>,
+    database_name: String,
+    settlement: Settlement,
+}
+
+impl Seed {
+    /// Seeds the collections of a new database and waits until its splits,
+    /// merges, and garbage collection stop.
+    pub(super) fn create(
+        handle: &Handle,
+        backend: Arc<dyn Backend>,
+        database_name: String,
+        config: &SeedConfig,
+    ) -> Result<Self, Box<dyn Error>> {
+        let settlement = seed_and_settle(handle, backend.clone(), &database_name, config)?;
+        Ok(Self {
+            backend,
+            database_name,
+            settlement,
+        })
+    }
+
+    /// Returns the same seeded database over `backend`, which must hold a
+    /// copy of this seed's storage.
+    pub(super) fn with_backend(&self, backend: Arc<dyn Backend>) -> Self {
+        Self {
+            backend,
+            database_name: self.database_name.clone(),
+            settlement: self.settlement,
+        }
+    }
+
+    /// Opens one measurement database instance for each of the first `databases`
+    /// collections, with handles to all of these collections.
+    pub(super) fn open_cell(
+        &self,
+        handle: &Handle,
+        databases: usize,
+    ) -> Result<PreparedCell, Box<dyn Error>> {
+        let paths = collection_paths(databases)?;
+        let databases: Vec<_> = (0..databases)
+            .map(|_| open_db(handle, &self.database_name, self.backend.clone()))
+            .collect();
+        let collections = handle.block_on(open_collections(&databases, &paths))?;
+        Ok(PreparedCell {
+            databases,
+            collections,
+            settlement: self.settlement,
+        })
+    }
 }
 
 /// A seeded cell whose measurement clients have opened every target collection.
 pub(super) struct PreparedCell {
     databases: Vec<Database>,
     collections: Vec<Arc<[Collection]>>,
-    settlement: SplitSettlement,
+    settlement: Settlement,
 }
 
 impl PreparedCell {
@@ -34,37 +90,80 @@ impl PreparedCell {
         &self.databases
     }
 
-    /// Starts the measured phase by capturing client counter baselines.
+    /// Returns the handles of each database instance to every target
+    /// collection.
+    pub(super) fn collections(&self) -> &[Arc<[Collection]>] {
+        &self.collections
+    }
+
+    /// Waits while the workload runs for at least `minimum` of model time,
+    /// then until the splits and merges of the database instances stop for
+    /// `quiet`, or until `timeout`, or until `stop` is set.
+    ///
+    /// The topology policy decides from windows of measurements, so a load
+    /// causes no split until it has run for some windows. Without the
+    /// minimum, a short `quiet` would end the warm-up before that.
+    pub(super) async fn warm_up(
+        &self,
+        stop: &AtomicBool,
+        minimum: Duration,
+        quiet: Duration,
+        timeout: Duration,
+    ) -> Warmup {
+        let started = Instant::now();
+        let start = restructurer_stats(&self.databases);
+        tokio::select! {
+            () = rt::sleep(minimum) => {}
+            () = wait_for_stop(stop) => {}
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let outcome = wait_for_quiet(
+            || structural_changes(&self.databases),
+            || true,
+            stop,
+            quiet,
+            remaining,
+        )
+        .await;
+        let end = restructurer_stats(&self.databases);
+        Warmup {
+            splits: end.splits - start.splits,
+            merges: end.merges - start.merges,
+            elapsed: started.elapsed(),
+            quiet: outcome.quiet,
+        }
+    }
+
+    /// Starts the measured phase by capturing the counter baselines of the
+    /// database instances.
     pub(super) fn begin_measurement(self) -> ActiveCell {
         let baselines = self.databases.iter().map(Database::stats).collect();
         ActiveCell {
             databases: self.databases,
-            collections: self.collections,
             settlement: self.settlement,
             baselines,
         }
     }
 }
 
+/// The splits, merges, and duration of a cell's warm-up.
+#[derive(Clone, Copy)]
+pub(super) struct Warmup {
+    pub(super) splits: u64,
+    pub(super) merges: u64,
+    pub(super) elapsed: Duration,
+    /// Whether the changes stopped before the timeout.
+    pub(super) quiet: bool,
+}
+
 /// A prepared cell with measurement counter baselines captured.
 pub(super) struct ActiveCell {
     databases: Vec<Database>,
-    collections: Vec<Arc<[Collection]>>,
-    settlement: SplitSettlement,
+    settlement: Settlement,
     baselines: Vec<Stats>,
 }
 
 impl ActiveCell {
-    /// Returns the clients whose counters are part of the measured interval.
-    pub(super) fn databases(&self) -> &[Database] {
-        &self.databases
-    }
-
-    /// Returns each client's handles to every target collection.
-    pub(super) fn collections(&self) -> &[Arc<[Collection]>] {
-        &self.collections
-    }
-
     /// Shuts down measurement clients and returns their settled counter deltas.
     ///
     /// Shutdown always runs before errors are returned. A worker error retains
@@ -86,7 +185,7 @@ impl ActiveCell {
             .collect();
         Ok(CompletedCell {
             databases: self.databases.len(),
-            setup_splits: self.settlement.completed,
+            setup_splits: self.settlement.splits,
             split_settle_elapsed: self.settlement.elapsed,
             deltas,
         })
@@ -101,32 +200,10 @@ pub(super) struct CompletedCell {
     pub(super) deltas: Vec<Stats>,
 }
 
-/// Seeds storage, waits for structural settlement, and opens measurement clients.
-pub(super) fn prepare_cell(
-    handle: &Handle,
-    backend: Arc<dyn Backend>,
-    database_name: &str,
-    config: CellConfig,
-) -> Result<PreparedCell, Box<dyn Error>> {
-    let collection_paths = (0..config.databases)
+fn collection_paths(count: usize) -> Result<Vec<CollectionPath>, GError> {
+    (0..count)
         .map(|index| CollectionPath::new(format!("{COLLECTION_PREFIX}-{index}").as_bytes()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let settlement = seed_and_settle(
-        handle,
-        backend.clone(),
-        database_name,
-        &collection_paths,
-        &config,
-    )?;
-    let databases: Vec<_> = (0..config.databases)
-        .map(|_| open_db(handle, database_name, backend.clone()))
-        .collect();
-    let collections = handle.block_on(open_collections(&databases, &collection_paths))?;
-    Ok(PreparedCell {
-        databases,
-        collections,
-        settlement,
-    })
+        .collect()
 }
 
 fn open_db(handle: &Handle, name: &str, backend: Arc<dyn Backend>) -> Database {
@@ -150,28 +227,71 @@ async fn open_collections(
     Ok(all)
 }
 
+/// Returns the completed splits and merges of `databases`.
+fn structural_changes(databases: &[Database]) -> u64 {
+    let stats = restructurer_stats(databases);
+    stats.splits + stats.merges
+}
+
+/// Returns the sum of the restructurer counters of `databases`.
+fn restructurer_stats(databases: &[Database]) -> RestructurerStats {
+    databases
+        .iter()
+        .fold(RestructurerStats::default(), |mut total, database| {
+            total += database.stats().restructurer;
+            total
+        })
+}
+
+/// Returns the garbage collection candidates that `databases` know of and have
+/// not finished.
+fn gc_backlog(databases: &[Database]) -> u64 {
+    databases
+        .iter()
+        .map(|database| {
+            let gc = database.diagnostics().gc;
+            gc.ready + gc.deferred + gc.in_flight
+        })
+        .sum()
+}
+
+/// Waits until `stop` is set.
+async fn wait_for_stop(stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Returns the garbage collection progress of `databases`.
+fn gc_progress(databases: &[Database]) -> u64 {
+    databases
+        .iter()
+        .map(|database| database.stats().gc.progress)
+        .sum()
+}
+
 #[derive(Clone, Copy)]
-struct SplitSettlement {
-    completed: u64,
+struct Settlement {
+    splits: u64,
     elapsed: Duration,
 }
 
-struct SplitQuietTracker {
-    completed: u64,
+struct QuietTracker {
+    changes: u64,
     unchanged_since: Instant,
 }
 
-impl SplitQuietTracker {
-    fn new(completed: u64, now: Instant) -> Self {
+impl QuietTracker {
+    fn new(changes: u64, now: Instant) -> Self {
         Self {
-            completed,
+            changes,
             unchanged_since: now,
         }
     }
 
-    fn observe(&mut self, completed: u64, now: Instant) {
-        if completed != self.completed {
-            self.completed = completed;
+    fn observe(&mut self, changes: u64, now: Instant) {
+        if changes != self.changes {
+            self.changes = changes;
             self.unchanged_since = now;
         }
     }
@@ -185,47 +305,49 @@ fn deadline_expired(started: Instant, now: Instant, timeout: Duration) -> bool {
     now.duration_since(started) >= timeout
 }
 
-/// Waits until completed splits stop moving for a full quiet period.
-async fn wait_for_split_quiet(
-    database: &Database,
+struct QuietOutcome {
+    elapsed: Duration,
+    quiet: bool,
+}
+
+/// Waits until `changes` stops moving for a full quiet period while `idle`
+/// holds, or until `timeout` or `stop`.
+async fn wait_for_quiet(
+    changes: impl Fn() -> u64,
+    idle: impl Fn() -> bool,
+    stop: &AtomicBool,
     quiet: Duration,
     timeout: Duration,
-) -> Result<SplitSettlement, Box<dyn Error>> {
+) -> QuietOutcome {
     let started = Instant::now();
-    let mut tracker = SplitQuietTracker::new(database.stats().restructurer.splits, started);
+    let mut tracker = QuietTracker::new(changes(), started);
     let poll = (quiet / 4).clamp(Duration::from_millis(20), Duration::from_millis(250));
     loop {
         let now = Instant::now();
-        tracker.observe(database.stats().restructurer.splits, now);
-        if tracker.is_quiet(now, quiet) {
-            return Ok(SplitSettlement {
-                completed: tracker.completed,
+        tracker.observe(changes(), now);
+        let is_quiet = tracker.is_quiet(now, quiet) && idle();
+        if is_quiet || deadline_expired(started, now, timeout) || stop.load(Ordering::Relaxed) {
+            return QuietOutcome {
                 elapsed: started.elapsed(),
-            });
-        }
-        if deadline_expired(started, Instant::now(), timeout) {
-            return Err(format!(
-                "setup splits did not stay quiet for {quiet:?} within {timeout:?} \
-                 (completed={})",
-                tracker.completed
-            )
-            .into());
+                quiet: is_quiet,
+            };
         }
         tokio::time::sleep(poll).await;
     }
 }
 
-/// Seeds every collection and lets its complete split cascade finish.
+/// Seeds every collection and lets its complete split cascade and garbage
+/// collection finish.
 fn seed_and_settle(
     handle: &Handle,
     backend: Arc<dyn Backend>,
     database_name: &str,
-    paths: &[CollectionPath],
-    config: &CellConfig,
-) -> Result<SplitSettlement, Box<dyn Error>> {
+    config: &SeedConfig,
+) -> Result<Settlement, Box<dyn Error>> {
     let database = open_db(handle, database_name, backend);
-    handle.block_on(async {
-        for path in paths {
+    let paths = collection_paths(config.collections)?;
+    let seeded = handle.block_on(async {
+        for path in &paths {
             let name = path
                 .segments()
                 .next()
@@ -252,20 +374,49 @@ fn seed_and_settle(
             }
         }
         Ok::<(), GError>(())
-    })?;
-    let settlement = handle.block_on(wait_for_split_quiet(
-        &database,
-        config.split_quiet,
-        config.split_settle_timeout,
-    ))?;
-    eprintln!(
-        "{}",
-        result::setup_settled(settlement.elapsed, settlement.completed, config.split_quiet)
-    );
+    });
+    if let Err(error) = seeded {
+        // The run fails either way. The seeding error stays the reported one.
+        let _ = handle.block_on(shutdown_databases_until(
+            std::slice::from_ref(&database),
+            tokio::time::Instant::now() + config.drain_timeout,
+        ));
+        return Err(error.into());
+    }
+    // Garbage collection also changes the stored state, so every fork would
+    // otherwise carry work that its cell does while it measures. A hinted
+    // candidate waits longer than a short quiet period before its first check,
+    // so quiet counters alone do not prove that no work is left.
+    let databases = std::slice::from_ref(&database);
+    let changes = || structural_changes(databases) + gc_progress(databases);
+    let idle = || gc_backlog(databases) == 0;
+    let outcome = handle.block_on(wait_for_quiet(
+        changes,
+        idle,
+        &AtomicBool::new(false),
+        config.quiet_period,
+        config.timeout,
+    ));
+    let settlement = Settlement {
+        splits: database.stats().restructurer.splits,
+        elapsed: outcome.elapsed,
+    };
     handle.block_on(shutdown_databases_until(
-        std::slice::from_ref(&database),
+        databases,
         tokio::time::Instant::now() + config.drain_timeout,
     ))?;
+    if !outcome.quiet {
+        return Err(format!(
+            "setup splits, merges, and garbage collection did not stay quiet for {:?} \
+             within {:?} (completed splits={})",
+            config.quiet_period, config.timeout, settlement.splits
+        )
+        .into());
+    }
+    eprintln!(
+        "{}",
+        result::setup_settled(settlement.elapsed, settlement.splits, config.quiet_period)
+    );
     Ok(settlement)
 }
 
@@ -279,7 +430,7 @@ mod tests {
     fn quiet_period_resets_and_deadline_is_inclusive() {
         let start = Instant::now();
         let quiet = Duration::from_secs(2);
-        let mut tracker = SplitQuietTracker::new(3, start);
+        let mut tracker = QuietTracker::new(3, start);
 
         assert!(!tracker.is_quiet(start + Duration::from_secs(1), quiet));
         tracker.observe(4, start + Duration::from_millis(1500));
@@ -299,49 +450,60 @@ mod tests {
     }
 
     #[test]
-    fn setup_seeds_each_collection_and_teardown_closes_clients() -> Result<(), Box<dyn Error>> {
+    fn cells_open_independent_forks_of_one_seed() -> Result<(), Box<dyn Error>> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
         let handle = runtime.handle();
-        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let prepared = prepare_cell(
+        let storage = Arc::new(MemoryBackend::new());
+        let seed = Seed::create(
             handle,
-            backend,
-            "mixedsetuptest",
-            CellConfig {
-                databases: 2,
+            storage.clone(),
+            "mixedsetuptest".to_string(),
+            &SeedConfig {
+                collections: 2,
                 pool_size: 3,
-                split_quiet: Duration::from_millis(20),
-                split_settle_timeout: Duration::from_secs(1),
+                quiet_period: Duration::from_millis(20),
+                timeout: Duration::from_secs(1),
                 drain_timeout: Duration::from_secs(1),
             },
         )?;
 
-        assert_eq!(prepared.databases().len(), 2);
-        assert!(
-            prepared
-                .collections
-                .iter()
-                .all(|collections| collections.len() == 2)
-        );
-        for collection in prepared.collections[0].iter() {
-            let keys: Vec<_> = handle.block_on(collection.iter_keys())?.collect();
-            assert_eq!(keys, [key_bytes(0), key_bytes(1), key_bytes(2)]);
-        }
+        // A cell can use fewer collections than the seed has.
+        let cell = seed
+            .with_backend(Arc::new(storage.fork()))
+            .open_cell(handle, 1)?;
+        assert_eq!(cell.databases().len(), 1);
+        assert_eq!(cell.collections()[0].len(), 1);
+        let collection = cell.collections()[0][0].clone();
+        let keys: Vec<_> = handle.block_on(collection.iter_keys())?.collect();
+        assert_eq!(keys, [key_bytes(0), key_bytes(1), key_bytes(2)]);
 
-        let probe = prepared.databases()[0].clone();
-        let active = prepared.begin_measurement();
-        let completed = active.teardown(
+        // A write in one cell is not visible to the next cell.
+        handle.block_on(collection.write(&key_bytes(0), b"cell"))?;
+        let next = seed
+            .with_backend(Arc::new(storage.fork()))
+            .open_cell(handle, 2)?;
+        assert_eq!(next.collections()[1].len(), 2);
+        let value = handle.block_on(next.collections()[0][0].read(&key_bytes(0)))?;
+        assert_eq!(value, Some(super::value()));
+
+        let probe = cell.databases()[0].clone();
+        let completed = cell.begin_measurement().teardown(
             handle,
             tokio::time::Instant::now() + Duration::from_secs(1),
             Ok(()),
         )?;
-        assert_eq!(completed.databases, 2);
+        assert_eq!(completed.databases, 1);
         assert!(matches!(
             handle.block_on(probe.root_collection().read(b"after-shutdown")),
             Err(GError::ShuttingDown)
         ));
+        next.begin_measurement().teardown(
+            handle,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            Ok(()),
+        )?;
         Ok(())
     }
 }

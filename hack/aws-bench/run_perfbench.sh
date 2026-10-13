@@ -17,11 +17,12 @@ common=(
 ./perfbench "${common[@]}" --output=out/mixed.json mixed \
   --modes="$MIX_MODES" --affinities="$MIX_AFFINITIES" \
   --databases="$MIX_DATABASES" --workers-per-shape="$MIX_WORKERS" \
-  --num-keys="$MIX_NUM_KEYS" --hot-keys="$MIX_HOT_KEYS" \
+  --num-keys="$MIX_NUM_KEYS" --shared-pct="$MIX_SHARED_PCT" \
+  --hot-keys="$MIX_HOT_KEYS" \
   --multi-keys="$MIX_MULTI_KEYS" --duration="$MIX_DURATION" \
   --max-duration="$MIX_MAX_DURATION" --target-ci="$MIX_TARGET_CI" \
-  --split-quiet="$MIX_SPLIT_QUIET" \
-  --split-settle-timeout="$MIX_SPLIT_SETTLE_TIMEOUT"
+  --quiet-period="$MIX_QUIET_PERIOD" --seed-timeout="$MIX_SEED_TIMEOUT" \
+  --warmup-timeout="$MIX_WARMUP_TIMEOUT"
 
 ./perfbench "${common[@]}" --output=out/contention.json contention \
   --keys="$CONTENTION_KEYS" --duration="$CONTENTION_DURATION"

@@ -142,9 +142,14 @@ impl Bench {
         }
     }
 
-    /// Records one model-time latency sample.
-    fn record(&self, duration: Duration) {
-        self.inner.lock().unwrap().samples.push(duration);
+    /// Records one model-time latency sample, unless the benchmark has not
+    /// started. Operations can run before [`Bench::start`] to warm up the
+    /// system without becoming part of the results.
+    fn record(&self, latency: Duration) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.model_start.is_some() {
+            inner.samples.push(latency);
+        }
     }
 }
 
@@ -244,16 +249,14 @@ mod tests {
         assert!(p50 >= Duration::from_millis(40) && p50 <= Duration::from_millis(70));
     }
 
-    #[test]
-    fn records_model_time_samples() {
-        let b = Bench::new(Duration::from_secs(1));
-        b.record(Duration::from_millis(10));
-        b.record(Duration::from_millis(20));
-        let r = b.results();
-        assert_eq!(
-            r.samples,
-            vec![Duration::from_millis(10), Duration::from_millis(20)]
-        );
+    #[tokio::test]
+    async fn records_only_operations_that_end_after_start() {
+        let bench = Bench::new(Duration::from_secs(1));
+        let ok = || async { Ok::<_, ()>(()) };
+        bench.measure_once(ok).await.unwrap();
+        bench.start();
+        bench.measure_once(ok).await.unwrap();
+        assert_eq!(bench.sample_count(), 1);
     }
 
     #[test]

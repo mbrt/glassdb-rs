@@ -17,31 +17,29 @@ timing diagnostics and their separate backend-cost measurement pass.
 
 ## Mixed workload
 
-The `mixed` scenario runs four transaction shapes concurrently:
+`mixed` runs four transaction shapes at the same time and reports the
+throughput and latency of each:
 
-- `rwSingle`: one-key read-modify-write;
-- `rwMany`: multi-key read-modify-write;
-- `roSingle`: one-key serializable read;
-- `roMulti`: multi-key serializable read.
+- `rwSingle`: read-modify-write of one key.
+- `rwMany`: read-modify-write of `--multi-keys` keys.
+- `roSingle`: serializable read of one key.
+- `roMulti`: serializable read of `--multi-keys` keys.
 
-Every open `Database` runs every shape and has a distinct home collection.
-For each transaction it chooses its home with the configured affinity;
-otherwise it chooses uniformly among all collections. The default
-`0,25,50,75,100%` sweep ranges from no instance-specific preference to complete
-instance isolation. The separate `lo` and `hi` modes vary the key pool within a
-collection, keeping key contention independent from collection affinity.
-`--workers-per-shape` and `--databases` also accept comma-separated sweeps.
-The Database value is a limit: each cell opens the smaller of that limit and
-its worker count, ensuring that every open database instance runs every shape.
-Results record the limit, active database-instance count, and worker count
-separately.
+Each of these options takes a comma-separated list. Every combination of the
+values is one cell:
 
-Each cell gets an isolated database namespace. A throwaway database instance
-seeds every collection and observes its completed-split counter. Any change
-resets the quiet timer. Fresh measurement database instances open only after
-that counter stays unchanged for `--split-quiet`; failure to settle before
-`--split-settle-timeout` fails the cell. Setup split count and settlement wall
-time are included in each result.
+- `--modes`: `lo` gives each worker its own keys, so that transactions rarely
+  conflict. `--shared-pct` percent of the transactions use any key instead.
+  `hi` makes all workers share `--hot-keys` keys.
+- `--affinities`: the percentage of transactions that a database instance runs
+  on its own home collection. The other transactions use a random collection.
+- `--databases`: the maximum number of database instances in a cell. A cell
+  never opens more instances than it has workers per shape.
+- `--workers-per-shape`: the concurrent workers of each shape, spread over the
+  instances.
+
+In the `lo` mode, `--num-keys` must give each worker at least `--multi-keys`
+keys. The benchmark rejects a smaller pool.
 
 ```bash
 cargo run --release -p glassdb-bench-scale --bin perfbench -- \
@@ -52,19 +50,35 @@ cargo run --release -p glassdb-bench-scale --bin perfbench -- \
   --duration=2s --max-duration=60s --target-ci=0.1
 ```
 
-Every shape runs until all shapes reach the requested throughput confidence
-interval, or the cell reaches `--max-duration`. Capped shapes are marked
-unconverged. Whole-cell results include backend operations and transaction
-replays plus coordinator submissions, rounds, CAS retries, members per round, and
-direct-path coverage, all derived from the public `Database::stats()` counters.
+Run `perfbench mixed --help` for all options and their defaults.
+
+### Setup, warm-up, and measurement
+
+Before the cells run, perfbench writes all keys and waits until splits, merges,
+and garbage collection stop for `--quiet-period`. If that takes longer than
+`--seed-timeout`, the run fails. With `--backend=memory`, this happens once for
+each mode, and each cell gets its own copy of the result. With other backends,
+each cell writes its keys again.
+
+Each cell then runs its load without measuring it. The warm-up lasts at least
+`--warmup-minimum`, and then until splits and merges stop for `--quiet-period`,
+or until `--warmup-timeout`. Under load, the tree often keeps splitting, so a
+loaded cell usually measures after the timeout. The cell result records the
+splits and merges of the warm-up. `hack/perf/investigations.md` explains why the
+splits continue.
+
+The measurement runs for at least `--duration`. It ends when the throughput of
+every shape reaches the confidence interval `--target-ci`, or at
+`--max-duration`. A shape that reaches `--max-duration` first is marked
+unconverged. The result of each cell also includes backend operations and
+coordinator counters.
 
 ### Worker and affinity sweep plots
 
-The canonical scale plots use the low-contention mixed workload and the local
-S3 model. `--prefix-depth=3` gives each physical collection subtree
-(`db/_c/<collection-id>`) an independent simulated S3 request-rate bucket;
-database-wide transaction-record shards remain separate prefixes. Build once and
-run the two grids:
+The canonical plots use the `lo` mode and the local S3 model. `--prefix-depth=3`
+gives each collection its own simulated S3 request-rate limit. The worker grid
+uses 20,000 keys, so that each of the 800 workers at 200 workers per shape gets
+25 keys. Build once and run the two grids:
 
 ```bash
 cargo build --release -p glassdb-bench-scale --bin perfbench
@@ -74,7 +88,8 @@ target/release/perfbench \
   --runs=3 --drain-timeout=90s \
   --output=hack/aws-bench/out-sweeps/workers.json \
   mixed --modes=lo --affinities=100 --databases=5 \
-  --workers-per-shape="1,$(seq -s, 10 10 200)" \
+  --workers-per-shape="1,$(seq -s, 10 10 200)" --num-keys=20000 \
+  --quiet-period=5s --warmup-timeout=180s \
   --duration=2s --max-duration=60s --target-ci=0.1
 
 target/release/perfbench \
@@ -88,11 +103,10 @@ target/release/perfbench \
 uv run hack/aws-bench/plot_results.py --canonical
 ```
 
-The canonical mode requires three clean, converged runs. Throughput is shown as the
-cross-run median line. Latency uses the cross-run median p50 as a line and the
-area from p50 through p90 as a band. Affinity figures put all transaction shapes
-on one panel per Database-instance count. The four figures are written under
-`hack/aws-bench/out-sweeps/`.
+The canonical mode needs three clean, converged runs. Throughput is the median
+over the runs. Latency shows the median p50 as a line and the p50 to p90 range
+as a band. Each affinity figure has one panel for each database instance count,
+with all shapes. The four figures go to `hack/aws-bench/out-sweeps/`.
 
 ### Plotting any result file
 

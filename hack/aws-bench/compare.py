@@ -652,6 +652,25 @@ def _indexed_mixed_cells(report: Any) -> dict:
     return indexed
 
 
+def _paired_mixed_keys(ca: dict, cb: dict) -> list[tuple]:
+    """Return the cell identities of both reports, in order.
+
+    Cells with a different `sharedPct` ran different key selections, so their
+    ratios would not measure an engine change. A cell written before stripes
+    has no `sharedPct`, so it does not pair with a striped cell either.
+    """
+    keys = sorted(set(ca) & set(cb))
+    for key in keys:
+        shared_a, shared_b = ca[key].get("sharedPct"), cb[key].get("sharedPct")
+        if shared_a != shared_b:
+            raise ValueError(
+                f"mixed cell {key} has sharedPct={shared_a} in a and "
+                f"sharedPct={shared_b} in b; compare reports with the same "
+                "key selection"
+            )
+    return keys
+
+
 def mixed_shape_table(a: Any, b: Any) -> pd.DataFrame:
     """Per workload cell and shape throughput and latency ratios.
 
@@ -661,7 +680,7 @@ def mixed_shape_table(a: Any, b: Any) -> pd.DataFrame:
     """
     ca, cb = _indexed_mixed_cells(a), _indexed_mixed_cells(b)
     rows = []
-    for key in sorted(set(ca) & set(cb)):
+    for key in _paired_mixed_keys(ca, cb):
         run, mode, dimension, value = key
         sa = {s["shape"]: s for s in ca[key].get("shapes", [])}
         sb = {s["shape"]: s for s in cb[key].get("shapes", [])}
@@ -723,7 +742,7 @@ def mixed_aggregate_table(a: Any, b: Any) -> pd.DataFrame:
     """Whole-cell aggregate ops/tx and replays/tx per workload cell."""
     ca, cb = _indexed_mixed_cells(a), _indexed_mixed_cells(b)
     rows = []
-    for key in sorted(set(ca) & set(cb)):
+    for key in _paired_mixed_keys(ca, cb):
         run, mode, dimension, value = key
         oa, ob = ca[key].get("aggregateOps"), cb[key].get("aggregateOps")
         if not (oa and ob):

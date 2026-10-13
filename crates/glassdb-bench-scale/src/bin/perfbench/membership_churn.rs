@@ -343,7 +343,9 @@ mod tests {
             "membership-churn",
             "--direct-workers=1",
             "--locked-workers=1",
-            "--scanner-workers=1",
+            // A scan waits for the membership lock of the locked churner, so
+            // one scanner can commit no scan in a short run on a slow machine.
+            "--scanner-workers=4",
             // Without a warmup, the first transaction of each worker starts
             // in the measurement.
             "--warmup=0s",

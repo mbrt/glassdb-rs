@@ -153,16 +153,52 @@ impl Factory {
     /// Creates an independent middleware instance over the selected storage.
     pub(super) fn backend(&self) -> Arc<dyn Backend> {
         match self {
-            Factory::Memory(delays) => Arc::new(
-                DelayBackend::new(Arc::new(MemoryBackend::new()), *delays)
-                    .expect("generated delay profile is valid"),
-            ),
+            Factory::Memory(delays) => delayed(Arc::new(MemoryBackend::new()), *delays),
             Factory::Gcs { bucket } => Arc::new(glassdb::gcs::GcsBackend::new(bucket.clone())),
             Factory::S3 { client, bucket, .. } => {
                 Arc::new(glassdb::s3::S3Backend::new(client.clone(), bucket.clone()))
             }
         }
     }
+
+    /// Creates an empty storage whose state can be forked, or none when the
+    /// selected storage cannot fork.
+    pub(super) fn forkable(&self) -> Option<ForkableBackend> {
+        match self {
+            Factory::Memory(delays) => Some(ForkableBackend {
+                memory: Arc::new(MemoryBackend::new()),
+                delays: *delays,
+            }),
+            Factory::Gcs { .. } | Factory::S3 { .. } => None,
+        }
+    }
+}
+
+/// A simulated storage whose state can be copied into independent storages.
+pub(super) struct ForkableBackend {
+    memory: Arc<MemoryBackend>,
+    delays: DelayOptions,
+}
+
+impl ForkableBackend {
+    /// Returns a backend over this storage with the simulated provider delays.
+    pub(super) fn backend(&self) -> Arc<dyn Backend> {
+        delayed(self.memory.clone(), self.delays)
+    }
+
+    /// Returns an independent storage that starts with the current state.
+    pub(super) fn fork(&self) -> ForkableBackend {
+        ForkableBackend {
+            memory: Arc::new(self.memory.fork()),
+            delays: self.delays,
+        }
+    }
+}
+
+/// Wraps `memory` in its own delay model, so that its rate limits do not
+/// depend on traffic to other storages.
+fn delayed(memory: Arc<MemoryBackend>, delays: DelayOptions) -> Arc<dyn Backend> {
+    Arc::new(DelayBackend::new(memory, delays).expect("generated delay profile is valid"))
 }
 
 fn fake_http_client(pool: &str) -> Option<SharedHttpClient> {
