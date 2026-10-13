@@ -2605,7 +2605,7 @@ async fn reclaim_topology(committed: bool, case: TopologyReclamation) {
     assert!(
         !ctx.gc
             .topology
-            .leave(&collection(), &id, Requirement::after(barrier))
+            .leave(&collection(), &[id], Requirement::after(barrier))
             .await
             .unwrap()
     );

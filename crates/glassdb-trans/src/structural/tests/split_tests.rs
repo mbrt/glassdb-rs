@@ -909,7 +909,7 @@ async fn separator_capacity_splits_parent_during_reconciliation_and_recovery() {
                 .unwrap();
             sp.changes
                 .topology
-                .join(&collection(), &participant)
+                .join(&collection(), &[participant])
                 .await
                 .unwrap();
             s.write_structural_intent(
@@ -1903,4 +1903,239 @@ impl RootWriteBlocker {
     fn block(&self, on: bool) {
         self.blocked.store(on, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+// The splits of one sweep in one collection must not each write the
+// collection record to join and to leave the topology. Concurrent splits then
+// lose most of their record CASes to each other, and back off for longer than
+// the splits take.
+#[tokio::test]
+async fn one_sweep_of_splits_writes_the_collection_record_twice() {
+    const LEAVES: usize = 6;
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let s = store_with_backend(backend.clone() as Arc<dyn Backend>);
+    seed_sibling_leaves(&s, LEAVES).await;
+    let record_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    backend.set_before({
+        let record = ObjectPath::CollectionRecord {
+            collection: collection(),
+        }
+        .to_string();
+        let record_writes = record_writes.clone();
+        move |op| {
+            if matches!(op, BackendOp::WriteIf { .. }) && op.path() == record {
+                record_writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let future: HookFuture = Box::pin(async { Ok(()) });
+            future
+        }
+    });
+    let bg = Arc::new(Background::new());
+    let policy = NodeSizePolicy::builder()
+        .leaf_max_entries(2)
+        .node_soft_max_bytes(1 << 20)
+        .index_max_children(100)
+        .build()
+        .unwrap();
+    let candidates = MaintenanceCandidates::with_policy(policy);
+    push_soft_cap_splits(&candidates, LEAVES);
+    let sp = restructurer_with_candidates(&s, &bg, candidates);
+
+    sp.run_once().await;
+    backend.clear_before();
+
+    assert_eq!(sp.stats_and_reset().splits, LEAVES as u64);
+    assert_eq!(
+        record_writes.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one CAS to join and one to leave"
+    );
+    let (record, _) = s
+        .records
+        .load_record(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(record.topology_participants().count(), 0);
+    assert!(
+        s.discover_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
+        .leaves(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(leaves.len(), 2 * LEAVES);
+}
+
+// When the participants of a batch cannot join the collection record, each
+// split must stop cleanly: no intent and no participant stay, and each
+// candidate waits for a later sweep.
+#[tokio::test]
+async fn a_batch_that_cannot_join_the_topology_leaves_nothing_behind() {
+    let s = store();
+    seed_sibling_leaves(&s, 3).await;
+    // A live drop holds the topology freeze, so no participant can join.
+    let bg = Arc::new(Background::new());
+    let sp = restructurer_with_candidates(&s, &bg, MaintenanceCandidates::with_policy(tiny()));
+    let holder = sp.candidates.new_id();
+    sp.mon.begin_tx(&holder);
+    let (mut record, observed) = s
+        .records
+        .load_record(&collection(), Requirement::ANY)
+        .await
+        .unwrap();
+    assert!(record.set_topology_freeze(holder));
+    assert!(s.records.store_record(&record, &observed).await.unwrap());
+    push_soft_cap_splits(&sp.candidates, 3);
+
+    sp.run_once().await;
+
+    assert_eq!(
+        sp.stats_and_reset(),
+        RestructurerStats {
+            candidates: 3,
+            deferred: 3,
+            ..RestructurerStats::default()
+        }
+    );
+    assert_eq!(sp.candidates.drain().len(), 3, "each candidate is requeued");
+    let (record, _) = s
+        .records
+        .load_record(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(record.topology_participants().count(), 0);
+    assert!(
+        s.discover_structural_intents("db", Requirement::after(s.timeline.currentness_barrier()))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+// Two causes can ask for a split of the same node in one sweep. The node
+// splits for each of them, one after the other, and neither waits for the
+// gate of the other.
+#[tokio::test]
+async fn two_causes_split_one_node_one_after_the_other() {
+    let s = store();
+    s.store_node(
+        COLL,
+        "L",
+        &leaf_node(&[b"a", b"b", b"c", b"d", b"e", b"f"], None, None),
+        None,
+    )
+    .await
+    .unwrap();
+    let root = Node::index(IndexNode::from_children([(Vec::new(), test_node_id("L"))]));
+    s.create_root(COLL, &root).await.unwrap();
+    let bg = Arc::new(Background::new());
+    let policy = NodeSizePolicy::builder()
+        .leaf_max_entries(2)
+        .node_soft_max_bytes(1 << 20)
+        .index_max_children(100)
+        .build()
+        .unwrap();
+    let candidates = MaintenanceCandidates::with_policy(policy);
+    for cause in [
+        CandidateCause::Split(SplitReason::SoftCap),
+        CandidateCause::Split(SplitReason::Demand {
+            at: Some(b"b".to_vec()),
+            rate: Duration::from_secs(1),
+        }),
+    ] {
+        candidates.push(MaintenanceCandidate {
+            path: node_path("L"),
+            priority: candidates.new_id(),
+            cause,
+        });
+    }
+    let sp = restructurer_with_candidates(&s, &bg, candidates);
+
+    sp.run_once().await;
+
+    let stats = sp.stats_and_reset();
+    assert_eq!((stats.splits, stats.deferred), (2, 0));
+    let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
+        .leaves(
+            &collection(),
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(leaves.len(), 3);
+}
+
+/// Stores `count` sibling leaves of three keys each below the tree root.
+async fn seed_sibling_leaves(s: &TestStore, count: usize) -> Vec<String> {
+    let names: Vec<String> = (0..count).map(|leaf| format!("L{leaf}")).collect();
+    let mut children = Vec::new();
+    for (leaf, name) in names.iter().enumerate() {
+        let low = b'a' + 3 * leaf as u8;
+        let keys: Vec<[u8; 1]> = (0..3).map(|key| [low + key]).collect();
+        let keys: Vec<&[u8]> = keys.iter().map(|key| key.as_slice()).collect();
+        let right = names.get(leaf + 1).map(String::as_str);
+        let high = [low + 3];
+        let node = leaf_node(&keys, right.map(|_| high.as_slice()), right);
+        s.store_node(COLL, name, &node, None).await.unwrap();
+        let separator = if leaf == 0 { Vec::new() } else { vec![low] };
+        children.push((separator, test_node_id(name)));
+    }
+    s.create_root(COLL, &Node::index(IndexNode::from_children(children)))
+        .await
+        .unwrap();
+    names
+}
+
+/// Queues a soft cap split of each of the `count` leaves of
+/// [`seed_sibling_leaves`].
+fn push_soft_cap_splits(candidates: &MaintenanceCandidates, count: usize) {
+    for leaf in 0..count {
+        candidates.push(MaintenanceCandidate {
+            path: node_path(&format!("L{leaf}")),
+            priority: candidates.new_id(),
+            cause: CandidateCause::Split(SplitReason::SoftCap),
+        });
+    }
+}
+
+// While the queue is long, the demand splits that remove the most avoidable
+// time must land first, after the splits that a size cause asks for.
+#[test]
+fn a_sweep_orders_splits_by_cause_and_rate() {
+    let candidates = MaintenanceCandidates::with_policy(NodeSizePolicy::default());
+    let push = |name: &str, cause: CandidateCause| {
+        candidates.push(MaintenanceCandidate {
+            path: node_path(name),
+            priority: candidates.new_id(),
+            cause,
+        })
+    };
+    push("merge", CandidateCause::Merge(MergeReason::Underfull));
+    push("slow", CandidateCause::Split(demand_split(10)));
+    push("fast", CandidateCause::Split(demand_split(500)));
+    push("cap", CandidateCause::Split(SplitReason::SoftCap));
+    push("medium", CandidateCause::Split(demand_split(100)));
+
+    let order: Vec<_> = candidates
+        .drain()
+        .into_iter()
+        .map(|candidate| candidate.path)
+        .collect();
+
+    assert_eq!(
+        order,
+        ["cap", "fast", "medium", "slow", "merge"].map(node_path)
+    );
 }

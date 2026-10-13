@@ -46,11 +46,12 @@ impl TopologyMembership {
             .await
     }
 
-    /// Admits `id` as a topology participant of `collection`.
+    /// Admits `ids` as topology participants of `collection`, with one CAS
+    /// for all of them.
     pub(super) async fn join(
         &self,
         collection: &CollectionAddress,
-        id: &TxId,
+        ids: &[TxId],
     ) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
         loop {
@@ -60,12 +61,18 @@ impl TopologyMembership {
                     Err(StorageError::NotFound) => return Err(TransError::StaleCollection),
                     Err(error) => return Err(error.into()),
                 };
-            if record
-                .topology_participants()
-                .any(|participant| participant == id)
-            {
-                // This is the same change's admission; its identity is not
-                // reused after departure. New admission requires the CAS below.
+            // An admitted participant is the same change's admission; its
+            // identity is not reused after departure. New admission requires
+            // the CAS below.
+            let missing: Vec<_> = ids
+                .iter()
+                .filter(|id| {
+                    !record
+                        .topology_participants()
+                        .any(|admitted| admitted == *id)
+                })
+                .collect();
+            if missing.is_empty() {
                 return Ok(());
             }
             if let Some(holder) = record.topology_freeze() {
@@ -83,8 +90,10 @@ impl TopologyMembership {
                     TxCommitStatus::Pending | TxCommitStatus::Unknown => Err(TransError::Retry),
                 };
             }
-            if !record.add_topology_participant(*id) {
-                return Err(TransError::Retry);
+            for id in missing {
+                if !record.add_topology_participant(*id) {
+                    return Err(TransError::Retry);
+                }
             }
             if self.records.store_record(&record, &observed).await? {
                 return Ok(());
@@ -93,15 +102,16 @@ impl TopologyMembership {
         }
     }
 
-    /// Removes a participant whose structural intents have settled.
+    /// Removes participants whose structural intents have settled, with one
+    /// CAS for all of them.
     ///
-    /// Returns whether a removal CAS applied. A present record without the
-    /// participant must satisfy `requirement`. Local admission or
+    /// Returns whether a removal CAS applied. A present record without any of
+    /// the participants must satisfy `requirement`. Local admission or
     /// topology-freeze evidence permits `ANY`.
     pub(crate) async fn leave(
         &self,
         collection: &CollectionAddress,
-        id: &TxId,
+        ids: &[TxId],
         requirement: Requirement,
     ) -> Result<bool, TransError> {
         let mut backoff = self.retry.backoff();
@@ -118,7 +128,11 @@ impl TopologyMembership {
                     Err(StorageError::NotFound) => return Ok(false),
                     Err(error) => return Err(error.into()),
                 };
-            if !record.remove_topology_participant(id) {
+            let mut removed = false;
+            for id in ids {
+                removed |= record.remove_topology_participant(id);
+            }
+            if !removed {
                 if observed.satisfies(requirement) {
                     return Ok(false);
                 }

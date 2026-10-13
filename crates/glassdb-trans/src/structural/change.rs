@@ -8,10 +8,12 @@
 //! the intent when the change completes, discards it when the change stops
 //! before `Ready`, and leaves it to recovery otherwise.
 
+use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use glassdb_concurr::rt;
+use glassdb_concurr::{join_all_bounded, rt};
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::{LeafObservation, Node, Requirement};
 use tokio::sync::Notify;
@@ -126,6 +128,12 @@ struct StructuralChangeAttempt<'a> {
     worker: &'a TxId,
 }
 
+/// One change of a sweep, which owns its topology participant `worker`.
+pub(super) struct SweepChange<'a> {
+    pub(super) change: PlannedChange<'a>,
+    pub(super) worker: TxId,
+}
+
 impl ChangeLifecycle {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
@@ -160,13 +168,85 @@ impl ChangeLifecycle {
         worker: TxId,
         topology: StructuralTopology<'_>,
     ) -> Result<(), TransError> {
-        StructuralChangeAttempt {
-            lifecycle: self,
-            change,
-            worker: &worker,
+        match topology {
+            StructuralTopology::Owned => self
+                .run_sweep(vec![&SweepChange { change, worker }], NonZeroUsize::MIN)
+                .await
+                .pop()
+                .expect("a sweep returns one result for each change"),
+            StructuralTopology::Joined(participant) => {
+                StructuralChangeAttempt {
+                    lifecycle: self,
+                    change,
+                    worker: &worker,
+                }
+                .run_joined(participant)
+                .await
+            }
         }
-        .run(topology)
-        .await
+    }
+
+    /// Makes the `changes` of one sweep, at most `parallelism` at a time,
+    /// and returns the result of each one. Each change completes, or leaves
+    /// its Ready intent to recovery.
+    ///
+    /// Each change has its own topology participant, but the participants of
+    /// one collection join and leave its record with one CAS. Concurrent
+    /// changes of one collection otherwise lose most of their record CASes to
+    /// each other, and back off for longer than the changes take.
+    pub(super) async fn run_sweep(
+        &self,
+        changes: Vec<&SweepChange<'_>>,
+        parallelism: NonZeroUsize,
+    ) -> Vec<Result<(), TransError>> {
+        // The futures are collected before they run, because an iterator of
+        // closures over borrowed state held across an await is not `Send`.
+        let attempts: Vec<_> = changes
+            .into_iter()
+            .map(|change| StructuralChangeAttempt {
+                lifecycle: self,
+                change: change.change,
+                worker: &change.worker,
+            })
+            .collect();
+        let preparing: Vec<_> = attempts
+            .iter()
+            .map(|attempt| attempt.prepare_owned())
+            .collect();
+        let prepared = join_all_bounded(preparing, parallelism).await;
+
+        let mut joining = Participants::default();
+        for (attempt, prepared) in attempts.iter().zip(&prepared) {
+            if prepared.is_ok() {
+                joining.add(attempt);
+            }
+        }
+        let joined = joining.join(&self.topology, parallelism).await;
+
+        let changing: Vec<_> = attempts
+            .iter()
+            .zip(prepared)
+            .map(|(attempt, prepared)| attempt.change_admitted(prepared, &joined))
+            .collect();
+        let settled = join_all_bounded(changing, parallelism).await;
+
+        let mut leaving = Participants::default();
+        for (attempt, (_, departs)) in attempts.iter().zip(&settled) {
+            if *departs {
+                leaving.add(attempt);
+            }
+        }
+        let left = leaving.leave(&self.topology, parallelism).await;
+
+        let finalizing: Vec<_> = attempts
+            .iter()
+            .zip(settled)
+            .map(|(attempt, (result, departs))| {
+                let departed = departs.then(|| &left[attempt.change.collection()]);
+                attempt.finalize_owned(result, departed)
+            })
+            .collect();
+        join_all_bounded(finalizing, parallelism).await
     }
 
     /// Splits the node at `path` when `reason` still calls for it.
@@ -306,46 +386,84 @@ impl ChangeAttemptOutcome {
 }
 
 impl StructuralChangeAttempt<'_> {
-    async fn run(&self, topology: StructuralTopology<'_>) -> Result<(), TransError> {
+    /// Makes the change beneath the topology participant of another change.
+    async fn run_joined(&self, participant: &TxId) -> Result<(), TransError> {
         let lifecycle = self.lifecycle;
-        let collection = self.change.collection();
-        let result = match topology {
-            StructuralTopology::Owned => {
-                match lifecycle.topology.begin(collection, self.worker).await {
-                    Ok(()) => self.run_prepared(topology).await,
-                    Err(error) => Err(error),
-                }
+        lifecycle.structural_nodes.begin_worker(self.worker);
+        let result = match self.prepare_intent(participant).await {
+            Ok(prepared) => {
+                let cancellation = prepared.cancellation_witness();
+                let outcome = self.coordinate(prepared).await;
+                self.settle(outcome, &cancellation).await.0
             }
-            StructuralTopology::Joined(_) => {
-                lifecycle.structural_nodes.begin_worker(self.worker);
-                self.run_prepared(topology).await
-            }
+            Err(error) => Err(error),
         };
-
-        match topology {
-            StructuralTopology::Owned => {
-                lifecycle.topology.finalize(collection, self.worker).await;
-            }
-            StructuralTopology::Joined(_) => {
-                lifecycle
-                    .structural_nodes
-                    .finalize_worker(self.worker)
-                    .await;
-            }
-        }
+        lifecycle
+            .structural_nodes
+            .finalize_worker(self.worker)
+            .await;
         if result.is_err() {
             lifecycle.recovery_wake.notify_one();
         }
         result
     }
 
-    async fn run_prepared(&self, topology: StructuralTopology<'_>) -> Result<(), TransError> {
-        let participant = match topology {
-            StructuralTopology::Owned => self.worker,
-            StructuralTopology::Joined(participant) => participant,
+    /// Persists the recovery manifest of the owned topology participant, and
+    /// writes the Preparing intent of the change beneath it.
+    async fn prepare_owned(
+        &self,
+    ) -> Result<(PreparedIntent, PreparedIntentCancellation), TransError> {
+        self.lifecycle
+            .topology
+            .begin(self.change.collection(), self.worker)
+            .await?;
+        let prepared = self.prepare_intent(self.worker).await?;
+        let cancellation = prepared.cancellation_witness();
+        Ok((prepared, cancellation))
+    }
+
+    /// Makes the change of an owned participant after its collection
+    /// admission in `joined`, and settles its intent.
+    async fn change_admitted(
+        &self,
+        prepared: Result<(PreparedIntent, PreparedIntentCancellation), TransError>,
+        joined: &RecordResults<'_>,
+    ) -> (Result<(), TransError>, bool) {
+        let (prepared, cancellation) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => return (Err(error), false),
         };
-        let prepared = self
-            .lifecycle
+        let outcome = match &joined[self.change.collection()] {
+            Ok(()) => self.coordinate(prepared).await,
+            Err(error) => ChangeAttemptOutcome::retry_cleanly(Err(error.clone())),
+        };
+        self.settle(outcome, &cancellation).await
+    }
+
+    /// Gives the owned participant its final status, after its departure
+    /// `departed`, if it could depart.
+    async fn finalize_owned(
+        &self,
+        result: Result<(), TransError>,
+        departed: Option<&Result<(), TransError>>,
+    ) -> Result<(), TransError> {
+        let lifecycle = self.lifecycle;
+        // One departure CAS removes all the participants of a collection, so
+        // its error does not fail the changes that landed. Garbage collection
+        // removes a participant with a final status and no intents.
+        let departure_failed = departed.is_some_and(|departed| departed.is_err());
+        lifecycle
+            .topology
+            .finalize(self.change.collection(), self.worker)
+            .await;
+        if result.is_err() || departure_failed {
+            lifecycle.recovery_wake.notify_one();
+        }
+        result
+    }
+
+    async fn prepare_intent(&self, participant: &TxId) -> Result<PreparedIntent, TransError> {
+        self.lifecycle
             .recovery
             .prepare_intent(
                 self.change.collection(),
@@ -353,23 +471,7 @@ impl StructuralChangeAttempt<'_> {
                 self.change.kind(),
                 participant,
             )
-            .await?;
-        let cancellation = prepared.cancellation_witness();
-        let outcome = match topology {
-            StructuralTopology::Owned => {
-                match self
-                    .lifecycle
-                    .topology
-                    .join(self.change.collection(), self.worker)
-                    .await
-                {
-                    Ok(()) => self.coordinate(prepared).await,
-                    Err(error) => ChangeAttemptOutcome::retry_cleanly(Err(error)),
-                }
-            }
-            StructuralTopology::Joined(_) => self.coordinate(prepared).await,
-        };
-        self.finish(outcome, &cancellation, topology).await
+            .await
     }
 
     async fn coordinate(&self, prepared: PreparedIntent) -> ChangeAttemptOutcome {
@@ -576,40 +678,76 @@ impl StructuralChangeAttempt<'_> {
             .await
     }
 
-    async fn finish(
+    /// Discards the Preparing intent of a change that stopped cleanly.
+    /// Returns the result of the change, and whether its participant can
+    /// leave the topology, because the participant has no intent left.
+    async fn settle(
         &self,
         outcome: ChangeAttemptOutcome,
         prepared: &PreparedIntentCancellation,
-        topology: StructuralTopology<'_>,
-    ) -> Result<(), TransError> {
+    ) -> (Result<(), TransError>, bool) {
         let ChangeAttemptOutcome { result, state } = outcome;
         match state {
-            ChangeAttemptResult::Completed => match topology {
-                StructuralTopology::Owned => result.and(self.leave_topology().await),
-                StructuralTopology::Joined(_) => result,
-            },
+            ChangeAttemptResult::Completed => (result, true),
             ChangeAttemptResult::RetryCleanly => {
-                let cleanup = match self.lifecycle.recovery.discard_prepared(prepared).await {
-                    Ok(()) => match topology {
-                        StructuralTopology::Owned => self.leave_topology().await,
-                        StructuralTopology::Joined(_) => Ok(()),
-                    },
-                    Err(error) => Err(error),
-                };
-                result.and(cleanup)
+                match self.lifecycle.recovery.discard_prepared(prepared).await {
+                    Ok(()) => (result, true),
+                    Err(error) => (result.and(Err(error)), false),
+                }
             }
-            ChangeAttemptResult::RecoveryRequired(_ready) => result,
+            ChangeAttemptResult::RecoveryRequired(_ready) => (result, false),
         }
     }
+}
 
-    /// Removes the owned topology participant, which this database instance
-    /// admitted.
-    async fn leave_topology(&self) -> Result<(), TransError> {
+/// The owned topology participants of one sweep, grouped by collection.
+#[derive(Default)]
+struct Participants<'a> {
+    by_collection: BTreeMap<&'a CollectionAddress, Vec<TxId>>,
+}
+
+/// The result of one CAS on the record of each collection.
+type RecordResults<'a> = BTreeMap<&'a CollectionAddress, Result<(), TransError>>;
+
+impl<'a> Participants<'a> {
+    fn add(&mut self, attempt: &StructuralChangeAttempt<'a>) {
+        self.by_collection
+            .entry(attempt.change.collection())
+            .or_default()
+            .push(*attempt.worker);
+    }
+
+    /// Admits the participants of each collection with one CAS.
+    async fn join(
+        self,
+        topology: &TopologyMembership,
+        parallelism: NonZeroUsize,
+    ) -> RecordResults<'a> {
+        let joins: Vec<_> = self
+            .by_collection
+            .iter()
+            .map(|(collection, ids)| topology.join(collection, ids))
+            .collect();
+        let results = join_all_bounded(joins, parallelism).await;
+        self.by_collection.into_keys().zip(results).collect()
+    }
+
+    /// Removes the participants of each collection with one CAS.
+    async fn leave(
+        self,
+        topology: &TopologyMembership,
+        parallelism: NonZeroUsize,
+    ) -> RecordResults<'a> {
         // The local admission permits any record observation.
-        self.lifecycle
-            .topology
-            .leave(self.change.collection(), self.worker, Requirement::ANY)
-            .await?;
-        Ok(())
+        let leaves: Vec<_> = self
+            .by_collection
+            .iter()
+            .map(|(collection, ids)| topology.leave(collection, ids, Requirement::ANY))
+            .collect();
+        let results = join_all_bounded(leaves, parallelism).await;
+        self.by_collection
+            .into_keys()
+            .zip(results.into_iter().map(|left| left.map(|_| ())))
+            .collect()
     }
 }

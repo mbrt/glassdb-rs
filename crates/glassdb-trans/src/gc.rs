@@ -711,7 +711,11 @@ impl Gc {
             }
             changed |= self
                 .topology
-                .leave(collection, tid, Requirement::after(barrier))
+                .leave(
+                    collection,
+                    std::slice::from_ref(tid),
+                    Requirement::after(barrier),
+                )
                 .await?;
         }
         Ok(Reclamation {

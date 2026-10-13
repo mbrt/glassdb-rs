@@ -57,7 +57,7 @@ async fn departure_backs_off_after_a_rejected_cas() {
     let barrier = store.timeline.currentness_barrier();
     assert!(
         topology
-            .leave(&collection(), &departing, Requirement::after(barrier))
+            .leave(&collection(), &[departing], Requirement::after(barrier))
             .await
             .unwrap()
     );

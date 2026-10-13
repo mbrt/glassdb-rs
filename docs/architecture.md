@@ -624,6 +624,12 @@ burst of writes. A deferred candidate waits for the next sweep, which comes at
 most a fixed interval later, so a busy node cannot cause a tight retry loop. A
 merge defers while a live transaction holds a lock on its source or target.
 
+Under load, a rule asks for many more leaf splits than one split at a time can
+make, and the tree does not settle. So a sweep splits different nodes at the
+same time, in batches of a fixed size. Each split keeps its own topology
+participant, but the participants of one collection share one CAS. Merges happen
+one at a time, after splits.
+
 Each database instance decides on its own transactions, so instances can
 disagree on a leaf. A split or merge that a rule asks for keeps its paid rate
 in the leaves that it writes, and the opposite change of these leaves must pay

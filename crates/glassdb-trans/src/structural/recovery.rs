@@ -923,7 +923,11 @@ impl StructuralRecovery {
                     SettlementMode::Explicit => Requirement::ANY,
                 };
                 self.topology
-                    .leave(&settlement.collection, &settlement.participant, departure)
+                    .leave(
+                        &settlement.collection,
+                        std::slice::from_ref(&settlement.participant),
+                        departure,
+                    )
                     .await?;
                 return Ok(ParticipantSettlementStep::Completed);
             }

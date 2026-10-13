@@ -26,13 +26,14 @@ mod split;
 mod stats;
 mod topology;
 
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::{Background, ScanCadence, rt};
+use glassdb_concurr::{Background, ScanCadence, join_all_bounded, rt};
 use glassdb_data::{CollectionAddress, DbPrefix, ObjectPath, TxId};
 use glassdb_storage::{
     InlinePolicy, NodeSizePolicy, NodeStore, StructuralIntentStore, Timeline, TreeRouter,
@@ -48,14 +49,15 @@ use crate::monitor::Monitor;
 use crate::retry_timing::RetryTiming;
 
 use candidates::{CandidateCause, MaintenanceCandidate, MaintenanceCandidates};
-use change::{ChangeLifecycle, PlannedChange, StructuralTopology};
+use change::{ChangeLifecycle, PlannedChange, StructuralTopology, SweepChange};
+use merge::MergeReason;
 use merge::Merger;
 use nodes::StructuralNodeAccess;
 use reclamation::ReclamationReporter;
 use reconcile::ParentReconciler;
 use recovery::{RecoveryAction, RecoveryStep, StructuralRecovery};
 use rule::{TOPOLOGY_WINDOW, TopologyRule};
-use split::Splitter;
+use split::{SplitReason, Splitter};
 use stats::Stats;
 
 pub use candidates::StructuralHintSink;
@@ -71,6 +73,10 @@ const STRUCTURAL_RECOVERY_IDLE_INTERVAL: Duration = Duration::from_secs(600);
 /// they run out, the caller stops its step, and a later sweep or recovery
 /// attempt tries again.
 const NODE_CAS_ATTEMPTS: usize = 8;
+
+/// The maximum number of splits of different nodes that one sweep makes at
+/// the same time.
+const STRUCTURAL_CHANGE_PARALLELISM: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 
 /// Background executor that halves over-full B-link nodes (ADR-031) and merges
 /// underfull nodes into their right sibling (ADR-073). Holds no
@@ -95,6 +101,13 @@ pub struct Restructurer {
     recovery: StructuralRecovery,
     recovery_wake: Arc<Notify>,
     topology_policy: TopologyPolicy,
+}
+
+/// A split candidate and the node that its split divides.
+struct LocatedSplit {
+    candidate: MaintenanceCandidate,
+    reason: SplitReason,
+    path: ObjectPath,
 }
 
 impl Restructurer {
@@ -301,38 +314,27 @@ impl Restructurer {
     /// transient error on one candidate only defers its change to a later
     /// cycle, so it is logged and the sweep continues.
     async fn run_once(&self) {
-        let stats = &self.stats;
+        let mut splits = Vec::new();
+        let mut merges = Vec::new();
         for candidate in self.candidates.drain() {
-            stats.candidates.fetch_add(1, Ordering::Relaxed);
-            let pressure = candidate.cause.is_inline_pressure();
-            if pressure {
-                stats
-                    .inline_pressure_candidates
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if let Err(e) = self.process_candidate(&candidate).await {
-                tracing::debug!(
-                    target: "glassdb::restructurer",
-                    path = %candidate.path,
-                    error = %e,
-                    "structural candidate deferred"
-                );
-                let discard = pressure
-                    && matches!(e, TransError::InvalidInput(_) | TransError::StaleCollection);
-                if discard {
-                    stats
-                        .inline_pressure_discarded
-                        .fetch_add(1, Ordering::Relaxed);
-                } else if !matches!(e, TransError::InvalidInput(_)) {
-                    stats.deferred.fetch_add(1, Ordering::Relaxed);
-                    if pressure {
-                        stats
-                            .inline_pressure_deferred
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    self.candidates.requeue(candidate);
+            self.count_candidate(&candidate);
+            match &candidate.cause {
+                CandidateCause::Split(reason) => {
+                    let reason = reason.clone();
+                    splits.push((candidate, reason));
+                }
+                CandidateCause::Merge(reason) => {
+                    let reason = *reason;
+                    merges.push((candidate, reason));
                 }
             }
+        }
+        self.split_all(splits).await;
+        // A merge changes two nodes and reserves its target (ADR-073), so the
+        // merges run in sequence after the splits.
+        for (candidate, reason) in merges {
+            let result = self.merge(&candidate, reason).await;
+            self.settle_candidate(candidate, result);
         }
         // Re-drive reconciliations a previous cycle could not land, so parents
         // eventually agree with their children and descent stops relying on
@@ -352,45 +354,158 @@ impl Restructurer {
         }
     }
 
-    /// Dispatches one candidate to the change that its cause calls for.
-    async fn process_candidate(&self, candidate: &MaintenanceCandidate) -> Result<(), TransError> {
+    /// Makes the splits of `candidates` that are still necessary, many at a
+    /// time. The candidates that locate the same node split it one after the
+    /// other, in the order of the candidates.
+    async fn split_all(&self, candidates: Vec<(MaintenanceCandidate, SplitReason)>) {
+        let locating: Vec<_> = candidates
+            .iter()
+            .map(|(candidate, reason)| self.splitter.locate(&candidate.path, reason))
+            .collect();
+        let located = join_all_bounded(locating, STRUCTURAL_CHANGE_PARALLELISM).await;
+        // Splits of the same node compete for its gate, so each round splits
+        // a node at most once.
+        let mut rounds = Vec::<Vec<LocatedSplit>>::new();
+        let mut rounds_of_node = BTreeMap::<ObjectPath, usize>::new();
+        for ((candidate, reason), located) in candidates.into_iter().zip(located) {
+            match located {
+                Ok(Some(path)) => {
+                    let round = rounds_of_node.entry(path.clone()).or_default();
+                    if *round == rounds.len() {
+                        rounds.push(Vec::new());
+                    }
+                    rounds[*round].push(LocatedSplit {
+                        candidate,
+                        reason,
+                        path,
+                    });
+                    *round += 1;
+                }
+                Ok(None) => {}
+                Err(error) => self.settle_candidate(candidate, Err(error)),
+            }
+        }
+        for round in rounds {
+            // A participant stays in the collection record until the changes
+            // of its batch end, so a batch is not larger than the changes
+            // that run at the same time.
+            let mut round = round.into_iter().peekable();
+            while round.peek().is_some() {
+                let batch: Vec<_> = round
+                    .by_ref()
+                    .take(STRUCTURAL_CHANGE_PARALLELISM.get())
+                    .collect();
+                self.split_batch(batch).await;
+            }
+        }
+    }
+
+    /// Makes the splits of `batch`, each of a different node, at the same
+    /// time.
+    async fn split_batch(&self, batch: Vec<LocatedSplit>) {
+        let changes: Vec<_> = batch
+            .iter()
+            .map(|split| {
+                PlannedChange::split(&split.path, &split.reason).map(|change| SweepChange {
+                    change,
+                    // The candidate's already-aged wound-wait priority
+                    // becomes the identity of the change.
+                    worker: split.candidate.priority.renew(),
+                })
+            })
+            .collect();
+        let planned: Vec<_> = changes.iter().filter_map(|c| c.as_ref().ok()).collect();
+        let mut results = self
+            .changes
+            .run_sweep(planned, STRUCTURAL_CHANGE_PARALLELISM)
+            .await
+            .into_iter();
+        let results: Vec<_> = changes
+            .iter()
+            .map(|change| match change {
+                Ok(_) => results.next().expect("one result for each change"),
+                Err(error) => Err(error.clone()),
+            })
+            .collect();
+        for (split, result) in batch.into_iter().zip(results) {
+            self.settle_candidate(split.candidate, result);
+        }
+    }
+
+    /// Merges the node of `candidate` into its right sibling, if `reason`
+    /// still calls for it.
+    async fn merge(
+        &self,
+        candidate: &MaintenanceCandidate,
+        reason: MergeReason,
+    ) -> Result<(), TransError> {
+        let ObjectPath::Node {
+            collection,
+            id: source,
+        } = &candidate.path
+        else {
+            return Ok(());
+        };
+        if !self
+            .merger
+            .is_actionable(collection, source, reason)
+            .await?
+        {
+            return Ok(());
+        }
+        let change = PlannedChange::Merge {
+            collection,
+            source,
+            reason,
+        };
         // The candidate's already-aged wound-wait priority becomes the
         // identity of the change.
-        let id = candidate.priority.renew();
-        match &candidate.cause {
-            CandidateCause::Split(reason) => {
-                let Some(path) = self.splitter.locate(&candidate.path, reason).await? else {
-                    return Ok(());
-                };
-                let change = PlannedChange::split(&path, reason)?;
-                self.changes
-                    .run(change, id, StructuralTopology::Owned)
-                    .await
+        self.changes
+            .run(
+                change,
+                candidate.priority.renew(),
+                StructuralTopology::Owned,
+            )
+            .await
+    }
+
+    /// Counts one candidate that a sweep processes.
+    fn count_candidate(&self, candidate: &MaintenanceCandidate) {
+        self.stats.candidates.fetch_add(1, Ordering::Relaxed);
+        if candidate.cause.is_inline_pressure() {
+            self.stats
+                .inline_pressure_candidates
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Requeues `candidate` when a transient error deferred its change.
+    fn settle_candidate(&self, candidate: MaintenanceCandidate, result: Result<(), TransError>) {
+        let Err(e) = result else {
+            return;
+        };
+        let stats = &self.stats;
+        let pressure = candidate.cause.is_inline_pressure();
+        tracing::debug!(
+            target: "glassdb::restructurer",
+            path = %candidate.path,
+            error = %e,
+            "structural candidate deferred"
+        );
+        let discard =
+            pressure && matches!(e, TransError::InvalidInput(_) | TransError::StaleCollection);
+        if discard {
+            stats
+                .inline_pressure_discarded
+                .fetch_add(1, Ordering::Relaxed);
+        } else if !matches!(e, TransError::InvalidInput(_)) {
+            stats.deferred.fetch_add(1, Ordering::Relaxed);
+            if pressure {
+                stats
+                    .inline_pressure_deferred
+                    .fetch_add(1, Ordering::Relaxed);
             }
-            CandidateCause::Merge(reason) => {
-                let ObjectPath::Node {
-                    collection,
-                    id: source,
-                } = &candidate.path
-                else {
-                    return Ok(());
-                };
-                if !self
-                    .merger
-                    .is_actionable(collection, source, *reason)
-                    .await?
-                {
-                    return Ok(());
-                }
-                let change = PlannedChange::Merge {
-                    collection,
-                    source,
-                    reason: *reason,
-                };
-                self.changes
-                    .run(change, id, StructuralTopology::Owned)
-                    .await
-            }
+            self.candidates.requeue(candidate);
         }
     }
 

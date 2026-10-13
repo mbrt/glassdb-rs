@@ -77,7 +77,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantReclamation)
         owner
             .changes
             .topology
-            .join(&collection(), &id)
+            .join(&collection(), &[id])
             .await
             .unwrap();
         assert_eq!(
@@ -116,7 +116,7 @@ async fn recover_peer_participant(committed: bool, case: ParticipantReclamation)
                         owner
                             .changes
                             .topology
-                            .leave(&collection(), &participant, Requirement::ANY)
+                            .leave(&collection(), &[participant], Requirement::ANY)
                             .await
                             .map_err(|error| {
                                 glassdb_backend::BackendError::with_source("owner departure", error)
@@ -371,7 +371,7 @@ async fn settlement_cancels_a_prepared_split_before_node_creation() {
         .unwrap();
     sp.changes
         .topology
-        .join(&collection(), &participant)
+        .join(&collection(), &[participant])
         .await
         .unwrap();
     sp.mon.abort_owned_tx(&participant).await.unwrap();
@@ -921,7 +921,7 @@ async fn check_recovery_batch_reuses_source_reads(explicit: bool) {
         .unwrap();
     sp.changes
         .topology
-        .join(&collection(), &participant)
+        .join(&collection(), &[participant])
         .await
         .unwrap();
 
@@ -1047,7 +1047,7 @@ async fn later_participant_discovery_checks_sources_after_its_own_ready_intents(
             .unwrap();
         sp.changes
             .topology
-            .join(&collection(), &participant)
+            .join(&collection(), &[participant])
             .await
             .unwrap();
         let first_worker = TxId::with_priority(1, b"first-worker");
