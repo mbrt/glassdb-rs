@@ -108,7 +108,7 @@ uv run hack/aws-bench/plot_results.py --canonical
 ```
 
 The canonical mode needs three clean, converged runs. Throughput shows the p50
-of the throughput windows as a line and their p50 to p90 range as a band.
+of the throughput windows as a line and their p10 to p90 range as a band.
 Latency shows the p50 as a line and the p50 to p90 range as a band. Both use the
 median over the runs. Each affinity figure has one panel for each database
 instance count, with all shapes. The four figures go to `hack/aws-bench/out-sweeps/`.

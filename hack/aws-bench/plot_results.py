@@ -19,8 +19,9 @@ The scenario recorded in each file selects the figures:
 `--series LABEL=FILE` (at least twice) overlays files of one scenario instead.
 Each scenario gets its own figures, named `cmp-<scenario>-*.png`.
 
-Lines show the p50 and bands the p50 to p90 range: of a shape's throughput
-windows for throughput, and of its transaction latencies for latency. With
+Lines show the p50. Bands show the p10 to p90 range of a shape's throughput
+windows for throughput, and the p50 to p90 range of its transaction latencies
+for latency. With
 several runs in a file, lines and band edges show the cross-run median. Pass `--canonical`
 to render the four fixed worker and affinity figures of the local S3 model
 instead; that mode insists on the complete grids described in the README.
@@ -59,11 +60,19 @@ AFFINITY_DATABASES = (1, 3, 5, 7)
 EXPECTED_RUNS = (1, 2, 3)
 FIXED_AFFINITY_WORKERS = 20
 WORKER_DATABASE_LIMIT = 5
-METRICS = ("throughput", "throughput_p50", "throughput_p90", "p50_ms", "p90_ms")
+METRICS = (
+    "throughput",
+    "throughput_p10",
+    "throughput_p50",
+    "throughput_p90",
+    "p50_ms",
+    "p90_ms",
+)
 # The line and band edges of each metric: (line, band low, band high).
-THROUGHPUT_BAND = ("throughput_p50", "throughput_p50", "throughput_p90")
+THROUGHPUT_BAND = ("throughput_p50", "throughput_p10", "throughput_p90")
 LATENCY_BAND = ("p50_ms", "p50_ms", "p90_ms")
-BAND_TITLE = "p50 line; p90 band"
+THROUGHPUT_BAND_TITLE = "p50 line; p10–p90 band"
+LATENCY_BAND_TITLE = "p50 line; p50–p90 band"
 # One line style per overlaid source; shapes keep their colors.
 SOURCE_STYLES = ("-", "--", ":", "-.")
 # Dimensions that a generic mixed report may sweep along its x-axis.
@@ -200,7 +209,7 @@ def plot_worker_throughput(data: pd.DataFrame, out_dir: Path) -> Path:
     fig, ax = plt.subplots(figsize=(14, 6))
     _plot_shape_bands(ax, medians, "workers", THROUGHPUT_BAND, colors)
     ax.set_title(
-        f"Mixed-workload throughput with isolated collections\n{BAND_TITLE}"
+        f"Mixed-workload throughput with isolated collections\n{THROUGHPUT_BAND_TITLE}"
     )
     ax.set_xlabel("Concurrent workers per shape")
     ax.set_ylabel("Transactions / sec")
@@ -217,7 +226,7 @@ def plot_worker_latency(data: pd.DataFrame, out_dir: Path) -> Path:
     fig, ax = plt.subplots(figsize=(14, 6))
     _plot_shape_bands(ax, medians, "workers", LATENCY_BAND, colors)
     ax.set_title(
-        f"Mixed-workload latency with isolated collections\n{BAND_TITLE}"
+        f"Mixed-workload latency with isolated collections\n{LATENCY_BAND_TITLE}"
     )
     ax.set_xlabel("Concurrent workers per shape")
     ax.set_ylabel("Latency (ms)")
@@ -255,7 +264,7 @@ def plot_affinity_throughput(data: pd.DataFrame, out_dir: Path) -> Path:
         ax.set_xticks(AFFINITY_POINTS)
     handles, labels = axes.flat[0].get_legend_handles_labels()
     fig.suptitle(
-        f"Throughput by home-collection affinity — {BAND_TITLE}", y=0.99
+        f"Throughput by home-collection affinity — {THROUGHPUT_BAND_TITLE}", y=0.99
     )
     fig.legend(
         handles,
@@ -290,7 +299,7 @@ def plot_affinity_latency(data: pd.DataFrame, out_dir: Path) -> Path:
         ax.set_ylabel("Latency (ms)")
         ax.set_xticks(AFFINITY_POINTS)
     handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.suptitle(f"Latency by home-collection affinity — {BAND_TITLE}", y=0.99)
+    fig.suptitle(f"Latency by home-collection affinity — {LATENCY_BAND_TITLE}", y=0.99)
     fig.legend(
         handles,
         labels,
@@ -418,7 +427,7 @@ def plot_mixed_report(
             axis,
             THROUGHPUT_BAND,
             title="Mixed-workload throughput"
-            + ("" if overlay else f" — {BAND_TITLE}"),
+            + ("" if overlay else f" — {THROUGHPUT_BAND_TITLE}"),
             out_dir=out_dir,
             name=f"{stem}-throughput.png",
         ),
@@ -427,7 +436,7 @@ def plot_mixed_report(
             axis,
             LATENCY_BAND,
             title="Mixed-workload latency — "
-            + ("p50" if overlay else BAND_TITLE),
+            + ("p50" if overlay else LATENCY_BAND_TITLE),
             out_dir=out_dir,
             name=f"{stem}-latency.png",
         ),

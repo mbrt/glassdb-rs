@@ -136,6 +136,7 @@ class MixedSweepPlotterTest(unittest.TestCase):
             (medians["workers"] == 1) & (medians["shape"] == "rwSingle")
         ].iloc[0]
         self.assertEqual(row["throughput"], 122.0)
+        self.assertAlmostEqual(row["throughput_p10"], 1210.0)
         self.assertAlmostEqual(row["throughput_p50"], 1220.0)
         self.assertAlmostEqual(row["throughput_p90"], 1230.0)
         self.assertEqual(row["p50_ms"], 244.0)

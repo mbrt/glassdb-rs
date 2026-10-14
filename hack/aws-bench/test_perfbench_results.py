@@ -163,11 +163,13 @@ class PerfbenchResultsTest(unittest.TestCase):
             _, frame = perfbench_results.read_mixed(path, require_converged=False)
 
         by_shape = frame.set_index("shape")
+        self.assertAlmostEqual(by_shape.loc["rwSingle", "throughput_p10"], 4.0)
         self.assertAlmostEqual(by_shape.loc["rwSingle", "throughput_p50"], 12.0)
         self.assertAlmostEqual(by_shape.loc["rwSingle", "throughput_p90"], 20.0)
         # Without windows, the line is the shape's throughput and there is no
         # band.
         self.assertTrue((by_shape.loc["rwMany":, "throughput_p50"] == 1).all())
+        self.assertTrue(by_shape.loc["rwMany":, "throughput_p10"].isna().all())
         self.assertTrue(by_shape.loc["rwMany":, "throughput_p90"].isna().all())
 
     def test_several_single_run_files_are_numbered_as_consecutive_runs(self) -> None:
