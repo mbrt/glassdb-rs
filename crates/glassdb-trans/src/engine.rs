@@ -23,7 +23,7 @@ use crate::collection_commit::{CollectionCommit, CollectionReservations};
 use crate::collection_coordination::CollectionStateResolver;
 use crate::collections::{CatalogAccesses, CollectionLifecycle, DirectorySnapshot};
 use crate::error::TransError;
-use crate::gc::{DEFAULT_GC_PARALLELISM, Gc, GcDiagnostics, GcHints, GcLimits, GcStats};
+use crate::gc::{DEFAULT_GC_PARALLELISM, Gc, GcDiagnostics, GcHints, GcLimits, GcReport, GcStats};
 use crate::key_resolver::{KeyResolver, ScanResult};
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
@@ -298,6 +298,11 @@ impl Engine {
     /// Finalizes a transaction, aborting its current identity when necessary.
     pub async fn end(&self, tx: &mut EngineTransaction) -> Result<(), TransError> {
         self.algo.end(&mut tx.0).await
+    }
+
+    /// Runs one full GC with at most `parallelism` checks at the same time.
+    pub async fn collect_garbage(&self, parallelism: NonZeroUsize) -> Result<GcReport, TransError> {
+        self.gc.collect(parallelism).await
     }
 
     /// Gracefully drains background work and closes engine storage.

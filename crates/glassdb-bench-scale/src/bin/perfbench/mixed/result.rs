@@ -6,7 +6,7 @@ use glassdb::Stats;
 use glassdb_bench_scale::bench::Results;
 
 use super::options::CellDimension;
-use super::setup::Warmup;
+use super::setup::{Collected, Warmup};
 use super::workload::KeySelection;
 
 /// Number of equal windows that split each cell's measured interval. Their
@@ -216,6 +216,14 @@ pub(super) fn cell_capped(dimension: CellDimension, window_commits: u64) -> Stri
         dimension.databases,
         dimension.database_limit,
         dimension.workers_per_shape,
+    )
+}
+
+/// Formats the full GCs that ran after a load.
+pub(super) fn garbage_collected(collected: &Collected) -> String {
+    format!(
+        "  full GC took {:?}: {} transaction records deleted",
+        collected.elapsed, collected.deleted
     )
 }
 

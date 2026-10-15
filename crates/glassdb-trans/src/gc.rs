@@ -27,12 +27,15 @@ use futures::{
     FutureExt,
     future::{BoxFuture, OptionFuture},
 };
+use glassdb_backend::{ListCursor, ListLimit};
 use glassdb_concurr::{Background, ScanCadence, map_all_bounded, rt};
 use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::{
     CurrentnessBarrier, NodeStore, Observation, Requirement, StorageError, StructuralIntentStore,
     Timeline, TreeRouter,
-    transaction::{TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxRecordState, TxRecordStore},
+    transaction::{
+        TxCollectionOp, TxCommitStatus, TxListPage, TxLock, TxRecord, TxRecordState, TxRecordStore,
+    },
 };
 use tokio::sync::Notify;
 
@@ -81,15 +84,38 @@ enum GcEligibility {
     Ready(Observation<TxRecord>),
     Deferred(Duration),
     Retained,
+    Missing,
 }
 
 /// Result of a GC candidate check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GcOutcome {
     Retained,
+    Missing,
     Deferred(Duration),
     Reclaimed,
     Progress,
+}
+
+/// Counts of the transaction records that one full GC checked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Records that the full GC deleted.
+    pub deleted: u64,
+    /// Listed records that were already deleted when the full GC checked them.
+    pub missing: u64,
+    /// Records whose check reclaimed some effects but kept the record. A later
+    /// check can delete them.
+    pub reclaimed_effects: u64,
+    /// Records that wait for their safety horizon.
+    pub deferred: u64,
+    /// Time from the end of the full GC until the first deferred record
+    /// becomes eligible. `None` when no record is deferred.
+    pub retry_after: Option<Duration>,
+    /// Records that stored objects still name, or that are pending or wounded.
+    pub retained: u64,
+    /// Checks that failed. A later full GC or background GC can repeat them.
+    pub failed: u64,
 }
 
 struct Reclamation {
@@ -347,6 +373,59 @@ impl Gc {
         background.spawn(self.clone().run());
     }
 
+    /// Runs one full GC: checks every transaction record that one listing
+    /// finds, with at most `parallelism` checks at the same time.
+    pub(crate) async fn collect(&self, parallelism: NonZeroUsize) -> Result<GcReport, TransError> {
+        let mut retry_at = None::<rt::Instant>;
+        let mut report = GcReport::default();
+        let mut page = self.list_all(None).await?;
+        loop {
+            // The next LIST overlaps the checks of this page, so that a full
+            // GC waits for one of them, not for both.
+            let (next, checked) = futures::join!(
+                OptionFuture::from(
+                    page.next
+                        .map(|cursor| async move { self.list_all(Some(cursor)).await })
+                ),
+                self.clone().check_batch(page.ids, parallelism),
+            );
+            let (mut progress, mut failures) = (0, 0);
+            for (tid, outcome) in checked {
+                match outcome {
+                    Ok(GcOutcome::Reclaimed) => {
+                        report.deleted += 1;
+                        progress += 1;
+                    }
+                    Ok(GcOutcome::Progress) => {
+                        report.reclaimed_effects += 1;
+                        progress += 1;
+                    }
+                    Ok(GcOutcome::Missing) => report.missing += 1,
+                    Ok(GcOutcome::Retained) => report.retained += 1,
+                    Ok(GcOutcome::Deferred(delay)) => {
+                        report.deferred += 1;
+                        let due = rt::Instant::now() + delay;
+                        retry_at = Some(retry_at.map_or(due, |at| at.min(due)));
+                    }
+                    Err(error) => {
+                        tracing::debug!(tx = %tid, error = %error, "full GC check failed");
+                        report.failed += 1;
+                        failures += 1;
+                    }
+                }
+            }
+            let counters = &self.hints.counters;
+            counters.progress.fetch_add(progress, Ordering::Relaxed);
+            counters.failures.fetch_add(failures, Ordering::Relaxed);
+            match next {
+                Some(next) => page = next?,
+                None => break,
+            }
+        }
+        report.retry_after = retry_at.map(|at| at.saturating_duration_since(rt::Instant::now()));
+        Ok(report)
+    }
+
     async fn run(self) {
         let mut scheduler = Scheduler::new(&self);
         loop {
@@ -373,6 +452,15 @@ impl Gc {
         }
     }
 
+    /// Lists one page of all transaction records of the database.
+    async fn list_all(&self, cursor: Option<ListCursor>) -> Result<TxListPage, TransError> {
+        self.hints.counters.lists.fetch_add(1, Ordering::Relaxed);
+        Ok(self
+            .tx_records
+            .scan_transaction_ids(0, 0, cursor.as_ref(), ListLimit::new(PAGE_SIZE).unwrap())
+            .await?)
+    }
+
     async fn check_batch(
         self,
         tids: Vec<TxId>,
@@ -395,6 +483,7 @@ impl Gc {
                 }
                 Ok(GcEligibility::Deferred(delay)) => Ok(GcOutcome::Deferred(delay)),
                 Ok(GcEligibility::Retained) => Ok(GcOutcome::Retained),
+                Ok(GcEligibility::Missing) => Ok(GcOutcome::Missing),
                 Err(error) => Err(error),
             };
             results.push((tid, outcome));
@@ -431,7 +520,8 @@ impl Gc {
             .commit_status_at(tid, Requirement::after(barrier))
             .await?;
         match TxRecordState::try_from_observation(&status.observation)? {
-            TxRecordState::Missing | TxRecordState::Pending | TxRecordState::Wounded => {
+            TxRecordState::Missing => return Ok(GcEligibility::Missing),
+            TxRecordState::Pending | TxRecordState::Wounded => {
                 return Ok(GcEligibility::Retained);
             }
             TxRecordState::Committed | TxRecordState::Aborted => {}
@@ -905,7 +995,7 @@ impl Scheduler {
                     Some(self.retry_delay)
                 }
                 Ok(GcOutcome::Deferred(delay)) => Some(delay),
-                Ok(GcOutcome::Retained) => candidate
+                Ok(GcOutcome::Retained | GcOutcome::Missing) => candidate
                     .reported_again
                     .then_some(self.candidates.hint_delay),
                 Err(error) => {

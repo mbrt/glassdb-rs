@@ -169,3 +169,130 @@ async fn list_failures_do_not_look_like_an_idle_database() {
     ));
     db.shutdown().await;
 }
+
+fn record_path(id: &TxId) -> String {
+    glassdb_data::ObjectPath::Transaction {
+        db_prefix: DbPrefix::try_from("gc").unwrap(),
+        id: *id,
+    }
+    .to_string()
+}
+
+async fn record_exists(backend: Arc<dyn Backend>, id: &TxId) -> bool {
+    !matches!(
+        tx_record_store(backend).get_at(id, Requirement::ANY).await,
+        Err(StorageError::NotFound)
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_gc_checks_every_page_and_reports_records_it_keeps() {
+    let backend = Arc::new(MemoryBackend::new());
+    let db = Database::open("gc", backend.clone()).await.unwrap();
+    let tx_records = tx_record_store(backend.clone());
+    // More than one LIST page.
+    let aborted = old_objects(&tx_records, 1_001).await;
+    let pending = TxId::with_priority(1, b"pending");
+    let mut record = TxRecord::new(pending, TxCommitStatus::Pending);
+    record.timestamp = Some(UNIX_EPOCH);
+    tx_records.set(&record).await.unwrap();
+    let young = TxId::with_priority(2, b"young");
+    let mut record = TxRecord::new(young, TxCommitStatus::Aborted);
+    record.timestamp = Some(glassdb_concurr::rt::system_now());
+    tx_records.set(&record).await.unwrap();
+
+    let report = db
+        .collect_garbage(NonZeroUsize::new(16).unwrap())
+        .await
+        .unwrap();
+
+    assert_eq!(report.deleted, 1_001);
+    assert_eq!(report.retained, 1);
+    assert_eq!(report.deferred, 1);
+    assert_eq!(
+        (report.missing, report.reclaimed_effects, report.failed),
+        (0, 0, 0)
+    );
+    let retry_after = report.retry_after.unwrap();
+    assert!(retry_after > Duration::ZERO && retry_after <= Duration::from_secs(45));
+    for id in aborted {
+        assert!(!record_exists(backend.clone(), &id).await);
+    }
+    assert!(record_exists(backend.clone(), &pending).await);
+    assert!(record_exists(backend.clone(), &young).await);
+    db.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_gc_counts_failed_checks_and_continues() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let db = Database::open("gc", backend.clone()).await.unwrap();
+    let ids = old_objects(&tx_record_store(backend.clone()), 3).await;
+    let failing = record_path(&ids[0]);
+    backend.set_before(move |operation| {
+        let fail = matches!(operation, BackendOp::Read { path } if *path == failing);
+        Box::pin(async move {
+            if fail {
+                Err(BackendError::Unavailable("offline".into()))
+            } else {
+                Ok(())
+            }
+        })
+    });
+
+    let report = db.collect_garbage(NonZeroUsize::MIN).await.unwrap();
+
+    assert_eq!((report.deleted, report.failed), (2, 1));
+    assert!(record_exists(backend.clone(), &ids[0]).await);
+    backend.clear_before();
+    db.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_full_gc_completes_the_checks_of_a_dropped_one() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let db = Database::open("gc", backend.clone()).await.unwrap();
+    let ids = old_objects(&tx_record_store(backend.clone()), 1).await;
+    backend.set_before(|operation| {
+        let stall = matches!(operation, BackendOp::DeleteIf { path, .. } if path.contains("/_t/"));
+        Box::pin(async move {
+            if stall {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Ok(())
+        })
+    });
+
+    let dropped = tokio::time::timeout(
+        Duration::from_secs(1),
+        db.collect_garbage(NonZeroUsize::MIN),
+    )
+    .await;
+    assert!(dropped.is_err(), "the delete stalls past the timeout");
+    // The dropped check stopped before its delete. Background GC starts its
+    // first scan after the pending timeout, so it cannot delete the record yet.
+    step(6).await;
+    assert!(record_exists(backend.clone(), &ids[0]).await);
+    backend.clear_before();
+
+    let report = db.collect_garbage(NonZeroUsize::MIN).await.unwrap();
+
+    assert_eq!(report.deleted, 1);
+    assert!(!record_exists(backend.clone(), &ids[0]).await);
+    db.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_gc_is_refused_after_shutdown() {
+    let db = Database::open("gc", Arc::new(MemoryBackend::new()))
+        .await
+        .unwrap();
+    db.shutdown().await;
+
+    let result = db.collect_garbage(NonZeroUsize::MIN).await;
+
+    assert!(
+        matches!(result, Err(glassdb::Error::ShuttingDown)),
+        "{result:?}"
+    );
+}

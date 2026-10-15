@@ -68,7 +68,7 @@ pub use glassdb_storage::{
     PersistentCacheConfig,
 };
 pub use glassdb_trans::{
-    DirectCommitStats, GcLimits, InlinePressureStats, LeafCoordinatorStats, LockerStats,
+    DirectCommitStats, GcLimits, GcReport, InlinePressureStats, LeafCoordinatorStats, LockerStats,
     MonitorStats, ProtocolTiming, RestructurerStats, RetryTiming, TopologyPolicy,
 };
 // Re-export the schedule type so callers can build a `RetryTiming` without

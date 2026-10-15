@@ -452,6 +452,7 @@ async fn check_candidate(gc: &Gc, tid: &TxId) -> Result<GcOutcome, TransError> {
         GcEligibility::Ready(observation) => gc.try_reclaim(tid, &observation, barrier).await,
         GcEligibility::Deferred(delay) => Ok(GcOutcome::Deferred(delay)),
         GcEligibility::Retained => Ok(GcOutcome::Retained),
+        GcEligibility::Missing => Ok(GcOutcome::Missing),
     }
 }
 
@@ -3370,7 +3371,7 @@ async fn cached_candidate_converges_after_a_peer_deletes_it() {
 
     assert_eq!(
         check_candidate(&ctx.gc, &id).await.unwrap(),
-        GcOutcome::Retained
+        GcOutcome::Missing
     );
 }
 

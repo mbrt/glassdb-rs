@@ -57,10 +57,6 @@ impl Sub for MonitorStats {
 }
 
 /// Timing parameters for transaction liveness and recovery.
-///
-/// Production uses [`ProtocolTiming::default`]. Deterministic simulation uses
-/// [`ProtocolTiming::simulation`] so lease-boundary interleavings are cheap to
-/// explore while preserving the production ratios.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProtocolTiming {
     pending_timeout: Duration,

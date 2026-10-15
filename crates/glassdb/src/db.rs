@@ -12,7 +12,7 @@ use glassdb_data::{DatabaseId, DbPrefix};
 use glassdb_storage::{InlinePolicy, NodeSizePolicy, PersistentCacheConfig, PersistentCacheMedia};
 use glassdb_trans::{
     AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction, GcLimits,
-    ProtocolTiming, RetryTiming, TopologyPolicy, TransError,
+    GcReport, ProtocolTiming, RetryTiming, TopologyPolicy, TransError,
 };
 use tokio::sync::Notify;
 
@@ -365,6 +365,42 @@ impl Database {
         T: Send,
     {
         self.inner.tx(f).await
+    }
+
+    /// Runs one full GC and returns when it is complete.
+    ///
+    /// A full GC lists every transaction record of the database once and checks
+    /// each one with the same safety rules as background GC, with at most
+    /// `parallelism` checks at the same time. It does not wait for records
+    /// inside their safety horizon: the report counts them as deferred and
+    /// gives the time until the first one becomes eligible. To remove all
+    /// garbage of a finished load, call it again until the report has no
+    /// deferred records and no records with reclaimed effects.
+    ///
+    /// Background GC, transactions, and other database instances continue
+    /// while it runs. Records that transactions create during a full GC can be
+    /// missed. A full GC makes backend reads, LISTs, and deletes at the rate
+    /// that `parallelism` permits, so it can slow down transactions that run
+    /// at the same time.
+    ///
+    /// # Errors
+    ///
+    /// A failed LIST ends the full GC with an error. Failed checks do not: the
+    /// report counts them.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future stops the full GC, also in the middle of a check.
+    /// This is safe: the steps of a check are idempotent, the delete of the
+    /// record is the last step, and a later check repeats the steps that
+    /// remain.
+    pub async fn collect_garbage(&self, parallelism: NonZeroUsize) -> Result<GcReport, Error> {
+        let _guard = self.inner.admit_operation()?;
+        self.inner
+            .engine
+            .collect_garbage(parallelism)
+            .await
+            .map_err(Error::from_read_trans)
     }
 
     /// Retrieves cumulative foreground and background performance stats.

@@ -273,6 +273,7 @@ impl<'a> Seeds<'a> {
                 pool_size: mode.pool_size(self.options),
                 quiet_period: self.options.quiet_period,
                 timeout: self.options.seed_timeout,
+                gc_timeout: self.options.gc_timeout,
                 drain_timeout: self.execution.drain_timeout,
             },
         )
@@ -322,6 +323,10 @@ fn run_cell(
         // The checkpoint, the baselines and the samples then start with no
         // transaction in flight.
         ctx.pause().close_and_wait(handles.len(), &stop).await;
+        match prepared.collect_garbage(options.gc_timeout).await {
+            Ok(collected) => eprintln!("{}", result::garbage_collected(&collected)),
+            Err(error) => eprintln!("  note: {error}"),
+        }
         let checkpoint = start.checkpoint();
         let active = prepared.begin_measurement();
         workload::start_measurement(&plans);

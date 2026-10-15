@@ -865,6 +865,17 @@ mark-sweep ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
 GC deletion counts are approximate: a delete of a missing object succeeds, so
 two database instances can count the same deletion.
 
+### Full GC
+
+`Database::collect_garbage` runs a full GC
+([ADR-078](adr/078-full-gc-and-gc-write-budget.md)). It lists every transaction
+record once and checks each one with the same rules as background GC, outside
+the candidate queues and the scan cadence. It does not wait for safety
+horizons, so the caller repeats it until no record is deferred. It runs in the
+caller's task. A caller that drops it can stop a check partway, which is safe
+for the same reason as a background check that stops at shutdown. Benchmarks
+use it to start a measurement with no garbage from the warm-up.
+
 ### Adaptive GC scans
 
 GC scans are a backup for dropped hints. Each scan turn does at most one LIST.
