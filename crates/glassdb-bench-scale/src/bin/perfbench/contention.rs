@@ -96,7 +96,7 @@ fn run_cell(
     duration: Duration,
     execution: Execution,
 ) -> Result<CellResult, Box<dyn Error>> {
-    let db = handle.block_on(Database::open(database_name, backend))?;
+    let db = handle.block_on(crate::database_builder(database_name, backend).open())?;
     let collection = handle.block_on(
         db.root_collection()
             .create_collection_if_absent(b"contention"),

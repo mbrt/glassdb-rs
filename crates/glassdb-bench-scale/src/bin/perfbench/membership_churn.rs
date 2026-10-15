@@ -121,7 +121,7 @@ fn run_once(
     let databases: Vec<Database> = handle.block_on(async {
         let opens = ROLES
             .iter()
-            .map(|_| Database::builder(name, backend.clone()).open());
+            .map(|_| crate::database_builder(name, backend.clone()).open());
         join_all(opens).await.into_iter().collect::<Result<_, _>>()
     })?;
     let collections: Vec<Collection> = handle.block_on(async {
@@ -200,7 +200,9 @@ async fn seed(
     name: &str,
     execution: Execution,
 ) -> Result<(), Box<dyn Error>> {
-    let db = Database::builder(name, backend.clone()).open().await?;
+    let db = crate::database_builder(name, backend.clone())
+        .open()
+        .await?;
     db.root_collection()
         .create_collection_if_absent(COLLECTION)
         .await?;

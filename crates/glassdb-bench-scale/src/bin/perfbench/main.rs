@@ -18,10 +18,19 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use glassdb::{Backend, Database, DatabaseBuilder, ProtocolTiming};
 use glassdb_concurr::rt;
 use serde::Serialize;
 
 const SCHEMA_VERSION: u32 = 1;
+
+/// The protocol timing of every database that a scenario creates.
+///
+/// All instances run on one machine and read one clock, so they need no
+/// clock skew allowance, and GC can check the records of a load 30 s sooner.
+/// The pending timeout keeps the production value, so that leases, refreshes,
+/// and wounds behave as in production.
+const TIMING: ProtocolTiming = ProtocolTiming::new(Duration::from_secs(15), Duration::ZERO);
 
 #[derive(Parser)]
 #[command(about = "Run GlassDB database-level performance scenarios")]
@@ -147,6 +156,11 @@ fn execution(cli: &Cli) -> Execution {
         run_cooldown: cli.run_cooldown,
         drain_timeout: cli.drain_timeout,
     }
+}
+
+/// Starts a database builder with the protocol timing of perfbench.
+fn database_builder<B: Backend + 'static>(name: &str, backend: B) -> DatabaseBuilder {
+    Database::builder(name, backend).protocol_timing(TIMING)
 }
 
 fn write_json(path: Option<PathBuf>, value: &serde_json::Value) -> Result<(), Box<dyn Error>> {

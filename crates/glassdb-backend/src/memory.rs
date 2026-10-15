@@ -5,7 +5,8 @@
 //! same revision again, so tests see the revision ABA that the protocol must
 //! tolerate (ADR-043).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -46,7 +47,9 @@ fn content_hash(data: &[u8]) -> u64 {
 
 #[derive(Clone)]
 struct State {
-    objects: HashMap<String, Object>,
+    // Ordered, so that a LIST reads only the keys of its page instead of
+    // scanning every object.
+    objects: BTreeMap<String, Object>,
 }
 
 /// An in-memory implementation of [`Backend`].
@@ -59,7 +62,7 @@ impl MemoryBackend {
     pub fn new() -> Self {
         MemoryBackend {
             state: Mutex::new(State {
-                objects: HashMap::new(),
+                objects: BTreeMap::new(),
             }),
         }
     }
@@ -157,22 +160,16 @@ impl Backend for MemoryBackend {
         let after = list_provider_token(prefix, cursor)?
             .map(|cursor| decode_memory_list_cursor(prefix, cursor))
             .transpose()?;
+        // A decoded cursor always starts with `prefix`.
+        let start = after.map_or(Bound::Included(prefix), Bound::Excluded);
         let state = self.state.lock().unwrap();
-        let mut matches: Vec<&str> = state
+        let mut matches = state
             .objects
-            .keys()
-            .map(String::as_str)
-            .filter(|key| key.starts_with(prefix))
-            .filter(|key| after.is_none_or(|after| *key > after))
-            .collect();
-        matches.sort_unstable();
-
-        let has_more = matches.len() > limit.get();
-        let objects: Vec<String> = matches
-            .into_iter()
-            .take(limit.get())
-            .map(str::to_string)
-            .collect();
+            .range::<str, _>((start, Bound::Unbounded))
+            .map(|(key, _)| key)
+            .take_while(|key| key.starts_with(prefix));
+        let objects: Vec<String> = matches.by_ref().take(limit.get()).cloned().collect();
+        let has_more = matches.next().is_some();
         let next = if has_more {
             objects
                 .last()

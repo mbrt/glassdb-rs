@@ -15,8 +15,10 @@ use super::{key_bytes, value};
 
 const COLLECTION_PREFIX: &str = "mix";
 // The full GCs run while no worker runs, so they can use many more checks than
-// background GC. The limit keeps the backend client within its connections.
-const FULL_GC_PARALLELISM: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+// background GC. A full GC checks one LIST page of 1,000 records at a time, and
+// each check waits mostly for backend latency, so the limit lets a whole page
+// run at the same time.
+const FULL_GC_PARALLELISM: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 /// Inputs that determine how storage is seeded and settled.
 pub(super) struct SeedConfig {
@@ -218,7 +220,7 @@ fn collection_paths(count: usize) -> Result<Vec<CollectionPath>, GError> {
 
 fn open_db(handle: &Handle, name: &str, backend: Arc<dyn Backend>) -> Database {
     handle
-        .block_on(Database::open(name, backend))
+        .block_on(crate::database_builder(name, backend).open())
         .expect("open db")
 }
 
