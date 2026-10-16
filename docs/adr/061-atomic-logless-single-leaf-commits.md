@@ -4,6 +4,10 @@
 
 Accepted — implemented.
 
+[ADR-081](081-in-doubt-cas-stays-in-doubt-until-fenced.md) refines the
+non-landing proof: unchanged predecessors prove it only after the leaf changed
+in a way that cannot be undone since the in-doubt CAS.
+
 Supersedes [ADR-051](051-inline-latest-values.md)'s initial direct-commit
 eligibility, which was limited to one `Put` of an existing key and reads of that
 same found key. ADR-051's authoritative inline representation and bounded

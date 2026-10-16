@@ -191,7 +191,14 @@ pub(crate) struct CoordinatedOutcome {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReloadCause {
     Fresh,
-    Reloaded { in_doubt: bool },
+    Reloaded {
+        in_doubt: bool,
+        /// The loaded leaf changed in a way that cannot be undone since the
+        /// state that the in-doubt CAS expected, so that CAS can never land
+        /// after this load. While this is false, the CAS can still land: an
+        /// unchanged leaf proves only that it has not landed yet.
+        cas_fenced: bool,
+    },
 }
 
 /// Per-submission mailbox carrying one transaction's [`CoordinatedOutcome`]
@@ -280,10 +287,12 @@ pub(crate) trait MemberPolicy: Send + Sync {
     /// resolution. Retained facts must remain valid when a plan is discarded.
     ///
     /// When `ctx.cause` carries unresolved uncertainty, returning `InDoubt`
-    /// preserves it. Any other decision certifies that the policy reconciled
-    /// the earlier CAS; in particular, a new stage must already be safe to
-    /// apply zero or one additional time. That reconciliation must remain valid
-    /// even if this plan is discarded or its CAS is rejected.
+    /// preserves it. A new stage over a leaf that the in-doubt CAS can still
+    /// land on also preserves it, until a CAS lands. Any other decision
+    /// certifies that the policy reconciled the earlier CAS; in particular, a
+    /// new stage must already be safe to apply zero or one additional time.
+    /// That reconciliation must remain valid even if this plan is discarded or
+    /// its CAS is rejected.
     async fn resolve(
         &self,
         ctx: &ResolveCtx<'_>,
@@ -665,6 +674,44 @@ enum CapacityDecision {
     Rejected(MemberOutcome),
 }
 
+/// The members whose changes rode a CAS that came back in doubt, with the leaf
+/// state that the CAS expected.
+type InDoubtMembers = BTreeMap<TxId, LeafObservation>;
+
+/// Whether `loaded` proves that a CAS which expected `expected` can never land.
+///
+/// A different revision is not enough. On a backend whose revisions depend on
+/// content, a lock that is taken and released restores the exact bytes and
+/// revision, and the CAS can land again (ADR-043). Only a change that cannot be
+/// undone fences it: the membership generation never decreases (ADR-073), and
+/// a current writer is a transaction identity that never returns.
+fn fences(expected: &LeafObservation, loaded: &LeafObservation) -> bool {
+    if expected.same_state(loaded) {
+        return false;
+    }
+    let (Some(expected), Some(loaded)) = (expected.value(), loaded.value()) else {
+        return false;
+    };
+    if loaded.membership_generation() > expected.membership_generation() {
+        return true;
+    }
+    let (Some(expected), Some(loaded)) = (expected.as_leaf(), loaded.as_leaf()) else {
+        return false;
+    };
+    expected.entries().any(|entry| {
+        entry.current.writer().is_some_and(|writer| {
+            loaded
+                .lookup(&entry.key)
+                .is_none_or(|loaded| loaded.current.writer() != Some(writer))
+        })
+    }) || loaded.entries().any(|entry| {
+        entry.current.writer().is_some()
+            && expected
+                .lookup(&entry.key)
+                .is_none_or(|expected| expected.current.writer() != entry.current.writer())
+    })
+}
+
 enum PersistResult {
     Applied(CasReceipt<Node>),
     Unchanged(LeafObservation),
@@ -931,7 +978,7 @@ impl CasWorker {
         members: &BTreeMap<TxId, LeafMember>,
         requirement: Requirement,
         reloaded: bool,
-        in_doubt: &mut BTreeSet<TxId>,
+        in_doubt: &mut InDoubtMembers,
     ) -> Result<MutationPlan, TransError> {
         let mut plan = MutationPlan {
             entries: edit
@@ -958,7 +1005,10 @@ impl CasWorker {
         // not overwrite it before the shared CAS (ADR-051).
         let mut protected_markers: BTreeSet<Vec<u8>> = BTreeSet::new();
         for (tx, member) in ordered {
-            let member_in_doubt = in_doubt.contains(tx);
+            let member_in_doubt = in_doubt.contains_key(tx);
+            let cas_fenced = in_doubt
+                .get(tx)
+                .is_none_or(|expected| fences(expected, edit.observation()));
             let ctx = ResolveCtx {
                 key_state: &self.core.key_state,
                 tmon: &self.core.tmon,
@@ -966,6 +1016,7 @@ impl CasWorker {
                 cause: if reloaded {
                     ReloadCause::Reloaded {
                         in_doubt: member_in_doubt,
+                        cas_fenced,
                     }
                 } else {
                     ReloadCause::Fresh
@@ -1003,10 +1054,14 @@ impl CasWorker {
                 .policy
                 .resolve(&ctx, &plan.entries, &plan.locks)
                 .await?;
-            if member_in_doubt && !matches!(step.outcome(), MemberOutcome::InDoubt(_)) {
+            // The new CAS from the expected state either lands, which fences
+            // the in-doubt CAS, or fails, and then the doubt stays.
+            let restaged = !cas_fenced && matches!(step, Step::Stage { .. });
+            if member_in_doubt && !restaged && !matches!(step.outcome(), MemberOutcome::InDoubt(_))
+            {
                 in_doubt.remove(tx);
             }
-            let member_in_doubt = in_doubt.contains(tx);
+            let member_in_doubt = in_doubt.contains_key(tx);
             match step {
                 Step::Stage {
                     entries: changes,
@@ -1246,7 +1301,11 @@ impl CasWorker {
         // not carry — one skipped for a same-key direct reservation, or merged into
         // the batch afterwards — definitively did not land, and inheriting the
         // batch's in-doubt outcome would strand it over a write it never made.
-        let mut in_doubt: BTreeSet<TxId> = BTreeSet::new();
+        //
+        // A member that stages again over a leaf that does not fence its
+        // in-doubt CAS also stays in doubt, until a CAS lands. So each member
+        // keeps the leaf state that its in-doubt CAS expected.
+        let mut in_doubt = InDoubtMembers::new();
         let mut lost_cas: Option<LostCas> = None;
         // It is reported at each leaf CAS, so that the windows of a topology
         // rule see a round that keeps losing before the round ends.
@@ -1287,7 +1346,7 @@ impl CasWorker {
                     let members = self.round_members(batch, round);
                     for (tx, member) in &members {
                         *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
-                            outcome: member.policy.reroute_outcome(in_doubt.contains(tx)),
+                            outcome: member.policy.reroute_outcome(in_doubt.contains_key(tx)),
                             evidence: None,
                         });
                     }
@@ -1379,7 +1438,9 @@ impl CasWorker {
                 // Rebuilding the plan from a reloaded leaf is idempotent. Only the
                 // members this in-doubt CAS actually carried inherit its doubt.
                 PersistResult::InDoubt(staged_ids) => {
-                    in_doubt.extend(staged_ids);
+                    for id in staged_ids {
+                        in_doubt.insert(id, loaded_observation.clone());
+                    }
                     reloaded = true;
                     failed = true;
                     continue;
@@ -1420,7 +1481,7 @@ impl CasWorker {
         }
         for (tx, m) in &self.round_members(batch, round) {
             *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
-                outcome: m.policy.exhausted_outcome(in_doubt.contains(tx)),
+                outcome: m.policy.exhausted_outcome(in_doubt.contains_key(tx)),
                 evidence: None,
             });
         }
@@ -4283,7 +4344,7 @@ mod tests {
             _staged: &BTreeMap<Vec<u8>, LeafEntry>,
             _staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
-            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
+            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true, .. });
             let outcome = if in_doubt {
                 MemberOutcome::InDoubt("in-doubt CAS attributed to skipped member".into())
             } else {
@@ -4851,7 +4912,7 @@ mod tests {
             staged_locks: &NodeLocks,
         ) -> Result<Step, TransError> {
             let evaluation = self.evaluations.fetch_add(1, Ordering::SeqCst);
-            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
+            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true, .. });
             if in_doubt && !self.recovers_non_landing {
                 return Ok(Step::Skip {
                     outcome: MemberOutcome::InDoubt(
@@ -4998,8 +5059,11 @@ mod tests {
         coord.close().await;
     }
 
+    // Regression: an unchanged leaf after an in-doubt CAS proves only that the
+    // CAS has not landed yet. A capacity rejection of the new stage cannot turn
+    // that into a definitive conflict.
     #[tokio::test]
-    async fn proven_non_landing_clears_uncertainty_before_capacity_rejection() {
+    async fn unchanged_leaf_keeps_uncertainty_through_capacity_rejection() {
         let tx = TxId::with_priority(1, b"t");
         let small = LeafEntry::new(b"k").with_current(CurrentState::Inline {
             writer: tx,
@@ -5058,7 +5122,7 @@ mod tests {
         assert!(matches!(
             outcome,
             Some(CoordinatedOutcome {
-                outcome: MemberOutcome::Conflict,
+                outcome: MemberOutcome::InDoubt(_),
                 evidence: Some(CoordinationEvidence::Observed(_)),
                 ..
             })
@@ -5140,7 +5204,7 @@ mod tests {
                     outcome: MemberOutcome::Landed,
                 });
             }
-            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
+            let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true, .. });
             *self.seen_in_doubt.lock().unwrap() = Some(in_doubt);
             let outcome = if in_doubt {
                 MemberOutcome::InDoubt("lost race after in-doubt CAS".into())
@@ -5311,33 +5375,123 @@ mod tests {
         }
     }
 
-    // The first CAS becomes in-doubt and every subsequent CAS misses, driving
-    // the coordinator through its exhaustion exit rather than a policy exit.
-    fn in_doubt_then_miss_forever(inner: Arc<dyn Backend>) -> Arc<HookBackend> {
-        let backend = HookBackend::new(inner);
+    // A leaf state that differs from the expected one fences an in-doubt CAS
+    // only when the change cannot be undone. A lock that is taken and released
+    // restores the exact bytes, and on a backend whose revisions depend on
+    // content also the revision, so the CAS could land again (ADR-043).
+    #[tokio::test]
+    async fn only_changes_that_cannot_be_undone_fence_an_in_doubt_cas() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let store = cold_store(mem);
+        let writer = TxId::with_priority(1, b"writer");
+        let holder = TxId::with_priority(2, b"holder");
+        store_leaf_entries(
+            &store,
+            &leaf(),
+            vec![entry(b"k", LockType::None, None, Some(&writer))],
+        )
+        .await;
+        let observe = || async { store.load_leaf(&leaf(), Requirement::ANY).await.unwrap() };
+        let expected = observe().await.observation().clone();
+        assert!(!fences(&expected, &expected));
+
+        store_leaf_entries(
+            &store,
+            &leaf(),
+            vec![entry(b"k", LockType::Read, Some(&holder), Some(&writer))],
+        )
+        .await;
+        let locked = observe().await.observation().clone();
+        assert!(!expected.same_state(&locked));
+        assert!(
+            !fences(&expected, &locked),
+            "a held lock can be released again"
+        );
+
+        let newer = TxId::with_priority(3, b"newer");
+        store_leaf_entries(
+            &store,
+            &leaf(),
+            vec![entry(b"k", LockType::None, None, Some(&newer))],
+        )
+        .await;
+        let rewritten = observe().await.observation().clone();
+        assert!(fences(&expected, &rewritten), "a writer never returns");
+
+        store_leaf_entries(
+            &store,
+            &leaf(),
+            vec![entry(b"k", LockType::None, None, Some(&writer))],
+        )
+        .await;
+        let loaded = observe().await;
+        let mut edit = loaded.into_edit();
+        let mut locks = edit.locks().clone();
+        locks.advance_membership_generation();
+        edit.set_locks(locks);
+        store.commit_leaf(edit).await.unwrap();
+        let advanced = observe().await.observation().clone();
+        assert!(
+            fences(&expected, &advanced),
+            "the membership generation never decreases"
+        );
+    }
+
+    // The first CAS becomes in-doubt without landing. Before each later CAS, a
+    // peer commits a new writer to the `peer` entry, so every later CAS is
+    // rejected against a leaf that really moved. This drives the coordinator
+    // through its exhaustion exit rather than a policy exit.
+    fn in_doubt_then_peer_wins_forever(inner: Arc<dyn Backend>) -> Arc<HookBackend> {
+        let backend = HookBackend::new(inner.clone());
         let leaf_cas = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peer = cold_store(inner);
         backend.set_before(move |op| {
-            let result = match op {
+            let attempt = match op {
                 BackendOp::WriteIf { path, .. }
                     if path.contains("/_n/") || path.ends_with("/_r") =>
                 {
-                    match leaf_cas.fetch_add(1, Ordering::SeqCst) {
-                        0 => Err(glassdb_backend::BackendError::Unavailable(
-                            "simulated in-doubt leaf CAS".into(),
-                        )),
-                        _ => Err(glassdb_backend::BackendError::Precondition),
-                    }
+                    Some(leaf_cas.fetch_add(1, Ordering::SeqCst))
                 }
-                _ => Ok(()),
+                _ => None,
             };
-            let future: HookFuture = Box::pin(async move { result });
+            let peer = peer.clone();
+            let future: HookFuture = Box::pin(async move {
+                match attempt {
+                    Some(0) => Err(glassdb_backend::BackendError::Unavailable(
+                        "simulated in-doubt leaf CAS".into(),
+                    )),
+                    Some(n) => {
+                        let writer = TxId::with_priority(100 + n as u64, b"peer");
+                        commit_peer_writer(&peer, &writer).await;
+                        Ok(())
+                    }
+                    None => Ok(()),
+                }
+            });
             future
         });
         backend
     }
 
+    // Replaces the writer of the `peer` entry with a plain CAS, as a commit
+    // of another database instance would.
+    async fn commit_peer_writer(store: &NodeStore, writer: &TxId) {
+        let loaded = store.load_leaf(&leaf(), Requirement::ANY).await.unwrap();
+        let mut entries: Vec<LeafEntry> = loaded.entries().entries().cloned().collect();
+        entries.retain(|entry| entry.key != b"peer");
+        entries.push(entry(b"peer", LockType::None, None, Some(writer)));
+        let mut edit = loaded.into_edit();
+        edit.set_entries(LeafBody::from_entries(entries));
+        assert!(matches!(
+            store.commit_leaf(edit).await.unwrap(),
+            CasResult::Applied(_)
+        ));
+    }
+
     // Regression: exhausting the retry budget must not turn a possibly-landed
-    // commit CAS into `Moved`, which would permit a non-idempotent retry.
+    // commit CAS into `Moved`, which would permit a non-idempotent retry. A
+    // member that reconciled on a leaf that fences the in-doubt CAS gets its
+    // ordinary exhaustion outcome.
     #[tokio::test(start_paused = true)]
     async fn exhausted_budget_after_in_doubt_cas_stays_in_doubt() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -5349,7 +5503,7 @@ mod tests {
         )
         .await;
         let (gated, gate) = Gate::wrap(mem);
-        let backend: Arc<dyn Backend> = in_doubt_then_miss_forever(gated as Arc<dyn Backend>);
+        let backend: Arc<dyn Backend> = in_doubt_then_peer_wins_forever(gated as Arc<dyn Backend>);
         let (coord, _nodes, _timeline, _bg) = coord_over_fast(backend).await;
 
         let in_doubt = TxId::with_priority(2, b"in-doubt");
@@ -5406,6 +5560,8 @@ mod tests {
             ),
             "exhaustion after an in-doubt CAS must stay in doubt"
         );
+        // The joiner rode the in-doubt CAS too. A peer writer then fenced that
+        // CAS, so the joiner's later stages lost only ordinary races.
         assert!(matches!(
             retrying_outcome,
             Some(CoordinatedOutcome {

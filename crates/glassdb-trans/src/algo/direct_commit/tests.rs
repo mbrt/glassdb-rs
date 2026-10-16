@@ -759,7 +759,10 @@ async fn direct_commit_blocked_after_in_doubt_cas_stays_in_doubt() {
         let outcome = resolve_outcome(
             &policy,
             &tctx,
-            ReloadCause::Reloaded { in_doubt: true },
+            ReloadCause::Reloaded {
+                in_doubt: true,
+                cas_fenced: false,
+            },
             &staged,
             locks,
         )
@@ -916,7 +919,10 @@ async fn a_blind_put_after_an_in_doubt_cas_never_republishes_over_a_newer_writer
         resolve_step(
             &blind,
             &tctx,
-            ReloadCause::Reloaded { in_doubt: true },
+            ReloadCause::Reloaded {
+                in_doubt: true,
+                cas_fenced: false,
+            },
             &staged,
             &locks,
         )
@@ -937,7 +943,10 @@ async fn a_blind_put_after_an_in_doubt_cas_never_republishes_over_a_newer_writer
     let outcome = resolve_outcome(
         &blind,
         &tctx,
-        ReloadCause::Reloaded { in_doubt: true },
+        ReloadCause::Reloaded {
+            in_doubt: true,
+            cas_fenced: false,
+        },
         &superseded,
         &locks,
     )
@@ -945,6 +954,57 @@ async fn a_blind_put_after_an_in_doubt_cas_never_republishes_over_a_newer_writer
     assert!(
         matches!(outcome, MemberOutcome::InDoubt(_)),
         "a newer writer cannot disprove a landed in-doubt CAS, got {outcome:?}"
+    );
+}
+
+// Regression (fuzz `concurrent-tx` with late landings): an unchanged
+// predecessor after an in-doubt CAS proves only that the CAS has not landed
+// yet. A new holder does not fence the CAS, because the holder can release its
+// lock and restore the expected state. So a decision that stages nothing must
+// stay in doubt. When the coordinator reports a fenced CAS, for example after
+// the membership generation advanced, the same state is a definitive loss.
+#[tokio::test]
+async fn an_unchanged_leaf_does_not_prove_that_an_in_doubt_cas_cannot_land() {
+    let (tm, tctx) = new_algo().await;
+    let keyp = logical_key(b"k");
+    commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
+    let seed = entry(&tctx, b"k").await.unwrap();
+    let current = seed.current.writer().cloned().unwrap();
+    let policy = put_policy(
+        &tm,
+        TxId::with_priority(9, b"direct"),
+        keyp.clone(),
+        Some(Some(current)),
+        b"v2",
+    );
+    let staged = BTreeMap::from([(b"k".to_vec(), seed.clone())]);
+    let locks = NodeLocks::default();
+    assert!(matches!(
+        resolve_step(&policy, &tctx, ReloadCause::Fresh, &staged, &locks).await,
+        Step::Stage { .. }
+    ));
+
+    // A live holder now blocks the publication, while every output still
+    // names its predecessor.
+    let holder = TxId::with_priority(1, b"holder");
+    tctx.tmon.begin_tx(&holder);
+    let mut held = seed;
+    held.replace_write_lock(holder);
+    let blocked = BTreeMap::from([(b"k".to_vec(), held)]);
+    let in_doubt = |cas_fenced| ReloadCause::Reloaded {
+        in_doubt: true,
+        cas_fenced,
+    };
+
+    let outcome = resolve_outcome(&policy, &tctx, in_doubt(false), &blocked, &locks).await;
+    assert!(
+        matches!(outcome, MemberOutcome::InDoubt(_)),
+        "the in-doubt CAS can still land on the expected leaf, got {outcome:?}"
+    );
+    let outcome = resolve_outcome(&policy, &tctx, in_doubt(true), &blocked, &locks).await;
+    assert!(
+        matches!(outcome, MemberOutcome::Moved),
+        "a moved leaf fences the in-doubt CAS, got {outcome:?}"
     );
 }
 
@@ -1008,7 +1068,10 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
         resolve_step(
             &policy,
             &tctx,
-            ReloadCause::Reloaded { in_doubt: true },
+            ReloadCause::Reloaded {
+                in_doubt: true,
+                cas_fenced: false,
+            },
             &recovered,
             &NodeLocks::default(),
         )
@@ -1053,7 +1116,10 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
         resolve_step(
             &policy,
             &tctx,
-            ReloadCause::Reloaded { in_doubt: true },
+            ReloadCause::Reloaded {
+                in_doubt: true,
+                cas_fenced: false,
+            },
             &empty,
             &NodeLocks::default(),
         )
@@ -1103,7 +1169,10 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
         resolve_step(
             &policy,
             &tctx,
-            ReloadCause::Reloaded { in_doubt: true },
+            ReloadCause::Reloaded {
+                in_doubt: true,
+                cas_fenced: false,
+            },
             &unchanged,
             &NodeLocks::default(),
         )
@@ -1152,7 +1221,10 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     let outcome = resolve_outcome(
         &stale,
         &tctx,
-        ReloadCause::Reloaded { in_doubt: true },
+        ReloadCause::Reloaded {
+            in_doubt: true,
+            cas_fenced: false,
+        },
         &staged,
         &locks,
     )
@@ -1230,7 +1302,10 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         resolve_step(
             &budgeted,
             &tctx,
-            ReloadCause::Reloaded { in_doubt: true },
+            ReloadCause::Reloaded {
+                in_doubt: true,
+                cas_fenced: false,
+            },
             &crowded,
             &locks,
         )
