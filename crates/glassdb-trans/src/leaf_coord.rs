@@ -3163,8 +3163,12 @@ mod tests {
     }
 
     // Returns `node` with a peer's committed write of `key`.
+    // Each call commits a new writer, so every peer write changes the leaf. A
+    // repeated writer would restore the same bytes, and on a backend whose
+    // revisions depend on content, also the same revision.
     fn with_peer_writer(node: &Node, key: &[u8]) -> Node {
-        let writer = TxId::with_priority(9, b"peer");
+        static PEER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let writer = TxId::with_priority(9, &PEER.fetch_add(1, Ordering::Relaxed).to_be_bytes());
         let mut entries: BTreeMap<_, _> = node
             .as_leaf()
             .unwrap()
