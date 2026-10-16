@@ -1,9 +1,9 @@
 //! In-memory backend for testing and development (ADR-016, ADR-023, ADR-042).
 //!
-//! Content-CAS only: the opaque revision token is the object generation, bumped
-//! on every content write. This matches the (now generation-only) GCS token,
-//! so the in-memory backend keeps modelling production conditional-mutation
-//! semantics.
+//! Content-CAS only: the opaque revision token is a hash of the object
+//! contents, like the S3 ETag. Identical contents at one path therefore get the
+//! same revision again, so tests see the revision ABA that the protocol must
+//! tolerate (ADR-043).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -13,22 +13,40 @@ use async_trait::async_trait;
 use crate::implementation::{bind_list_cursor, list_provider_token};
 use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, Revision};
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct Object {
     data: Vec<u8>,
-    generation: i64,
+    hash: u64,
 }
 
 impl Object {
-    fn revision(&self) -> Revision {
-        Revision::new(self.generation.to_string())
+    fn new(data: Vec<u8>) -> Self {
+        let hash = content_hash(&data);
+        Object { data, hash }
     }
+
+    fn revision(&self) -> Revision {
+        Revision::new(format!("{:016x}", self.hash))
+    }
+}
+
+/// Returns a hash that depends only on `data`.
+///
+/// The hash must not change between runs or Rust versions, because simulation
+/// replays compare backend operations exactly. So this uses FNV-1a and not a
+/// seeded or `std` hasher. A collision would look like a revision ABA, which
+/// the protocol must tolerate anyway.
+fn content_hash(data: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    data.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
 }
 
 #[derive(Clone)]
 struct State {
     objects: HashMap<String, Object>,
-    next_gen: i64,
 }
 
 /// An in-memory implementation of [`Backend`].
@@ -42,7 +60,6 @@ impl MemoryBackend {
         MemoryBackend {
             state: Mutex::new(State {
                 objects: HashMap::new(),
-                next_gen: 1,
             }),
         }
     }
@@ -59,19 +76,6 @@ impl MemoryBackend {
 impl Default for MemoryBackend {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl State {
-    fn next_generation(&mut self) -> i64 {
-        let res = self.next_gen;
-        self.next_gen += 1;
-        res
-    }
-
-    fn update_data(&mut self, obj: &mut Object, d: Vec<u8>) {
-        obj.data = d;
-        obj.generation = self.next_generation();
     }
 }
 
@@ -109,15 +113,11 @@ impl Backend for MemoryBackend {
         expected: &Revision,
     ) -> Result<Revision, BackendError> {
         let mut state = self.state.lock().unwrap();
-        let mut obj = state
-            .objects
-            .get(path)
-            .ok_or(BackendError::NotFound)?
-            .clone();
+        let obj = state.objects.get(path).ok_or(BackendError::NotFound)?;
         if &obj.revision() != expected {
             return Err(BackendError::Precondition);
         }
-        state.update_data(&mut obj, value);
+        let obj = Object::new(value);
         let revision = obj.revision();
         state.objects.insert(path.to_string(), obj);
         Ok(revision)
@@ -132,8 +132,7 @@ impl Backend for MemoryBackend {
         if state.objects.contains_key(path) {
             return Err(BackendError::Precondition);
         }
-        let mut obj = Object::default();
-        state.update_data(&mut obj, value);
+        let obj = Object::new(value);
         let revision = obj.revision();
         state.objects.insert(path.to_string(), obj);
         Ok(revision)
@@ -236,6 +235,22 @@ mod tests {
         ));
         original.write_if("a", b"4".to_vec(), &kept).await.unwrap();
         assert_eq!(fork.read("a").await.unwrap().revision, forked);
+    }
+
+    // Like an S3 ETag, the revision depends only on the contents. Writing back
+    // earlier contents restores the earlier revision.
+    #[tokio::test]
+    async fn identical_contents_get_the_same_revision_again() {
+        let b = MemoryBackend::new();
+        let first = b.write_if_not_exists("a", b"1".to_vec()).await.unwrap();
+        let second = b.write_if("a", b"2".to_vec(), &first).await.unwrap();
+        assert_ne!(first, second);
+        let restored = b.write_if("a", b"1".to_vec(), &second).await.unwrap();
+        assert_eq!(restored, first);
+
+        b.delete_if("a", &restored).await.unwrap();
+        let recreated = b.write_if_not_exists("a", b"1".to_vec()).await.unwrap();
+        assert_eq!(recreated, first);
     }
 
     #[tokio::test]
