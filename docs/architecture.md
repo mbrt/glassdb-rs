@@ -450,7 +450,12 @@ Recovery of an in-doubt direct commit uses only local information. Any inline
 value or tombstone with this identity proves that the whole commit landed. If
 there is no marker, unchanged previous states prove that it did not land, but
 only if at least one output could not return to its previous state through
-tombstone reclamation. Otherwise, the transaction can report an in-doubt error.
+tombstone reclamation, and only after the leaf changed in a way that cannot be
+undone: a higher membership generation or a new current writer. A different
+revision is not enough, because a released lock can restore it. Until then,
+the CAS can still land, so only a new CAS that lands can resolve it
+([ADR-081](adr/081-in-doubt-cas-stays-in-doubt-until-fenced.md)). Otherwise,
+the transaction can report an in-doubt error.
 If the reads are still valid, the transaction can try a direct commit again. An
 invalidated read causes a body replay. If pruning a holder with a final status
 changed the temporary generation and caused validation to

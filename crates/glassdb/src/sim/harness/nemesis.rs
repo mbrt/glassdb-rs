@@ -46,10 +46,14 @@ impl FaultTransports {
         std::mem::take(&mut self.instance_backends)
     }
 
-    /// Disables every injector before final verification.
-    pub(super) fn final_heal(&self) {
+    /// Disables every injector and waits for late requests before final
+    /// verification, so no mutation lands after the final state is read.
+    pub(super) async fn final_heal(&self) {
         for transport in &self.injected {
             transport.set_active(false);
+        }
+        for transport in &self.injected {
+            transport.settle().await;
         }
     }
 }

@@ -577,7 +577,8 @@ impl DirectCommitOperation {
         }
     }
 
-    /// Proves that the last attempted CAS left every output untouched.
+    /// Proves that the last attempted CAS has not changed any output, so far.
+    /// It proves that the CAS never lands only together with a fenced leaf.
     fn proves_non_landing(&self, resolutions: &[HolderResolution]) -> bool {
         let staged = self.staged_over.lock().unwrap();
         let Some(staged) = staged.as_ref() else {
@@ -661,14 +662,30 @@ impl MemberPolicy for DirectCommitOperation {
         }
 
         let resolutions = self.resolve_keys(ctx, staged).await?;
-        let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true });
+        let (in_doubt, cas_fenced) = match ctx.cause {
+            ReloadCause::Fresh => (false, true),
+            ReloadCause::Reloaded {
+                in_doubt,
+                cas_fenced,
+            } => (in_doubt, cas_fenced),
+        };
         if in_doubt && !self.proves_non_landing(&resolutions) {
             return Ok(Step::Skip {
                 outcome: self.in_doubt_outcome(),
             });
         }
-        self.resolve_fresh(ctx, staged, staged_locks, &resolutions)
-            .await
+        let step = self
+            .resolve_fresh(ctx, staged, staged_locks, &resolutions)
+            .await?;
+        // Unchanged predecessors prove only that the in-doubt CAS has not
+        // landed yet, while the leaf stays in the state it expected. Only a new
+        // CAS from that state can fence it, so any other decision stays in doubt.
+        if in_doubt && !cas_fenced && !matches!(step, Step::Stage { .. }) {
+            return Ok(Step::Skip {
+                outcome: self.in_doubt_outcome(),
+            });
+        }
+        Ok(step)
     }
 
     fn reorderable(&self) -> bool {

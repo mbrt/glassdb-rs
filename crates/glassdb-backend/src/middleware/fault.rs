@@ -15,6 +15,12 @@
 //! - **lost ack** (after landing): the op *lands* at the store but the response
 //!   is lost, reported as [`BackendError::Unavailable`] (outcome unknown) — the
 //!   in-doubt case that drives commit-status / redrive recovery;
+//! - **late landing** (mutations only): the caller gets
+//!   [`BackendError::Unavailable`] at once, and the request reaches the store
+//!   later, after the caller may have read the object back. Real stores can
+//!   still apply a request after a client timeout. Call
+//!   [`settle`](FaultBackend::settle) to wait until every such request has
+//!   reached the store;
 //! - **outage**: a sustained, all-or-nothing window ([`down`](FaultBackend::down)
 //!   / [`heal`](FaultBackend::heal)) during which *every* op on this client's
 //!   transport faults (either side). One down/heal pair makes a whole correlated
@@ -25,6 +31,8 @@
 //! under the deterministic executor the whole fault schedule is a pure function
 //! of the input and the task schedule, and a failing run reproduces exactly.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -51,8 +59,13 @@ pub struct FaultOptions {
     /// store but the ack is lost) rather than before. The remainder are dropped
     /// requests that never land.
     pub lost_ack_prob: u8,
+    /// Given a mutation fault that is not a lost ack, the chance that the
+    /// request reaches the store later instead of never.
+    pub late_landing_prob: u8,
     /// Upper bound on an injected delay.
     pub max_delay: Duration,
+    /// Upper bound on the time until a late request reaches the store.
+    pub max_late_landing: Duration,
 }
 
 impl FaultOptions {
@@ -66,7 +79,11 @@ impl FaultOptions {
             reply_delay_prob: scale(64),
             fault_prob: scale(24),
             lost_ack_prob: 128,
+            late_landing_prob: 128,
             max_delay: Duration::from_millis(200),
+            // Longer than the GC safety horizon of the simulation protocol
+            // timing, so GC can act before the request lands.
+            max_late_landing: Duration::from_secs(2),
         }
     }
 }
@@ -83,7 +100,20 @@ enum Fault {
     Dropped,
     /// The op landed at the store but its ack was lost (outcome unknown).
     LostAck,
+    /// The caller gets no reply, and the request reaches the store after this
+    /// delay.
+    LateLanding(Duration),
 }
+
+/// The transport behavior selected for one call.
+struct Transport {
+    request_delay: Option<Duration>,
+    fault: Option<Fault>,
+    reply_delay: Option<Duration>,
+}
+
+/// A mutation that a late request applies after its caller returned.
+type LateMutation = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// A per-client transport [`Backend`] decorator injecting faults while
 /// [active](Self::set_active). Faults are off until `set_active(true)`, so the
@@ -101,6 +131,8 @@ pub struct FaultBackend {
     /// Whether this client's transport is currently in a sustained outage
     /// (all-or-nothing: every op faults until healed).
     down: AtomicBool,
+    /// Late requests that did not reach the store yet.
+    late: Mutex<Vec<rt::JoinHandle<()>>>,
 }
 
 impl FaultBackend {
@@ -125,6 +157,7 @@ impl FaultBackend {
             tape: Mutex::new(Tape::new(tape, seed)),
             active: AtomicBool::new(false),
             down: AtomicBool::new(false),
+            late: Mutex::new(Vec::new()),
         })
     }
 
@@ -145,6 +178,20 @@ impl FaultBackend {
         self.down.store(false, Ordering::SeqCst);
     }
 
+    /// Waits until every late request has reached the store. Requests that
+    /// fail there leave no effect.
+    pub async fn settle(&self) {
+        loop {
+            let late = std::mem::take(&mut *self.late.lock().unwrap());
+            if late.is_empty() {
+                return;
+            }
+            for handle in late {
+                let _ = handle.await;
+            }
+        }
+    }
+
     fn is_active(&self) -> bool {
         self.active.load(Ordering::SeqCst)
     }
@@ -153,31 +200,73 @@ impl FaultBackend {
     /// Cancellation abandons delivery without undoing an applied mutation.
     async fn transport<T, Fut>(&self, op: impl FnOnce() -> Fut) -> Result<T, BackendError>
     where
-        Fut: std::future::Future<Output = Result<T, BackendError>>,
+        Fut: Future<Output = Result<T, BackendError>>,
     {
-        if !self.is_active() {
+        let Some(transport) = self.select(false) else {
             return op().await;
-        }
-        // Select both delays and the fault before suspending so each call keeps
-        // its own transport decisions even when replies arrive out of order.
-        let (request_delay, fault, reply_delay) = {
-            let mut t = self.tape.lock().unwrap();
-            let delay = self.roll_delay(&mut t, self.opts.delay_prob);
-            let faulted = self.down.load(Ordering::SeqCst) || t.roll(self.opts.fault_prob);
-            let fault = faulted.then(|| {
-                if t.roll(self.opts.lost_ack_prob) {
-                    Fault::LostAck
-                } else {
-                    Fault::Dropped
-                }
-            });
-            let reply_delay = self.roll_delay(&mut t, self.opts.reply_delay_prob);
-            (delay, fault, reply_delay)
         };
-        if let Some(d) = request_delay {
+        self.deliver(transport, op, None).await
+    }
+
+    /// Models a mutation through the faulty transport. `late` builds the same
+    /// mutation for a request that reaches the store after the caller returned.
+    async fn mutation<T, Fut>(
+        &self,
+        op: impl FnOnce() -> Fut,
+        late: impl FnOnce() -> LateMutation,
+    ) -> Result<T, BackendError>
+    where
+        Fut: Future<Output = Result<T, BackendError>>,
+    {
+        let Some(transport) = self.select(true) else {
+            return op().await;
+        };
+        let late = matches!(transport.fault, Some(Fault::LateLanding(_))).then(late);
+        self.deliver(transport, op, late).await
+    }
+
+    /// Selects both delays and the fault before suspending, so each call keeps
+    /// its own transport decisions even when replies arrive out of order.
+    /// Returns `None` while injection is disabled.
+    fn select(&self, mutation: bool) -> Option<Transport> {
+        if !self.is_active() {
+            return None;
+        }
+        let mut t = self.tape.lock().unwrap();
+        let request_delay = self.roll_delay(&mut t, self.opts.delay_prob);
+        let faulted = self.down.load(Ordering::SeqCst) || t.roll(self.opts.fault_prob);
+        let fault = faulted.then(|| {
+            if t.roll(self.opts.lost_ack_prob) {
+                Fault::LostAck
+            } else if mutation && t.roll(self.opts.late_landing_prob) {
+                Fault::LateLanding(Duration::from_nanos(
+                    t.below(self.opts.max_late_landing.as_nanos() as u64 + 1),
+                ))
+            } else {
+                Fault::Dropped
+            }
+        });
+        let reply_delay = self.roll_delay(&mut t, self.opts.reply_delay_prob);
+        Some(Transport {
+            request_delay,
+            fault,
+            reply_delay,
+        })
+    }
+
+    async fn deliver<T, Fut>(
+        &self,
+        transport: Transport,
+        op: impl FnOnce() -> Fut,
+        late: Option<LateMutation>,
+    ) -> Result<T, BackendError>
+    where
+        Fut: Future<Output = Result<T, BackendError>>,
+    {
+        if let Some(d) = transport.request_delay {
             rt::sleep(d).await;
         }
-        let result = match fault {
+        let result = match transport.fault {
             None => op().await,
             Some(Fault::Dropped) => {
                 return Err(BackendError::Unavailable(
@@ -192,10 +281,21 @@ impl FaultBackend {
                 )),
                 Err(e) => Err(e),
             },
+            Some(Fault::LateLanding(delay)) => {
+                let late = late.expect("only mutations can land late");
+                let handle = rt::spawn(async move {
+                    rt::sleep(delay).await;
+                    late.await;
+                });
+                self.late.lock().unwrap().push(handle);
+                return Err(BackendError::Unavailable(
+                    "injected late landing (request still in flight)".into(),
+                ));
+            }
         };
         // Precondition and NotFound also carry read evidence. Retain the full
         // result selected by the backend instead of reading again at delivery.
-        if let Some(d) = reply_delay {
+        if let Some(d) = transport.reply_delay {
             rt::sleep(d).await;
         }
         result
@@ -233,8 +333,21 @@ impl Backend for FaultBackend {
         value: Vec<u8>,
         expected: &Revision,
     ) -> Result<Revision, BackendError> {
-        self.transport(|| self.inner.write_if(path, value, expected))
-            .await
+        self.mutation(
+            || self.inner.write_if(path, value.clone(), expected),
+            || {
+                let (inner, path, value, expected) = (
+                    self.inner.clone(),
+                    path.to_string(),
+                    value.clone(),
+                    expected.clone(),
+                );
+                Box::pin(async move {
+                    let _ = inner.write_if(&path, value, &expected).await;
+                })
+            },
+        )
+        .await
     }
 
     async fn write_if_not_exists(
@@ -242,13 +355,30 @@ impl Backend for FaultBackend {
         path: &str,
         value: Vec<u8>,
     ) -> Result<Revision, BackendError> {
-        self.transport(|| self.inner.write_if_not_exists(path, value))
-            .await
+        self.mutation(
+            || self.inner.write_if_not_exists(path, value.clone()),
+            || {
+                let (inner, path, value) = (self.inner.clone(), path.to_string(), value.clone());
+                Box::pin(async move {
+                    let _ = inner.write_if_not_exists(&path, value).await;
+                })
+            },
+        )
+        .await
     }
 
     async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
-        self.transport(|| self.inner.delete_if(path, expected))
-            .await
+        self.mutation(
+            || self.inner.delete_if(path, expected),
+            || {
+                let (inner, path, expected) =
+                    (self.inner.clone(), path.to_string(), expected.clone());
+                Box::pin(async move {
+                    let _ = inner.delete_if(&path, &expected).await;
+                })
+            },
+        )
+        .await
     }
 
     async fn list(
@@ -320,7 +450,9 @@ mod tests {
             reply_delay_prob: 0,
             fault_prob: 0,
             lost_ack_prob: 0,
+            late_landing_prob: 0,
             max_delay: Duration::from_millis(10),
+            max_late_landing: Duration::ZERO,
         };
         // First byte fires the delay roll; the next three encode 5_000_000ns.
         let fb = FaultBackend::with_tape(mem, vec![0, 0x4c, 0x4b, 0x40], 1, opts);
@@ -341,7 +473,9 @@ mod tests {
             reply_delay_prob: 0,
             fault_prob: 255,
             lost_ack_prob: 0,
+            late_landing_prob: 0,
             max_delay: Duration::from_millis(0),
+            max_late_landing: Duration::ZERO,
         };
         let fb = FaultBackend::with_tape(mem.clone(), vec![0], 1, opts);
         fb.set_active(true);
@@ -366,7 +500,9 @@ mod tests {
             reply_delay_prob: 0,
             fault_prob: 255,
             lost_ack_prob: 255,
+            late_landing_prob: 0,
             max_delay: Duration::from_millis(0),
+            max_late_landing: Duration::ZERO,
         };
         // First byte fires the fault roll; second byte chooses lost-ack.
         let fb = FaultBackend::with_tape(mem.clone(), vec![0, 0], 1, opts);
@@ -382,6 +518,34 @@ mod tests {
         assert_eq!(landed.contents, b"v");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn late_landing_reports_unavailable_before_landing() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let opts = FaultOptions {
+            delay_prob: 0,
+            reply_delay_prob: 0,
+            fault_prob: 255,
+            lost_ack_prob: 0,
+            late_landing_prob: 255,
+            max_delay: Duration::ZERO,
+            max_late_landing: Duration::from_secs(1),
+        };
+        // The bytes fire the fault, choose the late landing, and then encode
+        // the delay.
+        let fb = FaultBackend::with_tape(mem.clone(), vec![0, 0, 0, 0, 0, 10], 1, opts);
+        fb.set_active(true);
+
+        let err = fb
+            .write_if_not_exists("p", b"v".to_vec())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BackendError::Unavailable(msg) if msg.contains("late landing")));
+        assert!(matches!(mem.read("p").await, Err(BackendError::NotFound)));
+
+        fb.settle().await;
+        assert_eq!(mem.read("p").await.unwrap().contents, b"v");
+    }
+
     #[tokio::test]
     async fn delete_lost_ack_reports_unavailable_after_landing() {
         let mem = Arc::new(MemoryBackend::new());
@@ -392,7 +556,9 @@ mod tests {
             reply_delay_prob: 0,
             fault_prob: 255,
             lost_ack_prob: 255,
+            late_landing_prob: 0,
             max_delay: Duration::from_millis(0),
+            max_late_landing: Duration::ZERO,
         };
         let fault = FaultBackend::with_tape(backend, vec![0, 0], 1, opts);
         fault.set_active(true);
@@ -415,7 +581,9 @@ mod tests {
             reply_delay_prob: 0,
             fault_prob: 0,
             lost_ack_prob: 0,
+            late_landing_prob: 0,
             max_delay: Duration::from_millis(0),
+            max_late_landing: Duration::ZERO,
         };
         let fb = FaultBackend::new(mem, 1, opts);
         fb.set_active(true);

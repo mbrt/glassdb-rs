@@ -105,7 +105,9 @@ impl FaultConfig {
             reply_delay_prob: delay_prob,
             fault_prob: 0,
             lost_ack_prob: 0,
+            late_landing_prob: 0,
             max_delay: FAULTLESS_MAX_DELAY,
+            max_late_landing: Duration::ZERO,
         }
     }
 }
@@ -478,7 +480,7 @@ impl<W: SimWorkload> RunContext<W> {
     async fn teardown(self, timed_out: bool) -> OpLog {
         // Heal every transport before verifying so recovery reads cannot themselves
         // fail.
-        self.transports.final_heal();
+        self.transports.final_heal().await;
 
         // The workload reads the final committed state (driving recovery of any
         // crashed instance's locks via lease expiry) and asserts its invariant.

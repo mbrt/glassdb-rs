@@ -66,6 +66,9 @@ type Before = Box<dyn for<'a> Fn(&BackendOp<'a>) -> Result<(), BackendError> + S
 type After = Box<dyn for<'a, 'b> Fn(&BackendOp<'a>, HookOutcome<'b>) -> HookFuture + Send + Sync>;
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type Competitor = Box<dyn FnOnce() -> BoxFuture<()> + Send + Sync>;
+/// The path, value, and expected revision of a conditional write that a test
+/// delivers later.
+type HeldWrite = (String, Vec<u8>, glassdb::backend::Revision);
 
 fn is_committed_tx_record(body: &[u8]) -> bool {
     glassdb_storage::txrecord::status(body)
@@ -441,6 +444,83 @@ async fn single_rw_lost_ack_then_moved_surfaces_in_doubt() {
 
     // The competitor's write is the durable one; our in-doubt write did not win.
     assert_eq!(read_int(&coll.read(b"k").await.unwrap().unwrap()), 99);
+}
+
+/// Regression (fuzz `concurrent-tx` with late landings): a direct-commit CAS
+/// that comes back in doubt can land after the read-back found the leaf
+/// unchanged. An unchanged leaf proves only that the CAS has not landed yet.
+///
+/// The owner's first commit CAS reports in doubt and is held. Its retry from
+/// the same leaf reaches storage after the held CAS landed, so it is rejected.
+/// A peer then overwrites the value, which removes the owner's marker. The
+/// owner cannot tell whether its commit landed, so it must report the outcome
+/// as in doubt. Replaying the body would apply the increment a second time.
+#[tokio::test(start_paused = true)]
+async fn direct_commit_cas_that_lands_late_is_never_replayed() {
+    let memory = Arc::new(MemoryBackend::new());
+    let backend = HookBackend::new(memory.clone());
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let coll = db
+        .root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .unwrap();
+    seed(&coll, b"k", 10).await;
+    let peer = Database::open("example", memory.clone() as Arc<dyn Backend>)
+        .await
+        .unwrap();
+    let peer_coll = peer
+        .open_collection(&CollectionPath::new(b"c").unwrap())
+        .await
+        .unwrap();
+    settle_writebacks().await;
+
+    let held: Arc<Mutex<Option<HeldWrite>>> = Arc::new(Mutex::new(None));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    backend.set_before({
+        let held = held.clone();
+        let attempts = attempts.clone();
+        let memory = memory.clone();
+        let peer_coll = peer_coll.clone();
+        move |op| {
+            let attempt = leaf_cas(op).then(|| attempts.fetch_add(1, Ordering::SeqCst));
+            if attempt == Some(0)
+                && let BackendOp::WriteIf {
+                    path,
+                    value,
+                    expected,
+                } = op
+            {
+                *held.lock().unwrap() =
+                    Some((path.to_string(), value.to_vec(), (*expected).clone()));
+            }
+            let held = held.clone();
+            let memory = memory.clone();
+            let peer_coll = peer_coll.clone();
+            Box::pin(async move {
+                match attempt {
+                    Some(0) => Err(not_applied("write_if")),
+                    Some(1) => {
+                        let (path, value, expected) = held.lock().unwrap().take().unwrap();
+                        memory.write_if(&path, value, &expected).await.unwrap();
+                        peer_coll.write(b"k", &write_int(99)).await.unwrap();
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            })
+        }
+    });
+
+    let result = increment(&db, &coll, b"k").await;
+    backend.clear_before();
+    assert!(matches!(result, Err(Error::InDoubt(_))), "{result:?}");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "the owner did not replay"
+    );
+    assert_eq!(read_int(&peer_coll.read(b"k").await.unwrap().unwrap()), 99);
 }
 
 /// A single read-write in-doubt outcome on a commit CAS that did *not* land
