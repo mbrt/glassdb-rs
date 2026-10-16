@@ -169,7 +169,8 @@ enum OwnerAdmission {
 enum CommitWrite {
     #[default]
     NotStarted,
-    Started,
+    InFlight,
+    Finished,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -177,6 +178,9 @@ struct OwnerLifecycle {
     operations: OwnerOperations,
     admission: OwnerAdmission,
     commit_write: CommitWrite,
+    /// A create of the committed record ended in doubt, so it can still land
+    /// on an empty path. No later write can clear this.
+    commit_create_may_land: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,12 +240,22 @@ impl OwnerLifecycle {
         *has_unresolved |= unresolved;
     }
 
-    fn start_commit_write(&mut self) -> Result<(), TransError> {
+    fn begin_commit_write(&mut self) -> Result<(), TransError> {
         if self.admission == OwnerAdmission::Closed {
             return Err(TransError::AlreadyFinalized);
         }
-        self.commit_write = CommitWrite::Started;
+        self.commit_write = CommitWrite::InFlight;
         Ok(())
+    }
+
+    fn finish_commit_write(&mut self, create_may_land: bool) {
+        debug_assert_eq!(
+            self.commit_write,
+            CommitWrite::InFlight,
+            "commit write finished without a matching begin"
+        );
+        self.commit_write = CommitWrite::Finished;
+        self.commit_create_may_land |= create_may_land;
     }
 
     fn close(&mut self, reason: OwnerCloseReason, record: OwnerRecordState) -> OwnerClosePlan {
@@ -258,13 +272,24 @@ impl OwnerLifecycle {
             } => OwnerRetirementProof::Guarded,
             OwnerOperations::Guarded { .. } => OwnerRetirementProof::Unavailable,
         };
-        let commit_write_started = self.commit_write == CommitWrite::Started;
+        let commit_write_started = self.commit_write != CommitWrite::NotStarted;
+        let commit_write_fenced = match self.commit_write {
+            CommitWrite::NotStarted => true,
+            // GC can delete an acknowledged abort, and then a delayed create
+            // lands on the empty path (ADR-059).
+            _ if self.commit_create_may_land => false,
+            // A wound changes the revision that a conditional commit expects.
+            // A create in flight is not fenced by a wound, but its owner
+            // operation is still active or unresolved, so the retirement proof
+            // already refuses an acknowledgement.
+            CommitWrite::InFlight | CommitWrite::Finished => record == OwnerRecordState::Wounded,
+        };
 
         match reason {
             OwnerCloseReason::Preemption => {
                 if record != OwnerRecordState::NotEngaged
                     && retirement == OwnerRetirementProof::Guarded
-                    && (!commit_write_started || record == OwnerRecordState::Wounded)
+                    && commit_write_fenced
                 {
                     OwnerClosePlan::Transition(AbortTransition::Acknowledge)
                 } else {
@@ -281,7 +306,7 @@ impl OwnerLifecycle {
                 }
             }
             OwnerCloseReason::OwnerAbort => {
-                if retirement != OwnerRetirementProof::Unavailable {
+                if retirement != OwnerRetirementProof::Unavailable && commit_write_fenced {
                     OwnerClosePlan::Transition(AbortTransition::Acknowledge)
                 } else {
                     OwnerClosePlan::Transition(AbortTransition::EnsureWounded)
@@ -394,6 +419,13 @@ enum AbortObservationAction {
 enum CommitWriteFailure {
     Rejected,
     InDoubt { started_at: rt::Instant },
+}
+
+/// A failure to persist the committed record.
+struct CommitWriteError {
+    error: TransError,
+    /// A create of the record ended in doubt, so it can still land.
+    create_may_land: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -846,17 +878,18 @@ impl Monitor {
             // This handshake shares the owner-state lock with local wounding.
             // Either the wound closes admission first, or the commit is marked
             // as dispatched before a local task can report safe retirement.
-            self.start_commit_write(&tid)?;
+            self.begin_commit_write(&tid)?;
             self.stop_tx_refresh(&tid);
+            let result = self.persist_committed_record(record).await;
+            let create_may_land = result.as_ref().is_err_and(|error| error.create_may_land);
+            self.finish_commit_write(&tid, create_may_land);
             // `context` preserves the `AlreadyFinalized` sentinel so the commit
             // path can recognize an abort-side final status, as well as any
             // classification of an escaping error.
             // In-doubt outcomes are normally retried inside
             // `persist_committed_record` because the record is keyed by transaction
             // identity and the write is idempotent.
-            self.persist_committed_record(record)
-                .await
-                .map_err(|error| error.context("writing transaction record"))?;
+            result.map_err(|error| error.error.context("writing transaction record"))?;
         }
 
         self.finish_local_tx(&tid);
@@ -1072,7 +1105,7 @@ impl Monitor {
 
     /// Persists the commit decision and resolves in-doubt mutations while its
     /// durable record can still be read back (ADR-009, ADR-057).
-    async fn persist_committed_record(&self, mut record: TxRecord) -> Result<(), TransError> {
+    async fn persist_committed_record(&self, mut record: TxRecord) -> Result<(), CommitWriteError> {
         let tid = &record.id;
         record.status = TxCommitStatus::Committed;
         let mut expected = {
@@ -1088,59 +1121,73 @@ impl Monitor {
                 })
         };
 
-        let mut backoff = self.inner.retry.backoff();
-        loop {
-            let started_at = rt::Instant::now();
-            let attempt = match &expected {
-                Some(observed) => self.inner.tx_records.set_if(&record, observed).await,
-                None => self.inner.tx_records.set(&record).await,
-            };
-            let failure = match attempt {
-                Ok(observed) => {
-                    self.record_durable_observation(tid, &observed);
-                    return Ok(());
-                }
-                // A clean rejection proves this write did not land. An
-                // unavailable result does not, so its read-back is bounded by
-                // the record's reclamation horizon.
-                Err(StorageError::Precondition) => CommitWriteFailure::Rejected,
-                Err(StorageError::Unavailable(_)) => CommitWriteFailure::InDoubt { started_at },
-                Err(error) => return Err(error.into()),
-            };
-            let status = match failure {
-                CommitWriteFailure::Rejected => {
-                    self.read_tx_status_retrying_unavailable(tid, &mut backoff)
-                        .await?
-                }
-                CommitWriteFailure::InDoubt { started_at } => {
-                    self.read_in_doubt_commit_before_reclaim(tid, &mut backoff, started_at)
-                        .await?
-                }
-            };
+        let mut create_may_land = false;
+        // The block keeps every early return inside it, so every error reports
+        // a create that may still land.
+        let result: Result<(), TransError> = async {
+            let mut backoff = self.inner.retry.backoff();
+            loop {
+                let started_at = rt::Instant::now();
+                let attempt = match &expected {
+                    Some(observed) => self.inner.tx_records.set_if(&record, observed).await,
+                    None => self.inner.tx_records.set(&record).await,
+                };
+                let failure = match attempt {
+                    Ok(observed) => {
+                        self.record_durable_observation(tid, &observed);
+                        return Ok(());
+                    }
+                    // A clean rejection proves this write did not land. An
+                    // unavailable result does not, so its read-back is bounded by
+                    // the record's reclamation horizon.
+                    Err(StorageError::Precondition) => CommitWriteFailure::Rejected,
+                    Err(StorageError::Unavailable(_)) => {
+                        create_may_land |= expected.is_none();
+                        CommitWriteFailure::InDoubt { started_at }
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let status = match failure {
+                    CommitWriteFailure::Rejected => {
+                        self.read_tx_status_retrying_unavailable(tid, &mut backoff)
+                            .await?
+                    }
+                    CommitWriteFailure::InDoubt { started_at } => {
+                        self.read_in_doubt_commit_before_reclaim(tid, &mut backoff, started_at)
+                            .await?
+                    }
+                };
 
-            let record_state = TxRecordState::try_from_observation(&status.observation)?;
-            match classify_commit_observation(failure, record_state)? {
-                CommitResolution::Committed => {
-                    self.record_durable_observation(tid, &status.observation);
-                    return Ok(());
-                }
-                CommitResolution::AlreadyFinalized => {
-                    self.record_durable_observation(tid, &status.observation);
-                    return Err(TransError::AlreadyFinalized);
-                }
-                CommitResolution::InDoubt => {
-                    return Err(in_doubt(format!(
-                        "transaction {tid} record was reclaimed while its outcome was in doubt"
-                    )));
-                }
-                CommitResolution::Retry => {
-                    // Pending proves the preceding attempt did not land. The
-                    // next write receives a fresh reclamation budget.
-                    expected = Some(status.observation);
-                    rt::sleep(backoff.next_delay()).await;
+                let record_state = TxRecordState::try_from_observation(&status.observation)?;
+                match classify_commit_observation(record_state)? {
+                    CommitResolution::Committed => {
+                        self.record_durable_observation(tid, &status.observation);
+                        return Ok(());
+                    }
+                    CommitResolution::AlreadyFinalized => {
+                        self.record_durable_observation(tid, &status.observation);
+                        return Err(TransError::AlreadyFinalized);
+                    }
+                    CommitResolution::InDoubt => {
+                        return Err(in_doubt(format!(
+                            "transaction {tid} record was reclaimed while its outcome was in doubt"
+                        )));
+                    }
+                    CommitResolution::Retry => {
+                        // Pending proves only that the preceding attempt had not
+                        // landed yet. If it lands later, the next write is rejected
+                        // and its read-back decides the outcome.
+                        expected = Some(status.observation);
+                        rt::sleep(backoff.next_delay()).await;
+                    }
                 }
             }
         }
+        .await;
+        result.map_err(|error| CommitWriteError {
+            error,
+            create_may_land,
+        })
     }
 
     /// Advances an abort-side lifecycle transition from an exact observation.
@@ -1238,15 +1285,16 @@ impl Monitor {
         abort_record
     }
 
-    /// Reads back an in-doubt commit write before its record can become
-    /// reclaimable.
+    /// Reads back an in-doubt commit write, giving up before its record usually
+    /// becomes reclaimable.
     ///
-    /// GC reclaims a final transaction record once its safety horizon has
+    /// Correctness does not depend on this deadline: a missing record is always
+    /// classified as in doubt. The deadline makes that outcome rare. GC
+    /// reclaims a final transaction record only after its safety horizon has
     /// elapsed since the timestamp that write stamped (ADR-022), and that
     /// timestamp is never earlier than the attempt that may have landed it.
-    /// Measuring from the attempt and omitting the skew allowance (which is
-    /// exactly what GC's own check adds to tolerate a foreign clock) therefore
-    /// leaves at least GC's skew allowance after this recovery budget expires.
+    /// Measuring from the attempt and omitting the skew allowance leaves at
+    /// least GC's skew allowance, unless the owner pauses for longer.
     async fn read_in_doubt_commit_before_reclaim(
         &self,
         tid: &TxId,
@@ -1340,7 +1388,7 @@ impl Monitor {
         owned.close(OwnerCloseReason::OwnerAbort)
     }
 
-    fn start_commit_write(&self, tid: &TxId) -> Result<(), TransError> {
+    fn begin_commit_write(&self, tid: &TxId) -> Result<(), TransError> {
         let mut st = self.shard_for(tid).lock().unwrap();
         let owned = match st.transactions.entry(*tid) {
             Entry::Vacant(entry) => {
@@ -1362,7 +1410,18 @@ impl Monitor {
         {
             return Err(TransError::AlreadyFinalized);
         }
-        owned.lifecycle.start_commit_write()
+        owned.lifecycle.begin_commit_write()
+    }
+
+    fn finish_commit_write(&self, tid: &TxId, create_may_land: bool) {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        if let Some(TxRuntimeEntry {
+            role: TxRuntimeRole::Owned(owned),
+            ..
+        }) = st.transactions.get_mut(tid)
+        {
+            owned.lifecycle.finish_commit_write(create_may_land);
+        }
     }
 
     fn finish_local_tx(&self, tid: &TxId) {
@@ -1591,7 +1650,7 @@ impl Monitor {
             // Readers must check durable status while that outcome is pending,
             // including when a peer has already published the writer in a leaf.
             TxRuntimeRole::Owned(owned)
-                if owned.lifecycle.commit_write == CommitWrite::Started
+                if owned.lifecycle.commit_write != CommitWrite::NotStarted
                     && owned
                         .record
                         .as_ref()
@@ -2065,20 +2124,21 @@ fn classify_abort_observation(
 
 /// Classifies what a durable read proves after a committed-record write did not
 /// return success.
-fn classify_commit_observation(
-    failure: CommitWriteFailure,
-    current: TxRecordState,
-) -> Result<CommitResolution, TransError> {
+///
+/// A missing record is in doubt even after a clean rejection: GC deleted a
+/// final record, and during a commit the only final record that GC can delete
+/// is this owner's own `Committed` record from an earlier attempt that was in
+/// doubt. A peer writes `Wounded`, which GC keeps. An acknowledgement as
+/// `Aborted` needs proof that no owner operation is active, and a commit runs
+/// inside one.
+fn classify_commit_observation(current: TxRecordState) -> Result<CommitResolution, TransError> {
     match (current.relation_to(TxRecordState::Committed), current) {
         (TxLifecycleRelation::Same, TxRecordState::Committed) => Ok(CommitResolution::Committed),
         (TxLifecycleRelation::Blocks, TxRecordState::Aborted | TxRecordState::Wounded) => {
             Ok(CommitResolution::AlreadyFinalized)
         }
         (TxLifecycleRelation::CanAdvance, TxRecordState::Pending) => Ok(CommitResolution::Retry),
-        (TxLifecycleRelation::CanAdvance, TxRecordState::Missing) => Ok(match failure {
-            CommitWriteFailure::Rejected => CommitResolution::AlreadyFinalized,
-            CommitWriteFailure::InDoubt { .. } => CommitResolution::InDoubt,
-        }),
+        (TxLifecycleRelation::CanAdvance, TxRecordState::Missing) => Ok(CommitResolution::InDoubt),
         _ => Err(TransError::other(
             "transaction lifecycle relation cannot resolve a commit",
         )),
@@ -2169,36 +2229,26 @@ mod tests {
 
     #[test]
     fn commit_observation_classification_matches_the_protocol() {
-        let rejected = CommitWriteFailure::Rejected;
-        let in_doubt = CommitWriteFailure::InDoubt {
-            started_at: rt::Instant::now(),
-        };
-
-        for failure in [rejected, in_doubt] {
-            assert_eq!(
-                classify_commit_observation(failure, TxRecordState::Committed).unwrap(),
-                CommitResolution::Committed
-            );
-            assert_eq!(
-                classify_commit_observation(failure, TxRecordState::Aborted).unwrap(),
-                CommitResolution::AlreadyFinalized
-            );
-            assert_eq!(
-                classify_commit_observation(failure, TxRecordState::Wounded).unwrap(),
-                CommitResolution::AlreadyFinalized
-            );
-            assert_eq!(
-                classify_commit_observation(failure, TxRecordState::Pending).unwrap(),
-                CommitResolution::Retry
-            );
-        }
-
         assert_eq!(
-            classify_commit_observation(rejected, TxRecordState::Missing).unwrap(),
+            classify_commit_observation(TxRecordState::Committed).unwrap(),
+            CommitResolution::Committed
+        );
+        assert_eq!(
+            classify_commit_observation(TxRecordState::Aborted).unwrap(),
             CommitResolution::AlreadyFinalized
         );
         assert_eq!(
-            classify_commit_observation(in_doubt, TxRecordState::Missing).unwrap(),
+            classify_commit_observation(TxRecordState::Wounded).unwrap(),
+            CommitResolution::AlreadyFinalized
+        );
+        assert_eq!(
+            classify_commit_observation(TxRecordState::Pending).unwrap(),
+            CommitResolution::Retry
+        );
+        // GC deleted a final record. It can be this owner's own commit from an
+        // earlier attempt, even if the latest attempt was a clean rejection.
+        assert_eq!(
+            classify_commit_observation(TxRecordState::Missing).unwrap(),
             CommitResolution::InDoubt
         );
     }
@@ -2243,7 +2293,7 @@ mod tests {
         let mut dispatched = OwnerLifecycle::default();
         dispatched.begin_operation().unwrap();
         dispatched.finish_operation(false);
-        dispatched.start_commit_write().unwrap();
+        dispatched.begin_commit_write().unwrap();
         assert_eq!(
             dispatched.close(OwnerCloseReason::OwnerAbort, OwnerRecordState::Other),
             OwnerClosePlan::PreserveCommit
@@ -2251,7 +2301,7 @@ mod tests {
 
         let mut unresolved_dispatch = OwnerLifecycle::default();
         unresolved_dispatch.begin_operation().unwrap();
-        unresolved_dispatch.start_commit_write().unwrap();
+        unresolved_dispatch.begin_commit_write().unwrap();
         assert_eq!(
             unresolved_dispatch.close(OwnerCloseReason::OwnerAbort, OwnerRecordState::Other),
             OwnerClosePlan::Transition(AbortTransition::WoundIfPresent)
@@ -2260,11 +2310,24 @@ mod tests {
         let mut observed_wound = OwnerLifecycle::default();
         observed_wound.begin_operation().unwrap();
         observed_wound.finish_operation(false);
-        observed_wound.start_commit_write().unwrap();
+        observed_wound.begin_commit_write().unwrap();
         assert_eq!(
             observed_wound.close(OwnerCloseReason::OwnerAbort, OwnerRecordState::Wounded),
             OwnerClosePlan::Transition(AbortTransition::Acknowledge)
         );
+
+        // A delayed create can land after GC deletes an acknowledged abort.
+        for reason in [OwnerCloseReason::OwnerAbort, OwnerCloseReason::Preemption] {
+            let mut create_in_doubt = OwnerLifecycle::default();
+            create_in_doubt.begin_operation().unwrap();
+            create_in_doubt.finish_operation(false);
+            create_in_doubt.begin_commit_write().unwrap();
+            create_in_doubt.finish_commit_write(true);
+            assert_eq!(
+                create_in_doubt.close(reason, OwnerRecordState::Wounded),
+                OwnerClosePlan::Transition(AbortTransition::EnsureWounded)
+            );
+        }
 
         let mut never_engaged = OwnerLifecycle::default();
         assert_eq!(
@@ -2940,6 +3003,191 @@ mod tests {
         )
     }
 
+    /// A commit-record write that the backend applies only when the test
+    /// releases it, while its caller already received `Unavailable`.
+    #[derive(Clone, Default)]
+    struct DelayedWrite(Arc<Mutex<Option<HeldWrite>>>);
+
+    /// The path, value, and expected revision of a held write. A create has no
+    /// expected revision.
+    type HeldWrite = (String, Vec<u8>, Option<glassdb_backend::Revision>);
+
+    impl DelayedWrite {
+        fn hold(&self, operation: &BackendOp<'_>) {
+            let held = match operation {
+                BackendOp::WriteIf {
+                    path,
+                    value,
+                    expected,
+                } => (path.to_string(), value.to_vec(), Some((*expected).clone())),
+                BackendOp::WriteIfNotExists { path, value } => {
+                    (path.to_string(), value.to_vec(), None)
+                }
+                _ => panic!("only writes can be held"),
+            };
+            *self.0.lock().unwrap() = Some(held);
+        }
+
+        async fn release(&self, memory: &MemoryBackend) -> Result<(), BackendError> {
+            let (path, value, expected) = self.0.lock().unwrap().take().expect("a held write");
+            match expected {
+                Some(expected) => memory.write_if(&path, value, &expected).await,
+                None => memory.write_if_not_exists(&path, value).await,
+            }
+            .map(|_| ())
+        }
+    }
+
+    // Regression: a `Pending` read after an in-doubt commit write proves only
+    // that the write had not landed yet. If it lands later and GC deletes the
+    // committed record, the retry is rejected and finds no record. The owner
+    // must report the outcome as in doubt, not as an abort.
+    #[tokio::test(start_paused = true)]
+    async fn commit_stays_in_doubt_when_a_delayed_write_lands_after_a_pending_read() {
+        let memory = Arc::new(MemoryBackend::new());
+        let backend = HookBackend::new(memory.clone());
+        let (owner, _owner_ctx) = new_test_monitor(backend.clone());
+        let (_collector, collector_ctx) = new_test_monitor(memory.clone());
+        let tx = tx_id(b"delayed-commit");
+        let lock = TxLock::TopologyParticipant {
+            collection: CollectionAddress::root("test"),
+        };
+        owner
+            .begin_persisted_tx(
+                &tx,
+                TxRecoveryManifest {
+                    locks: vec![lock.clone()],
+                    ..TxRecoveryManifest::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let delayed = DelayedWrite::default();
+        let commit_writes = Arc::new(AtomicUsize::new(0));
+        backend.set_before({
+            let delayed = delayed.clone();
+            let commit_writes = commit_writes.clone();
+            let collector = collector_ctx.tx_records.clone();
+            move |operation| {
+                let attempt = is_commit_write(operation)
+                    .then(|| commit_writes.fetch_add(1, Ordering::SeqCst));
+                if attempt == Some(0) {
+                    delayed.hold(operation);
+                }
+                let delayed = delayed.clone();
+                let memory = memory.clone();
+                let collector = collector.clone();
+                Box::pin(async move {
+                    match attempt {
+                        Some(0) => Err(BackendError::Unavailable("injected delayed write".into())),
+                        Some(1) => {
+                            // The first attempt lands after the owner read
+                            // `Pending`, then GC deletes the committed record.
+                            delayed.release(&memory).await.unwrap();
+                            let committed = collector.get_at(&tx, Requirement::ANY).await.unwrap();
+                            assert_eq!(
+                                committed.value().unwrap().status,
+                                TxCommitStatus::Committed
+                            );
+                            collector.delete(&committed).await.unwrap();
+                            Ok(())
+                        }
+                        _ => Ok(()),
+                    }
+                })
+            }
+        });
+
+        let mut record = TxRecord::new(tx, TxCommitStatus::Pending);
+        record.locks.push(lock);
+        let error = owner.commit_tx(record).await.unwrap_err();
+        assert!(
+            matches!(error, TransError::Storage(StorageError::Unavailable(_))),
+            "expected an in-doubt outcome, got {error:?}"
+        );
+        assert_eq!(commit_writes.load(Ordering::SeqCst), 2);
+    }
+
+    // Regression (ADR-059): a create of the committed record that is in doubt
+    // can land after a peer wounds the empty path. The owner must keep the
+    // wound pinned. If it acknowledged the wound, GC could delete `Aborted`,
+    // and the delayed create would then commit an identity that peers treat as
+    // aborted.
+    #[tokio::test(start_paused = true)]
+    async fn in_doubt_commit_create_keeps_a_later_wound_pinned() {
+        let memory = Arc::new(MemoryBackend::new());
+        let backend = HookBackend::new(memory.clone());
+        let (owner, owner_ctx) = new_test_monitor(backend.clone());
+        let (wounder, _wounder_ctx) = new_test_monitor(backend.clone());
+        let tx = tx_id(b"delayed-create");
+
+        let owner_operation = owner.begin_owner_operation(&tx).unwrap();
+        owner.begin_tx(&tx);
+
+        let delayed = DelayedWrite::default();
+        let held = Arc::new(AtomicBool::new(false));
+        backend.set_before({
+            let delayed = delayed.clone();
+            let held = held.clone();
+            move |operation| {
+                let hold = matches!(operation, BackendOp::WriteIfNotExists { value, .. }
+                        if glassdb_storage::txrecord::status(value)
+                            .is_ok_and(|status| status == TxCommitStatus::Committed))
+                    && !held.swap(true, Ordering::SeqCst);
+                if hold {
+                    delayed.hold(operation);
+                }
+                let wounder = wounder.clone();
+                Box::pin(async move {
+                    if !hold {
+                        return Ok(());
+                    }
+                    // A peer wounds the identity before the owner reads back.
+                    assert_eq!(
+                        wounder.preempt_tx(&tx).await.unwrap(),
+                        TxFinalStatus::Aborted
+                    );
+                    Err(BackendError::Unavailable("injected delayed create".into()))
+                })
+            }
+        });
+
+        let mut record = TxRecord::new(tx, TxCommitStatus::Committed);
+        record.locks.push(TxLock::TopologyParticipant {
+            collection: CollectionAddress::root("test"),
+        });
+        assert!(matches!(
+            owner.commit_tx(record).await,
+            Err(TransError::AlreadyFinalized)
+        ));
+        owner_operation.complete();
+        assert_eq!(
+            owner.abort_owned_tx(&tx).await.unwrap(),
+            OwnerAbortOutcome::Pinned
+        );
+
+        let wounded = owner_ctx
+            .tx_records
+            .get_at(&tx, Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(wounded.value().unwrap().status, TxCommitStatus::Wounded);
+        assert!(matches!(
+            delayed.release(&memory).await,
+            Err(BackendError::Precondition)
+        ));
+        assert_eq!(
+            owner_ctx
+                .tx_records
+                .commit_status_at(&tx, Requirement::ANY)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Wounded
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn commit_retries_status_read_after_rejected_cas() {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
@@ -3179,7 +3427,7 @@ mod tests {
 
         let owner = mon.begin_owner_operation(&tx).unwrap();
         mon.begin_tx(&tx);
-        mon.start_commit_write(&tx).unwrap();
+        mon.begin_commit_write(&tx).unwrap();
         drop(owner);
 
         assert!(matches!(

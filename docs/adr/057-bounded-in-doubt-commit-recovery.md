@@ -4,6 +4,9 @@
 
 Accepted — implemented.
 
+[ADR-080](080-commit-recovery-does-not-depend-on-gc-retention.md) refines the
+classification of a missing record: it is always in doubt during a commit.
+
 This refines [ADR-009](009-in-doubt-conditional-writes.md)'s treatment of
 locked commits and leaves [ADR-022](022-garbage-collection-mark-sweep.md)'s
 reclamation policy unchanged.
