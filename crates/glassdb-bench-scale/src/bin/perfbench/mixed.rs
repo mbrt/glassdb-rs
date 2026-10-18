@@ -28,6 +28,14 @@
 //! so. Setup, warm-up, collection opening, and their backend operations are
 //! outside the measured interval.
 //!
+//! On a storage that can fork, the state after the warm-up of a cell is the
+//! checkpoint where the next cell starts, when only the workers per shape
+//! differ between the two. Every cell of such a chain then starts near the
+//! topology of its own load, so its warm-up stays short. A cell with another
+//! mode, affinity, or Database limit starts from the seed instead, because the
+//! topology of the other traffic does not fit it. The result of a cell
+//! therefore depends on the cells before it in its chain.
+//!
 //! Each cell uses **sequential (adaptive) sampling**: all shapes run
 //! concurrently until every shape has committed `--window-commits` per
 //! throughput window on average (or `--max-duration` caps the run). The
@@ -94,19 +102,48 @@ pub(super) fn run(
         let mut cells = Vec::new();
         for &dimension in &dimensions {
             eprintln!("{}", result::cell_started(run, dimension));
-            let seed = seeds.for_cell(dimension)?;
-            cells.push(run_cell(handle, &seed, options, execution, dimension)?);
+            let start = seeds.for_cell(dimension)?;
+            let (cell, checkpoint) = run_cell(handle, &start, options, execution, dimension)?;
+            seeds.record_checkpoint(dimension, checkpoint);
+            cells.push(cell);
         }
         runs.push(RunResult::new(run, cells));
     }
     Ok(runs)
 }
 
+/// The database a cell starts from, and the storage that holds it.
+struct CellStart {
+    seed: Seed,
+    /// The storage of the cell, when it can fork.
+    storage: Option<ForkableBackend>,
+}
+
+impl CellStart {
+    /// Returns a start over its own fork of `storage`, which holds `seed`.
+    fn fork_of(storage: &ForkableBackend, seed: &Seed) -> Self {
+        let cell = storage.fork();
+        Self {
+            seed: seed.with_backend(cell.backend()),
+            storage: Some(cell),
+        }
+    }
+
+    /// Returns a copy of the current state of the storage, or none when the
+    /// storage cannot fork.
+    ///
+    fn checkpoint(&self) -> Option<ForkableBackend> {
+        self.storage.as_ref().map(ForkableBackend::fork)
+    }
+}
+
 /// Provides each cell of a run with its own seeded database.
 ///
 /// A storage that can fork is seeded once for each mode of the run, with the
-/// largest collection count of that mode, and every cell gets its own fork.
-/// Any other storage is seeded again for each cell, in a new database.
+/// largest collection count of that mode. A cell gets a fork of the checkpoint
+/// that the cell before it recorded when both cells differ only in their
+/// workers per shape. Any other cell gets a fork of the seed. A storage that
+/// cannot fork is seeded again for each cell, in a new database.
 struct Seeds<'a> {
     handle: &'a Handle,
     factory: &'a backend::Factory,
@@ -118,6 +155,27 @@ struct Seeds<'a> {
     /// The seeded storage of the mode of the last cell. Cells come grouped by
     /// mode, so the storage of an earlier mode is not used again.
     forkable: Option<(Mode, ForkableBackend, Seed)>,
+    /// The latest checkpoint, with the cell it follows from.
+    checkpoint: Option<(Chain, ForkableBackend)>,
+}
+
+/// The dimensions of a cell that its checkpoint carries over to the next cell.
+/// Only the workers per shape may change along a chain.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Chain {
+    mode: Mode,
+    affinity_pct: u8,
+    database_limit: usize,
+}
+
+impl Chain {
+    fn of(cell: CellDimension) -> Self {
+        Self {
+            mode: cell.mode,
+            affinity_pct: cell.affinity_pct,
+            database_limit: cell.database_limit,
+        }
+    }
 }
 
 impl<'a> Seeds<'a> {
@@ -145,16 +203,24 @@ impl<'a> Seeds<'a> {
             name_prefix: format!("perfbenchmixed{invocation}r{run}"),
             collections,
             forkable: None,
+            checkpoint: None,
         }
     }
 
     /// Returns a seeded database for the cell, which no other cell uses.
-    fn for_cell(&mut self, dimension: CellDimension) -> Result<Seed, Box<dyn Error>> {
+    fn for_cell(&mut self, dimension: CellDimension) -> Result<CellStart, Box<dyn Error>> {
         let mode = dimension.mode;
+        if let Some((chain, storage)) = &self.checkpoint
+            && *chain == Chain::of(dimension)
+            && let Some((_, _, seed)) = &self.forkable
+        {
+            return Ok(CellStart::fork_of(storage, seed));
+        }
+        self.checkpoint = None;
         if let Some((seeded, storage, seed)) = &self.forkable
             && *seeded == mode
         {
-            return Ok(seed.with_backend(storage.fork().backend()));
+            return Ok(CellStart::fork_of(storage, seed));
         }
         if let Some(storage) = self.factory.forkable() {
             self.forkable = None;
@@ -165,9 +231,9 @@ impl<'a> Seeds<'a> {
                 .map_or(dimension.databases, |&(_, count)| count);
             let name = format!("{}{}", self.name_prefix, mode.label());
             let seed = self.seed(storage.backend(), name, collections, mode)?;
-            let cell = seed.with_backend(storage.fork().backend());
+            let start = CellStart::fork_of(&storage, &seed);
             self.forkable = Some((mode, storage, seed));
-            return Ok(cell);
+            return Ok(start);
         }
         let name = format!(
             "{}{}a{}d{}l{}w{}",
@@ -178,7 +244,17 @@ impl<'a> Seeds<'a> {
             dimension.database_limit,
             dimension.workers_per_shape,
         );
-        self.seed(self.factory.backend(), name, dimension.databases, mode)
+        let seed = self.seed(self.factory.backend(), name, dimension.databases, mode)?;
+        Ok(CellStart {
+            seed,
+            storage: None,
+        })
+    }
+
+    /// Makes the checkpoint of `dimension` the start of the next cell of its
+    /// chain. Does nothing when the storage cannot fork.
+    fn record_checkpoint(&mut self, dimension: CellDimension, checkpoint: Option<ForkableBackend>) {
+        self.checkpoint = checkpoint.map(|storage| (Chain::of(dimension), storage));
     }
 
     fn seed(
@@ -203,15 +279,17 @@ impl<'a> Seeds<'a> {
     }
 }
 
+/// Runs one cell and returns its result with the checkpoint taken after its
+/// warm-up.
 fn run_cell(
     handle: &Handle,
-    seed: &Seed,
+    start: &CellStart,
     options: &Options,
     execution: Execution,
     dimension: CellDimension,
-) -> Result<CellResult, Box<dyn Error>> {
+) -> Result<(CellResult, Option<ForkableBackend>), Box<dyn Error>> {
     // Collection binding and its record reads are setup, not transaction work.
-    let prepared = seed.open_cell(handle, dimension.databases)?;
+    let prepared = start.seed.open_cell(handle, dimension.databases)?;
     let plans = workload::plans(
         dimension.workers_per_shape,
         prepared.databases().len(),
@@ -228,7 +306,7 @@ fn run_cell(
         dimension.affinity_pct,
         key_selection,
     );
-    let (warmup, drive, active, run, deadline) = handle.block_on(async {
+    let (warmup, checkpoint, drive, active, run, deadline) = handle.block_on(async {
         let handles =
             workload::spawn_workers(prepared.databases(), prepared.collections(), &plans, &ctx);
         // The workload runs before the measurement, so that the splits and
@@ -241,9 +319,10 @@ fn run_cell(
                 options.warmup_timeout,
             )
             .await;
-        // The baselines and the samples then start with no transaction in
-        // flight.
+        // The checkpoint, the baselines and the samples then start with no
+        // transaction in flight.
         ctx.pause().close_and_wait(handles.len(), &stop).await;
+        let checkpoint = start.checkpoint();
         let active = prepared.begin_measurement();
         workload::start_measurement(&plans);
         ctx.pause().open();
@@ -260,7 +339,7 @@ fn run_cell(
         workload::end_measurement(&plans);
         let deadline = tokio::time::Instant::now() + execution.drain_timeout;
         let run = join_tasks_until(handles, deadline).await;
-        (warmup, drive, active, run, deadline)
+        (warmup, checkpoint, drive, active, run, deadline)
     });
 
     let completed = active.teardown(handle, deadline, run)?;
@@ -282,7 +361,7 @@ fn run_cell(
         eprintln!("{}", result::cell_capped(dimension, options.window_commits));
     }
 
-    Ok(CellResult::summarize(
+    let result = CellResult::summarize(
         CellMetadata::new(
             dimension.mode.label(),
             dimension.affinity_pct,
@@ -297,7 +376,8 @@ fn run_cell(
         workload::measurements(&plans),
         &completed.deltas,
         target,
-    ))
+    );
+    Ok((result, checkpoint))
 }
 
 #[cfg(test)]
@@ -316,7 +396,8 @@ mod tests {
     }
 
     #[test]
-    fn each_cell_gets_an_own_copy_of_one_seed_per_mode() -> Result<(), Box<dyn Error>> {
+    fn a_checkpoint_carries_over_only_to_cells_that_differ_in_workers() -> Result<(), Box<dyn Error>>
+    {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -334,9 +415,9 @@ mod tests {
         let options = TestCli::try_parse_from([
             "perfbench",
             "--modes=lo,hi",
-            "--affinities=100",
-            "--databases=1,2",
-            "--workers-per-shape=2",
+            "--affinities=0,100",
+            "--databases=2",
+            "--workers-per-shape=1,2",
             "--num-keys=16",
             "--hot-keys=4",
             "--multi-keys=2",
@@ -344,6 +425,8 @@ mod tests {
             "--seed-timeout=5s",
         ])?
         .options;
+        // Cells come in this order: `lo` with 0% affinity and 1 and 2 workers,
+        // `lo` with 100% affinity and 1 and 2 workers, then the same for `hi`.
         let dimensions = options.cell_dimensions()?;
         let execution = Execution {
             runs: 1,
@@ -354,30 +437,44 @@ mod tests {
 
         // The first `lo` cell opens one collection, but the seed has the two
         // collections of the largest `lo` cell.
-        let first = seeds.for_cell(dimensions[0])?.open_cell(handle, 2)?;
+        let first_start = seeds.for_cell(dimensions[0])?;
+        let first = first_start.seed.open_cell(handle, 2)?;
         let collection = first.collections()[0][1].clone();
         let keys: Vec<_> = handle.block_on(collection.iter_keys())?.collect();
         assert_eq!(keys.len(), 16);
+
+        // The checkpoint holds the writes before it, and not the writes after.
         handle.block_on(collection.write(&key_bytes(0), b"first"))?;
+        seeds.record_checkpoint(dimensions[0], first_start.checkpoint());
+        handle.block_on(collection.write(&key_bytes(1), b"after"))?;
 
-        // A later cell of the same mode does not see the writes of earlier
-        // cells.
-        let second = seeds.for_cell(dimensions[1])?.open_cell(handle, 2)?;
-        let read = handle.block_on(second.collections()[0][1].read(&key_bytes(0)))?;
+        // A cell that differs only in its workers starts from the checkpoint.
+        let second_start = seeds.for_cell(dimensions[1])?;
+        let second = second_start.seed.open_cell(handle, 2)?;
+        let second_collection = second.collections()[0][1].clone();
+        let read = handle.block_on(second_collection.read(&key_bytes(0)))?;
+        assert_eq!(read, Some(b"first".to_vec()));
+        let read = handle.block_on(second_collection.read(&key_bytes(1)))?;
         assert_eq!(read, Some(value()));
-        handle.block_on(second.collections()[0][1].write(&key_bytes(0), b"second"))?;
-        let third = seeds.for_cell(dimensions[1])?.open_cell(handle, 2)?;
-        let read = handle.block_on(third.collections()[0][1].read(&key_bytes(0)))?;
-        assert_eq!(read, Some(value()));
+        seeds.record_checkpoint(dimensions[1], second_start.checkpoint());
 
-        // The `hi` mode has its own seed with its own pool.
-        let hot = seeds.for_cell(dimensions[2])?.open_cell(handle, 1)?;
+        // Another affinity starts again from the seed.
+        let other_affinity_start = seeds.for_cell(dimensions[2])?;
+        let other_affinity = other_affinity_start.seed.open_cell(handle, 2)?;
+        let read = handle.block_on(other_affinity.collections()[0][1].read(&key_bytes(0)))?;
+        assert_eq!(read, Some(value()));
+        seeds.record_checkpoint(dimensions[2], other_affinity_start.checkpoint());
+
+        // The mode `hi` starts from its own seed, with its own pool, and
+        // not from the checkpoint of the cell before it.
+        let hot_start = seeds.for_cell(dimensions[4])?;
+        let hot = hot_start.seed.open_cell(handle, 1)?;
         let keys: Vec<_> = handle
             .block_on(hot.collections()[0][0].iter_keys())?
             .collect();
         assert_eq!(keys.len(), 4);
 
-        for cell in [first, second, third, hot] {
+        for cell in [first, second, other_affinity, hot] {
             cell.begin_measurement().teardown(
                 handle,
                 tokio::time::Instant::now() + Duration::from_secs(5),
