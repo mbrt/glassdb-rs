@@ -87,14 +87,17 @@ async fn separate_instances_find_orphans_without_local_hints() {
 
 #[tokio::test(start_paused = true)]
 async fn writers_complete_while_gc_is_saturated_and_stalled() {
+    // The default parallelism is above the 100 stalled records, so GC runs at
+    // most all of them at once. Checks that stall before their writes do not
+    // raise the concurrency above the read-only limit of 8.
     for configured_limit in [None, Some(1), Some(3), Some(12)] {
-        let limit = configured_limit.unwrap_or(8);
+        let limit = configured_limit.unwrap_or(256).min(8);
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let tx_records = tx_record_store(backend.clone());
         old_objects(&tx_records, 100).await;
         let mut builder = Database::builder("gc", backend.clone());
-        if let Some(limit) = configured_limit {
-            builder = builder.gc_parallelism(NonZeroUsize::new(limit).unwrap());
+        if let Some(configured) = configured_limit {
+            builder = builder.gc_parallelism(NonZeroUsize::new(configured).unwrap());
         }
         let db = builder.open().await.unwrap();
         backend.set_before(|operation| {

@@ -146,7 +146,7 @@ impl WriteBudget {
     }
 
     /// The writes in each second that GC can spend now.
-    fn spend_limit(&self) -> f64 {
+    pub(super) fn spend_limit(&self) -> f64 {
         self.earned / SPEND_TIME.as_secs_f64() + self.base_rate
     }
 }

@@ -3840,7 +3840,7 @@ fn hint_producers_share_capacity_and_keep_the_latest_reports() {
 
 #[test]
 fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
-    for capacity in [1, 3, HINT_CAPACITY] {
+    for capacity in [1, 3, MIN_HINT_CAPACITY] {
         let now = rt::Instant::now();
         let counters = Counters::default();
         let mut candidates = Candidates::new(
@@ -3892,7 +3892,7 @@ fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
 fn scan_reports_preserve_candidates_in_each_scheduling_state() {
     let now = rt::Instant::now();
     let counters = Counters::default();
-    let mut candidates = Candidates::default();
+    let mut candidates = Candidates::new(Duration::ZERO, GcLimits::default());
     let hint = tx(1);
     let ready_scan = tx(2);
     let deferred_scan = tx(3);
@@ -3982,4 +3982,117 @@ fn scan_admission_does_not_advance_a_hint_deadline() {
     assert_eq!(candidates.take_ready(), None);
     candidates.promote_due(now + delay);
     assert_eq!(candidates.take_ready(), Some(id));
+}
+
+#[test]
+fn candidate_capacities_follow_the_spend_limit() {
+    let delay = Duration::from_secs(45);
+    let mut candidates = Candidates::new(delay, GcLimits::default());
+    // A small budget keeps the lower capacities.
+    candidates.set_capacities(10.0, Duration::from_secs(15));
+    assert_eq!(
+        (candidates.hint_capacity, candidates.scan_capacity),
+        (MIN_HINT_CAPACITY, MIN_SCAN_CAPACITY)
+    );
+    // 500 writes in each second check about 22,500 hints in a retention period
+    // and 30,000 scan candidates in a retention period and a progress delay.
+    candidates.set_capacities(500.0, Duration::from_secs(15));
+    assert_eq!(
+        (candidates.hint_capacity, candidates.scan_capacity),
+        (22_500, 30_000)
+    );
+    // The limits cap a large budget.
+    candidates.set_capacities(1e9, Duration::from_secs(15));
+    assert_eq!(
+        (candidates.hint_capacity, candidates.scan_capacity),
+        (MAX_CANDIDATES, MAX_CANDIDATES)
+    );
+    // A scan always has room for two pages, even with a lower limit.
+    let mut small = Candidates::new(
+        delay,
+        GcLimits {
+            max_hint_candidates: 10,
+            max_scan_candidates: 10,
+            ..GcLimits::default()
+        },
+    );
+    small.set_capacities(1e9, Duration::from_secs(15));
+    assert_eq!(
+        (small.hint_capacity, small.scan_capacity),
+        (10, MIN_SCAN_CAPACITY)
+    );
+}
+
+// Checks that only read, of records that stay live, lower the concurrency to the
+// read-only limit, also right after checks that wrote raised it. Checks that
+// write raise it up to the parallelism, and an idle GC returns to one check.
+#[tokio::test(start_paused = true)]
+async fn concurrency_rises_above_the_read_only_limit_only_while_checks_write() {
+    let ctx = new_ctx().await;
+    // A large base rate keeps the write budget from limiting the checks.
+    let gc = Gc {
+        max_checks: NonZeroUsize::new(64).unwrap(),
+        hints: GcHints::new(GcLimits {
+            base_write_rate: 1e9,
+            ..GcLimits::default()
+        }),
+        ..ctx.gc.clone()
+    };
+    let mut scheduler = Scheduler::new(&gc);
+    // Aborted records past their retention period are deleted, which is a
+    // write; pending records are only read. The read-only records follow the
+    // writing ones without a pause, so GC does not go idle between them.
+    let mut ids = Vec::new();
+    for (index, writes) in [(0u8, true), (1, false)] {
+        for i in 0..512u32 {
+            let mut prefix = [index; 8];
+            prefix[4..].copy_from_slice(&i.to_be_bytes());
+            let id = TxId::with_priority(0, &prefix);
+            let mut record = committed(id, PAST_HORIZON, &[], &[]);
+            record.status = if writes {
+                TxCommitStatus::Aborted
+            } else {
+                TxCommitStatus::Pending
+            };
+            ctx.tx_records.set(&record).await.unwrap();
+            ids.push(id);
+        }
+    }
+    let mut pending = ids.into_iter();
+    let mut seen = Vec::new();
+    let mut completed = 0;
+    loop {
+        // Keep a backlog of a few rounds, in order, so that read-only checks
+        // also see ready work behind them.
+        let now = rt::Instant::now();
+        while scheduler.candidates.ready_len() < 256
+            && let Some(id) = pending.next()
+        {
+            scheduler
+                .candidates
+                .admit(id, true, now, &scheduler.counters);
+        }
+        scheduler.start_checks(&gc, now);
+        seen.push((completed, scheduler.concurrency));
+        let Some((id, result)) = scheduler.checks.next().await else {
+            break;
+        };
+        scheduler.complete_check(id, result);
+        completed += 1;
+    }
+    let during = |range: std::ops::Range<usize>| {
+        seen.iter()
+            .filter(|(done, _)| range.contains(done))
+            .map(|(_, concurrency)| *concurrency)
+            .max()
+    };
+
+    assert_eq!(during(256..512), Some(64), "checks that write raise it");
+    assert_eq!(
+        during(800..900),
+        Some(READ_ONLY_CONCURRENCY),
+        "checks that only read lower it to the read-only limit"
+    );
+    scheduler.start_checks(&gc, rt::Instant::now());
+    assert_eq!(scheduler.concurrency, 1, "an idle GC returns to one check");
 }

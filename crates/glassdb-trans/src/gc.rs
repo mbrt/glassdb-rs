@@ -48,9 +48,20 @@ use budget::WriteBudget;
 use pipeline::CheckPipeline;
 use scan::{GcScan, PAGE_SIZE};
 
-const HINT_CAPACITY: usize = 4096;
-const SCAN_CAPACITY: usize = 2 * PAGE_SIZE;
-pub(crate) const DEFAULT_GC_PARALLELISM: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+// The candidate capacities when the budget is small. A scan needs room for two
+// pages, so that a LIST can always start.
+const MIN_HINT_CAPACITY: usize = 4096;
+const MIN_SCAN_CAPACITY: usize = 2 * PAGE_SIZE;
+// About 10 MB of candidates of each kind (ADR-078).
+const MAX_CANDIDATES: usize = 65_536;
+// A safety limit for memory and backend connections. The write budget, not the
+// parallelism, limits how fast GC writes (ADR-078).
+pub(crate) const DEFAULT_GC_PARALLELISM: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+// GC raises its concurrency above this only while its checks write. Checks that
+// only read, of records that stay live, need no more.
+const READ_ONLY_CONCURRENCY: usize = 8;
+// The default limit of reports that wait for admission.
+const PENDING_HINT_CAPACITY: usize = 4096;
 const ADMISSION_BATCH: usize = 64;
 
 /// GC limits for one database instance.
@@ -63,10 +74,18 @@ pub struct GcLimits {
     /// At capacity, a new report replaces the oldest. Zero drops every report.
     pub max_pending_hints: usize,
     /// Maximum retained candidates from hints, including ready, deferred, and
-    /// running checks. Defaults to 4,096. At capacity, new candidates are
-    /// discarded; existing candidates keep their place. Zero rejects all new
-    /// candidates from hints.
+    /// running checks. Defaults to 65,536. GC retains fewer while its write
+    /// budget is small: about the hints that it can check within one
+    /// retention period, and at least 4,096 or this maximum if it is lower. At
+    /// capacity, new candidates are discarded; existing candidates keep their
+    /// place. Zero rejects all new candidates from hints.
     pub max_hint_candidates: usize,
+    /// Maximum retained candidates from GC scans. Defaults to 65,536. GC
+    /// retains fewer while its write budget is small, and at least two LIST
+    /// pages, also with a lower maximum, so that a scan can always continue.
+    /// After the capacity drops, scans pause until the retained candidates
+    /// fall below it.
+    pub max_scan_candidates: usize,
     /// Writes in each second that background GC can always send. Above this
     /// rate, background GC sends at most about as many writes as the rest of
     /// the instance. Defaults to 100. The rate is at least 0.01; a NaN uses
@@ -80,8 +99,9 @@ pub struct GcLimits {
 impl Default for GcLimits {
     fn default() -> Self {
         Self {
-            max_pending_hints: HINT_CAPACITY,
-            max_hint_candidates: HINT_CAPACITY,
+            max_pending_hints: PENDING_HINT_CAPACITY,
+            max_hint_candidates: MAX_CANDIDATES,
+            max_scan_candidates: MAX_CANDIDATES,
             base_write_rate: budget::DEFAULT_BASE_RATE,
         }
     }
@@ -158,10 +178,11 @@ enum CandidateState {
 }
 
 /// Bounds local work and preserves scan capacity under a stream of hints.
-#[derive(Default)]
 struct Candidates {
     entries: BTreeMap<TxId, Candidate>,
     limits: GcLimits,
+    hint_capacity: usize,
+    scan_capacity: usize,
     hint_delay: Duration,
     hints: CandidateQueue,
     scans: CandidateQueue,
@@ -177,11 +198,40 @@ struct CandidateQueue {
 
 impl Candidates {
     fn new(hint_delay: Duration, limits: GcLimits) -> Self {
-        Self {
-            hint_delay,
+        let mut candidates = Self {
+            entries: BTreeMap::new(),
             limits,
-            ..Self::default()
-        }
+            hint_capacity: 0,
+            scan_capacity: 0,
+            hint_delay,
+            hints: CandidateQueue::default(),
+            scans: CandidateQueue::default(),
+            deferred: BTreeSet::new(),
+        };
+        candidates.set_capacities(0.0, Duration::ZERO);
+        candidates
+    }
+
+    /// Sizes the candidate queues to about the checks that `spend_limit`
+    /// allows while a candidate holds its slot: the hint delay for hints, and
+    /// also the deferral after progress for scans. Most checks make about one
+    /// write. Candidates above a lower capacity keep their place.
+    fn set_capacities(&mut self, spend_limit: f64, progress_delay: Duration) {
+        // A NaN or negative product casts to zero, and a huge one saturates.
+        let sized = |hold: Duration, min: usize, max: usize| {
+            let wanted = (spend_limit * hold.as_secs_f64()) as usize;
+            wanted.clamp(min.min(max), max)
+        };
+        self.hint_capacity = sized(
+            self.hint_delay,
+            MIN_HINT_CAPACITY,
+            self.limits.max_hint_candidates,
+        );
+        self.scan_capacity = sized(
+            self.hint_delay + progress_delay,
+            MIN_SCAN_CAPACITY,
+            self.limits.max_scan_candidates.max(MIN_SCAN_CAPACITY),
+        );
     }
 
     fn admit(&mut self, tid: TxId, from_scan: bool, now: rt::Instant, counters: &Counters) {
@@ -206,9 +256,9 @@ impl Candidates {
             return;
         }
         let capacity = if from_scan {
-            SCAN_CAPACITY
+            self.scan_capacity
         } else {
-            self.limits.max_hint_candidates
+            self.hint_capacity
         };
         let queue = self.queue_mut(from_scan);
         if queue.count >= capacity {
@@ -879,6 +929,10 @@ struct Scheduler {
     retry_delay: Duration,
     counters: Arc<Counters>,
     budget: WriteBudget,
+    // The checks that completed in the current round of decisions, and those
+    // of them that wrote.
+    round_checks: usize,
+    round_writes: usize,
 }
 
 impl Scheduler {
@@ -911,6 +965,8 @@ impl Scheduler {
                 counters.full_gc_writes.clone(),
                 rt::Instant::now(),
             ),
+            round_checks: 0,
+            round_writes: 0,
             counters,
         }
     }
@@ -940,14 +996,34 @@ impl Scheduler {
             .map(|due| now.saturating_duration_since(due))
             .unwrap_or_default();
         self.budget.refresh(now);
-        // A backlog that the budget holds back is not a reason for more
-        // concurrency.
-        let budget_blocks = !self.budget.allows_checks();
-        if !budget_blocks && (ready > self.concurrency || oldest >= self.retry_delay / 16) {
-            self.concurrency = self.concurrency.saturating_mul(2).min(gc.max_checks.get());
-        } else if ready == 0 && self.checks.is_idle() {
+        self.candidates
+            .set_capacities(self.budget.spend_limit(), self.retry_delay);
+        let backlog = ready > self.concurrency || oldest >= self.retry_delay / 16;
+        if ready == 0 && self.checks.is_idle() {
             self.concurrency = 1;
+            self.round_checks = 0;
+            self.round_writes = 0;
+        } else if self.concurrency < READ_ONLY_CONCURRENCY {
+            // Below the read-only limit, any backlog is a reason for more,
+            // within the budget.
+            if backlog && self.budget.allows_checks() {
+                self.concurrency *= 2;
+            }
+        } else if self.round_checks >= self.concurrency {
+            // One decision for each round of completions, so the concurrency
+            // follows the share of checks that write, not each event. A budget
+            // that blocks holds the concurrency: it lasts until the allowance
+            // refills.
+            let writing = self.round_writes * 2 >= self.round_checks;
+            if !writing {
+                self.concurrency = (self.concurrency / 2).max(READ_ONLY_CONCURRENCY);
+            } else if backlog && self.budget.allows_checks() {
+                self.concurrency *= 2;
+            }
+            self.round_checks = 0;
+            self.round_writes = 0;
         }
+        self.concurrency = self.concurrency.min(gc.max_checks.get());
         self.checks
             .set_limit(NonZeroUsize::new(self.concurrency).unwrap());
         // `take_ready` chooses between hint and scan candidates (ADR-070), so
@@ -967,7 +1043,7 @@ impl Scheduler {
     fn can_list(&self) -> bool {
         self.scan.is_some()
             && self.scanned.is_empty()
-            && self.candidates.scans.count + PAGE_SIZE <= SCAN_CAPACITY
+            && self.candidates.scans.count + PAGE_SIZE <= self.candidates.scan_capacity
     }
 
     fn deadline(&self, now: rt::Instant) -> rt::Instant {
@@ -1032,16 +1108,19 @@ impl Scheduler {
 
     fn complete_check(&mut self, tid: TxId, result: Result<GcOutcome, TransError>) {
         self.budget.release_check();
+        self.round_checks += 1;
         let mut candidate = self.candidates.complete(&tid);
         let retry = match result {
             Ok(GcOutcome::Reclaimed) => {
                 self.counters.progress.fetch_add(1, Ordering::Relaxed);
                 self.scan_useful |= candidate.from_scan;
+                self.round_writes += 1;
                 None
             }
             Ok(GcOutcome::Progress) => {
                 self.counters.progress.fetch_add(1, Ordering::Relaxed);
                 self.scan_useful |= candidate.from_scan;
+                self.round_writes += 1;
                 Some(self.retry_delay)
             }
             Ok(GcOutcome::Deferred(delay)) => Some(delay),

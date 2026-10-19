@@ -57,8 +57,10 @@ impl DatabaseBuilder {
     }
 
     /// Limits concurrent GC candidate checks per database instance.
-    /// Defaults to 8. GC adjusts concurrency between one and this maximum.
-    /// Each candidate check can issue multiple backend operations.
+    /// Defaults to 256. GC adjusts concurrency between one and this maximum:
+    /// above 8 only while its checks write, and only within its write budget
+    /// (see [`GcLimits::base_write_rate`]). Each candidate check can issue
+    /// multiple backend operations.
     pub fn gc_parallelism(mut self, parallelism: NonZeroUsize) -> Self {
         self.engine_config.set_gc_parallelism(parallelism);
         self
