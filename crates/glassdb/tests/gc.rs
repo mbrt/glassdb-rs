@@ -4,7 +4,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb::backend::{BackendError, memory::MemoryBackend};
 use glassdb::middleware::{BackendOp, HookBackend};
-use glassdb::{Backend, Database};
+use glassdb::{Backend, Database, GcLimits};
 use glassdb_data::{DbPrefix, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxRecord, TxRecordStore};
 use glassdb_storage::{CachedStore, Requirement, StorageError, Timeline};
@@ -361,6 +361,53 @@ async fn a_full_gc_does_not_spend_the_background_budget() {
     assert!(
         (900..=1_100).contains(&deleted),
         "deleted {deleted} records in 10 s"
+    );
+    db.shutdown().await;
+}
+
+// A burst of transaction writes raises the budget of background GC above its
+// base rate for some time after the burst (ADR-078).
+#[tokio::test(start_paused = true)]
+async fn a_burst_of_writes_raises_the_gc_budget_after_it() {
+    let backend = Arc::new(MemoryBackend::new());
+    let tx_records = tx_record_store(backend.clone());
+    old_objects(&tx_records, 3_000).await;
+    // A low base rate makes the budget of the burst visible.
+    let db = Database::builder("gc", backend.clone())
+        .gc_limits(GcLimits {
+            base_write_rate: 1.0,
+            ..GcLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let collection = db.root_collection();
+    let deleted_in = |seconds: u64| {
+        let db = db.clone();
+        async move {
+            let before = db.stats().gc.progress;
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            db.stats().gc.progress - before
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let quiet = deleted_in(20).await;
+
+    // 500 separate commits make about 500 writes. Over the 600 s spend time,
+    // they allow about 0.8 more GC writes in each second, on top of the base
+    // rate of 1.
+    for i in 0..500u32 {
+        collection.write(&i.to_be_bytes(), b"v").await.unwrap();
+    }
+    let after_burst = deleted_in(20).await;
+
+    assert!(
+        quiet <= 25,
+        "deleted {quiet} records in 20 s at a base rate of 1"
+    );
+    assert!(
+        after_burst >= quiet + 10,
+        "deleted {after_burst} records in 20 s after the burst, against {quiet} before"
     );
     db.shutdown().await;
 }

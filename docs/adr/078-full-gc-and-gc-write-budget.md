@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Accepted — implemented.
 
 [ADR-079](079-gc-safety-does-not-depend-on-time.md) renames the safety horizon
 to retention period, and sets the rule for barriers that several GC checks
@@ -255,12 +255,13 @@ its spend limit:
   pages, so that a LIST can always start. `GcLimits` gives a maximum for each
   capacity, which limits memory.
 - **Adaptive concurrency.** GC concurrency is the number of GC checks that run
-  at the same time. It starts at 1, and increases only while ready GC work
-  waits and the allowance is positive. Above 8, the default GC parallelism
-  today, it increases only while GC checks make mutations. It decreases when
-  the allowance is empty or when no ready GC work waits. So checks that only
-  read, for example of records whose values are still live, do not raise
-  concurrency above 8.
+  at the same time. It starts at 1, and increases while ready GC work waits
+  and the allowance is positive. From 8 up, it changes once for each round of
+  completions, as many as the concurrency: it doubles when at least half of
+  the checks of the round wrote, and halves to at least 8 otherwise. While the
+  budget holds checks back, it does not change, and it returns to 1 when no GC
+  work is left. So checks that only read, for example of records whose values
+  are still live, do not raise concurrency above 8.
 - **GC parallelism.** It is only a safety limit on concurrency, for memory and
   backend connections. Its default is larger than the concurrency that the
   measured load needs, so it does not limit catch-up at that load.
