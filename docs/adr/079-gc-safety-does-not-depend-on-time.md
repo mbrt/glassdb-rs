@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Accepted.
 
 Refines the safety argument of
 [ADR-022](022-garbage-collection-mark-sweep.md) and renames its safety horizon.
