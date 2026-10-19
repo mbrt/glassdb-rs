@@ -177,7 +177,7 @@ not depend on. These limits keep a change to one policy from spreading.
 | `TopologyMembership` | topology participant admission and departure | structural intents, GC eligibility |
 | `StructuralRecovery` | structural intent lifecycle, fencing, orphan cleanup | split and merge planning, maintenance causes |
 | `Monitor` | transaction status, wounds, lease refresh, waits | leaves |
-| `Gc` | GC queues, GC checks, safety horizon, reclamation | commit policy, structural recovery |
+| `Gc` | GC queues, GC checks, retention period, reclamation | commit policy, structural recovery |
 
 These rules are not visible from any one module:
 
@@ -842,13 +842,22 @@ mark-sweep ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
 - **Local state.** Each opened `Database` has its own GC state, and clones share
   it. Memory, admission, and concurrency are all bounded. GC scans have their
   own capacity, so they can find work after hints are dropped.
-- **Safety horizon.** GC keeps a candidate that is not `Wounded` for the lease
-  plus the allowed clock skew. The GC check is not atomic, so it can race a
-  lock that a live transaction took but did not publish yet. GC changes a dead
-  `Pending` record to `Wounded`, so its death survives an owner suspension of
-  any length. GC can then reclaim the effects of that record, but cannot delete
-  it until the owner changes it to `Aborted`
-  ([ADR-059](adr/059-pin-foreign-wounds-until-owner-retirement.md)).
+- **Status before leaves.** GC checks only committed and aborted records
+  ([ADR-071](adr/071-gc-skips-pending-and-wounded-transactions.md)). It reads
+  the status first, then captures a currentness barrier, and makes the reads
+  that prove the absence of a reference after that barrier. Write-back sets a
+  committed transaction as the writer of each key it wrote, and only an owner
+  with a retirement proof writes `Aborted`
+  ([ADR-059](adr/059-pin-foreign-wounds-until-owner-retirement.md)). So the
+  check cannot miss a writer or a value-bearing lock, and its safety does not
+  depend on time ([ADR-079](adr/079-gc-safety-does-not-depend-on-time.md)).
+  Locks on keys whose value the transaction does not hold can stay behind as
+  stray holders. Each costs a grace wait and a `Wounded` record.
+- **Retention period.** GC still waits the pending timeout plus the allowed
+  clock skew, from the last update of the record, before it checks a final
+  record ([ADR-079](adr/079-gc-safety-does-not-depend-on-time.md)). The wait
+  makes false in-doubt commit outcomes and leaked wounds rarer. It is not a
+  safety rule.
 - **Reclamation through the coordinator.** GC releases locks through the unlock
   methods of `Locker`, so its changes batch with live traffic in the same
   coordinator round ([ADR-029](adr/029-gc-through-shard-coordinator.md)). Entry

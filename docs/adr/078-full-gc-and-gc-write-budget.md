@@ -2,7 +2,11 @@
 
 ## Status
 
-Proposed.
+Accepted.
+
+[ADR-079](079-gc-safety-does-not-depend-on-time.md) renames the safety horizon
+to retention period, and sets the rule for barriers that several GC checks
+share.
 
 Refines GC scheduling in
 [ADR-070](070-demand-driven-garbage-collection.md). The reclamation rules of
@@ -217,11 +221,26 @@ Duplicate deletes by other instances use tokens. This is accepted.
 The budget is useful only when candidate slots and check scheduling can reach
 its spend limit:
 
-- **Pipelined checks.** GC starts a check when a check ends, up to its current
-  concurrency. The slowest check no longer holds up the others.
+- **Barrier epochs and pipelined checks.** Each GC check must make its reads
+  that prove the absence of a reference after a currentness barrier that GC
+  captured after the status read of that check completed
+  ([ADR-079](079-gc-safety-does-not-depend-on-time.md)). Checks that share a
+  barrier also share their leaf reads. GC therefore runs status reads without
+  pauses, up to its concurrency. At intervals, it captures one barrier and
+  starts the leaf checks of every record whose status read completed before
+  that barrier, as one epoch. The checks of an epoch run independently, so the
+  slowest check holds up neither the next epoch nor the next status reads. A
+  full GC also lists the next page while the checks of the current page run.
+
+  Today a full GC captures one barrier for each LIST page, and background GC
+  one for each batch of checks. In a full GC after the
+  measured load, 98.7% of the 362,114 leaf reads found the leaf unchanged:
+  about one read of each of 4,664 leaves for each of 106 pages. These reads
+  took 55% of the time of a check. With epochs, each leaf is read about once
+  for each epoch that touches it.
 - **Candidate capacities.** The hint and scan candidate capacities follow the
   spend limit multiplied by the time that a candidate holds its slot. For hints,
-  this time is the safety horizon. For scans, it includes the deferral after a
+  this time is the retention period. For scans, it includes the deferral after a
   check that reclaims some effects. The scan capacity is at least two LIST
   pages, so that a LIST can always start. `GcLimits` gives a maximum for each
   capacity, which limits memory.

@@ -4,6 +4,9 @@
 
 Accepted — implemented.
 
+[ADR-079](079-gc-safety-does-not-depend-on-time.md) renames the safety horizon
+to retention period.
+
 Refines the classification of a missing record in
 [ADR-057](057-bounded-in-doubt-commit-recovery.md). The rule of
 [ADR-059](059-pin-foreign-wounds-until-owner-retirement.md) does not change.

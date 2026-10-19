@@ -4,6 +4,10 @@
 
 Accepted — implemented.
 
+[ADR-079](079-gc-safety-does-not-depend-on-time.md) replaces the safety argument
+of the safety horizon: GC safety does not depend on time, and the wait is now
+the retention period.
+
 [ADR-071](071-gc-skips-pending-and-wounded-transactions.md) supersedes
 candidate-driven wounding and reclamation of wounded candidates: GC skips
 missing, pending, and wounded transaction records.

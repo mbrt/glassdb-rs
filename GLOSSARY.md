@@ -481,7 +481,7 @@ One GC run that a caller starts and waits for. It checks every transaction recor
 _Avoid_: Forced GC, GC drain
 
 **Garbage**:
-The durable effects and transaction records that GC can eventually reclaim, including those inside their safety horizon, whether or not a database instance knows about them.
+The durable effects and transaction records that GC can eventually reclaim, including those inside their retention period, whether or not a database instance knows about them.
 _Avoid_: GC backlog (which is only known work)
 
 **GC hint**:
@@ -496,9 +496,9 @@ _Avoid_: Cleanup candidate
 The check of one GC candidate's recovery manifest and committed writes against the current stored objects. It decides which effects GC can reclaim and whether GC can delete the transaction record.
 _Avoid_: Reverse liveness check, reverse check, reference check
 
-**Safety horizon**:
-The time after the last refresh of a transaction record during which GC keeps the record and its effects, unless the record is wounded. It is the lease plus the allowed clock skew.
-_Avoid_: Cleanup horizon, sweep horizon, retention horizon, lease horizon, safety lease
+**Retention period**:
+The time after the last update of a committed or aborted transaction record during which GC keeps the record and its effects. It is the pending timeout plus the allowed clock skew. It makes false in-doubt outcomes rarer, and GC safety does not depend on it.
+_Avoid_: Safety horizon, cleanup horizon, sweep horizon, retention horizon, lease horizon, safety lease
 
 **Pinned wound**:
 A wounded transaction record that GC keeps until the owner proves protocol-clean retirement and changes it to aborted.

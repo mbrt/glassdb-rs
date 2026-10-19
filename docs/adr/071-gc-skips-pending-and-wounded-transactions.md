@@ -4,6 +4,10 @@
 
 Accepted — implemented.
 
+[ADR-079](079-gc-safety-does-not-depend-on-time.md) renames the safety horizon
+to retention period. [ADR-080](080-commit-recovery-does-not-depend-on-gc-retention.md)
+makes in-doubt commit recovery correct without it.
+
 Refines the GC policy in [ADR-022](022-garbage-collection-mark-sweep.md) and
 [ADR-059](059-pin-foreign-wounds-until-owner-retirement.md). Scheduling remains
 as defined in [ADR-070](070-demand-driven-garbage-collection.md).

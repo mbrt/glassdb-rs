@@ -6,6 +6,9 @@ These are the principles from which GlassDB is founded:
 - Optimistic concurrency: we assume things to "go well" by default: there's no
   conflict, the cache is up to date. We revert to slower algorithms only when
   proven to be necessary.
+- Correctness does not depend on time. Clock skew or execution pauses beyond the
+  configured Database limits never causes inconsistencies, only performance
+  degradation.
 - Read only transactions take no locks and do no writes by default.
 - Single value transactions with warm caches should take a single backend
   operation.
