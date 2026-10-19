@@ -296,3 +296,68 @@ async fn full_gc_is_refused_after_shutdown() {
         "{result:?}"
     );
 }
+
+// Background GC writes at most at its base rate, 100 writes in each second,
+// when its instance runs no transactions (ADR-078).
+#[tokio::test(start_paused = true)]
+async fn background_gc_without_transactions_keeps_to_the_base_rate() {
+    let backend = Arc::new(MemoryBackend::new());
+    let tx_records = tx_record_store(backend.clone());
+    old_objects(&tx_records, 2_000).await;
+    let db = Database::builder("gc", backend.clone())
+        .gc_parallelism(NonZeroUsize::new(512).unwrap())
+        .open()
+        .await
+        .unwrap();
+    // A paused clock advances only when every task waits, so GC is limited by
+    // its budget and not by the test.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let before = db.stats().gc.progress;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let deleted = db.stats().gc.progress - before;
+
+    // Each deleted aborted record is one write. The allowance holds one second
+    // of writes, so ten seconds allow up to eleven seconds of the base rate.
+    assert!(
+        (900..=1_100).contains(&deleted),
+        "deleted {deleted} records in 10 s"
+    );
+    db.shutdown().await;
+}
+
+// The writes of a full GC do not spend the budget of background GC, which
+// keeps its base rate afterwards (ADR-078).
+#[tokio::test(start_paused = true)]
+async fn a_full_gc_does_not_spend_the_background_budget() {
+    let backend = Arc::new(MemoryBackend::new());
+    let tx_records = tx_record_store(backend.clone());
+    old_objects(&tx_records, 3_000).await;
+    let db = Database::builder("gc", backend.clone())
+        .gc_parallelism(NonZeroUsize::new(512).unwrap())
+        .open()
+        .await
+        .unwrap();
+    let report = db
+        .collect_garbage(NonZeroUsize::new(64).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, 3_000, "{report:?}");
+    // New records, which only background GC deletes. They are more than its
+    // base rate can delete in the measured time.
+    for i in 0..5_000u64 {
+        let id = TxId::with_priority(i, &(i + 1_000_000).to_be_bytes());
+        let mut record = TxRecord::new(id, TxCommitStatus::Aborted);
+        record.timestamp = Some(UNIX_EPOCH);
+        tx_records.set(&record).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let before = db.stats().gc.progress;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let deleted = db.stats().gc.progress - before;
+
+    assert!(
+        (900..=1_100).contains(&deleted),
+        "deleted {deleted} records in 10 s"
+    );
+    db.shutdown().await;
+}

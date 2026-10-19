@@ -115,7 +115,7 @@ impl EngineConfig {
         self.gc_parallelism = parallelism;
     }
 
-    /// Sets the capacities of the GC hint queues.
+    /// Sets the GC limits.
     pub fn set_gc_limits(&mut self, limits: GcLimits) {
         self.gc_limits = limits;
     }
@@ -614,6 +614,7 @@ impl DormantEngine {
             monitor.protocol_timing(),
             gc_hints.clone(),
             gc_parallelism,
+            Some(backend.write_meter()),
         );
         let collection_commit = CollectionCommit::new(
             collection_catalog.clone(),

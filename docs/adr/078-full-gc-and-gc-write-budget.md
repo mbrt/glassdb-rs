@@ -124,34 +124,44 @@ rate of its conditional mutations. The budget follows the conditional
 mutations of the transactions of the instance, with a minimum rate for
 instances with few transactions.
 
-**Transaction mutations** are the applied conditional mutations that the
-instance sends for transactions: lock CASes, transaction-record writes,
-write-back CASes, direct commits, aborts, and wounds. A CAS of a coordinator
-round counts as a transaction mutation when the round has at least one
-transaction member. Lost CASes do not count, so contention cannot add budget.
+**Instance writes** are the conditional mutations that the instance sends to
+the backend, counted by one cumulative counter in front of the backend. They
+include the writes of transactions, of splits and merges, and lost CASes.
 
-**GC mutations** are the conditional mutations that background GC sends: record
-deletes, lock releases in coordinator rounds with only GC members, topology
-departures, directory write-backs, and deletes of collection records and
-nodes. Lost GC mutations count.
+**GC writes** are an estimate that GC keeps from the outcomes of its checks:
+one write for each deleted record, one for a check that reclaimed some effects,
+and one for each deleted object of a collection. Writes of full GCs count too,
+but they spend no budget of background GC.
 
-Split and merge work counts as neither.
+GC earns budget from the instance writes minus its own estimated writes. This
+needs no attribution of each mutation in the write path, which would change the
+interfaces of the coordinator and of the stores. The budget limits a rate, so a
+rough count is enough:
+
+- Splits, merges, and lost CASes of transactions add budget. They mostly follow
+  transaction load. Under heavy contention, GC can write a little more than β
+  times the applied transaction writes.
+- The estimate of GC writes undercounts a check that releases locks on many
+  leaves. That check then earns a little budget from its own writes.
 
 The budget has three values:
 
-- **Earned tokens.** Each transaction mutation adds β tokens. Each GC mutation
-  removes one token, but earned tokens never go below zero. Earned tokens that
+- **Earned tokens.** Each instance write that is not a GC write adds β tokens.
+  Each GC write of background GC removes one token, but earned tokens never go below zero. Earned tokens that
   GC does not use decrease with the time constant τ_keep.
-- **Spend limit.** `(earned tokens) / τ + base rate`, in GC mutations in each
+- **Spend limit.** `(earned tokens) / τ + base rate`, in GC writes in each
   second.
-- **Allowance.** It increases at the spend limit, up to the GC mutations of one
-  second at the spend limit. Each GC mutation removes one. GC starts no check
+- **Allowance.** It increases at the spend limit, up to the GC writes of one
+  second at the spend limit. Each GC write removes one. GC starts no check
   while the allowance is zero or less.
 
-GC cannot know before a check how many mutations the check makes. A running
-check can make the allowance negative. Between the node pages of a dropped
-collection, GC waits until the allowance is positive again, so one large drop
-cannot use the budget of many seconds at once.
+GC cannot know before a check how many writes the check makes. Each check that
+starts reserves one write, so a refill cannot start more checks than the
+allowance holds. A running check can still make the allowance negative, and GC
+then starts no check until it refills. The concurrency does not grow while the
+budget holds checks back. A dropped collection is deleted in one check, which
+can make the allowance very negative. GC then pauses for as long as the base
+rate needs to pay for it.
 
 β is at most 1, and its default is 1. Writers do not wait for the budget. The
 budget is local memory, and the rule of ADR-070 that writers do not wait for GC
@@ -159,12 +169,12 @@ stays the same.
 
 The budget gives these properties:
 
-- **Limit.** Each GC mutation while earned tokens are positive removes one
-  earned token. While no earned tokens are left, GC mutations are limited to
-  the base rate. So over any interval, GC mutations are at most β times the
-  transaction mutations, plus the base rate times the interval, plus the earned
+- **Limit.** Each GC write while earned tokens are positive removes one
+  earned token. While no earned tokens are left, GC writes are limited to
+  the base rate. So over any interval, GC writes are at most about β times the
+  other instance writes, plus the base rate times the interval, plus the earned
   tokens at its start. Running checks can add a small overshoot to this limit.
-- **Sustained load.** At a sustained transaction mutation rate m, GC uses at
+- **Sustained load.** At a sustained rate m of other instance writes, GC uses at
   most about the larger of β × m and the base rate.
 - **Bursts.** During a burst that is short compared to τ, earned tokens and the
   spend limit increase only a little, so GC competes only a little with the
@@ -275,10 +285,10 @@ Use these initial values, and test them with representative workloads:
 
 | Value | Initial value | Reason |
 | --- | --- | --- |
-| β | 1 | GC makes at most as many conditional mutations as transactions |
+| β | 1 | GC makes at most about as many writes as the rest of the instance |
 | τ | 10 minutes | GC uses the budget of a burst within about 10 minutes after the burst |
 | τ_keep | 2 hours | Records that scans find late keep their budget |
-| Base rate | 100 mutations in each second | 5 instances can delete 328k records in about 11 minutes |
+| Base rate | 100 writes in each second, set with `GcLimits::base_write_rate` | 5 instances can delete 328k records in about 11 minutes |
 | GC parallelism | 256 | About twice the concurrency that the measured load needs |
 | Maximum hint candidates | 65,536 | About 10 MB. The measured load needs about 25,000: 560 hints in each second for 45 s |
 | Maximum scan candidates | 65,536 | About 10 MB |
@@ -302,8 +312,8 @@ then GC needs less concurrency for the same rate.
 - Operators can start a full GC, for example at a time with little load. The
   public API has one more method and one more option, which the crate must
   document and keep compatible.
-- Background GC mutations have a limit that does not depend on the workload:
-  at most β times the transaction mutations of the instance, plus the base
+- Background GC writes have a limit that does not depend on the workload:
+  at most about β times the other writes of the instance, plus the base
   rate.
 - Under sustained load, garbage decreases when g is less than the total GC
   rate. In the worst case, GC only keeps up, and garbage can grow until the load

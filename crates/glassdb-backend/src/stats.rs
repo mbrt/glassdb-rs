@@ -41,12 +41,27 @@ impl Sub for BackendStats {
     }
 }
 
+/// Reads the cumulative count of writes that one [`StatsBackend`] sent.
+///
+/// The count only grows: [`StatsBackend::stats_and_reset`] does not reset it,
+/// so several readers can each measure their own intervals.
+#[derive(Debug, Clone)]
+pub struct WriteMeter(Arc<AtomicU64>);
+
+impl WriteMeter {
+    /// Returns the number of writes sent so far.
+    pub fn writes(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// Wraps a backend and counts the operations performed on it.
 pub struct StatsBackend {
     inner: Arc<dyn Backend>,
     obj_reads: AtomicU64,
     obj_writes: AtomicU64,
     obj_lists: AtomicU64,
+    total_writes: Arc<AtomicU64>,
 }
 
 impl StatsBackend {
@@ -57,7 +72,18 @@ impl StatsBackend {
             obj_reads: AtomicU64::new(0),
             obj_writes: AtomicU64::new(0),
             obj_lists: AtomicU64::new(0),
+            total_writes: Arc::default(),
         }
+    }
+
+    /// Returns a handle that reads the cumulative write count.
+    pub fn write_meter(&self) -> WriteMeter {
+        WriteMeter(self.total_writes.clone())
+    }
+
+    fn count_write(&self) {
+        self.obj_writes.fetch_add(1, Ordering::Relaxed);
+        self.total_writes.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns the current counters and resets them to zero.
@@ -92,7 +118,7 @@ impl Backend for StatsBackend {
         value: Vec<u8>,
         expected: &Revision,
     ) -> Result<Revision, BackendError> {
-        self.obj_writes.fetch_add(1, Ordering::Relaxed);
+        self.count_write();
         self.inner.write_if(path, value, expected).await
     }
 
@@ -101,12 +127,12 @@ impl Backend for StatsBackend {
         path: &str,
         value: Vec<u8>,
     ) -> Result<Revision, BackendError> {
-        self.obj_writes.fetch_add(1, Ordering::Relaxed);
+        self.count_write();
         self.inner.write_if_not_exists(path, value).await
     }
 
     async fn delete_if(&self, path: &str, expected: &Revision) -> Result<(), BackendError> {
-        self.obj_writes.fetch_add(1, Ordering::Relaxed);
+        self.count_write();
         self.inner.delete_if(path, expected).await
     }
 

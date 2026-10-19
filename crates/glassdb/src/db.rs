@@ -64,7 +64,8 @@ impl DatabaseBuilder {
         self
     }
 
-    /// Sets GC hint queue limits per database instance. See [`GcLimits`] for defaults.
+    /// Sets GC limits per database instance: the hint queues and the base write
+    /// rate of background GC. See [`GcLimits`] for defaults.
     /// Cloned database handles share the queues; separate opens have independent limits.
     pub fn gc_limits(mut self, limits: GcLimits) -> Self {
         self.engine_config.set_gc_limits(limits);

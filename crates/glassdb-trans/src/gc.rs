@@ -14,6 +14,7 @@
 //! Lock reclamation uses the locker's coordinator-backed operations (ADR-029),
 //! so GC does not issue its own leaf mutations.
 
+mod budget;
 mod pipeline;
 mod scan;
 
@@ -24,19 +25,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::{
-    FutureExt,
-    future::{BoxFuture, OptionFuture},
-};
-use glassdb_backend::{ListCursor, ListLimit};
+use futures::FutureExt;
+use futures::future::{BoxFuture, OptionFuture};
+use glassdb_backend::{ListCursor, ListLimit, WriteMeter};
 use glassdb_concurr::{Background, ScanCadence, rt};
-use glassdb_data::{LogicalKey, TxId};
+use glassdb_data::{CollectionAddress, LogicalKey, TxId};
+use glassdb_storage::transaction::{
+    TxCollectionOp, TxCommitStatus, TxListPage, TxLock, TxRecord, TxRecordState, TxRecordStore,
+};
 use glassdb_storage::{
     CurrentnessBarrier, NodeStore, Observation, Requirement, StorageError, StructuralIntentStore,
     Timeline, TreeRouter,
-    transaction::{
-        TxCollectionOp, TxCommitStatus, TxListPage, TxLock, TxRecord, TxRecordState, TxRecordStore,
-    },
 };
 use tokio::sync::Notify;
 
@@ -45,6 +44,7 @@ use crate::error::TransError;
 use crate::monitor::ProtocolTiming;
 use crate::structural::TopologyMembership;
 use crate::tlocker::Locker;
+use budget::WriteBudget;
 use pipeline::CheckPipeline;
 use scan::{GcScan, PAGE_SIZE};
 
@@ -53,7 +53,7 @@ const SCAN_CAPACITY: usize = 2 * PAGE_SIZE;
 pub(crate) const DEFAULT_GC_PARALLELISM: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 const ADMISSION_BATCH: usize = 64;
 
-/// GC hint queue limits for one database instance.
+/// GC limits for one database instance.
 ///
 /// Excess hints are discarded without delaying writers. GC scans can still
 /// discover their transaction records and use a separate candidate budget.
@@ -67,6 +67,14 @@ pub struct GcLimits {
     /// discarded; existing candidates keep their place. Zero rejects all new
     /// candidates from hints.
     pub max_hint_candidates: usize,
+    /// Writes in each second that background GC can always send. Above this
+    /// rate, background GC sends at most about as many writes as the rest of
+    /// the instance. Defaults to 100. The rate is at least 0.01; a NaN uses
+    /// the default.
+    ///
+    /// An instance that only collects garbage can set a higher rate. It then
+    /// competes with the transactions of other instances on the same backend.
+    pub base_write_rate: f64,
 }
 
 impl Default for GcLimits {
@@ -74,6 +82,7 @@ impl Default for GcLimits {
         Self {
             max_pending_hints: HINT_CAPACITY,
             max_hint_candidates: HINT_CAPACITY,
+            base_write_rate: budget::DEFAULT_BASE_RATE,
         }
     }
 }
@@ -332,10 +341,17 @@ pub(crate) struct Gc {
     timeline: Timeline,
     hints: GcHints,
     max_checks: NonZeroUsize,
+    writes: Option<WriteMeter>,
+    // Where this clone counts its estimated writes. Background GC spends
+    // them from its budget; full GCs count them only so that GC earns no
+    // budget from them.
+    own_writes: Arc<AtomicU64>,
 }
 
 impl Gc {
-    /// Creates GC with bounded candidate admission and adaptive scans.
+    /// Creates GC with bounded candidate admission and adaptive scans. The
+    /// write budget of background GC follows the writes that `writes` counts,
+    /// and allows only the base rate of the hint limits without a meter.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         tx_records: TxRecordStore,
@@ -348,6 +364,7 @@ impl Gc {
         timing: ProtocolTiming,
         hints: GcHints,
         max_checks: NonZeroUsize,
+        writes: Option<WriteMeter>,
     ) -> Self {
         Self {
             tx_records,
@@ -360,6 +377,8 @@ impl Gc {
             timeline,
             hints,
             max_checks,
+            writes,
+            own_writes: Arc::default(),
         }
     }
 
@@ -379,6 +398,14 @@ impl Gc {
     /// Runs one full GC: checks every transaction record that one listing
     /// finds, with at most `parallelism` checks at the same time.
     pub(crate) async fn collect(&self, parallelism: NonZeroUsize) -> Result<GcReport, TransError> {
+        let full_gc = Self {
+            own_writes: self.hints.counters.full_gc_writes.clone(),
+            ..self.clone()
+        };
+        full_gc.collect_inner(parallelism).await
+    }
+
+    async fn collect_inner(&self, parallelism: NonZeroUsize) -> Result<GcReport, TransError> {
         let mut retry_at = None::<rt::Instant>;
         let mut report = GcReport::default();
         let mut checks = CheckPipeline::new(self.clone(), parallelism);
@@ -519,6 +546,33 @@ impl Gc {
         Ok(GcEligibility::Ready(status.observation))
     }
 
+    /// Adds to the estimate of the writes of this GC. The estimate is about
+    /// one write for each object that a check changed or deleted.
+    fn count_writes(&self, writes: u64) {
+        self.own_writes.fetch_add(writes, Ordering::Relaxed);
+    }
+
+    /// Adds an estimate of the lock releases of a check: one write for each
+    /// recorded lock, when the check changed anything. Collection deletes are
+    /// counted where they happen.
+    fn count_lock_writes(&self, record: &TxRecord, changed: bool) {
+        if changed {
+            self.count_writes(record.locks.len() as u64);
+        }
+    }
+
+    /// Deletes the objects of `collections`, and reports whether it deleted
+    /// any. Each deleted object is a GC write. Deletes before an error are not
+    /// counted, which the rough estimate accepts.
+    async fn reclaim_collections(
+        &self,
+        collections: &[CollectionAddress],
+    ) -> Result<bool, TransError> {
+        let deleted = self.collection_lifecycle.reclaim(collections).await?;
+        self.count_writes(deleted);
+        Ok(deleted > 0)
+    }
+
     /// Reclaims an eligible candidate after checking its recorded references.
     async fn try_reclaim(
         &self,
@@ -585,8 +639,8 @@ impl Gc {
             .filter(|collection| !active_created.contains(*collection))
             .cloned()
             .collect::<Vec<_>>();
-        changed |= self.collection_lifecycle.reclaim(&dropped).await?;
-        changed |= self.collection_lifecycle.reclaim(&unused_prepared).await?;
+        changed |= self.reclaim_collections(&dropped).await?;
+        changed |= self.reclaim_collections(&unused_prepared).await?;
         if self.entries_referenced(tid, record, barrier).await? {
             return Ok(GcOutcome::from_progress(changed));
         }
@@ -620,10 +674,12 @@ impl Gc {
         remaining.retain(|lock| !matches!(lock, TxLock::Directory { .. }));
         let released = self.release_locks(tid, &remaining, barrier).await?;
         changed |= released.changed;
+        self.count_lock_writes(record, changed);
         if !released.complete {
             return Ok(GcOutcome::from_progress(changed));
         }
         self.tx_records.delete(observation).await?;
+        self.count_writes(1);
         Ok(GcOutcome::Reclaimed)
     }
 
@@ -638,10 +694,12 @@ impl Gc {
         barrier: CurrentnessBarrier,
     ) -> Result<GcOutcome, TransError> {
         let reclaimed = self.reclaim_aborted_effects(tid, record, barrier).await?;
+        self.count_lock_writes(record, reclaimed.changed);
         if !reclaimed.complete {
             return Ok(GcOutcome::from_progress(reclaimed.changed));
         }
         self.tx_records.delete(observation).await?;
+        self.count_writes(1);
         Ok(GcOutcome::Reclaimed)
     }
 
@@ -666,8 +724,7 @@ impl Gc {
             .clear_aborted_drops(tid, &drops, Requirement::after(barrier))
             .await?;
         reclaimed.changed |= self
-            .collection_lifecycle
-            .reclaim(&record.prepared_collections)
+            .reclaim_collections(&record.prepared_collections)
             .await?;
         Ok(reclaimed)
     }
@@ -821,6 +878,7 @@ struct Scheduler {
     scan_failed: bool,
     retry_delay: Duration,
     counters: Arc<Counters>,
+    budget: WriteBudget,
 }
 
 impl Scheduler {
@@ -846,6 +904,13 @@ impl Scheduler {
             scan_useful: false,
             scan_failed: false,
             retry_delay,
+            budget: WriteBudget::new(
+                gc.writes.clone(),
+                gc.hints.limits.base_write_rate,
+                gc.own_writes.clone(),
+                counters.full_gc_writes.clone(),
+                rt::Instant::now(),
+            ),
             counters,
         }
     }
@@ -874,7 +939,11 @@ impl Scheduler {
             .oldest_ready()
             .map(|due| now.saturating_duration_since(due))
             .unwrap_or_default();
-        if ready > self.concurrency || oldest >= self.retry_delay / 16 {
+        self.budget.refresh(now);
+        // A backlog that the budget holds back is not a reason for more
+        // concurrency.
+        let budget_blocks = !self.budget.allows_checks();
+        if !budget_blocks && (ready > self.concurrency || oldest >= self.retry_delay / 16) {
             self.concurrency = self.concurrency.saturating_mul(2).min(gc.max_checks.get());
         } else if ready == 0 && self.checks.is_idle() {
             self.concurrency = 1;
@@ -884,8 +953,10 @@ impl Scheduler {
         // `take_ready` chooses between hint and scan candidates (ADR-070), so
         // only about one round of candidates leaves it.
         while self.checks.wants_candidates()
-            && let Some(tid) = self.candidates.take_ready()
+            && self.candidates.ready_len() > 0
+            && self.budget.reserve_check()
         {
+            let tid = self.candidates.take_ready().unwrap();
             self.checks.push(tid);
         }
         if self.candidates.ready_len() == 0 {
@@ -900,9 +971,13 @@ impl Scheduler {
     }
 
     fn deadline(&self, now: rt::Instant) -> rt::Instant {
+        let refill = (self.candidates.ready_len() > 0)
+            .then(|| self.budget.refill_at(self.retry_delay * 40))
+            .flatten();
         self.candidates
             .next_due()
             .into_iter()
+            .chain(refill)
             .chain(self.can_list().then_some(self.next_scan))
             .min()
             .unwrap_or(now + self.retry_delay * 40)
@@ -956,6 +1031,7 @@ impl Scheduler {
     }
 
     fn complete_check(&mut self, tid: TxId, result: Result<GcOutcome, TransError>) {
+        self.budget.release_check();
         let mut candidate = self.candidates.complete(&tid);
         let retry = match result {
             Ok(GcOutcome::Reclaimed) => {
@@ -1108,6 +1184,8 @@ pub struct GcDiagnostics {
 
 #[derive(Default)]
 struct Counters {
+    // The estimated writes of every full GC of this instance.
+    full_gc_writes: Arc<AtomicU64>,
     dropped_candidates: AtomicU64,
     failures: AtomicU64,
     progress: AtomicU64,

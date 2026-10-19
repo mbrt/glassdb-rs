@@ -339,6 +339,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         mon.protocol_timing(),
         hints.clone(),
         DEFAULT_GC_PARALLELISM,
+        None,
     );
     Ctx {
         gc,
@@ -3820,6 +3821,7 @@ fn hint_producers_share_capacity_and_keep_the_latest_reports() {
         let hints = GcHints::new(GcLimits {
             max_pending_hints: capacity,
             max_hint_candidates: 0,
+            ..GcLimits::default()
         });
         let clone = hints.clone();
         let ids: Vec<_> = (0..5).map(tx).collect();

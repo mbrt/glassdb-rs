@@ -222,6 +222,7 @@ fn gc_hint_limits_preserve_writes_and_scan_reclamation() {
                 .gc_limits(GcLimits {
                     max_pending_hints: pending,
                     max_hint_candidates: retained,
+                    ..GcLimits::default()
                 })
                 .open()
                 .await
