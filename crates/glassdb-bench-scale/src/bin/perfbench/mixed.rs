@@ -307,7 +307,7 @@ fn run_cell(
         dimension.affinity_pct,
         key_selection,
     );
-    let (warmup, checkpoint, drive, active, run, deadline) = handle.block_on(async {
+    let (warmup, collected, checkpoint, drive, active, run, deadline) = handle.block_on(async {
         let handles =
             workload::spawn_workers(prepared.databases(), prepared.collections(), &plans, &ctx);
         // The workload runs before the measurement, so that the splits and
@@ -323,10 +323,16 @@ fn run_cell(
         // The checkpoint, the baselines and the samples then start with no
         // transaction in flight.
         ctx.pause().close_and_wait(handles.len(), &stop).await;
-        match prepared.collect_garbage(options.gc_timeout).await {
-            Ok(collected) => eprintln!("{}", result::garbage_collected(&collected)),
-            Err(error) => eprintln!("  note: {error}"),
-        }
+        let collected = match prepared.collect_garbage(options.gc_timeout).await {
+            Ok(collected) => {
+                eprintln!("{}", result::garbage_collected(&collected));
+                Some(collected)
+            }
+            Err(error) => {
+                eprintln!("  note: {error}");
+                None
+            }
+        };
         let checkpoint = start.checkpoint();
         let active = prepared.begin_measurement();
         workload::start_measurement(&plans);
@@ -344,7 +350,7 @@ fn run_cell(
         workload::end_measurement(&plans);
         let deadline = tokio::time::Instant::now() + execution.drain_timeout;
         let run = join_tasks_until(handles, deadline).await;
-        (warmup, checkpoint, drive, active, run, deadline)
+        (warmup, collected, checkpoint, drive, active, run, deadline)
     });
 
     let completed = active.teardown(handle, deadline, run)?;
@@ -377,7 +383,8 @@ fn run_cell(
             completed.split_settle_elapsed,
         )
         .with_key_selection(key_selection)
-        .with_warmup(warmup),
+        .with_warmup(warmup)
+        .with_collected(collected),
         workload::measurements(&plans),
         &completed.deltas,
         target,

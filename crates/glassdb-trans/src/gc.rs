@@ -428,10 +428,10 @@ impl Gc {
             topology,
             timing,
             timeline,
+            own_writes: hints.counters.background_writes.clone(),
             hints,
             max_checks,
             writes,
-            own_writes: Arc::default(),
         }
     }
 
@@ -496,6 +496,7 @@ impl Gc {
                 }
                 Some((tid, outcome)) = checks.next(), if !checks.is_idle() => {
                     let counters = &self.hints.counters;
+                    counters.count_check(&outcome);
                     match outcome {
                         Ok(GcOutcome::Reclaimed) => {
                             report.deleted += 1;
@@ -539,6 +540,7 @@ impl Gc {
             scheduler
                 .candidates
                 .record_backlog(scheduler.checks.waiting(), scheduler.checks.in_flight());
+            scheduler.record_budget();
             tokio::select! {
                 biased;
                 Some((scan, result)) = &mut scheduler.listing, if scheduler.scan.is_none() => {
@@ -1048,6 +1050,17 @@ impl Scheduler {
         }
     }
 
+    /// Publishes the state of the write budget and the concurrency.
+    fn record_budget(&self) {
+        // The cast saturates for a very large base rate.
+        self.counters
+            .spend_limit
+            .store(self.budget.spend_limit() as u64, Ordering::Relaxed);
+        self.counters
+            .concurrency
+            .store(self.concurrency as u64, Ordering::Relaxed);
+    }
+
     fn can_list(&self) -> bool {
         self.scan.is_some()
             && self.scanned.is_empty()
@@ -1121,6 +1134,7 @@ impl Scheduler {
     }
 
     fn complete_check(&mut self, tid: TxId, result: Result<GcOutcome, TransError>) {
+        self.counters.count_check(&result);
         self.budget.release_check();
         self.round_checks += 1;
         let mut candidate = self.candidates.complete(&tid);
@@ -1229,6 +1243,14 @@ pub struct GcStats {
     pub progress: u64,
     /// Transaction-record LIST requests.
     pub lists: u64,
+    /// Completed GC checks of background GC and full GCs.
+    pub checks: u64,
+    /// Checks that found their record inside its retention period, so that
+    /// they read it without a chance to reclaim it.
+    pub deferred_checks: u64,
+    /// The estimated writes of GC, which background GC spends from its write
+    /// budget. It counts one write for each object that GC changed or deleted.
+    pub writes: u64,
 }
 
 impl AddAssign for GcStats {
@@ -1237,6 +1259,9 @@ impl AddAssign for GcStats {
         self.failures += rhs.failures;
         self.progress += rhs.progress;
         self.lists += rhs.lists;
+        self.checks += rhs.checks;
+        self.deferred_checks += rhs.deferred_checks;
+        self.writes += rhs.writes;
     }
 }
 
@@ -1250,6 +1275,9 @@ impl Sub for GcStats {
             failures: self.failures.saturating_sub(rhs.failures),
             progress: self.progress.saturating_sub(rhs.progress),
             lists: self.lists.saturating_sub(rhs.lists),
+            checks: self.checks.saturating_sub(rhs.checks),
+            deferred_checks: self.deferred_checks.saturating_sub(rhs.deferred_checks),
+            writes: self.writes.saturating_sub(rhs.writes),
         }
     }
 }
@@ -1267,6 +1295,11 @@ pub struct GcDiagnostics {
     pub oldest_ready_age: Duration,
     /// Prefix count used for new traversals.
     pub prefix_count: u64,
+    /// The whole writes in each second that the write budget of background GC
+    /// allows now.
+    pub spend_limit: u64,
+    /// The checks that background GC can run at the same time now.
+    pub concurrency: u64,
 }
 
 #[derive(Default)]
@@ -1281,6 +1314,15 @@ struct Counters {
     failures: AtomicU64,
     progress: AtomicU64,
     lists: AtomicU64,
+    checks: AtomicU64,
+    deferred_checks: AtomicU64,
+    // The writes of `writes` that the last stats snapshot reported. The
+    // estimates themselves only grow, because the write budget reads them.
+    reported_writes: AtomicU64,
+    // The estimated writes of background GC.
+    background_writes: Arc<AtomicU64>,
+    spend_limit: AtomicU64,
+    concurrency: AtomicU64,
     ready: AtomicU64,
     waiting: AtomicU64,
     in_flight: AtomicU64,
@@ -1304,6 +1346,21 @@ impl Counters {
             failures: self.failures.swap(0, Ordering::Relaxed),
             progress: self.progress.swap(0, Ordering::Relaxed),
             lists: self.lists.swap(0, Ordering::Relaxed),
+            checks: self.checks.swap(0, Ordering::Relaxed),
+            deferred_checks: self.deferred_checks.swap(0, Ordering::Relaxed),
+            writes: {
+                let writes = self.background_writes.load(Ordering::Relaxed)
+                    + self.full_gc_writes.load(Ordering::Relaxed);
+                writes.saturating_sub(self.reported_writes.swap(writes, Ordering::Relaxed))
+            },
+        }
+    }
+
+    /// Counts a completed check.
+    fn count_check(&self, outcome: &Result<GcOutcome, TransError>) {
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        if matches!(outcome, Ok(GcOutcome::Deferred(_))) {
+            self.deferred_checks.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1319,6 +1376,8 @@ impl Counters {
                 .map(|due| rt::Instant::now().saturating_duration_since(due))
                 .unwrap_or_default(),
             prefix_count: self.prefix_count.load(Ordering::Relaxed),
+            spend_limit: self.spend_limit.load(Ordering::Relaxed),
+            concurrency: self.concurrency.load(Ordering::Relaxed),
         }
     }
 }

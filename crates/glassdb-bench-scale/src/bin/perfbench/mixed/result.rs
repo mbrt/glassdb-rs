@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use glassdb::Stats;
+use glassdb::{GcStats, Stats};
 use glassdb_bench_scale::bench::Results;
 
 use super::options::CellDimension;
@@ -47,6 +47,7 @@ pub(super) struct CellMetadata {
     split_settle_elapsed: Duration,
     shared_pct: Option<u8>,
     warmup: Option<Warmup>,
+    collected: Option<Collected>,
 }
 
 impl CellMetadata {
@@ -70,12 +71,20 @@ impl CellMetadata {
             split_settle_elapsed,
             shared_pct: None,
             warmup: None,
+            collected: None,
         }
     }
 
     /// Records the cell's warm-up before the measurement.
     pub(super) fn with_warmup(mut self, warmup: Warmup) -> Self {
         self.warmup = Some(warmup);
+        self
+    }
+
+    /// Records the full GCs between the warm-up and the measurement, when
+    /// they completed.
+    pub(super) fn with_collected(mut self, collected: Option<Collected>) -> Self {
+        self.collected = collected;
         self
     }
 
@@ -119,10 +128,16 @@ pub(super) struct CellResult {
     split_settle_wall_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     warmup: Option<WarmupResult>,
+    /// The full GCs between the warm-up and the measurement, which show the
+    /// garbage that background GC left after the warm-up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    full_gc: Option<FullGcResult>,
     failures: u64,
     shapes: Vec<ShapeResult>,
     aggregate_ops: OpsPerTx,
     aggregate_protocol: ProtocolPerTx,
+    /// The activity of background GC during the measurement.
+    gc: GcResult,
 }
 
 impl CellResult {
@@ -165,10 +180,15 @@ impl CellResult {
                 .try_into()
                 .unwrap_or(u64::MAX),
             warmup: metadata.warmup.map(WarmupResult::from),
+            full_gc: metadata.collected.map(FullGcResult::from),
             failures: 0,
             shapes,
             aggregate_ops: raw_ops.per_tx(logical_txn),
             aggregate_protocol: raw_protocol.per_tx(logical_txn),
+            gc: GcResult::from(deltas.iter().fold(GcStats::default(), |mut total, stats| {
+                total += stats.gc;
+                total
+            })),
         }
     }
 }
@@ -243,6 +263,8 @@ struct WarmupResult {
     wall_ms: u64,
     /// Whether the splits and merges stopped before the warm-up timeout.
     quiet: bool,
+    /// The activity of background GC during the warm-up.
+    gc: GcResult,
 }
 
 impl From<Warmup> for WarmupResult {
@@ -252,6 +274,55 @@ impl From<Warmup> for WarmupResult {
             merges: warmup.merges,
             wall_ms: warmup.elapsed.as_millis().try_into().unwrap_or(u64::MAX),
             quiet: warmup.quiet,
+            gc: GcResult::from(warmup.gc),
+        }
+    }
+}
+
+/// The GC counters of the database instances over one interval.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GcResult {
+    /// Completed GC checks, and those that found their record inside its
+    /// retention period.
+    checks: u64,
+    deferred_checks: u64,
+    /// Checks that reclaimed effects or deleted their record.
+    progress: u64,
+    /// The estimated writes of GC.
+    writes: u64,
+    lists: u64,
+    dropped_candidates: u64,
+    failures: u64,
+}
+
+impl From<GcStats> for GcResult {
+    fn from(gc: GcStats) -> Self {
+        Self {
+            checks: gc.checks,
+            deferred_checks: gc.deferred_checks,
+            progress: gc.progress,
+            writes: gc.writes,
+            lists: gc.lists,
+            dropped_candidates: gc.dropped_candidates,
+            failures: gc.failures,
+        }
+    }
+}
+
+/// The full GCs between the warm-up and the measurement.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FullGcResult {
+    deleted: u64,
+    wall_ms: u64,
+}
+
+impl From<Collected> for FullGcResult {
+    fn from(collected: Collected) -> Self {
+        Self {
+            deleted: collected.deleted,
+            wall_ms: collected.elapsed.as_millis().try_into().unwrap_or(u64::MAX),
         }
     }
 }
@@ -545,6 +616,15 @@ mod tests {
                     candidates: 5,
                     landed: 3,
                 },
+                gc: GcStats {
+                    checks: 4,
+                    deferred_checks: 1,
+                    progress: 2,
+                    writes: 3,
+                    lists: 1,
+                    dropped_candidates: 5,
+                    failures: 0,
+                },
                 ..Default::default()
             },
             Stats {
@@ -584,7 +664,19 @@ mod tests {
                     merges: 2,
                     elapsed: Duration::from_millis(2500),
                     quiet: false,
-                }),
+                    gc: GcStats {
+                        checks: 10,
+                        deferred_checks: 3,
+                        progress: 6,
+                        writes: 7,
+                        lists: 2,
+                        ..GcStats::default()
+                    },
+                })
+                .with_collected(Some(Collected {
+                    deleted: 40,
+                    elapsed: Duration::from_millis(1200),
+                })),
             std::iter::empty(),
             &[],
             3,
@@ -618,6 +710,15 @@ mod tests {
       "databaseLimit": 2,
       "databases": 2,
       "failures": 0,
+      "gc": {
+        "checks": 4,
+        "deferredChecks": 1,
+        "droppedCandidates": 5,
+        "failures": 0,
+        "lists": 1,
+        "progress": 2,
+        "writes": 3
+      },
       "mode": "hi",
       "setupSplits": 4,
       "shapes": [
@@ -693,12 +794,34 @@ mod tests {
       "databaseLimit": 0,
       "databases": 0,
       "failures": 0,
+      "fullGc": {
+        "deleted": 40,
+        "wallMs": 1200
+      },
+      "gc": {
+        "checks": 0,
+        "deferredChecks": 0,
+        "droppedCandidates": 0,
+        "failures": 0,
+        "lists": 0,
+        "progress": 0,
+        "writes": 0
+      },
       "mode": "lo",
       "setupSplits": 0,
       "shapes": [],
       "sharedPct": 1,
       "splitSettleWallMs": 0,
       "warmup": {
+        "gc": {
+          "checks": 10,
+          "deferredChecks": 3,
+          "droppedCandidates": 0,
+          "failures": 0,
+          "lists": 2,
+          "progress": 6,
+          "writes": 7
+        },
         "merges": 2,
         "quiet": false,
         "splits": 5,

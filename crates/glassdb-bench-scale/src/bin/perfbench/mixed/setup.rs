@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use glassdb::{Collection, CollectionPath, Database, Error as GError, RestructurerStats, Stats};
+use glassdb::{
+    Collection, CollectionPath, Database, Error as GError, GcStats, RestructurerStats, Stats,
+};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::run::shutdown_databases_until;
 use glassdb_concurr::rt;
@@ -119,6 +121,7 @@ impl PreparedCell {
     ) -> Warmup {
         let started = Instant::now();
         let start = restructurer_stats(&self.databases);
+        let gc_start = gc_stats(&self.databases);
         tokio::select! {
             () = rt::sleep(minimum) => {}
             () = wait_for_stop(stop) => {}
@@ -137,6 +140,7 @@ impl PreparedCell {
             merges: end.merges - start.merges,
             elapsed: started.elapsed(),
             quiet: settled,
+            gc: gc_stats(&self.databases) - gc_start,
         }
     }
 
@@ -166,6 +170,8 @@ pub(super) struct Warmup {
     pub(super) elapsed: Duration,
     /// Whether the changes stopped before the timeout.
     pub(super) quiet: bool,
+    /// The activity of background GC during the warm-up.
+    pub(super) gc: GcStats,
 }
 
 /// A prepared cell with measurement counter baselines captured.
@@ -245,6 +251,16 @@ fn structural_changes(databases: &[Database]) -> u64 {
     stats.splits + stats.merges
 }
 
+/// Returns the sum of the GC counters of `databases`.
+fn gc_stats(databases: &[Database]) -> GcStats {
+    databases
+        .iter()
+        .fold(GcStats::default(), |mut total, database| {
+            total += database.stats().gc;
+            total
+        })
+}
+
 /// Returns the sum of the restructurer counters of `databases`.
 fn restructurer_stats(databases: &[Database]) -> RestructurerStats {
     databases
@@ -263,6 +279,7 @@ async fn wait_for_stop(stop: &AtomicBool) {
 }
 
 /// The transaction records that full GCs deleted, and the time they took.
+#[derive(Clone, Copy)]
 pub(super) struct Collected {
     pub(super) deleted: u64,
     pub(super) elapsed: Duration,

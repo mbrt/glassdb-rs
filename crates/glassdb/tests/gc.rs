@@ -204,12 +204,20 @@ async fn full_gc_checks_every_page_and_reports_records_it_keeps() {
     record.timestamp = Some(glassdb_concurr::rt::system_now());
     tx_records.set(&record).await.unwrap();
 
+    let before = db.stats().gc;
     let report = db
         .collect_garbage(NonZeroUsize::new(16).unwrap())
         .await
         .unwrap();
+    let gc = db.stats().gc - before;
 
     assert_eq!(report.deleted, 1_001);
+    // Each listed record is one check; the young record is the deferred one,
+    // and each deleted record is one estimated write.
+    assert_eq!(
+        (gc.checks, gc.deferred_checks, gc.writes),
+        (1_003, 1, 1_001)
+    );
     assert_eq!(report.retained, 1);
     assert_eq!(report.deferred, 1);
     assert_eq!(
