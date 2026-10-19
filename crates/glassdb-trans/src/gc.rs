@@ -181,6 +181,7 @@ enum CandidateState {
 struct Candidates {
     entries: BTreeMap<TxId, Candidate>,
     limits: GcLimits,
+    counters: Arc<Counters>,
     hint_capacity: usize,
     scan_capacity: usize,
     hint_delay: Duration,
@@ -197,10 +198,11 @@ struct CandidateQueue {
 }
 
 impl Candidates {
-    fn new(hint_delay: Duration, limits: GcLimits) -> Self {
+    fn new(hint_delay: Duration, limits: GcLimits, counters: Arc<Counters>) -> Self {
         let mut candidates = Self {
             entries: BTreeMap::new(),
             limits,
+            counters,
             hint_capacity: 0,
             scan_capacity: 0,
             hint_delay,
@@ -234,7 +236,7 @@ impl Candidates {
         );
     }
 
-    fn admit(&mut self, tid: TxId, from_scan: bool, now: rt::Instant, counters: &Counters) {
+    fn admit(&mut self, tid: TxId, from_scan: bool, now: rt::Instant) {
         if let Some(candidate) = self.entries.get_mut(&tid) {
             if from_scan && !candidate.from_scan {
                 self.hints.count -= 1;
@@ -262,7 +264,7 @@ impl Candidates {
         };
         let queue = self.queue_mut(from_scan);
         if queue.count >= capacity {
-            counters.dropped_candidates.fetch_add(1, Ordering::Relaxed);
+            self.counters.drop_candidate(from_scan);
             return;
         }
         queue.count += 1;
@@ -364,7 +366,8 @@ impl Candidates {
     /// Publishes the GC backlog. `waiting` and `in_flight` count candidates
     /// that left the ready queues: those that wait for a slot or an epoch hold
     /// no backend operation, so they count as ready.
-    fn record_backlog(&self, counters: &Counters, waiting: usize, in_flight: usize) {
+    fn record_backlog(&self, waiting: usize, in_flight: usize) {
+        let counters = &self.counters;
         counters
             .ready
             .store((self.ready_len() + waiting) as u64, Ordering::Relaxed);
@@ -533,11 +536,9 @@ impl Gc {
             scheduler.start_checks(&self, now);
             let deadline = scheduler.deadline(now);
             scheduler.start_listing(now);
-            scheduler.candidates.record_backlog(
-                &scheduler.counters,
-                scheduler.checks.waiting(),
-                scheduler.checks.in_flight(),
-            );
+            scheduler
+                .candidates
+                .record_backlog(scheduler.checks.waiting(), scheduler.checks.in_flight());
             tokio::select! {
                 biased;
                 Some((scan, result)) = &mut scheduler.listing, if scheduler.scan.is_none() => {
@@ -929,6 +930,8 @@ struct Scheduler {
     retry_delay: Duration,
     counters: Arc<Counters>,
     budget: WriteBudget,
+    // The dropped hints at the last completed LIST.
+    dropped_hints: u64,
     // The checks that completed in the current round of decisions, and those
     // of them that wrote.
     round_checks: usize,
@@ -940,7 +943,11 @@ impl Scheduler {
         let retry_delay = gc.timing.pending_timeout();
         let counters = gc.hints.counters.clone();
         Self {
-            candidates: Candidates::new(retry_delay + gc.timing.max_clock_skew(), gc.hints.limits),
+            candidates: Candidates::new(
+                retry_delay + gc.timing.max_clock_skew(),
+                gc.hints.limits,
+                counters.clone(),
+            ),
             scanned: VecDeque::new(),
             checks: CheckPipeline::new(gc.clone(), NonZeroUsize::MIN),
             concurrency: 1,
@@ -965,6 +972,7 @@ impl Scheduler {
                 counters.full_gc_writes.clone(),
                 rt::Instant::now(),
             ),
+            dropped_hints: counters.dropped_hints.load(Ordering::Relaxed),
             round_checks: 0,
             round_writes: 0,
             counters,
@@ -974,13 +982,13 @@ impl Scheduler {
     fn admit_candidates(&mut self, hints: &GcHints, now: rt::Instant) -> bool {
         let (reports, more_hints) = hints.drain();
         for tid in reports {
-            self.candidates.admit(tid, false, now, &self.counters);
+            self.candidates.admit(tid, false, now);
         }
         for _ in 0..ADMISSION_BATCH {
             let Some(tid) = self.scanned.pop_front() else {
                 break;
             };
-            self.candidates.admit(tid, true, now, &self.counters);
+            self.candidates.admit(tid, true, now);
         }
         self.candidates.promote_due(now);
         more_hints
@@ -1079,6 +1087,12 @@ impl Scheduler {
         self.listing = None.into();
         let delay = match result {
             Ok(Some(ids)) => {
+                // A dropped hint names a record that can have GC work that GC
+                // does not know about, so scans must not slow down while hints
+                // are dropped (ADR-078).
+                let dropped_hints = self.counters.dropped_hints.load(Ordering::Relaxed);
+                self.scan_useful |= dropped_hints > self.dropped_hints;
+                self.dropped_hints = dropped_hints;
                 if !self.scan_failed {
                     self.cadence.observe(self.scan_useful);
                 }
@@ -1169,23 +1183,17 @@ impl GcHints {
     pub(crate) fn schedule_all(&self, tids: impl IntoIterator<Item = TxId>) {
         for tid in tids {
             if self.limits.max_pending_hints == 0 {
-                self.counters
-                    .dropped_candidates
-                    .fetch_add(1, Ordering::Relaxed);
+                self.counters.drop_candidate(false);
                 continue;
             }
             // A busy consumer must not put a writer behind the GC queue lock.
             let Ok(mut queue) = self.queue.try_lock() else {
-                self.counters
-                    .dropped_candidates
-                    .fetch_add(1, Ordering::Relaxed);
+                self.counters.drop_candidate(false);
                 continue;
             };
             if queue.len() == self.limits.max_pending_hints {
                 queue.pop_front();
-                self.counters
-                    .dropped_candidates
-                    .fetch_add(1, Ordering::Relaxed);
+                self.counters.drop_candidate(false);
             }
             let wake = queue.is_empty();
             queue.push_back(tid);
@@ -1263,6 +1271,10 @@ pub struct GcDiagnostics {
 
 #[derive(Default)]
 struct Counters {
+    // The hints dropped since GC started. Unlike `dropped_candidates`, a stats
+    // snapshot does not reset it, so the scan cadence can measure its own
+    // intervals.
+    dropped_hints: AtomicU64,
     // The estimated writes of every full GC of this instance.
     full_gc_writes: Arc<AtomicU64>,
     dropped_candidates: AtomicU64,
@@ -1277,6 +1289,15 @@ struct Counters {
 }
 
 impl Counters {
+    /// Counts a dropped candidate. Only a dropped hint is also scan demand: a
+    /// dropped scan candidate is a record that the next scan pass finds again.
+    fn drop_candidate(&self, from_scan: bool) {
+        self.dropped_candidates.fetch_add(1, Ordering::Relaxed);
+        if !from_scan {
+            self.dropped_hints.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn take(&self) -> GcStats {
         GcStats {
             dropped_candidates: self.dropped_candidates.swap(0, Ordering::Relaxed),

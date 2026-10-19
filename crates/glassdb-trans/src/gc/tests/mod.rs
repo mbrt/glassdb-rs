@@ -3842,38 +3842,39 @@ fn hint_producers_share_capacity_and_keep_the_latest_reports() {
 fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
     for capacity in [1, 3, MIN_HINT_CAPACITY] {
         let now = rt::Instant::now();
-        let counters = Counters::default();
+        let counters = Arc::new(Counters::default());
         let mut candidates = Candidates::new(
             Duration::ZERO,
             GcLimits {
                 max_hint_candidates: capacity,
                 ..GcLimits::default()
             },
+            counters.clone(),
         );
         let ids: Vec<_> = (0u64..capacity as u64)
             .map(|i| TxId::with_priority(0, &i.to_be_bytes()))
             .collect();
         for id in &ids {
-            candidates.admit(*id, false, now, &counters);
+            candidates.admit(*id, false, now);
         }
         let overflow = TxId::with_priority(0, b"overflow");
-        candidates.admit(overflow, false, now, &counters);
+        candidates.admit(overflow, false, now);
         assert_eq!(counters.take().dropped_candidates, 1);
         for _ in 0..capacity {
             let id = candidates.take_ready().unwrap();
-            candidates.admit(overflow, false, now, &counters);
+            candidates.admit(overflow, false, now);
             assert_eq!(counters.take().dropped_candidates, 1);
             let candidate = candidates.complete(&id);
             candidates.defer(id, candidate, now + Duration::from_secs(1));
         }
-        candidates.record_backlog(&counters, 0, 0);
+        candidates.record_backlog(0, 0);
         assert_eq!(counters.diagnostics().deferred, capacity as u64);
         assert_eq!(counters.diagnostics().ready, 0);
-        candidates.admit(overflow, false, now, &counters);
+        candidates.admit(overflow, false, now);
         assert_eq!(counters.take().dropped_candidates, 1);
 
         candidates.promote_due(now + Duration::from_secs(1));
-        candidates.record_backlog(&counters, 0, 0);
+        candidates.record_backlog(0, 0);
         let promoted = capacity.min(ADMISSION_BATCH);
         assert_eq!(counters.diagnostics().ready, promoted as u64);
         assert_eq!(
@@ -3882,7 +3883,7 @@ fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
         );
         let id = candidates.take_ready().unwrap();
         candidates.complete(&id);
-        candidates.admit(overflow, false, now, &counters);
+        candidates.admit(overflow, false, now);
         assert_eq!(counters.take().dropped_candidates, 0);
         assert_eq!(candidates.oldest_ready(), Some(now));
     }
@@ -3891,31 +3892,31 @@ fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
 #[test]
 fn scan_reports_preserve_candidates_in_each_scheduling_state() {
     let now = rt::Instant::now();
-    let counters = Counters::default();
-    let mut candidates = Candidates::new(Duration::ZERO, GcLimits::default());
+    let counters = Arc::new(Counters::default());
+    let mut candidates = Candidates::new(Duration::ZERO, GcLimits::default(), counters.clone());
     let hint = tx(1);
     let ready_scan = tx(2);
     let deferred_scan = tx(3);
-    candidates.admit(hint, false, now, &counters);
-    candidates.admit(ready_scan, false, now, &counters);
-    candidates.admit(ready_scan, true, now, &counters);
+    candidates.admit(hint, false, now);
+    candidates.admit(ready_scan, false, now);
+    candidates.admit(ready_scan, true, now);
     assert_eq!(candidates.take_ready(), Some(ready_scan));
     candidates.complete(&ready_scan);
 
     let running = candidates.take_ready().unwrap();
     assert_eq!(running, hint);
-    candidates.admit(running, true, now, &counters);
+    candidates.admit(running, true, now);
     let candidate = candidates.complete(&running);
     assert!(!candidate.reported_again);
     candidates.defer(running, candidate, now + Duration::from_secs(1));
 
-    candidates.admit(deferred_scan, false, now, &counters);
+    candidates.admit(deferred_scan, false, now);
     assert_eq!(candidates.take_ready(), Some(deferred_scan));
     let candidate = candidates.complete(&deferred_scan);
     candidates.defer(deferred_scan, candidate, now + Duration::from_secs(2));
-    candidates.admit(deferred_scan, true, now, &counters);
-    candidates.admit(deferred_scan, false, now, &counters);
-    candidates.record_backlog(&counters, 0, 0);
+    candidates.admit(deferred_scan, true, now);
+    candidates.admit(deferred_scan, false, now);
+    candidates.record_backlog(0, 0);
     assert_eq!(counters.diagnostics().in_flight, 0);
     assert_eq!(counters.diagnostics().deferred, 2);
     candidates.promote_due(now + Duration::from_secs(1));
@@ -3925,7 +3926,7 @@ fn scan_reports_preserve_candidates_in_each_scheduling_state() {
     candidates.promote_due(now + Duration::from_secs(2));
     assert_eq!(candidates.take_ready(), Some(deferred_scan));
     candidates.complete(&deferred_scan);
-    candidates.record_backlog(&counters, 0, 0);
+    candidates.record_backlog(0, 0);
     assert_eq!(counters.diagnostics(), GcDiagnostics::default());
     assert_eq!(candidates.next_due(), None);
 }
@@ -3936,30 +3937,22 @@ async fn only_a_hint_during_a_check_requests_a_delayed_follow_up() {
     let mut scheduler = Scheduler::new(&ctx.gc);
     let now = rt::Instant::now();
     let id = tx(20);
-    scheduler
-        .candidates
-        .admit(id, true, now, &scheduler.counters);
+    scheduler.candidates.admit(id, true, now);
     assert_eq!(scheduler.candidates.take_ready(), Some(id));
-    scheduler
-        .candidates
-        .admit(id, true, now, &scheduler.counters);
+    scheduler.candidates.admit(id, true, now);
     scheduler.complete_check(id, Ok(GcOutcome::Retained));
     assert_eq!(scheduler.candidates.next_due(), None);
 
-    scheduler
-        .candidates
-        .admit(id, true, now, &scheduler.counters);
+    scheduler.candidates.admit(id, true, now);
     assert_eq!(scheduler.candidates.take_ready(), Some(id));
-    scheduler
-        .candidates
-        .admit(id, false, now, &scheduler.counters);
+    scheduler.candidates.admit(id, false, now);
     scheduler.complete_check(id, Ok(GcOutcome::Retained));
     let delay = ctx.gc.timing.pending_timeout() + ctx.gc.timing.max_clock_skew();
     let due = now + delay;
     assert_eq!(scheduler.candidates.next_due(), Some(due));
     scheduler
         .candidates
-        .admit(id, false, now + Duration::from_secs(1), &scheduler.counters);
+        .admit(id, false, now + Duration::from_secs(1));
     assert_eq!(scheduler.candidates.next_due(), Some(due));
     scheduler
         .candidates
@@ -3973,11 +3966,10 @@ async fn only_a_hint_during_a_check_requests_a_delayed_follow_up() {
 fn scan_admission_does_not_advance_a_hint_deadline() {
     let now = rt::Instant::now();
     let delay = Duration::from_secs(45);
-    let mut candidates = Candidates::new(delay, GcLimits::default());
-    let counters = Counters::default();
+    let mut candidates = Candidates::new(delay, GcLimits::default(), Arc::default());
     let id = tx(21);
-    candidates.admit(id, false, now, &counters);
-    candidates.admit(id, true, now + delay / 2, &counters);
+    candidates.admit(id, false, now);
+    candidates.admit(id, true, now + delay / 2);
     assert_eq!(candidates.next_due(), Some(now + delay));
     assert_eq!(candidates.take_ready(), None);
     candidates.promote_due(now + delay);
@@ -3987,7 +3979,7 @@ fn scan_admission_does_not_advance_a_hint_deadline() {
 #[test]
 fn candidate_capacities_follow_the_spend_limit() {
     let delay = Duration::from_secs(45);
-    let mut candidates = Candidates::new(delay, GcLimits::default());
+    let mut candidates = Candidates::new(delay, GcLimits::default(), Arc::default());
     // A small budget keeps the lower capacities.
     candidates.set_capacities(10.0, Duration::from_secs(15));
     assert_eq!(
@@ -4015,6 +4007,7 @@ fn candidate_capacities_follow_the_spend_limit() {
             max_scan_candidates: 10,
             ..GcLimits::default()
         },
+        Arc::default(),
     );
     small.set_capacities(1e9, Duration::from_secs(15));
     assert_eq!(
@@ -4068,9 +4061,7 @@ async fn concurrency_rises_above_the_read_only_limit_only_while_checks_write() {
         while scheduler.candidates.ready_len() < 256
             && let Some(id) = pending.next()
         {
-            scheduler
-                .candidates
-                .admit(id, true, now, &scheduler.counters);
+            scheduler.candidates.admit(id, true, now);
         }
         scheduler.start_checks(&gc, now);
         seen.push((completed, scheduler.concurrency));
@@ -4095,4 +4086,50 @@ async fn concurrency_rises_above_the_read_only_limit_only_while_checks_write() {
     );
     scheduler.start_checks(&gc, rt::Instant::now());
     assert_eq!(scheduler.concurrency, 1, "an idle GC returns to one check");
+}
+
+// Scans that find nothing to reclaim slow down, unless hints were dropped since
+// the last scan: those name records that can have GC work that only a scan can
+// find (ADR-078).
+#[tokio::test(start_paused = true)]
+async fn dropped_hints_keep_scans_fast() {
+    for drop_hints in [false, true] {
+        let ctx = new_ctx().await;
+        let bg = Arc::new(glassdb_concurr::Background::new());
+        ctx.gc.start(&bg);
+        let mut next = 0u64;
+        // The first scan starts after the pending timeout.
+        tokio::time::advance(ctx.gc.timing.pending_timeout()).await;
+        let before = ctx.gc.stats_and_reset().lists;
+        for _ in 0..120 {
+            if drop_hints {
+                // A zero-capacity producer drops each report, as a full queue
+                // or a locked one does.
+                let producer = GcHints {
+                    limits: GcLimits {
+                        max_pending_hints: 0,
+                        ..GcLimits::default()
+                    },
+                    ..ctx.hints.clone()
+                };
+                producer.schedule(TxId::with_priority(0, &next.to_be_bytes()));
+                next += 1;
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..16 {
+                rt::yield_now().await;
+            }
+        }
+        let lists = ctx.gc.stats_and_reset().lists + before;
+        bg.shutdown().await;
+
+        if drop_hints {
+            assert!(
+                lists >= 60,
+                "scans slowed down while hints were dropped: {lists}"
+            );
+        } else {
+            assert!(lists < 20, "idle scans did not back off: {lists}");
+        }
+    }
 }

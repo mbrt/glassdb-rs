@@ -901,7 +901,10 @@ of held cursors.
 
 The delay between turns follows the recent useful progress of scan-origin
 checks, with random variation and a cap tied to the pending-transaction timeout.
-Errors use separate retries and never count as idle turns. These limits are
+A hint dropped since the last turn also counts as progress, because only a scan
+can find its record
+([ADR-078](adr/078-full-gc-and-gc-write-budget.md)). Errors use separate
+retries and never count as idle turns. These limits are
 initial values. Production workloads must guide later tuning.
 
 GC runs only while a `Database` handle is open. To add GC capacity, open a
