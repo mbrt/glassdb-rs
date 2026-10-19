@@ -443,6 +443,32 @@ async fn is_gone(tx_records: &TxRecordStore, id: &TxId) -> bool {
     )
 }
 
+impl Gc {
+    /// Checks `tids` through the pipeline that background GC and full GCs use,
+    /// and returns the outcomes in the order of `tids`.
+    async fn check_through_pipeline(
+        self,
+        tids: Vec<TxId>,
+        limit: NonZeroUsize,
+    ) -> Vec<(TxId, Result<GcOutcome, TransError>)> {
+        let mut checks = pipeline::CheckPipeline::new(self, limit);
+        for tid in &tids {
+            checks.push(*tid);
+        }
+        checks.flush();
+        let mut done = BTreeMap::new();
+        while let Some((tid, result)) = checks.next().await {
+            done.insert(tid, result);
+        }
+        tids.into_iter()
+            .map(|tid| {
+                let result = done.remove(&tid).expect("each candidate completes once");
+                (tid, result)
+            })
+            .collect()
+    }
+}
+
 async fn check_candidate(gc: &Gc, tid: &TxId) -> Result<GcOutcome, TransError> {
     let status = gc
         .filter_candidate(tid, gc.timeline.currentness_barrier())
@@ -910,7 +936,7 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
         let outcomes = ctx
             .gc
             .clone()
-            .check_batch(vec![id], NonZeroUsize::MIN)
+            .check_through_pipeline(vec![id], NonZeroUsize::MIN)
             .await;
         assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
         assert!(!is_gone(&peer.tx_records, &id).await);
@@ -935,7 +961,7 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
         let outcomes = ctx
             .gc
             .clone()
-            .check_batch(vec![id], NonZeroUsize::MIN)
+            .check_through_pipeline(vec![id], NonZeroUsize::MIN)
             .await;
         assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Reclaimed);
         assert!(is_gone(&ctx.tx_records, &id).await);
@@ -1010,7 +1036,7 @@ async fn reference_checks_follow_a_split_behind_a_cached_parent() {
         let outcomes = ctx
             .gc
             .clone()
-            .check_batch(vec![id], NonZeroUsize::MIN)
+            .check_through_pipeline(vec![id], NonZeroUsize::MIN)
             .await;
         assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
         assert!(!is_gone(&peer.tx_records, &id).await);
@@ -1076,7 +1102,7 @@ async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
     let outcomes = ctx
         .gc
         .clone()
-        .check_batch(vec![id], NonZeroUsize::MIN)
+        .check_through_pipeline(vec![id], NonZeroUsize::MIN)
         .await;
     assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
     assert!(!is_gone(&peer.tx_records, &id).await);
@@ -3462,7 +3488,7 @@ async fn young_final_candidates_complete_without_a_reference_pass() {
     let outcomes = ctx
         .gc
         .clone()
-        .check_batch(ids.clone(), NonZeroUsize::new(2).unwrap())
+        .check_through_pipeline(ids.clone(), NonZeroUsize::new(2).unwrap())
         .now_or_never()
         .expect("ineligible cached candidates must not schedule reference work");
 
@@ -3490,7 +3516,7 @@ async fn reference_checks_reuse_a_concurrent_writer_observation() {
     // Poll GC first so the writer refreshes the leaf after the reference bound.
     let (outcomes, ()) = tokio::join!(
         biased;
-        ctx.gc.clone().check_batch(vec![id], NonZeroUsize::MIN),
+        ctx.gc.clone().check_through_pipeline(vec![id], NonZeroUsize::MIN),
         store_entry(&ctx, b"k", writer_entry(b"k", &tx(3))),
     );
 
@@ -3597,6 +3623,111 @@ async fn reference_checks_follow_candidate_filtering() {
     assert!(lookup_entry(&ctx, b"k").await.unwrap().is_locked_by(&id));
 }
 
+// One epoch shares one barrier. A barrier captured before a record's status
+// read completes must not serve it: the record can commit after the barrier, so
+// a leaf read at that barrier can miss its lock (ADR-079).
+#[tokio::test(start_paused = true)]
+async fn an_epoch_barrier_follows_every_status_read_it_serves() {
+    let backend = Arc::new(MemoryBackend::new());
+    let hooked = HookBackend::new(backend.clone());
+    let ctx = new_ctx_with(hooked.clone()).await;
+    let (early, late) = (tx(20), tx(21));
+    ctx.tx_records
+        .set(&committed(early, PAST_HORIZON, &[b"e"], &[]))
+        .await
+        .unwrap();
+    store_entry(&ctx, b"e", writer_entry(b"e", &tx(22))).await;
+    let mut record = committed(late, Duration::ZERO, &[b"k"], &[b"k"]);
+    record.status = TxCommitStatus::Pending;
+    ctx.tx_records.set(&record).await.unwrap();
+    store_entry(&ctx, b"k", writer_entry(b"k", &tx(23))).await;
+    let entered = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    hooked.set_before({
+        let path = ObjectPath::Transaction {
+            db_prefix: DbPrefix::try_from("db").unwrap(),
+            id: late,
+        }
+        .to_string();
+        let entered = entered.clone();
+        let resume = resume.clone();
+        move |op| {
+            let pause = op.path() == path
+                && matches!(
+                    op,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                );
+            let entered = entered.clone();
+            let resume = resume.clone();
+            Box::pin(async move {
+                if pause {
+                    entered.notify_one();
+                    resume.notified().await;
+                }
+                Ok(())
+            })
+        }
+    });
+
+    let checks = tokio::spawn(
+        ctx.gc
+            .clone()
+            .check_through_pipeline(vec![early, late], NonZeroUsize::new(2).unwrap()),
+    );
+    entered.notified().await;
+    // The early record's status read completed, so its epoch seals at the end
+    // of its wait and its barrier serves its check while the late read waits.
+    tokio::time::advance(pipeline::EPOCH_WAIT).await;
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
+    assert!(is_gone(&ctx.tx_records, &early).await);
+    // Read the leaf of the late record at a barrier from now, before the late
+    // record commits.
+    ctx.nodes
+        .load_leaf(
+            &root_path(),
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    let peer = AssemblyFixture::new(
+        backend,
+        DbPrefix::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let mut edit = peer
+        .nodes
+        .load_leaf(&root_path(), Requirement::ANY)
+        .await
+        .unwrap()
+        .into_edit();
+    let mut entries: BTreeMap<Vec<u8>, LeafEntry> = edit
+        .entries()
+        .entries()
+        .cloned()
+        .map(|entry| (entry.key.clone(), entry))
+        .collect();
+    entries.insert(b"k".to_vec(), locked_entry(b"k", &late));
+    edit.set_entries(LeafBody::from_entries(entries.into_values()));
+    assert!(peer.nodes.commit_leaf(edit).await.unwrap().is_applied());
+    record.status = TxCommitStatus::Committed;
+    record.timestamp = Some(base() - PAST_HORIZON);
+    let pending = peer
+        .tx_records
+        .get_at(&late, Requirement::ANY)
+        .await
+        .unwrap();
+    peer.tx_records.set_if(&record, &pending).await.unwrap();
+    resume.notify_one();
+    let outcomes = checks.await.unwrap();
+
+    assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Reclaimed);
+    assert_eq!(outcomes[1].1.as_ref().unwrap(), &GcOutcome::Retained);
+    assert!(is_gone(&ctx.tx_records, &early).await);
+    assert!(!is_gone(&ctx.tx_records, &late).await);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_transient_failure_keeps_the_candidate_until_retry() {
     let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
@@ -3671,6 +3802,12 @@ async fn a_ready_hint_queue_does_not_starve_the_scan() {
     for _ in 0..64 {
         rt::yield_now().await;
     }
+    // Hint checks keep status reads in flight, so the scan candidate's epoch
+    // closes when its wait ends.
+    tokio::time::advance(pipeline::EPOCH_WAIT).await;
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
     assert!(ctx.gc.stats_and_reset().lists > 0);
     assert!(is_gone(&ctx.tx_records, &id).await);
     assert!(reclaimed_with_ready_hints.load(Ordering::SeqCst));
@@ -3727,14 +3864,14 @@ fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
             let candidate = candidates.complete(&id);
             candidates.defer(id, candidate, now + Duration::from_secs(1));
         }
-        candidates.record_backlog(&counters);
+        candidates.record_backlog(&counters, 0, 0);
         assert_eq!(counters.diagnostics().deferred, capacity as u64);
         assert_eq!(counters.diagnostics().ready, 0);
         candidates.admit(overflow, false, now, &counters);
         assert_eq!(counters.take().dropped_candidates, 1);
 
         candidates.promote_due(now + Duration::from_secs(1));
-        candidates.record_backlog(&counters);
+        candidates.record_backlog(&counters, 0, 0);
         let promoted = capacity.min(ADMISSION_BATCH);
         assert_eq!(counters.diagnostics().ready, promoted as u64);
         assert_eq!(
@@ -3776,7 +3913,7 @@ fn scan_reports_preserve_candidates_in_each_scheduling_state() {
     candidates.defer(deferred_scan, candidate, now + Duration::from_secs(2));
     candidates.admit(deferred_scan, true, now, &counters);
     candidates.admit(deferred_scan, false, now, &counters);
-    candidates.record_backlog(&counters);
+    candidates.record_backlog(&counters, 0, 0);
     assert_eq!(counters.diagnostics().in_flight, 0);
     assert_eq!(counters.diagnostics().deferred, 2);
     candidates.promote_due(now + Duration::from_secs(1));
@@ -3786,7 +3923,7 @@ fn scan_reports_preserve_candidates_in_each_scheduling_state() {
     candidates.promote_due(now + Duration::from_secs(2));
     assert_eq!(candidates.take_ready(), Some(deferred_scan));
     candidates.complete(&deferred_scan);
-    candidates.record_backlog(&counters);
+    candidates.record_backlog(&counters, 0, 0);
     assert_eq!(counters.diagnostics(), GcDiagnostics::default());
     assert_eq!(candidates.next_due(), None);
 }
@@ -3804,7 +3941,7 @@ async fn only_a_hint_during_a_check_requests_a_delayed_follow_up() {
     scheduler
         .candidates
         .admit(id, true, now, &scheduler.counters);
-    scheduler.complete_checks(vec![(id, Ok(GcOutcome::Retained))]);
+    scheduler.complete_check(id, Ok(GcOutcome::Retained));
     assert_eq!(scheduler.candidates.next_due(), None);
 
     scheduler
@@ -3814,7 +3951,7 @@ async fn only_a_hint_during_a_check_requests_a_delayed_follow_up() {
     scheduler
         .candidates
         .admit(id, false, now, &scheduler.counters);
-    scheduler.complete_checks(vec![(id, Ok(GcOutcome::Retained))]);
+    scheduler.complete_check(id, Ok(GcOutcome::Retained));
     let delay = ctx.gc.timing.pending_timeout() + ctx.gc.timing.max_clock_skew();
     let due = now + delay;
     assert_eq!(scheduler.candidates.next_due(), Some(due));

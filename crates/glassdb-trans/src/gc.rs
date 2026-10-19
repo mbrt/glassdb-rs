@@ -5,15 +5,16 @@
 //! (ADR-022). A committed record stays live while a reference names it.
 //!
 //! GC skips missing, pending, and wounded records (ADR-071). It filters
-//! committed and acknowledged aborted candidates by
-//! durable status and the safety horizon before capturing a fresh requirement
-//! for GC checks. Cached leaf contents from before eligibility cannot
-//! rule out a reference. Pinned wounds stay until owner acknowledgement
+//! committed and acknowledged aborted candidates by durable status and the
+//! retention period before capturing the currentness barrier of their reference
+//! checks. Cached leaf contents from before eligibility cannot rule out a
+//! reference (ADR-079). Pinned wounds stay until owner acknowledgement
 //! (ADR-059).
 //!
 //! Lock reclamation uses the locker's coordinator-backed operations (ADR-029),
 //! so GC does not issue its own leaf mutations.
 
+mod pipeline;
 mod scan;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -28,7 +29,7 @@ use futures::{
     future::{BoxFuture, OptionFuture},
 };
 use glassdb_backend::{ListCursor, ListLimit};
-use glassdb_concurr::{Background, ScanCadence, map_all_bounded, rt};
+use glassdb_concurr::{Background, ScanCadence, rt};
 use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::{
     CurrentnessBarrier, NodeStore, Observation, Requirement, StorageError, StructuralIntentStore,
@@ -44,6 +45,7 @@ use crate::error::TransError;
 use crate::monitor::ProtocolTiming;
 use crate::structural::TopologyMembership;
 use crate::tlocker::Locker;
+use pipeline::CheckPipeline;
 use scan::{GcScan, PAGE_SIZE};
 
 const HINT_CAPACITY: usize = 4096;
@@ -76,7 +78,6 @@ impl Default for GcLimits {
     }
 }
 
-type Checks = BoxFuture<'static, Vec<(TxId, Result<GcOutcome, TransError>)>>;
 type Listing = BoxFuture<'static, (GcScan, Result<Option<Vec<TxId>>, StorageError>)>;
 
 /// Whether a transaction's durable state permits reclamation of its effects.
@@ -107,7 +108,7 @@ pub struct GcReport {
     /// Records whose check reclaimed some effects but kept the record. A later
     /// check can delete them.
     pub reclaimed_effects: u64,
-    /// Records that wait for their safety horizon.
+    /// Records that wait for their retention period.
     pub deferred: u64,
     /// Time from the end of the full GC until the first deferred record
     /// becomes eligible. `None` when no record is deferred.
@@ -301,17 +302,19 @@ impl Candidates {
         }
     }
 
-    fn record_backlog(&self, counters: &Counters) {
+    /// Publishes the GC backlog. `waiting` and `in_flight` count candidates
+    /// that left the ready queues: those that wait for a slot or an epoch hold
+    /// no backend operation, so they count as ready.
+    fn record_backlog(&self, counters: &Counters, waiting: usize, in_flight: usize) {
         counters
             .ready
-            .store(self.ready_len() as u64, Ordering::Relaxed);
+            .store((self.ready_len() + waiting) as u64, Ordering::Relaxed);
         counters
             .waiting
             .store(self.deferred.len() as u64, Ordering::Relaxed);
-        counters.in_flight.store(
-            (self.hints.running + self.scans.running) as u64,
-            Ordering::Relaxed,
-        );
+        counters
+            .in_flight
+            .store(in_flight as u64, Ordering::Relaxed);
         *counters.oldest_ready.lock().unwrap() = self.oldest_ready();
     }
 }
@@ -378,49 +381,68 @@ impl Gc {
     pub(crate) async fn collect(&self, parallelism: NonZeroUsize) -> Result<GcReport, TransError> {
         let mut retry_at = None::<rt::Instant>;
         let mut report = GcReport::default();
-        let mut page = self.list_all(None).await?;
+        let mut checks = CheckPipeline::new(self.clone(), parallelism);
+        let mut listing: Option<BoxFuture<'_, _>> = Some(self.list_all(None).boxed());
+        let mut cursor = None;
+        let mut list_error = None;
         loop {
-            // The next LIST overlaps the checks of this page, so that a full
-            // GC waits for one of them, not for both.
-            let (next, checked) = futures::join!(
-                OptionFuture::from(
-                    page.next
-                        .map(|cursor| async move { self.list_all(Some(cursor)).await })
-                ),
-                self.clone().check_batch(page.ids, parallelism),
-            );
-            let (mut progress, mut failures) = (0, 0);
-            for (tid, outcome) in checked {
-                match outcome {
-                    Ok(GcOutcome::Reclaimed) => {
-                        report.deleted += 1;
-                        progress += 1;
+            // The next LIST overlaps the checks. Records whose check has not
+            // started stay below about two pages, and the pipeline bounds the
+            // forming epoch, which bounds memory.
+            if listing.is_none()
+                && checks.queued() < PAGE_SIZE
+                && let Some(next) = cursor.take()
+            {
+                listing = Some(self.list_all(Some(next)).boxed());
+            }
+            if listing.is_none() && checks.is_idle() {
+                break;
+            }
+            tokio::select! {
+                page = async { listing.as_mut().unwrap().await }, if listing.is_some() => {
+                    listing = None;
+                    match page {
+                        Ok(page) => {
+                            page.ids.into_iter().for_each(|tid| checks.push(tid));
+                            cursor = page.next;
+                        }
+                        // Finish the checks that started, so that their effects
+                        // are counted, then report the failed LIST.
+                        Err(error) => list_error = Some(error),
                     }
-                    Ok(GcOutcome::Progress) => {
-                        report.reclaimed_effects += 1;
-                        progress += 1;
+                    if cursor.is_none() {
+                        checks.flush();
                     }
-                    Ok(GcOutcome::Missing) => report.missing += 1,
-                    Ok(GcOutcome::Retained) => report.retained += 1,
-                    Ok(GcOutcome::Deferred(delay)) => {
-                        report.deferred += 1;
-                        let due = rt::Instant::now() + delay;
-                        retry_at = Some(retry_at.map_or(due, |at| at.min(due)));
-                    }
-                    Err(error) => {
-                        tracing::debug!(tx = %tid, error = %error, "full GC check failed");
-                        report.failed += 1;
-                        failures += 1;
+                }
+                Some((tid, outcome)) = checks.next(), if !checks.is_idle() => {
+                    let counters = &self.hints.counters;
+                    match outcome {
+                        Ok(GcOutcome::Reclaimed) => {
+                            report.deleted += 1;
+                            counters.progress.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(GcOutcome::Progress) => {
+                            report.reclaimed_effects += 1;
+                            counters.progress.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(GcOutcome::Missing) => report.missing += 1,
+                        Ok(GcOutcome::Retained) => report.retained += 1,
+                        Ok(GcOutcome::Deferred(delay)) => {
+                            report.deferred += 1;
+                            let due = rt::Instant::now() + delay;
+                            retry_at = Some(retry_at.map_or(due, |at| at.min(due)));
+                        }
+                        Err(error) => {
+                            tracing::debug!(tx = %tid, error = %error, "full GC check failed");
+                            report.failed += 1;
+                            counters.failures.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
             }
-            let counters = &self.hints.counters;
-            counters.progress.fetch_add(progress, Ordering::Relaxed);
-            counters.failures.fetch_add(failures, Ordering::Relaxed);
-            match next {
-                Some(next) => page = next?,
-                None => break,
-            }
+        }
+        if let Some(error) = list_error {
+            return Err(error);
         }
         report.retry_after = retry_at.map(|at| at.saturating_duration_since(rt::Instant::now()));
         Ok(report)
@@ -434,14 +456,18 @@ impl Gc {
             scheduler.start_checks(&self, now);
             let deadline = scheduler.deadline(now);
             scheduler.start_listing(now);
-            scheduler.candidates.record_backlog(&scheduler.counters);
+            scheduler.candidates.record_backlog(
+                &scheduler.counters,
+                scheduler.checks.waiting(),
+                scheduler.checks.in_flight(),
+            );
             tokio::select! {
                 biased;
                 Some((scan, result)) = &mut scheduler.listing, if scheduler.scan.is_none() => {
                     scheduler.complete_listing(scan, result);
                 }
-                Some(completed) = &mut scheduler.checks, if scheduler.checking => {
-                    scheduler.complete_checks(completed);
+                Some((tid, result)) = scheduler.checks.next(), if !scheduler.checks.is_idle() => {
+                    scheduler.complete_check(tid, result);
                 }
                 _ = std::future::ready(()), if local_work => {}
                 _ = self.hints.wake.notified() => {}
@@ -461,52 +487,8 @@ impl Gc {
             .await?)
     }
 
-    async fn check_batch(
-        self,
-        tids: Vec<TxId>,
-        limit: NonZeroUsize,
-    ) -> Vec<(TxId, Result<GcOutcome, TransError>)> {
-        let gc = &self;
-        let status_barrier = self.timeline.currentness_barrier();
-        let filtered = map_all_bounded(tids, limit, |tid| async move {
-            let result = gc.filter_candidate(&tid, status_barrier).await;
-            (tid, result)
-        })
-        .await;
-        let mut ready = Vec::new();
-        let mut results = Vec::with_capacity(filtered.len());
-        for (tid, result) in filtered {
-            let outcome = match result {
-                Ok(GcEligibility::Ready(observation)) => {
-                    ready.push((tid, observation));
-                    continue;
-                }
-                Ok(GcEligibility::Deferred(delay)) => Ok(GcOutcome::Deferred(delay)),
-                Ok(GcEligibility::Retained) => Ok(GcOutcome::Retained),
-                Ok(GcEligibility::Missing) => Ok(GcOutcome::Missing),
-                Err(error) => Err(error),
-            };
-            results.push((tid, outcome));
-        }
-        if ready.is_empty() {
-            return results;
-        }
-        // Eligibility must precede the reference bound. Yield so concurrent
-        // writers can publish observations that satisfy it; otherwise GC adds
-        // backend reads for leaves those writers are already refreshing.
-        let barrier = self.timeline.currentness_barrier();
-        rt::yield_now().await;
-        results.extend(
-            map_all_bounded(ready, limit, |(tid, observation)| async move {
-                let result = gc.try_reclaim(&tid, &observation, barrier).await;
-                (tid, result)
-            })
-            .await,
-        );
-        results
-    }
-
-    /// Selects candidates whose durable state and safety horizon permit reclamation.
+    /// Selects candidates whose durable state and retention period permit
+    /// reclamation.
     async fn filter_candidate(
         &self,
         tid: &TxId,
@@ -558,7 +540,7 @@ impl Gc {
         }
     }
 
-    /// A committed candidate past the horizon is deleted only once its complete
+    /// A committed candidate past its retention period is deleted only once its complete
     /// record proves it unreferenced. Any recorded write still pointed at by a
     /// `current_writer`, or any recorded lock still held (the commit→write-back
     /// gap), keeps it. A committed record is never pruned or force-aborted — its
@@ -645,8 +627,8 @@ impl Gc {
         Ok(GcOutcome::Reclaimed)
     }
 
-    /// An acknowledged aborted candidate holds no value. Past its ordinary
-    /// safety horizon, release its recorded effects and delete it. The
+    /// An acknowledged aborted candidate holds no value. Past its retention
+    /// period, release its recorded effects and delete it. The
     /// anti-resurrection proof is the owner's acknowledgement, not elapsed time.
     async fn reclaim_aborted(
         &self,
@@ -829,8 +811,7 @@ impl GcOutcome {
 struct Scheduler {
     candidates: Candidates,
     scanned: VecDeque<TxId>,
-    checks: OptionFuture<Checks>,
-    checking: bool,
+    checks: CheckPipeline,
     concurrency: usize,
     scan: Option<GcScan>,
     listing: OptionFuture<Listing>,
@@ -849,8 +830,7 @@ impl Scheduler {
         Self {
             candidates: Candidates::new(retry_delay + gc.timing.max_clock_skew(), gc.hints.limits),
             scanned: VecDeque::new(),
-            checks: OptionFuture::default(),
-            checking: false,
+            checks: CheckPipeline::new(gc.clone(), NonZeroUsize::MIN),
             concurrency: 1,
             scan: Some(GcScan::new(
                 gc.tx_records.clone(),
@@ -888,7 +868,7 @@ impl Scheduler {
     }
 
     fn start_checks(&mut self, gc: &Gc, now: rt::Instant) {
-        let ready = self.candidates.ready_len();
+        let ready = self.candidates.ready_len() + self.checks.queued();
         let oldest = self
             .candidates
             .oldest_ready()
@@ -896,23 +876,20 @@ impl Scheduler {
             .unwrap_or_default();
         if ready > self.concurrency || oldest >= self.retry_delay / 16 {
             self.concurrency = self.concurrency.saturating_mul(2).min(gc.max_checks.get());
-        } else if ready == 0 && !self.checking {
+        } else if ready == 0 && self.checks.is_idle() {
             self.concurrency = 1;
         }
-        if self.checking {
-            return;
+        self.checks
+            .set_limit(NonZeroUsize::new(self.concurrency).unwrap());
+        // `take_ready` chooses between hint and scan candidates (ADR-070), so
+        // only about one round of candidates leaves it.
+        while self.checks.wants_candidates()
+            && let Some(tid) = self.candidates.take_ready()
+        {
+            self.checks.push(tid);
         }
-        let batch: Vec<_> = std::iter::from_fn(|| self.candidates.take_ready())
-            .take(self.concurrency)
-            .collect();
-        if !batch.is_empty() {
-            self.checking = true;
-            self.checks = Some(
-                gc.clone()
-                    .check_batch(batch, NonZeroUsize::new(self.concurrency).unwrap())
-                    .boxed(),
-            )
-            .into();
+        if self.candidates.ready_len() == 0 {
+            self.checks.flush();
         }
     }
 
@@ -978,38 +955,34 @@ impl Scheduler {
         self.scan = Some(scan);
     }
 
-    fn complete_checks(&mut self, completed: Vec<(TxId, Result<GcOutcome, TransError>)>) {
-        self.checking = false;
-        self.checks = None.into();
-        for (tid, result) in completed {
-            let mut candidate = self.candidates.complete(&tid);
-            let retry = match result {
-                Ok(GcOutcome::Reclaimed) => {
-                    self.counters.progress.fetch_add(1, Ordering::Relaxed);
-                    self.scan_useful |= candidate.from_scan;
-                    None
-                }
-                Ok(GcOutcome::Progress) => {
-                    self.counters.progress.fetch_add(1, Ordering::Relaxed);
-                    self.scan_useful |= candidate.from_scan;
-                    Some(self.retry_delay)
-                }
-                Ok(GcOutcome::Deferred(delay)) => Some(delay),
-                Ok(GcOutcome::Retained | GcOutcome::Missing) => candidate
-                    .reported_again
-                    .then_some(self.candidates.hint_delay),
-                Err(error) => {
-                    tracing::debug!(tx = %tid, error = %error, "GC candidate check deferred");
-                    self.counters.failures.fetch_add(1, Ordering::Relaxed);
-                    self.scan_failed |= candidate.from_scan;
-                    candidate.failures = candidate.failures.saturating_add(1);
-                    Some(self.retry_delay * (1u32 << candidate.failures.min(4)))
-                }
-            };
-            if let Some(delay) = retry {
-                self.candidates
-                    .defer(tid, candidate, rt::Instant::now() + delay);
+    fn complete_check(&mut self, tid: TxId, result: Result<GcOutcome, TransError>) {
+        let mut candidate = self.candidates.complete(&tid);
+        let retry = match result {
+            Ok(GcOutcome::Reclaimed) => {
+                self.counters.progress.fetch_add(1, Ordering::Relaxed);
+                self.scan_useful |= candidate.from_scan;
+                None
             }
+            Ok(GcOutcome::Progress) => {
+                self.counters.progress.fetch_add(1, Ordering::Relaxed);
+                self.scan_useful |= candidate.from_scan;
+                Some(self.retry_delay)
+            }
+            Ok(GcOutcome::Deferred(delay)) => Some(delay),
+            Ok(GcOutcome::Retained | GcOutcome::Missing) => candidate
+                .reported_again
+                .then_some(self.candidates.hint_delay),
+            Err(error) => {
+                tracing::debug!(tx = %tid, error = %error, "GC candidate check deferred");
+                self.counters.failures.fetch_add(1, Ordering::Relaxed);
+                self.scan_failed |= candidate.from_scan;
+                candidate.failures = candidate.failures.saturating_add(1);
+                Some(self.retry_delay * (1u32 << candidate.failures.min(4)))
+            }
+        };
+        if let Some(delay) = retry {
+            self.candidates
+                .defer(tid, candidate, rt::Instant::now() + delay);
         }
     }
 }
