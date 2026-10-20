@@ -251,12 +251,13 @@ pub(super) fn spawn_workers(
     for spec in worker_specs(plans) {
         let db = dbs[spec.database].clone();
         let collections = collections[spec.database].clone();
+        let home = home_collection(spec.database, collections.len());
         let bench = spec.bench.clone();
         let ctx = ctx.for_stripe(spec.stripe);
         handles.push(tokio::spawn(worker(
             db,
             collections,
-            spec.database,
+            home,
             spec.shape,
             bench,
             spec.seed,
@@ -264,6 +265,12 @@ pub(super) fn spawn_workers(
         )));
     }
     handles
+}
+
+/// Returns the home collection of `database`. Databases share home
+/// collections when the cell has fewer collections than Databases.
+fn home_collection(database: usize, collections: usize) -> usize {
+    database % collections
 }
 
 /// The pool indices `index` for which `index % count == offset`.
@@ -746,6 +753,18 @@ mod tests {
                 "workers continue after the pause"
             );
         }
+    }
+
+    #[test]
+    fn databases_share_home_collections_when_collections_are_fewer() {
+        let homes = |databases, collections| -> Vec<usize> {
+            (0..databases)
+                .map(|database| home_collection(database, collections))
+                .collect()
+        };
+        assert_eq!(homes(3, 3), [0, 1, 2]);
+        assert_eq!(homes(5, 2), [0, 1, 0, 1, 0]);
+        assert_eq!(homes(5, 1), [0, 0, 0, 0, 0]);
     }
 
     #[test]

@@ -12,10 +12,11 @@
 //! - client-`Database` limits and workers per shape. Each cell opens no more
 //!   Databases than it has workers per shape, so every open client is active.
 //!
-//! Every `Database` runs every shape and has one distinct home collection. An
-//! intermediate affinity mixes home traffic with uniformly selected
-//! collections, exposing cross-client overlap without hard-coding a small set
-//! of discrete client-to-collection layouts. All clients wrap the same backend.
+//! Every `Database` runs every shape and has one home collection, its own unless
+//! `--collections` makes the Databases share fewer collections. An intermediate
+//! affinity mixes home traffic with uniformly selected collections, exposing
+//! cross-client overlap without hard-coding a small set of discrete
+//! client-to-collection layouts. All clients wrap the same backend.
 //!
 //! The key set is seeded before the measurement clients open. The seeding
 //! database then waits until its splits, merges, and garbage collection have
@@ -191,8 +192,8 @@ impl<'a> Seeds<'a> {
         let mut collections: Vec<(Mode, usize)> = Vec::new();
         for cell in dimensions {
             match collections.iter_mut().find(|(mode, _)| *mode == cell.mode) {
-                Some((_, count)) => *count = (*count).max(cell.databases),
-                None => collections.push((cell.mode, cell.databases)),
+                Some((_, count)) => *count = (*count).max(cell.collections),
+                None => collections.push((cell.mode, cell.collections)),
             }
         }
         Self {
@@ -228,7 +229,7 @@ impl<'a> Seeds<'a> {
                 .collections
                 .iter()
                 .find(|(seeded, _)| *seeded == mode)
-                .map_or(dimension.databases, |&(_, count)| count);
+                .map_or(dimension.collections, |&(_, count)| count);
             let name = format!("{}{}", self.name_prefix, mode.label());
             let seed = self.seed(storage.backend(), name, collections, mode)?;
             let start = CellStart::fork_of(&storage, &seed);
@@ -236,15 +237,16 @@ impl<'a> Seeds<'a> {
             return Ok(start);
         }
         let name = format!(
-            "{}{}a{}d{}l{}w{}",
+            "{}{}a{}d{}l{}c{}w{}",
             self.name_prefix,
             mode.label(),
             dimension.affinity_pct,
             dimension.databases,
             dimension.database_limit,
+            dimension.collections,
             dimension.workers_per_shape,
         );
-        let seed = self.seed(self.factory.backend(), name, dimension.databases, mode)?;
+        let seed = self.seed(self.factory.backend(), name, dimension.collections, mode)?;
         Ok(CellStart {
             seed,
             storage: None,
@@ -290,7 +292,9 @@ fn run_cell(
     dimension: CellDimension,
 ) -> Result<(CellResult, Option<ForkableBackend>), Box<dyn Error>> {
     // Collection binding and its record reads are setup, not transaction work.
-    let prepared = start.seed.open_cell(handle, dimension.databases)?;
+    let prepared = start
+        .seed
+        .open_cell(handle, dimension.databases, dimension.collections)?;
     let plans = workload::plans(
         dimension.workers_per_shape,
         prepared.databases().len(),
@@ -382,6 +386,7 @@ fn run_cell(
             completed.setup_splits,
             completed.split_settle_elapsed,
         )
+        .with_collections(dimension.collections)
         .with_key_selection(key_selection)
         .with_warmup(warmup)
         .with_collected(collected),
@@ -450,7 +455,7 @@ mod tests {
         // The first `lo` cell opens one collection, but the seed has the two
         // collections of the largest `lo` cell.
         let first_start = seeds.for_cell(dimensions[0])?;
-        let first = first_start.seed.open_cell(handle, 2)?;
+        let first = first_start.seed.open_cell(handle, 2, 2)?;
         let collection = first.collections()[0][1].clone();
         let keys: Vec<_> = handle.block_on(collection.iter_keys())?.collect();
         assert_eq!(keys.len(), 16);
@@ -462,7 +467,7 @@ mod tests {
 
         // A cell that differs only in its workers starts from the checkpoint.
         let second_start = seeds.for_cell(dimensions[1])?;
-        let second = second_start.seed.open_cell(handle, 2)?;
+        let second = second_start.seed.open_cell(handle, 2, 2)?;
         let second_collection = second.collections()[0][1].clone();
         let read = handle.block_on(second_collection.read(&key_bytes(0)))?;
         assert_eq!(read, Some(b"first".to_vec()));
@@ -472,7 +477,7 @@ mod tests {
 
         // Another affinity starts again from the seed.
         let other_affinity_start = seeds.for_cell(dimensions[2])?;
-        let other_affinity = other_affinity_start.seed.open_cell(handle, 2)?;
+        let other_affinity = other_affinity_start.seed.open_cell(handle, 2, 2)?;
         let read = handle.block_on(other_affinity.collections()[0][1].read(&key_bytes(0)))?;
         assert_eq!(read, Some(value()));
         seeds.record_checkpoint(dimensions[2], other_affinity_start.checkpoint());
@@ -480,7 +485,7 @@ mod tests {
         // The mode `hi` starts from its own seed, with its own pool, and
         // not from the checkpoint of the cell before it.
         let hot_start = seeds.for_cell(dimensions[4])?;
-        let hot = hot_start.seed.open_cell(handle, 1)?;
+        let hot = hot_start.seed.open_cell(handle, 1, 1)?;
         let keys: Vec<_> = handle
             .block_on(hot.collections()[0][0].iter_keys())?
             .collect();

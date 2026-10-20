@@ -44,6 +44,9 @@ MIXED_ARGS = [
     # Keep provider means, throttling, and the full measurement window.
     "--latency-jitter=false",
     "--delay-scale=0.2",
+    # The delay profile is not part of the copied harness, so pin its prefix
+    # partition depth on both sides.
+    "--prefix-depth=3",
     "--runs=1",
     "--drain-timeout=10s",
     "mixed",

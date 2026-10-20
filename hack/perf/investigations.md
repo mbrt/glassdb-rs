@@ -9,6 +9,193 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-10-20: a split saves queue wait, and costs divided rounds
+
+Status: the queue wait that the avoidable time rule (ADR-074) counts is the
+wait that a split removes. But the rule does not count the cost of a split: a
+round that has members in both halves becomes two leaf CASes. Without the
+throttle, the saved wait for each added write is 0.6 to 1.1 leaf CAS times.
+With the throttle, it rises to 3.5 to 5.7 leaf CAS times, while the splits
+lower the throughput. So a price of one leaf CAS time for each write does not
+see the throttle.
+
+These runs had one write limit for all collections. With one limit for each
+collection, the same cell does not reach the limit, and behaves like the runs
+without the throttle. With 5 database instances on one collection, the limit
+comes back. ADR-082 proposes how the rule detects the write limit of a
+collection and prices writes at the limit. Splits from old rule requests
+continue after the load stops (see the last section).
+
+The first runs used the cell of the 2026-10-13 entry at `14aa6e295`, with the
+throttle on and off. Each variant ran twice. Temporary counters measured
+the leaf coordinator, the splits, and the writes of the memory backend, and
+were removed after the runs.
+
+### Counters
+
+Every 10 s of wall time, over the 5 database instances:
+
+- the coordinator rounds whose leaf CAS landed, their members, and the time of
+  that CAS;
+- the landed rounds with members on both sides of the median of the leaf
+  (divided rounds). After a split, each of these rounds needs two CASes. A
+  round with only members whose own keys are on both sides did not count;
+- all queue wait, and the queue wait that the rule counts;
+- in the runs without the throttle only, for each counted queue wait, the
+  part that a split would remove: the time from the end of the last round with
+  keys in the half of the member to the start of the round of the member, at
+  most the wait (shadow wait). The end of a round came from one map for all
+  database instances;
+- the splits and their time, and the backend writes with their throttle wait.
+
+### Results
+
+All 4 warm-ups did 7,318 to 7,702 splits and 0 merges in 300 s, and did not
+become quiet. Times are model time. The rates are for 10 s of wall time. One
+run of each variant:
+
+| Throttle | Time | Rounds | Members/round | Leaf CAS | Throttle wait/write | Counted wait | Divided rounds | Splits |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| on | 100 s | 172,651 | 2.42 | 194 ms | 96 ms | 2,102 s | 10,616 | 432 |
+| on | 190 s | 173,801 | 1.48 | 412 ms | 291 ms | 2,404 s | 2,909 | 189 |
+| on | 370 s | 174,589 | 1.26 | 671 ms | 517 ms | 472 s | 199 | 48 |
+| off | 100 s | 305,544 | 2.18 | 72 ms | 0 | 680 s | 14,429 | 830 |
+| off | 190 s | 628,084 | 1.41 | 71 ms | 0 | 148 s | 1,991 | 151 |
+| off | 370 s | 730,707 | 1.28 | 72 ms | 0 | 103 s | 1,374 | 49 |
+
+The second runs had the same rounds, members, leaf CAS time, and splits
+within about 10%. The counted wait and the divided rounds varied more, for
+example by 38% and 58% at 190 s with the throttle.
+
+- Without the throttle, the shadow wait was equal to the counted wait in all
+  windows. A member that the rule counts waits for a round of the other half,
+  while its own half has no round. So a split removes the time that the rule
+  counts. This is near to true by construction of the counter, and it does not
+  include the time after a split, for example in the throttle.
+- With the throttle, the landed rounds stayed at about 17,400 in each second
+  of wall time for the whole warm-up. The backend write rate limits the rounds,
+  and each split that lowers the members of a round lowers the throughput. The
+  queue wait that the splits removed came back as throttle wait.
+- Without the throttle, queue wait for each member fell from about 19 ms to
+  about 3 ms, of a mean transaction time of 65 to 273 ms for each shape.
+  Backend writes went from about 36,000 to about 78,000 in each second of wall
+  time. The 2026-10-13 entry measured that the throughput did not change.
+- Of all queue wait, the rule counts 4.6 to 18% with the throttle, and 2 to
+  5.3% without it. The other part is wait between
+  members in the same half, which no split removes.
+
+The saved wait for each added write is the counted wait over the divided
+rounds, in multiples of the leaf CAS time. The leaves are one root leaf plus
+the splits of the seed and the warm-up, of run 1 and run 2:
+
+| Throttle | 80 s | 100 s | 190 s | 370 s |
+| --- | ---: | ---: | ---: | ---: |
+| on | 0.77 to 0.85 | 1.02 to 1.04 | 1.74 to 2.01 | 3.53 to 5.69 |
+| on, leaves | 1,215 to 1,370 | 2,270 to 2,320 | 4,880 to 4,980 | 6,980 to 7,050 |
+| off | 0.67 to 0.69 | 0.65 to 0.73 | 0.92 to 1.04 | 1.03 |
+| off, leaves | 1,120 to 1,410 | 2,810 to 2,990 | 5,600 to 5,980 | 7,290 to 7,520 |
+
+- With the throttle, the ratio rises as the leaves get smaller. A price of one
+  leaf CAS time for each write stops no split after about 100 s, and a split
+  then pays more than the one before it.
+- The counted wait grows with the time of a round, and so with the leaf CAS
+  time. A price that is a multiple of the leaf CAS time grows in the same way.
+  So the throttle does not change the decision of such a price, but the splits
+  lowered the throughput by 36%.
+- The ratios are of all leaves. Each leaf can have a different ratio.
+- The divided rounds do not include rounds with a member whose own keys are on
+  both sides of the median. Late in the throttled runs, these were 2 to 48% of
+  the divided rounds, so the ratios are too high by up to this part.
+
+### Results of the cell
+
+| Throttle | Writes/tx | Members/round | `rwSingle` | `rwMany` | `roSingle` | `roMulti` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| on | 1.21 to 1.24 | 1.24 to 1.25 | 271 to 286 | 206 to 207 | 1,939 to 1,964 | 837 to 886 |
+| off | 2.03 to 2.04 | 1.28 to 1.29 | 1,454 to 1,500 | 729 to 750 | 2,979 to 3,068 | 1,336 to 1,418 |
+
+The unit is tx/s.
+
+### Cause
+
+The rule counts the time that a split removes, but not the time that it adds,
+except for the divided conflict time. The merge side counts the time that a
+merge removes, but not the queue wait that it adds, and not the writes that it
+saves. Under this load, the warm-ups made no merges. The keys of one
+transaction are in different leaves, and no shape scans, so the merge side
+likely has no time. The probe did not measure the merge side.
+
+### One write limit for each collection
+
+The s3 delay profile limited the writes of each prefix of 2 path segments, so
+all collections of a database shared one limit of 3,500 writes in each second
+(`db/_c`). S3 documents no partition boundary, and it partitions a prefix
+further under a sustained load. The profile now limits each prefix of 3 path
+segments, so each collection has its own limit (`db/_c/<collection>`), and
+transaction records have 64 limits (`db/_t/<symbol>`).
+
+With this limit, one run of the same cell had no throttle wait. The mean leaf
+CAS time of a window under load stayed at 71 to 82 ms, the backend writes went from about 31,000 to about
+80,000 in each second of wall time, and the warm-up did 7,459 splits and 0
+merges. The cell had 1,564 tx/s of `rwSingle` and 777 tx/s of `rwMany`. Each
+collection had about 3,200 writes in each second of model time, just below its
+limit.
+
+### Five database instances on one collection
+
+The new `mixed` option `--collections` sets how many collections the database
+instances share. One run with `--collections 1`, and the same other options,
+with the limit for each collection:
+
+| Time | Rounds | Members | Members/round | Leaf CAS | Throttle wait/write | Splits |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 50 s | 65,066 | 120,432 | 1.85 | 67 ms | 0 | 58 |
+| 110 s | 128,400 | 190,692 | 1.49 | 65 ms | 0 | 99 |
+| 150 s | 151,645 | 194,187 | 1.28 | 76 ms | 11 ms | 180 |
+| 230 s | 158,902 | 205,515 | 1.29 | 147 ms | 69 ms | 191 |
+| 310 s | 162,536 | 201,298 | 1.24 | 206 ms | 128 ms | 138 |
+
+The rates are for 10 s of wall time, and the leaf CAS time is the mean of a
+window. The seed made 113 splits, and the warm-up 5,167 splits and 0 merges.
+The collection has all 20,000 keys of the pool, but each of the 5 own
+collections of the other runs also had all of them. So this cell has 5 times
+the load on each key, not only on each limit.
+
+- Before about 150 s, the splits raised the round members, a measure of the
+  throughput, by 61 to 71%.
+- After about 150 s, the rounds stayed at about 16,000 in each second of wall
+  time, which is about 3,200 in each second of model time. The members stayed
+  the same, while the rule made about 2,700 more splits by 320 s. The mean leaf
+  CAS time rose from 76 ms to 206 ms, of which 128 ms was throttle wait.
+
+Two signals of the limit, from the same windows:
+
+| Time | Throttle wait / leaf CAS | 1 − 62 ms / leaf CAS |
+| ---: | ---: | ---: |
+| 110 s | 0 | 0.05 |
+| 150 s | 0.14 | 0.19 |
+| 190 s | 0.41 | 0.49 |
+| 310 s | 0.62 | 0.70 |
+
+62 ms is about the lowest mean leaf CAS time of a window in the runs: 58.6 ms
+in a window with 104 rounds, and 63.8 ms in the windows with more than 20,000
+rounds. Without a throttle, the mean leaf CAS time under load was 69 to 82 ms,
+so the second signal was 0.10 to 0.24. This difference comes from the load,
+not only from jitter. The probe measured means, not medians. The engine cannot
+see the throttle wait, because the memory
+backend waits inside the backend, and a provider adapter waits in its retries.
+So ADR-082 uses the leaf CAS time.
+
+### Splits continue after the load stops
+
+From about 330 s, the cell paused its workers for its full garbage
+collections. The restructurer still made 500, 551, 540, 174, 110, and 141
+splits in the next 10 s windows, with almost no transactions: about 2,000
+splits. The probe counted about 4,000 splits in the warm-up, against the 5,167
+of the result, so it may not count all splits. The rule asks for more splits
+than the restructurer can make, and the candidate queue keeps the requests.
+The cause was not confirmed.
+
 ## 2026-10-13: concurrent splits, and a tree that still does not settle
 
 Status: the restructurer now splits up to 16 nodes of one sweep at the same

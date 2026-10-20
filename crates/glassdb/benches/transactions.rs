@@ -50,16 +50,6 @@ fn simulated(profile: fn() -> DelayOptions) -> Arc<dyn Backend> {
     )
 }
 
-/// Uses one request-rate prefix for each large-transaction collection.
-fn simulated_s3_by_collection() -> Arc<dyn Backend> {
-    let mut options = s3_delays();
-    options.rate_limits.prefix_depth = 3;
-    Arc::new(
-        DelayBackend::new(Arc::new(MemoryBackend::new()), options)
-            .expect("built-in delay profile is valid"),
-    )
-}
-
 /// The three backends used by each standard workload, with fresh state.
 fn backends() -> Vec<(&'static str, Arc<dyn Backend>)> {
     vec![
@@ -139,7 +129,7 @@ async fn open_coll_with_inline(
 }
 
 async fn open_large_members(count: usize) -> (Database, Vec<(Collection, Vec<u8>)>) {
-    let db = Database::open("largetransactions", simulated_s3_by_collection())
+    let db = Database::open("largetransactions", simulated(s3_delays))
         .await
         .expect("open benchmark database");
     let mut members = Vec::with_capacity(count);
