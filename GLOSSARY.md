@@ -454,7 +454,7 @@ A coordinator round with members on both sides of the median of its leaf. After 
 _Avoid_: Shared round, split round
 
 **Write limit**:
-The rate of writes to one collection above which the backend throttles them. A database instance detects it from its leaf CAS time.
+The rate of writes to one partition of the backend above which the backend throttles them.
 _Avoid_: Throttle, backend limit
 
 **Write price**:

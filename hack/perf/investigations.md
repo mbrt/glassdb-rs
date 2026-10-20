@@ -22,9 +22,10 @@ see the throttle.
 These runs had one write limit for all collections. With one limit for each
 collection, the same cell does not reach the limit, and behaves like the runs
 without the throttle. With 5 database instances on one collection, the limit
-comes back. ADR-082 proposes how the rule detects the write limit of a
-collection and prices writes at the limit. Splits from old rule requests
-continue after the load stops (see the last section).
+comes back. The signals of the engine told the limit apart from a topology
+that does not pay only with small margins, and none located the partition at
+its limit. So ADR-082 rejects detection of the write limit. Splits from old rule requests continue after the
+load stops (see the last section).
 
 The first runs used the cell of the 2026-10-13 entry at `14aa6e295`, with the
 throttle on and off. Each variant ran twice. Temporary counters measured
@@ -182,9 +183,45 @@ in a window with 104 rounds, and 63.8 ms in the windows with more than 20,000
 rounds. Without a throttle, the mean leaf CAS time under load was 69 to 82 ms,
 so the second signal was 0.10 to 0.24. This difference comes from the load,
 not only from jitter. The probe measured means, not medians. The engine cannot
-see the throttle wait, because the memory
-backend waits inside the backend, and a provider adapter waits in its retries.
-So ADR-082 uses the leaf CAS time.
+see the throttle wait, because the memory backend waits inside the backend, and
+a provider adapter waits in its retries.
+
+### Medians and the landed rounds
+
+A second probe recorded each landed leaf CAS time with its collection and leaf,
+and printed the quantiles of each collection for each window. It ran two more
+times on the cell with 5 database instances on one collection (c1a and c1b),
+and one time with own collections (own), on the commit before ADR-082. The
+values are for 10 s windows late in the warm-up, from 200 s to 320 s:
+
+| Run | Splits | Rounds in 10 s | Members/round | Leaf CAS p50 | Throttle wait/write |
+| --- | ---: | ---: | --- | ---: | ---: |
+| c1a | 6,619 | 153,000 to 168,000 | 1.21 to 1.18 | 59 to 64 ms | 0 to 5 ms |
+| c1b | 4,615 | 152,000 to 163,000 | 1.36 to 1.22 | 104 to 132 ms | 37 to 63 ms |
+| own | 6,763 | 472,000 to 575,000 | 1.48 to 1.37 | 75 to 82 ms | 0 |
+
+The rounds of `own` are of 5 collections, and the others of one. One window of
+c1a, at 260 s, had a p50 of 86 ms and 22 ms of throttle wait.
+
+- The same cell had a p50 of 59 to 64 ms in one run, and of 104 to 132 ms in
+  the other. In both runs, the collection was at about 3,200 writes in each
+  second of model time, and the splits added writes. c1a had little throttle
+  wait, and c1b had 37 to 63 ms.
+- With own collections, the p50 was 75 to 82 ms with no throttle wait. With a
+  baseline of 59 ms, its saturation was about 0.23, against 0.05 for c1a and
+  0.53 for c1b. So a threshold on the leaf CAS time has a small margin, and the
+  baseline changes with the load.
+- From 200 s to 320 s, the landed rounds changed by −0.2% (c1a) and +5.6%
+  (c1b) at the limit, and by +0.3% in both runs with one limit for all
+  collections. Without a limit, they rose by 10 to 18% (own, both runs without
+  the throttle, and the run of depth 3 with own collections). But in windows
+  of 30 s, the runs without a limit also had rises of less than 1%. So the
+  check on the landed rounds needs some minutes of history, and its margin is
+  small.
+- After about 70 s, the busiest leaf had at most 1.6% of the leaf CASes of its
+  collection. No run had a hot leaf.
+- The throttle wait told the runs apart best: 0 without a limit, 0 to 22 ms in
+  c1a, and 37 to 63 ms in c1b. The engine cannot see it.
 
 ### Splits continue after the load stops
 
