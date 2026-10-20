@@ -66,14 +66,15 @@ impl Seed {
         }
     }
 
-    /// Opens one measurement database instance for each of the first `databases`
-    /// collections, with handles to all of these collections.
+    /// Opens `databases` measurement database instances, each with handles to
+    /// the first `collections` collections.
     pub(super) fn open_cell(
         &self,
         handle: &Handle,
         databases: usize,
+        collections: usize,
     ) -> Result<PreparedCell, Box<dyn Error>> {
-        let paths = collection_paths(databases)?;
+        let paths = collection_paths(collections)?;
         let databases: Vec<_> = (0..databases)
             .map(|_| open_db(handle, &self.database_name, self.backend.clone()))
             .collect();
@@ -509,7 +510,7 @@ mod tests {
         // A cell can use fewer collections than the seed has.
         let cell = seed
             .with_backend(Arc::new(storage.fork()))
-            .open_cell(handle, 1)?;
+            .open_cell(handle, 1, 1)?;
         assert_eq!(cell.databases().len(), 1);
         assert_eq!(cell.collections()[0].len(), 1);
         let collection = cell.collections()[0][0].clone();
@@ -520,10 +521,22 @@ mod tests {
         handle.block_on(collection.write(&key_bytes(0), b"cell"))?;
         let next = seed
             .with_backend(Arc::new(storage.fork()))
-            .open_cell(handle, 2)?;
+            .open_cell(handle, 2, 2)?;
         assert_eq!(next.collections()[1].len(), 2);
         let value = handle.block_on(next.collections()[0][0].read(&key_bytes(0)))?;
         assert_eq!(value, Some(super::value()));
+
+        // Databases can share fewer collections than they are.
+        let shared = seed
+            .with_backend(Arc::new(storage.fork()))
+            .open_cell(handle, 3, 1)?;
+        assert_eq!(shared.databases().len(), 3);
+        handle.block_on(shared.collections()[0][0].write(&key_bytes(1), b"shared"))?;
+        for collections in shared.collections() {
+            assert_eq!(collections.len(), 1);
+            let value = handle.block_on(collections[0].read(&key_bytes(1)))?;
+            assert_eq!(value, Some(b"shared".to_vec()));
+        }
 
         let probe = cell.databases()[0].clone();
         let completed = cell.begin_measurement().teardown(
@@ -536,11 +549,13 @@ mod tests {
             handle.block_on(probe.root_collection().read(b"after-shutdown")),
             Err(GError::ShuttingDown)
         ));
-        next.begin_measurement().teardown(
-            handle,
-            tokio::time::Instant::now() + Duration::from_secs(1),
-            Ok(()),
-        )?;
+        for cell in [next, shared] {
+            cell.begin_measurement().teardown(
+                handle,
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                Ok(()),
+            )?;
+        }
         Ok(())
     }
 }

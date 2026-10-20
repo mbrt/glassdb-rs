@@ -42,6 +42,7 @@ pub(super) struct CellMetadata {
     affinity_pct: u8,
     database_limit: usize,
     databases: usize,
+    collections: usize,
     workers_per_shape: usize,
     setup_splits: u64,
     split_settle_elapsed: Duration,
@@ -66,6 +67,7 @@ impl CellMetadata {
             affinity_pct,
             database_limit,
             databases,
+            collections: databases,
             workers_per_shape,
             setup_splits,
             split_settle_elapsed,
@@ -85,6 +87,12 @@ impl CellMetadata {
     /// they completed.
     pub(super) fn with_collected(mut self, collected: Option<Collected>) -> Self {
         self.collected = collected;
+        self
+    }
+
+    /// Records the collections that the databases of the cell share.
+    pub(super) fn with_collections(mut self, collections: usize) -> Self {
+        self.collections = collections;
         self
     }
 
@@ -119,6 +127,7 @@ pub(super) struct CellResult {
     affinity_pct: u8,
     database_limit: usize,
     databases: usize,
+    collections: usize,
     workers_per_shape: usize,
     /// Percentage of transactions that draw keys outside their worker's
     /// stripe. Absent when workers do not use stripes.
@@ -171,6 +180,7 @@ impl CellResult {
             affinity_pct: metadata.affinity_pct,
             database_limit: metadata.database_limit,
             databases: metadata.databases,
+            collections: metadata.collections,
             workers_per_shape: metadata.workers_per_shape,
             shared_pct: metadata.shared_pct,
             setup_splits: metadata.setup_splits,
@@ -196,11 +206,12 @@ impl CellResult {
 /// Formats the progress line emitted before a cell starts.
 pub(super) fn cell_started(run: usize, dimension: CellDimension) -> String {
     format!(
-        "mixed: run={run} mode={} affinity={}% databases={}/{} workers/shape={}",
+        "mixed: run={run} mode={} affinity={}% databases={}/{} collections={} workers/shape={}",
         dimension.mode.label(),
         dimension.affinity_pct,
         dimension.databases,
         dimension.database_limit,
+        dimension.collections,
         dimension.workers_per_shape,
     )
 }
@@ -707,6 +718,7 @@ mod tests {
         "directLandRate": 0.6666666666666666,
         "directLandedPerTx": 1.3333333333333333
       },
+      "collections": 2,
       "databaseLimit": 2,
       "databases": 2,
       "failures": 0,
@@ -791,6 +803,7 @@ mod tests {
         "directLandRate": 0.0,
         "directLandedPerTx": 0.0
       },
+      "collections": 0,
       "databaseLimit": 0,
       "databases": 0,
       "failures": 0,

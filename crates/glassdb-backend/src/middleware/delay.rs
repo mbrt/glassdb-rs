@@ -48,6 +48,11 @@ pub fn gcs_delays() -> DelayOptions {
 /// `prefix_read_ps` / `prefix_write_ps` / `prefix_depth` (S3 sustains at least
 /// 5,500 GET/HEAD and 3,500 PUT/COPY/POST/DELETE requests per second per
 /// partitioned prefix before returning `503 SlowDown`).
+///
+/// S3 documents no partition boundary, and it partitions a prefix further under
+/// sustained load. Depth 3 gives each collection (`db/_c/<collection>`) and each
+/// first symbol of a transaction ID (`db/_t/<symbol>`) its own partition, the
+/// granularity that S3 reaches under a sustained load on these prefixes.
 pub fn s3_delays() -> DelayOptions {
     DelayOptions {
         latency: ProviderLatencyProfile {
@@ -62,7 +67,7 @@ pub fn s3_delays() -> DelayOptions {
             same_obj_write_retry_delay: Duration::from_millis(110),
             prefix_read_ps: RateLimit::PerSecond(NonZeroU32::new(5500).unwrap()),
             prefix_write_ps: RateLimit::PerSecond(NonZeroU32::new(3500).unwrap()),
-            prefix_depth: 2,
+            prefix_depth: 3,
         },
     }
 }

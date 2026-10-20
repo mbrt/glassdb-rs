@@ -34,6 +34,11 @@ pub(crate) struct Options {
     /// several limits.
     #[arg(long, value_delimiter = ',', default_value = "4")]
     databases: Vec<usize>,
+    /// Maximum collections in each cell. Database `i` has collection
+    /// `i % collections` as its home, so fewer collections than Databases
+    /// make Databases share a home collection. Absent: one for each Database.
+    #[arg(long)]
+    collections: Option<usize>,
     /// Keys touched by the multi-key shapes (`rwMany`, `roMulti`); clamped to
     /// the pool size in the `hi` mode.
     #[arg(long, default_value_t = 10)]
@@ -98,11 +103,15 @@ impl Options {
             for &affinity_pct in &self.affinities {
                 for &database_limit in &self.databases {
                     for &workers_per_shape in &self.workers_per_shape {
+                        let databases = database_limit.min(workers_per_shape);
                         dimensions.push(CellDimension {
                             mode,
                             affinity_pct,
                             database_limit,
-                            databases: database_limit.min(workers_per_shape),
+                            databases,
+                            collections: self
+                                .collections
+                                .map_or(databases, |limit| limit.min(databases)),
                             workers_per_shape,
                         });
                     }
@@ -118,6 +127,9 @@ impl Options {
         }
         if self.databases.is_empty() || self.databases.contains(&0) {
             return Err("--databases must contain values >= 1".into());
+        }
+        if self.collections == Some(0) {
+            return Err("--collections must be >= 1".into());
         }
         if self.affinities.is_empty() || self.affinities.iter().any(|&a| a > 100) {
             return Err("--affinities must contain percentages from 0 through 100".into());
@@ -158,6 +170,7 @@ pub(super) struct CellDimension {
     pub(super) affinity_pct: u8,
     pub(super) database_limit: usize,
     pub(super) databases: usize,
+    pub(super) collections: usize,
     pub(super) workers_per_shape: usize,
 }
 
@@ -225,11 +238,12 @@ mod tests {
             .into_iter()
             .map(|cell| {
                 format!(
-                    "{}:{}:limit{}:db{}:w{}",
+                    "{}:{}:limit{}:db{}:c{}:w{}",
                     cell.mode.label(),
                     cell.affinity_pct,
                     cell.database_limit,
                     cell.databases,
+                    cell.collections,
                     cell.workers_per_shape
                 )
             })
@@ -242,16 +256,16 @@ mod tests {
         let cases: &[(&[&str], &str)] = &[
             (
                 &["perfbench"],
-                "lo:0:limit4:db4:w8\n\
-                 lo:25:limit4:db4:w8\n\
-                 lo:50:limit4:db4:w8\n\
-                 lo:75:limit4:db4:w8\n\
-                 lo:100:limit4:db4:w8\n\
-                 hi:0:limit4:db4:w8\n\
-                 hi:25:limit4:db4:w8\n\
-                 hi:50:limit4:db4:w8\n\
-                 hi:75:limit4:db4:w8\n\
-                 hi:100:limit4:db4:w8",
+                "lo:0:limit4:db4:c4:w8\n\
+                 lo:25:limit4:db4:c4:w8\n\
+                 lo:50:limit4:db4:c4:w8\n\
+                 lo:75:limit4:db4:c4:w8\n\
+                 lo:100:limit4:db4:c4:w8\n\
+                 hi:0:limit4:db4:c4:w8\n\
+                 hi:25:limit4:db4:c4:w8\n\
+                 hi:50:limit4:db4:c4:w8\n\
+                 hi:75:limit4:db4:c4:w8\n\
+                 hi:100:limit4:db4:c4:w8",
             ),
             (
                 &[
@@ -265,14 +279,14 @@ mod tests {
                     "--workers-per-shape",
                     "1,5",
                 ],
-                "hi:100:limit1:db1:w1\n\
-                 hi:100:limit1:db1:w5\n\
-                 hi:100:limit3:db1:w1\n\
-                 hi:100:limit3:db3:w5\n\
-                 lo:100:limit1:db1:w1\n\
-                 lo:100:limit1:db1:w5\n\
-                 lo:100:limit3:db1:w1\n\
-                 lo:100:limit3:db3:w5",
+                "hi:100:limit1:db1:c1:w1\n\
+                 hi:100:limit1:db1:c1:w5\n\
+                 hi:100:limit3:db1:c1:w1\n\
+                 hi:100:limit3:db3:c3:w5\n\
+                 lo:100:limit1:db1:c1:w1\n\
+                 lo:100:limit1:db1:c1:w5\n\
+                 lo:100:limit3:db1:c1:w1\n\
+                 lo:100:limit3:db3:c3:w5",
             ),
             (
                 &[
@@ -284,7 +298,22 @@ mod tests {
                     "--workers-per-shape",
                     "126",
                 ],
-                "hi:100:limit4:db4:w126",
+                "hi:100:limit4:db4:c4:w126",
+            ),
+            (
+                &[
+                    "perfbench",
+                    "--modes",
+                    "lo",
+                    "--affinities",
+                    "0",
+                    "--databases",
+                    "1,5",
+                    "--collections",
+                    "2",
+                ],
+                "lo:0:limit1:db1:c1:w8\n\
+                 lo:0:limit5:db5:c2:w8",
             ),
         ];
 
@@ -304,6 +333,10 @@ mod tests {
             (
                 &["perfbench", "--databases", "0"],
                 "--databases must contain values >= 1",
+            ),
+            (
+                &["perfbench", "--collections", "0"],
+                "--collections must be >= 1",
             ),
             (
                 &["perfbench", "--affinities", "101"],

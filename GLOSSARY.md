@@ -449,6 +449,18 @@ _Avoid_: Topology cost, contention cost, structural pressure
 What decides when the leaves of one database instance split and merge: the node sizes, or the avoidable time.
 _Avoid_: Leaf changes, split policy
 
+**Divided round**:
+A coordinator round with members on both sides of the median of its leaf. After a split at the median, the round needs two leaf CASes instead of one.
+_Avoid_: Shared round, split round
+
+**Write limit**:
+The rate of writes to one partition of the backend above which the backend throttles them.
+_Avoid_: Throttle, backend limit
+
+**Write price**:
+The time that the avoidable time rule counts for each backend write that a split adds or a merge saves.
+_Avoid_: Write cost, throttle cost
+
 **Paid rate**:
 The rate of avoidable time that paid for the last split or merge that a topology rule asked for, kept in the leaves of that change with its kind. The opposite change of these leaves must pay more.
 _Avoid_: Change record, change justification, change cost

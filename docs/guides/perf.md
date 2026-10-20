@@ -7,6 +7,12 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+The s3 delay profile limits each prefix of 3 path segments since 2026-10-20:
+each collection and each first symbol of a transaction ID has its own request
+limit. Earlier entries that do not pass `--prefix-depth` used 2 segments, where
+all collections of a database share one limit. Pass `--prefix-depth=2` to
+measure them again.
+
 ## ADRs 064-065: bounded parallel leaf work and renewed fallback identity
 
 [ADR-064](../adr/064-bounded-parallel-point-leaf-work.md) runs independent
