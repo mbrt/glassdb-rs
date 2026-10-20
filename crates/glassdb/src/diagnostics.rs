@@ -40,12 +40,15 @@ impl fmt::Display for Diagnostics {
         writeln!(f, "Diagnostics:")?;
         writeln!(
             f,
-            "  GC: ready={} deferred={} in_flight={} oldest_ready={:?} prefixes={}",
+            "  GC: ready={} deferred={} in_flight={} oldest_ready={:?} prefixes={} \
+             spend_limit={}/s concurrency={}",
             self.gc.ready,
             self.gc.deferred,
             self.gc.in_flight,
             self.gc.oldest_ready_age,
-            self.gc.prefix_count
+            self.gc.prefix_count,
+            self.gc.spend_limit,
+            self.gc.concurrency
         )?;
         writeln!(
             f,

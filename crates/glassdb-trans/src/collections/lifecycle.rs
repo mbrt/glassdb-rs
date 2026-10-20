@@ -161,16 +161,17 @@ impl CollectionLifecycle {
         Ok(changed)
     }
 
-    /// Reclaims physical objects for collections no longer discoverable.
+    /// Reclaims physical objects for collections no longer discoverable, and
+    /// returns how many objects it deleted.
     pub(crate) async fn reclaim(
         &self,
         collections: &[CollectionAddress],
-    ) -> Result<bool, TransError> {
+    ) -> Result<u64, TransError> {
         // Present bodies are conditional-delete seeds. Owner cleanup shares
         // the preparation cache; GC waits for commit or acknowledged abort.
         // Publication and identity rules exclude cached absence hiding a later
         // live object, though an abandoned late create can leave an orphan.
-        let mut changed = false;
+        let mut deleted = 0;
         for collection in collections {
             let mut cursor = None;
             loop {
@@ -180,7 +181,7 @@ impl CollectionLifecycle {
                     .await?;
                 for (_, observed) in page.nodes {
                     self.nodes.delete_node(&observed).await?;
-                    changed = true;
+                    deleted += 1;
                 }
                 match page.next {
                     Some(next) => cursor = Some(next),
@@ -193,7 +194,7 @@ impl CollectionLifecycle {
                 .await?;
             if observed.exists() {
                 self.nodes.delete_root(&observed).await?;
-                changed = true;
+                deleted += 1;
             }
             let observed = self
                 .records
@@ -201,10 +202,10 @@ impl CollectionLifecycle {
                 .await?;
             if observed.exists() {
                 self.records.delete_record(&observed).await?;
-                changed = true;
+                deleted += 1;
             }
         }
-        Ok(changed)
+        Ok(deleted)
     }
 
     async fn freeze_topology(
@@ -1018,6 +1019,7 @@ mod tests {
                 .reclaim(std::slice::from_ref(&collection))
                 .await
                 .unwrap()
+                > 0
         );
         let events = events.lock().unwrap();
         let first_delete = events.iter().position(|(op, _)| *op == "delete").unwrap();

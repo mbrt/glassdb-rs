@@ -175,7 +175,7 @@ fn open_database(
     name: &str,
 ) -> Result<Database, GError> {
     handle.block_on(
-        Database::builder(name, backend.clone())
+        crate::database_builder(name, backend.clone())
             .inline_policy(INLINE_POLICY)
             .open(),
     )

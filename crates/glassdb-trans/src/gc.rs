@@ -5,15 +5,17 @@
 //! (ADR-022). A committed record stays live while a reference names it.
 //!
 //! GC skips missing, pending, and wounded records (ADR-071). It filters
-//! committed and acknowledged aborted candidates by
-//! durable status and the safety horizon before capturing a fresh requirement
-//! for GC checks. Cached leaf contents from before eligibility cannot
-//! rule out a reference. Pinned wounds stay until owner acknowledgement
+//! committed and acknowledged aborted candidates by durable status and the
+//! retention period before capturing the currentness barrier of their reference
+//! checks. Cached leaf contents from before eligibility cannot rule out a
+//! reference (ADR-079). Pinned wounds stay until owner acknowledgement
 //! (ADR-059).
 //!
 //! Lock reclamation uses the locker's coordinator-backed operations (ADR-029),
 //! so GC does not issue its own leaf mutations.
 
+mod budget;
+mod pipeline;
 mod scan;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -23,16 +25,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::{
-    FutureExt,
-    future::{BoxFuture, OptionFuture},
+use futures::FutureExt;
+use futures::future::{BoxFuture, OptionFuture};
+use glassdb_backend::{ListCursor, ListLimit, WriteMeter};
+use glassdb_concurr::{Background, ScanCadence, rt};
+use glassdb_data::{CollectionAddress, LogicalKey, TxId};
+use glassdb_storage::transaction::{
+    TxCollectionOp, TxCommitStatus, TxListPage, TxLock, TxRecord, TxRecordState, TxRecordStore,
 };
-use glassdb_concurr::{Background, ScanCadence, map_all_bounded, rt};
-use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::{
     CurrentnessBarrier, NodeStore, Observation, Requirement, StorageError, StructuralIntentStore,
     Timeline, TreeRouter,
-    transaction::{TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxRecordState, TxRecordStore},
 };
 use tokio::sync::Notify;
 
@@ -41,14 +44,27 @@ use crate::error::TransError;
 use crate::monitor::ProtocolTiming;
 use crate::structural::TopologyMembership;
 use crate::tlocker::Locker;
+use budget::WriteBudget;
+use pipeline::CheckPipeline;
 use scan::{GcScan, PAGE_SIZE};
 
-const HINT_CAPACITY: usize = 4096;
-const SCAN_CAPACITY: usize = 2 * PAGE_SIZE;
-pub(crate) const DEFAULT_GC_PARALLELISM: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+// The candidate capacities when the budget is small. A scan needs room for two
+// pages, so that a LIST can always start.
+const MIN_HINT_CAPACITY: usize = 4096;
+const MIN_SCAN_CAPACITY: usize = 2 * PAGE_SIZE;
+// About 10 MB of candidates of each kind (ADR-078).
+const MAX_CANDIDATES: usize = 65_536;
+// A safety limit for memory and backend connections. The write budget, not the
+// parallelism, limits how fast GC writes (ADR-078).
+pub(crate) const DEFAULT_GC_PARALLELISM: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+// GC raises its concurrency above this only while its checks write. Checks that
+// only read, of records that stay live, need no more.
+const READ_ONLY_CONCURRENCY: usize = 8;
+// The default limit of reports that wait for admission.
+const PENDING_HINT_CAPACITY: usize = 4096;
 const ADMISSION_BATCH: usize = 64;
 
-/// GC hint queue limits for one database instance.
+/// GC limits for one database instance.
 ///
 /// Excess hints are discarded without delaying writers. GC scans can still
 /// discover their transaction records and use a separate candidate budget.
@@ -58,22 +74,39 @@ pub struct GcLimits {
     /// At capacity, a new report replaces the oldest. Zero drops every report.
     pub max_pending_hints: usize,
     /// Maximum retained candidates from hints, including ready, deferred, and
-    /// running checks. Defaults to 4,096. At capacity, new candidates are
-    /// discarded; existing candidates keep their place. Zero rejects all new
-    /// candidates from hints.
+    /// running checks. Defaults to 65,536. GC retains fewer while its write
+    /// budget is small: about the hints that it can check within one
+    /// retention period, and at least 4,096 or this maximum if it is lower. At
+    /// capacity, new candidates are discarded; existing candidates keep their
+    /// place. Zero rejects all new candidates from hints.
     pub max_hint_candidates: usize,
+    /// Maximum retained candidates from GC scans. Defaults to 65,536. GC
+    /// retains fewer while its write budget is small, and at least two LIST
+    /// pages, also with a lower maximum, so that a scan can always continue.
+    /// After the capacity drops, scans pause until the retained candidates
+    /// fall below it.
+    pub max_scan_candidates: usize,
+    /// Writes in each second that background GC can always send. Above this
+    /// rate, background GC sends at most about as many writes as the rest of
+    /// the instance. Defaults to 100. The rate is at least 0.01; a NaN uses
+    /// the default.
+    ///
+    /// An instance that only collects garbage can set a higher rate. It then
+    /// competes with the transactions of other instances on the same backend.
+    pub base_write_rate: f64,
 }
 
 impl Default for GcLimits {
     fn default() -> Self {
         Self {
-            max_pending_hints: HINT_CAPACITY,
-            max_hint_candidates: HINT_CAPACITY,
+            max_pending_hints: PENDING_HINT_CAPACITY,
+            max_hint_candidates: MAX_CANDIDATES,
+            max_scan_candidates: MAX_CANDIDATES,
+            base_write_rate: budget::DEFAULT_BASE_RATE,
         }
     }
 }
 
-type Checks = BoxFuture<'static, Vec<(TxId, Result<GcOutcome, TransError>)>>;
 type Listing = BoxFuture<'static, (GcScan, Result<Option<Vec<TxId>>, StorageError>)>;
 
 /// Whether a transaction's durable state permits reclamation of its effects.
@@ -81,15 +114,38 @@ enum GcEligibility {
     Ready(Observation<TxRecord>),
     Deferred(Duration),
     Retained,
+    Missing,
 }
 
 /// Result of a GC candidate check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GcOutcome {
     Retained,
+    Missing,
     Deferred(Duration),
     Reclaimed,
     Progress,
+}
+
+/// Counts of the transaction records that one full GC checked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GcReport {
+    /// Records that the full GC deleted.
+    pub deleted: u64,
+    /// Listed records that were already deleted when the full GC checked them.
+    pub missing: u64,
+    /// Records whose check reclaimed some effects but kept the record. A later
+    /// check can delete them.
+    pub reclaimed_effects: u64,
+    /// Records that wait for their retention period.
+    pub deferred: u64,
+    /// Time from the end of the full GC until the first deferred record
+    /// becomes eligible. `None` when no record is deferred.
+    pub retry_after: Option<Duration>,
+    /// Records that stored objects still name, or that are pending or wounded.
+    pub retained: u64,
+    /// Checks that failed. A later full GC or background GC can repeat them.
+    pub failed: u64,
 }
 
 struct Reclamation {
@@ -122,10 +178,12 @@ enum CandidateState {
 }
 
 /// Bounds local work and preserves scan capacity under a stream of hints.
-#[derive(Default)]
 struct Candidates {
     entries: BTreeMap<TxId, Candidate>,
     limits: GcLimits,
+    counters: Arc<Counters>,
+    hint_capacity: usize,
+    scan_capacity: usize,
     hint_delay: Duration,
     hints: CandidateQueue,
     scans: CandidateQueue,
@@ -140,15 +198,45 @@ struct CandidateQueue {
 }
 
 impl Candidates {
-    fn new(hint_delay: Duration, limits: GcLimits) -> Self {
-        Self {
-            hint_delay,
+    fn new(hint_delay: Duration, limits: GcLimits, counters: Arc<Counters>) -> Self {
+        let mut candidates = Self {
+            entries: BTreeMap::new(),
             limits,
-            ..Self::default()
-        }
+            counters,
+            hint_capacity: 0,
+            scan_capacity: 0,
+            hint_delay,
+            hints: CandidateQueue::default(),
+            scans: CandidateQueue::default(),
+            deferred: BTreeSet::new(),
+        };
+        candidates.set_capacities(0.0, Duration::ZERO);
+        candidates
     }
 
-    fn admit(&mut self, tid: TxId, from_scan: bool, now: rt::Instant, counters: &Counters) {
+    /// Sizes the candidate queues to about the checks that `spend_limit`
+    /// allows while a candidate holds its slot: the hint delay for hints, and
+    /// also the deferral after progress for scans. Most checks make about one
+    /// write. Candidates above a lower capacity keep their place.
+    fn set_capacities(&mut self, spend_limit: f64, progress_delay: Duration) {
+        // A NaN or negative product casts to zero, and a huge one saturates.
+        let sized = |hold: Duration, min: usize, max: usize| {
+            let wanted = (spend_limit * hold.as_secs_f64()) as usize;
+            wanted.clamp(min.min(max), max)
+        };
+        self.hint_capacity = sized(
+            self.hint_delay,
+            MIN_HINT_CAPACITY,
+            self.limits.max_hint_candidates,
+        );
+        self.scan_capacity = sized(
+            self.hint_delay + progress_delay,
+            MIN_SCAN_CAPACITY,
+            self.limits.max_scan_candidates.max(MIN_SCAN_CAPACITY),
+        );
+    }
+
+    fn admit(&mut self, tid: TxId, from_scan: bool, now: rt::Instant) {
         if let Some(candidate) = self.entries.get_mut(&tid) {
             if from_scan && !candidate.from_scan {
                 self.hints.count -= 1;
@@ -170,13 +258,13 @@ impl Candidates {
             return;
         }
         let capacity = if from_scan {
-            SCAN_CAPACITY
+            self.scan_capacity
         } else {
-            self.limits.max_hint_candidates
+            self.hint_capacity
         };
         let queue = self.queue_mut(from_scan);
         if queue.count >= capacity {
-            counters.dropped_candidates.fetch_add(1, Ordering::Relaxed);
+            self.counters.drop_candidate(from_scan);
             return;
         }
         queue.count += 1;
@@ -275,17 +363,20 @@ impl Candidates {
         }
     }
 
-    fn record_backlog(&self, counters: &Counters) {
+    /// Publishes the GC backlog. `waiting` and `in_flight` count candidates
+    /// that left the ready queues: those that wait for a slot or an epoch hold
+    /// no backend operation, so they count as ready.
+    fn record_backlog(&self, waiting: usize, in_flight: usize) {
+        let counters = &self.counters;
         counters
             .ready
-            .store(self.ready_len() as u64, Ordering::Relaxed);
+            .store((self.ready_len() + waiting) as u64, Ordering::Relaxed);
         counters
             .waiting
             .store(self.deferred.len() as u64, Ordering::Relaxed);
-        counters.in_flight.store(
-            (self.hints.running + self.scans.running) as u64,
-            Ordering::Relaxed,
-        );
+        counters
+            .in_flight
+            .store(in_flight as u64, Ordering::Relaxed);
         *counters.oldest_ready.lock().unwrap() = self.oldest_ready();
     }
 }
@@ -303,10 +394,17 @@ pub(crate) struct Gc {
     timeline: Timeline,
     hints: GcHints,
     max_checks: NonZeroUsize,
+    writes: Option<WriteMeter>,
+    // Where this clone counts its estimated writes. Background GC spends
+    // them from its budget; full GCs count them only so that GC earns no
+    // budget from them.
+    own_writes: Arc<AtomicU64>,
 }
 
 impl Gc {
-    /// Creates GC with bounded candidate admission and adaptive scans.
+    /// Creates GC with bounded candidate admission and adaptive scans. The
+    /// write budget of background GC follows the writes that `writes` counts,
+    /// and allows only the base rate of the hint limits without a meter.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         tx_records: TxRecordStore,
@@ -319,6 +417,7 @@ impl Gc {
         timing: ProtocolTiming,
         hints: GcHints,
         max_checks: NonZeroUsize,
+        writes: Option<WriteMeter>,
     ) -> Self {
         Self {
             tx_records,
@@ -329,8 +428,10 @@ impl Gc {
             topology,
             timing,
             timeline,
+            own_writes: hints.counters.background_writes.clone(),
             hints,
             max_checks,
+            writes,
         }
     }
 
@@ -347,6 +448,87 @@ impl Gc {
         background.spawn(self.clone().run());
     }
 
+    /// Runs one full GC: checks every transaction record that one listing
+    /// finds, with at most `parallelism` checks at the same time.
+    pub(crate) async fn collect(&self, parallelism: NonZeroUsize) -> Result<GcReport, TransError> {
+        let full_gc = Self {
+            own_writes: self.hints.counters.full_gc_writes.clone(),
+            ..self.clone()
+        };
+        full_gc.collect_inner(parallelism).await
+    }
+
+    async fn collect_inner(&self, parallelism: NonZeroUsize) -> Result<GcReport, TransError> {
+        let mut retry_at = None::<rt::Instant>;
+        let mut report = GcReport::default();
+        let mut checks = CheckPipeline::new(self.clone(), parallelism);
+        let mut listing: Option<BoxFuture<'_, _>> = Some(self.list_all(None).boxed());
+        let mut cursor = None;
+        let mut list_error = None;
+        loop {
+            // The next LIST overlaps the checks. Records whose check has not
+            // started stay below about two pages, and the pipeline bounds the
+            // forming epoch, which bounds memory.
+            if listing.is_none()
+                && checks.queued() < PAGE_SIZE
+                && let Some(next) = cursor.take()
+            {
+                listing = Some(self.list_all(Some(next)).boxed());
+            }
+            if listing.is_none() && checks.is_idle() {
+                break;
+            }
+            tokio::select! {
+                page = async { listing.as_mut().unwrap().await }, if listing.is_some() => {
+                    listing = None;
+                    match page {
+                        Ok(page) => {
+                            page.ids.into_iter().for_each(|tid| checks.push(tid));
+                            cursor = page.next;
+                        }
+                        // Finish the checks that started, so that their effects
+                        // are counted, then report the failed LIST.
+                        Err(error) => list_error = Some(error),
+                    }
+                    if cursor.is_none() {
+                        checks.flush();
+                    }
+                }
+                Some((tid, outcome)) = checks.next(), if !checks.is_idle() => {
+                    let counters = &self.hints.counters;
+                    counters.count_check(&outcome);
+                    match outcome {
+                        Ok(GcOutcome::Reclaimed) => {
+                            report.deleted += 1;
+                            counters.progress.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(GcOutcome::Progress) => {
+                            report.reclaimed_effects += 1;
+                            counters.progress.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(GcOutcome::Missing) => report.missing += 1,
+                        Ok(GcOutcome::Retained) => report.retained += 1,
+                        Ok(GcOutcome::Deferred(delay)) => {
+                            report.deferred += 1;
+                            let due = rt::Instant::now() + delay;
+                            retry_at = Some(retry_at.map_or(due, |at| at.min(due)));
+                        }
+                        Err(error) => {
+                            tracing::debug!(tx = %tid, error = %error, "full GC check failed");
+                            report.failed += 1;
+                            counters.failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(error) = list_error {
+            return Err(error);
+        }
+        report.retry_after = retry_at.map(|at| at.saturating_duration_since(rt::Instant::now()));
+        Ok(report)
+    }
+
     async fn run(self) {
         let mut scheduler = Scheduler::new(&self);
         loop {
@@ -355,14 +537,17 @@ impl Gc {
             scheduler.start_checks(&self, now);
             let deadline = scheduler.deadline(now);
             scheduler.start_listing(now);
-            scheduler.candidates.record_backlog(&scheduler.counters);
+            scheduler
+                .candidates
+                .record_backlog(scheduler.checks.waiting(), scheduler.checks.in_flight());
+            scheduler.record_budget();
             tokio::select! {
                 biased;
                 Some((scan, result)) = &mut scheduler.listing, if scheduler.scan.is_none() => {
                     scheduler.complete_listing(scan, result);
                 }
-                Some(completed) = &mut scheduler.checks, if scheduler.checking => {
-                    scheduler.complete_checks(completed);
+                Some((tid, result)) = scheduler.checks.next(), if !scheduler.checks.is_idle() => {
+                    scheduler.complete_check(tid, result);
                 }
                 _ = std::future::ready(()), if local_work => {}
                 _ = self.hints.wake.notified() => {}
@@ -373,51 +558,17 @@ impl Gc {
         }
     }
 
-    async fn check_batch(
-        self,
-        tids: Vec<TxId>,
-        limit: NonZeroUsize,
-    ) -> Vec<(TxId, Result<GcOutcome, TransError>)> {
-        let gc = &self;
-        let status_barrier = self.timeline.currentness_barrier();
-        let filtered = map_all_bounded(tids, limit, |tid| async move {
-            let result = gc.filter_candidate(&tid, status_barrier).await;
-            (tid, result)
-        })
-        .await;
-        let mut ready = Vec::new();
-        let mut results = Vec::with_capacity(filtered.len());
-        for (tid, result) in filtered {
-            let outcome = match result {
-                Ok(GcEligibility::Ready(observation)) => {
-                    ready.push((tid, observation));
-                    continue;
-                }
-                Ok(GcEligibility::Deferred(delay)) => Ok(GcOutcome::Deferred(delay)),
-                Ok(GcEligibility::Retained) => Ok(GcOutcome::Retained),
-                Err(error) => Err(error),
-            };
-            results.push((tid, outcome));
-        }
-        if ready.is_empty() {
-            return results;
-        }
-        // Eligibility must precede the reference bound. Yield so concurrent
-        // writers can publish observations that satisfy it; otherwise GC adds
-        // backend reads for leaves those writers are already refreshing.
-        let barrier = self.timeline.currentness_barrier();
-        rt::yield_now().await;
-        results.extend(
-            map_all_bounded(ready, limit, |(tid, observation)| async move {
-                let result = gc.try_reclaim(&tid, &observation, barrier).await;
-                (tid, result)
-            })
-            .await,
-        );
-        results
+    /// Lists one page of all transaction records of the database.
+    async fn list_all(&self, cursor: Option<ListCursor>) -> Result<TxListPage, TransError> {
+        self.hints.counters.lists.fetch_add(1, Ordering::Relaxed);
+        Ok(self
+            .tx_records
+            .scan_transaction_ids(0, 0, cursor.as_ref(), ListLimit::new(PAGE_SIZE).unwrap())
+            .await?)
     }
 
-    /// Selects candidates whose durable state and safety horizon permit reclamation.
+    /// Selects candidates whose durable state and retention period permit
+    /// reclamation.
     async fn filter_candidate(
         &self,
         tid: &TxId,
@@ -431,7 +582,8 @@ impl Gc {
             .commit_status_at(tid, Requirement::after(barrier))
             .await?;
         match TxRecordState::try_from_observation(&status.observation)? {
-            TxRecordState::Missing | TxRecordState::Pending | TxRecordState::Wounded => {
+            TxRecordState::Missing => return Ok(GcEligibility::Missing),
+            TxRecordState::Pending | TxRecordState::Wounded => {
                 return Ok(GcEligibility::Retained);
             }
             TxRecordState::Committed | TxRecordState::Aborted => {}
@@ -445,6 +597,33 @@ impl Gc {
             ));
         }
         Ok(GcEligibility::Ready(status.observation))
+    }
+
+    /// Adds to the estimate of the writes of this GC. The estimate is about
+    /// one write for each object that a check changed or deleted.
+    fn count_writes(&self, writes: u64) {
+        self.own_writes.fetch_add(writes, Ordering::Relaxed);
+    }
+
+    /// Adds an estimate of the lock releases of a check: one write for each
+    /// recorded lock, when the check changed anything. Collection deletes are
+    /// counted where they happen.
+    fn count_lock_writes(&self, record: &TxRecord, changed: bool) {
+        if changed {
+            self.count_writes(record.locks.len() as u64);
+        }
+    }
+
+    /// Deletes the objects of `collections`, and reports whether it deleted
+    /// any. Each deleted object is a GC write. Deletes before an error are not
+    /// counted, which the rough estimate accepts.
+    async fn reclaim_collections(
+        &self,
+        collections: &[CollectionAddress],
+    ) -> Result<bool, TransError> {
+        let deleted = self.collection_lifecycle.reclaim(collections).await?;
+        self.count_writes(deleted);
+        Ok(deleted > 0)
     }
 
     /// Reclaims an eligible candidate after checking its recorded references.
@@ -468,7 +647,7 @@ impl Gc {
         }
     }
 
-    /// A committed candidate past the horizon is deleted only once its complete
+    /// A committed candidate past its retention period is deleted only once its complete
     /// record proves it unreferenced. Any recorded write still pointed at by a
     /// `current_writer`, or any recorded lock still held (the commit→write-back
     /// gap), keeps it. A committed record is never pruned or force-aborted — its
@@ -513,8 +692,8 @@ impl Gc {
             .filter(|collection| !active_created.contains(*collection))
             .cloned()
             .collect::<Vec<_>>();
-        changed |= self.collection_lifecycle.reclaim(&dropped).await?;
-        changed |= self.collection_lifecycle.reclaim(&unused_prepared).await?;
+        changed |= self.reclaim_collections(&dropped).await?;
+        changed |= self.reclaim_collections(&unused_prepared).await?;
         if self.entries_referenced(tid, record, barrier).await? {
             return Ok(GcOutcome::from_progress(changed));
         }
@@ -548,15 +727,17 @@ impl Gc {
         remaining.retain(|lock| !matches!(lock, TxLock::Directory { .. }));
         let released = self.release_locks(tid, &remaining, barrier).await?;
         changed |= released.changed;
+        self.count_lock_writes(record, changed);
         if !released.complete {
             return Ok(GcOutcome::from_progress(changed));
         }
         self.tx_records.delete(observation).await?;
+        self.count_writes(1);
         Ok(GcOutcome::Reclaimed)
     }
 
-    /// An acknowledged aborted candidate holds no value. Past its ordinary
-    /// safety horizon, release its recorded effects and delete it. The
+    /// An acknowledged aborted candidate holds no value. Past its retention
+    /// period, release its recorded effects and delete it. The
     /// anti-resurrection proof is the owner's acknowledgement, not elapsed time.
     async fn reclaim_aborted(
         &self,
@@ -566,10 +747,12 @@ impl Gc {
         barrier: CurrentnessBarrier,
     ) -> Result<GcOutcome, TransError> {
         let reclaimed = self.reclaim_aborted_effects(tid, record, barrier).await?;
+        self.count_lock_writes(record, reclaimed.changed);
         if !reclaimed.complete {
             return Ok(GcOutcome::from_progress(reclaimed.changed));
         }
         self.tx_records.delete(observation).await?;
+        self.count_writes(1);
         Ok(GcOutcome::Reclaimed)
     }
 
@@ -594,8 +777,7 @@ impl Gc {
             .clear_aborted_drops(tid, &drops, Requirement::after(barrier))
             .await?;
         reclaimed.changed |= self
-            .collection_lifecycle
-            .reclaim(&record.prepared_collections)
+            .reclaim_collections(&record.prepared_collections)
             .await?;
         Ok(reclaimed)
     }
@@ -739,8 +921,7 @@ impl GcOutcome {
 struct Scheduler {
     candidates: Candidates,
     scanned: VecDeque<TxId>,
-    checks: OptionFuture<Checks>,
-    checking: bool,
+    checks: CheckPipeline,
     concurrency: usize,
     scan: Option<GcScan>,
     listing: OptionFuture<Listing>,
@@ -750,6 +931,13 @@ struct Scheduler {
     scan_failed: bool,
     retry_delay: Duration,
     counters: Arc<Counters>,
+    budget: WriteBudget,
+    // The dropped hints at the last completed LIST.
+    dropped_hints: u64,
+    // The checks that completed in the current round of decisions, and those
+    // of them that wrote.
+    round_checks: usize,
+    round_writes: usize,
 }
 
 impl Scheduler {
@@ -757,10 +945,13 @@ impl Scheduler {
         let retry_delay = gc.timing.pending_timeout();
         let counters = gc.hints.counters.clone();
         Self {
-            candidates: Candidates::new(retry_delay + gc.timing.max_clock_skew(), gc.hints.limits),
+            candidates: Candidates::new(
+                retry_delay + gc.timing.max_clock_skew(),
+                gc.hints.limits,
+                counters.clone(),
+            ),
             scanned: VecDeque::new(),
-            checks: OptionFuture::default(),
-            checking: false,
+            checks: CheckPipeline::new(gc.clone(), NonZeroUsize::MIN),
             concurrency: 1,
             scan: Some(GcScan::new(
                 gc.tx_records.clone(),
@@ -776,6 +967,16 @@ impl Scheduler {
             scan_useful: false,
             scan_failed: false,
             retry_delay,
+            budget: WriteBudget::new(
+                gc.writes.clone(),
+                gc.hints.limits.base_write_rate,
+                gc.own_writes.clone(),
+                counters.full_gc_writes.clone(),
+                rt::Instant::now(),
+            ),
+            dropped_hints: counters.dropped_hints.load(Ordering::Relaxed),
+            round_checks: 0,
+            round_writes: 0,
             counters,
         }
     }
@@ -783,13 +984,13 @@ impl Scheduler {
     fn admit_candidates(&mut self, hints: &GcHints, now: rt::Instant) -> bool {
         let (reports, more_hints) = hints.drain();
         for tid in reports {
-            self.candidates.admit(tid, false, now, &self.counters);
+            self.candidates.admit(tid, false, now);
         }
         for _ in 0..ADMISSION_BATCH {
             let Some(tid) = self.scanned.pop_front() else {
                 break;
             };
-            self.candidates.admit(tid, true, now, &self.counters);
+            self.candidates.admit(tid, true, now);
         }
         self.candidates.promote_due(now);
         more_hints
@@ -798,44 +999,82 @@ impl Scheduler {
     }
 
     fn start_checks(&mut self, gc: &Gc, now: rt::Instant) {
-        let ready = self.candidates.ready_len();
+        let ready = self.candidates.ready_len() + self.checks.queued();
         let oldest = self
             .candidates
             .oldest_ready()
             .map(|due| now.saturating_duration_since(due))
             .unwrap_or_default();
-        if ready > self.concurrency || oldest >= self.retry_delay / 16 {
-            self.concurrency = self.concurrency.saturating_mul(2).min(gc.max_checks.get());
-        } else if ready == 0 && !self.checking {
+        self.budget.refresh(now);
+        self.candidates
+            .set_capacities(self.budget.spend_limit(), self.retry_delay);
+        let backlog = ready > self.concurrency || oldest >= self.retry_delay / 16;
+        if ready == 0 && self.checks.is_idle() {
             self.concurrency = 1;
+            self.round_checks = 0;
+            self.round_writes = 0;
+        } else if self.concurrency < READ_ONLY_CONCURRENCY {
+            // Below the read-only limit, any backlog is a reason for more,
+            // within the budget.
+            if backlog && self.budget.allows_checks() {
+                self.concurrency *= 2;
+            }
+        } else if self.round_checks >= self.concurrency {
+            // One decision for each round of completions, so the concurrency
+            // follows the share of checks that write, not each event. A budget
+            // that blocks holds the concurrency: it lasts until the allowance
+            // refills.
+            let writing = self.round_writes * 2 >= self.round_checks;
+            if !writing {
+                self.concurrency = (self.concurrency / 2).max(READ_ONLY_CONCURRENCY);
+            } else if backlog && self.budget.allows_checks() {
+                self.concurrency *= 2;
+            }
+            self.round_checks = 0;
+            self.round_writes = 0;
         }
-        if self.checking {
-            return;
+        self.concurrency = self.concurrency.min(gc.max_checks.get());
+        self.checks
+            .set_limit(NonZeroUsize::new(self.concurrency).unwrap());
+        // `take_ready` chooses between hint and scan candidates (ADR-070), so
+        // only about one round of candidates leaves it.
+        while self.checks.wants_candidates()
+            && self.candidates.ready_len() > 0
+            && self.budget.reserve_check()
+        {
+            let tid = self.candidates.take_ready().unwrap();
+            self.checks.push(tid);
         }
-        let batch: Vec<_> = std::iter::from_fn(|| self.candidates.take_ready())
-            .take(self.concurrency)
-            .collect();
-        if !batch.is_empty() {
-            self.checking = true;
-            self.checks = Some(
-                gc.clone()
-                    .check_batch(batch, NonZeroUsize::new(self.concurrency).unwrap())
-                    .boxed(),
-            )
-            .into();
+        if self.candidates.ready_len() == 0 {
+            self.checks.flush();
         }
+    }
+
+    /// Publishes the state of the write budget and the concurrency.
+    fn record_budget(&self) {
+        // The cast saturates for a very large base rate.
+        self.counters
+            .spend_limit
+            .store(self.budget.spend_limit() as u64, Ordering::Relaxed);
+        self.counters
+            .concurrency
+            .store(self.concurrency as u64, Ordering::Relaxed);
     }
 
     fn can_list(&self) -> bool {
         self.scan.is_some()
             && self.scanned.is_empty()
-            && self.candidates.scans.count + PAGE_SIZE <= SCAN_CAPACITY
+            && self.candidates.scans.count + PAGE_SIZE <= self.candidates.scan_capacity
     }
 
     fn deadline(&self, now: rt::Instant) -> rt::Instant {
+        let refill = (self.candidates.ready_len() > 0)
+            .then(|| self.budget.refill_at(self.retry_delay * 40))
+            .flatten();
         self.candidates
             .next_due()
             .into_iter()
+            .chain(refill)
             .chain(self.can_list().then_some(self.next_scan))
             .min()
             .unwrap_or(now + self.retry_delay * 40)
@@ -861,6 +1100,12 @@ impl Scheduler {
         self.listing = None.into();
         let delay = match result {
             Ok(Some(ids)) => {
+                // A dropped hint names a record that can have GC work that GC
+                // does not know about, so scans must not slow down while hints
+                // are dropped (ADR-078).
+                let dropped_hints = self.counters.dropped_hints.load(Ordering::Relaxed);
+                self.scan_useful |= dropped_hints > self.dropped_hints;
+                self.dropped_hints = dropped_hints;
                 if !self.scan_failed {
                     self.cadence.observe(self.scan_useful);
                 }
@@ -888,38 +1133,39 @@ impl Scheduler {
         self.scan = Some(scan);
     }
 
-    fn complete_checks(&mut self, completed: Vec<(TxId, Result<GcOutcome, TransError>)>) {
-        self.checking = false;
-        self.checks = None.into();
-        for (tid, result) in completed {
-            let mut candidate = self.candidates.complete(&tid);
-            let retry = match result {
-                Ok(GcOutcome::Reclaimed) => {
-                    self.counters.progress.fetch_add(1, Ordering::Relaxed);
-                    self.scan_useful |= candidate.from_scan;
-                    None
-                }
-                Ok(GcOutcome::Progress) => {
-                    self.counters.progress.fetch_add(1, Ordering::Relaxed);
-                    self.scan_useful |= candidate.from_scan;
-                    Some(self.retry_delay)
-                }
-                Ok(GcOutcome::Deferred(delay)) => Some(delay),
-                Ok(GcOutcome::Retained) => candidate
-                    .reported_again
-                    .then_some(self.candidates.hint_delay),
-                Err(error) => {
-                    tracing::debug!(tx = %tid, error = %error, "GC candidate check deferred");
-                    self.counters.failures.fetch_add(1, Ordering::Relaxed);
-                    self.scan_failed |= candidate.from_scan;
-                    candidate.failures = candidate.failures.saturating_add(1);
-                    Some(self.retry_delay * (1u32 << candidate.failures.min(4)))
-                }
-            };
-            if let Some(delay) = retry {
-                self.candidates
-                    .defer(tid, candidate, rt::Instant::now() + delay);
+    fn complete_check(&mut self, tid: TxId, result: Result<GcOutcome, TransError>) {
+        self.counters.count_check(&result);
+        self.budget.release_check();
+        self.round_checks += 1;
+        let mut candidate = self.candidates.complete(&tid);
+        let retry = match result {
+            Ok(GcOutcome::Reclaimed) => {
+                self.counters.progress.fetch_add(1, Ordering::Relaxed);
+                self.scan_useful |= candidate.from_scan;
+                self.round_writes += 1;
+                None
             }
+            Ok(GcOutcome::Progress) => {
+                self.counters.progress.fetch_add(1, Ordering::Relaxed);
+                self.scan_useful |= candidate.from_scan;
+                self.round_writes += 1;
+                Some(self.retry_delay)
+            }
+            Ok(GcOutcome::Deferred(delay)) => Some(delay),
+            Ok(GcOutcome::Retained | GcOutcome::Missing) => candidate
+                .reported_again
+                .then_some(self.candidates.hint_delay),
+            Err(error) => {
+                tracing::debug!(tx = %tid, error = %error, "GC candidate check deferred");
+                self.counters.failures.fetch_add(1, Ordering::Relaxed);
+                self.scan_failed |= candidate.from_scan;
+                candidate.failures = candidate.failures.saturating_add(1);
+                Some(self.retry_delay * (1u32 << candidate.failures.min(4)))
+            }
+        };
+        if let Some(delay) = retry {
+            self.candidates
+                .defer(tid, candidate, rt::Instant::now() + delay);
         }
     }
 }
@@ -951,23 +1197,17 @@ impl GcHints {
     pub(crate) fn schedule_all(&self, tids: impl IntoIterator<Item = TxId>) {
         for tid in tids {
             if self.limits.max_pending_hints == 0 {
-                self.counters
-                    .dropped_candidates
-                    .fetch_add(1, Ordering::Relaxed);
+                self.counters.drop_candidate(false);
                 continue;
             }
             // A busy consumer must not put a writer behind the GC queue lock.
             let Ok(mut queue) = self.queue.try_lock() else {
-                self.counters
-                    .dropped_candidates
-                    .fetch_add(1, Ordering::Relaxed);
+                self.counters.drop_candidate(false);
                 continue;
             };
             if queue.len() == self.limits.max_pending_hints {
                 queue.pop_front();
-                self.counters
-                    .dropped_candidates
-                    .fetch_add(1, Ordering::Relaxed);
+                self.counters.drop_candidate(false);
             }
             let wake = queue.is_empty();
             queue.push_back(tid);
@@ -1003,6 +1243,14 @@ pub struct GcStats {
     pub progress: u64,
     /// Transaction-record LIST requests.
     pub lists: u64,
+    /// Completed GC checks of background GC and full GCs.
+    pub checks: u64,
+    /// Checks that found their record inside its retention period, so that
+    /// they read it without a chance to reclaim it.
+    pub deferred_checks: u64,
+    /// The estimated writes of GC, which background GC spends from its write
+    /// budget. It counts one write for each object that GC changed or deleted.
+    pub writes: u64,
 }
 
 impl AddAssign for GcStats {
@@ -1011,6 +1259,9 @@ impl AddAssign for GcStats {
         self.failures += rhs.failures;
         self.progress += rhs.progress;
         self.lists += rhs.lists;
+        self.checks += rhs.checks;
+        self.deferred_checks += rhs.deferred_checks;
+        self.writes += rhs.writes;
     }
 }
 
@@ -1024,6 +1275,9 @@ impl Sub for GcStats {
             failures: self.failures.saturating_sub(rhs.failures),
             progress: self.progress.saturating_sub(rhs.progress),
             lists: self.lists.saturating_sub(rhs.lists),
+            checks: self.checks.saturating_sub(rhs.checks),
+            deferred_checks: self.deferred_checks.saturating_sub(rhs.deferred_checks),
+            writes: self.writes.saturating_sub(rhs.writes),
         }
     }
 }
@@ -1041,14 +1295,34 @@ pub struct GcDiagnostics {
     pub oldest_ready_age: Duration,
     /// Prefix count used for new traversals.
     pub prefix_count: u64,
+    /// The whole writes in each second that the write budget of background GC
+    /// allows now.
+    pub spend_limit: u64,
+    /// The checks that background GC can run at the same time now.
+    pub concurrency: u64,
 }
 
 #[derive(Default)]
 struct Counters {
+    // The hints dropped since GC started. Unlike `dropped_candidates`, a stats
+    // snapshot does not reset it, so the scan cadence can measure its own
+    // intervals.
+    dropped_hints: AtomicU64,
+    // The estimated writes of every full GC of this instance.
+    full_gc_writes: Arc<AtomicU64>,
     dropped_candidates: AtomicU64,
     failures: AtomicU64,
     progress: AtomicU64,
     lists: AtomicU64,
+    checks: AtomicU64,
+    deferred_checks: AtomicU64,
+    // The writes of `writes` that the last stats snapshot reported. The
+    // estimates themselves only grow, because the write budget reads them.
+    reported_writes: AtomicU64,
+    // The estimated writes of background GC.
+    background_writes: Arc<AtomicU64>,
+    spend_limit: AtomicU64,
+    concurrency: AtomicU64,
     ready: AtomicU64,
     waiting: AtomicU64,
     in_flight: AtomicU64,
@@ -1057,12 +1331,36 @@ struct Counters {
 }
 
 impl Counters {
+    /// Counts a dropped candidate. Only a dropped hint is also scan demand: a
+    /// dropped scan candidate is a record that the next scan pass finds again.
+    fn drop_candidate(&self, from_scan: bool) {
+        self.dropped_candidates.fetch_add(1, Ordering::Relaxed);
+        if !from_scan {
+            self.dropped_hints.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn take(&self) -> GcStats {
         GcStats {
             dropped_candidates: self.dropped_candidates.swap(0, Ordering::Relaxed),
             failures: self.failures.swap(0, Ordering::Relaxed),
             progress: self.progress.swap(0, Ordering::Relaxed),
             lists: self.lists.swap(0, Ordering::Relaxed),
+            checks: self.checks.swap(0, Ordering::Relaxed),
+            deferred_checks: self.deferred_checks.swap(0, Ordering::Relaxed),
+            writes: {
+                let writes = self.background_writes.load(Ordering::Relaxed)
+                    + self.full_gc_writes.load(Ordering::Relaxed);
+                writes.saturating_sub(self.reported_writes.swap(writes, Ordering::Relaxed))
+            },
+        }
+    }
+
+    /// Counts a completed check.
+    fn count_check(&self, outcome: &Result<GcOutcome, TransError>) {
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        if matches!(outcome, Ok(GcOutcome::Deferred(_))) {
+            self.deferred_checks.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1078,6 +1376,8 @@ impl Counters {
                 .map(|due| rt::Instant::now().saturating_duration_since(due))
                 .unwrap_or_default(),
             prefix_count: self.prefix_count.load(Ordering::Relaxed),
+            spend_limit: self.spend_limit.load(Ordering::Relaxed),
+            concurrency: self.concurrency.load(Ordering::Relaxed),
         }
     }
 }

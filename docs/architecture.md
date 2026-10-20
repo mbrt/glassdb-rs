@@ -177,7 +177,7 @@ not depend on. These limits keep a change to one policy from spreading.
 | `TopologyMembership` | topology participant admission and departure | structural intents, GC eligibility |
 | `StructuralRecovery` | structural intent lifecycle, fencing, orphan cleanup | split and merge planning, maintenance causes |
 | `Monitor` | transaction status, wounds, lease refresh, waits | leaves |
-| `Gc` | GC queues, GC checks, safety horizon, reclamation | commit policy, structural recovery |
+| `Gc` | GC queues, GC checks, retention period, reclamation | commit policy, structural recovery |
 
 These rules are not visible from any one module:
 
@@ -842,13 +842,22 @@ mark-sweep ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
 - **Local state.** Each opened `Database` has its own GC state, and clones share
   it. Memory, admission, and concurrency are all bounded. GC scans have their
   own capacity, so they can find work after hints are dropped.
-- **Safety horizon.** GC keeps a candidate that is not `Wounded` for the lease
-  plus the allowed clock skew. The GC check is not atomic, so it can race a
-  lock that a live transaction took but did not publish yet. GC changes a dead
-  `Pending` record to `Wounded`, so its death survives an owner suspension of
-  any length. GC can then reclaim the effects of that record, but cannot delete
-  it until the owner changes it to `Aborted`
-  ([ADR-059](adr/059-pin-foreign-wounds-until-owner-retirement.md)).
+- **Status before leaves.** GC checks only committed and aborted records
+  ([ADR-071](adr/071-gc-skips-pending-and-wounded-transactions.md)). It reads
+  the status first, then captures a currentness barrier, and makes the reads
+  that prove the absence of a reference after that barrier. Write-back sets a
+  committed transaction as the writer of each key it wrote, and only an owner
+  with a retirement proof writes `Aborted`
+  ([ADR-059](adr/059-pin-foreign-wounds-until-owner-retirement.md)). So the
+  check cannot miss a writer or a value-bearing lock, and its safety does not
+  depend on time ([ADR-079](adr/079-gc-safety-does-not-depend-on-time.md)).
+  Locks on keys whose value the transaction does not hold can stay behind as
+  stray holders. Each costs a grace wait and a `Wounded` record.
+- **Retention period.** GC still waits the pending timeout plus the allowed
+  clock skew, from the last update of the record, before it checks a final
+  record ([ADR-079](adr/079-gc-safety-does-not-depend-on-time.md)). The wait
+  makes false in-doubt commit outcomes and leaked wounds rarer. It is not a
+  safety rule.
 - **Reclamation through the coordinator.** GC releases locks through the unlock
   methods of `Locker`, so its changes batch with live traffic in the same
   coordinator round ([ADR-029](adr/029-gc-through-shard-coordinator.md)). Entry
@@ -856,14 +865,52 @@ mark-sweep ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
   each need their own completion evidence. GC deletes only the exact revision
   that it checked. It reclaims a dropped collection one node page at a time and
   removes the root and the collection record last.
-- **Writer independence.** GC backlog never blocks transaction admission or completion, adds requests
-  to the commit path, or runs inside transaction bodies. At the GC limit,
-  garbage only stays longer. Sustained overload can delay reclamation without
-  limit. Shared CPU, backend requests, and coordinator rounds can still affect
-  transaction latency.
+- **Writer independence.** GC backlog never blocks transaction admission or
+  completion, adds requests to the commit path, or runs inside transaction
+  bodies. At the GC limit, garbage only stays longer. Shared CPU, backend
+  requests, and coordinator rounds can still affect transaction latency.
 
 GC deletion counts are approximate: a delete of a missing object succeeds, so
 two database instances can count the same deletion.
+
+### Write budget and check scheduling
+
+Background GC limits its writes with a write budget
+([ADR-078](adr/078-full-gc-and-gc-write-budget.md)). The engine gives GC a
+read-only `WriteMeter` of the writes of its `StatsBackend`. GC estimates its own
+writes from the outcomes of its checks, and earns budget from the other writes
+of the instance: about one GC write for each other write, spent over about ten
+minutes, plus `GcLimits::base_write_rate`. So under a sustained load GC keeps
+up with the garbage of its instance, and after a burst it uses the budget of
+the burst. Each check reserves a write before it starts, so a refill cannot
+start a burst of checks. The count needs no attribution in the write path, so
+it is rough: splits, merges, and lost CASes also add budget.
+
+The candidate capacities follow the budget: about the checks that the spend
+limit allows while a candidate holds its slot, between a floor and the maximum
+of `GcLimits`. Concurrency starts at one check. Below 8 it grows while ready
+work waits. Above 8 it grows only while most checks of a round write, so checks
+that only read, of records that stay live, keep it at 8. `gc_parallelism` is
+only a safety limit.
+
+Checks run in a pipeline. Status reads run without pauses. A reclaimable record
+joins an epoch, which gets one currentness barrier when it is full, when it has
+waited one second, or when no more candidates come for now. The reference checks
+of an epoch share their leaf reads and complete independently. A barrier serves
+only records whose status read completed before it
+([ADR-079](adr/079-gc-safety-does-not-depend-on-time.md)).
+
+### Full GC
+
+`Database::collect_garbage` runs a full GC
+([ADR-078](adr/078-full-gc-and-gc-write-budget.md)). It lists every transaction
+record once and checks each one with the same rules and the same check
+pipeline as background GC, outside the candidate queues, the scan cadence, and
+the write budget. It does not wait for retention periods, so the caller repeats
+it until no record is deferred. It runs in the
+caller's task. A caller that drops it can stop a check partway, which is safe
+for the same reason as a background check that stops at shutdown. Benchmarks
+use it to start a measurement with no garbage from the warm-up.
 
 ### Adaptive GC scans
 
@@ -881,8 +928,11 @@ of held cursors.
 
 The delay between turns follows the recent useful progress of scan-origin
 checks, with random variation and a cap tied to the pending-transaction timeout.
-Errors use separate retries and never count as idle turns. These limits are
-initial values. Production workloads must guide later tuning.
+A hint dropped since the last turn also counts as progress, because only a scan
+can find its record
+([ADR-078](adr/078-full-gc-and-gc-write-budget.md)). Errors use separate
+retries and never count as idle turns. These limits are initial values.
+Production workloads must guide later tuning.
 
 GC runs only while a `Database` handle is open. To add GC capacity, open a
 database instance that submits no transactions. All local GC state is

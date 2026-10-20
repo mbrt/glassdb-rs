@@ -1,9 +1,12 @@
 use std::error::Error;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use glassdb::{Collection, CollectionPath, Database, Error as GError, RestructurerStats, Stats};
+use glassdb::{
+    Collection, CollectionPath, Database, Error as GError, GcStats, RestructurerStats, Stats,
+};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::run::shutdown_databases_until;
 use glassdb_concurr::rt;
@@ -13,6 +16,11 @@ use super::result;
 use super::{key_bytes, value};
 
 const COLLECTION_PREFIX: &str = "mix";
+// The full GCs run while no worker runs, so they can use many more checks than
+// background GC. A full GC checks one LIST page of 1,000 records at a time, and
+// each check waits mostly for backend latency, so the limit lets a whole page
+// run at the same time.
+const FULL_GC_PARALLELISM: NonZeroUsize = NonZeroUsize::new(1024).unwrap();
 
 /// Inputs that determine how storage is seeded and settled.
 pub(super) struct SeedConfig {
@@ -20,6 +28,7 @@ pub(super) struct SeedConfig {
     pub(super) pool_size: usize,
     pub(super) quiet_period: Duration,
     pub(super) timeout: Duration,
+    pub(super) gc_timeout: Duration,
     pub(super) drain_timeout: Duration,
 }
 
@@ -112,14 +121,14 @@ impl PreparedCell {
     ) -> Warmup {
         let started = Instant::now();
         let start = restructurer_stats(&self.databases);
+        let gc_start = gc_stats(&self.databases);
         tokio::select! {
             () = rt::sleep(minimum) => {}
             () = wait_for_stop(stop) => {}
         }
         let remaining = timeout.saturating_sub(started.elapsed());
-        let outcome = wait_for_quiet(
+        let settled = wait_for_quiet(
             || structural_changes(&self.databases),
-            || true,
             stop,
             quiet,
             remaining,
@@ -130,8 +139,15 @@ impl PreparedCell {
             splits: end.splits - start.splits,
             merges: end.merges - start.merges,
             elapsed: started.elapsed(),
-            quiet: outcome.quiet,
+            quiet: settled,
+            gc: gc_stats(&self.databases) - gc_start,
         }
+    }
+
+    /// Deletes the garbage of the warm-up while the workers wait, so that the
+    /// measured interval does not do that GC work.
+    pub(super) async fn collect_garbage(&self, timeout: Duration) -> Result<Collected, GError> {
+        collect_garbage_until_clean(&self.databases[0], timeout).await
     }
 
     /// Starts the measured phase by capturing the counter baselines of the
@@ -154,6 +170,8 @@ pub(super) struct Warmup {
     pub(super) elapsed: Duration,
     /// Whether the changes stopped before the timeout.
     pub(super) quiet: bool,
+    /// The activity of background GC during the warm-up.
+    pub(super) gc: GcStats,
 }
 
 /// A prepared cell with measurement counter baselines captured.
@@ -208,7 +226,7 @@ fn collection_paths(count: usize) -> Result<Vec<CollectionPath>, GError> {
 
 fn open_db(handle: &Handle, name: &str, backend: Arc<dyn Backend>) -> Database {
     handle
-        .block_on(Database::open(name, backend))
+        .block_on(crate::database_builder(name, backend).open())
         .expect("open db")
 }
 
@@ -233,6 +251,16 @@ fn structural_changes(databases: &[Database]) -> u64 {
     stats.splits + stats.merges
 }
 
+/// Returns the sum of the GC counters of `databases`.
+fn gc_stats(databases: &[Database]) -> GcStats {
+    databases
+        .iter()
+        .fold(GcStats::default(), |mut total, database| {
+            total += database.stats().gc;
+            total
+        })
+}
+
 /// Returns the sum of the restructurer counters of `databases`.
 fn restructurer_stats(databases: &[Database]) -> RestructurerStats {
     databases
@@ -243,18 +271,6 @@ fn restructurer_stats(databases: &[Database]) -> RestructurerStats {
         })
 }
 
-/// Returns the garbage collection candidates that `databases` know of and have
-/// not finished.
-fn gc_backlog(databases: &[Database]) -> u64 {
-    databases
-        .iter()
-        .map(|database| {
-            let gc = database.diagnostics().gc;
-            gc.ready + gc.deferred + gc.in_flight
-        })
-        .sum()
-}
-
 /// Waits until `stop` is set.
 async fn wait_for_stop(stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
@@ -262,12 +278,42 @@ async fn wait_for_stop(stop: &AtomicBool) {
     }
 }
 
-/// Returns the garbage collection progress of `databases`.
-fn gc_progress(databases: &[Database]) -> u64 {
-    databases
-        .iter()
-        .map(|database| database.stats().gc.progress)
-        .sum()
+/// The transaction records that full GCs deleted, and the time they took.
+#[derive(Clone, Copy)]
+pub(super) struct Collected {
+    pub(super) deleted: u64,
+    pub(super) elapsed: Duration,
+}
+
+/// Runs full GCs on `database` until no garbage that a full GC can find is
+/// left, or until `timeout`.
+///
+/// The records of the last safety horizon are deferred, and a check that only
+/// reclaims some effects of a record can delete it the next time.
+async fn collect_garbage_until_clean(
+    database: &Database,
+    timeout: Duration,
+) -> Result<Collected, GError> {
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut deleted = 0;
+    loop {
+        let report = database.collect_garbage(FULL_GC_PARALLELISM).await?;
+        deleted += report.deleted;
+        if report.deferred == 0 && report.reclaimed_effects == 0 {
+            return Ok(Collected {
+                deleted,
+                elapsed: started.elapsed(),
+            });
+        }
+        let wait = report.retry_after.unwrap_or_default();
+        if tokio::time::Instant::now() + wait >= deadline {
+            return Err(GError::internal(format!(
+                "garbage collection did not finish within {timeout:?}: {report:?}"
+            )));
+        }
+        rt::sleep(wait).await;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -305,32 +351,23 @@ fn deadline_expired(started: Instant, now: Instant, timeout: Duration) -> bool {
     now.duration_since(started) >= timeout
 }
 
-struct QuietOutcome {
-    elapsed: Duration,
-    quiet: bool,
-}
-
-/// Waits until `changes` stops moving for a full quiet period while `idle`
-/// holds, or until `timeout` or `stop`.
+/// Waits until `changes` stops moving for a full quiet period, or until
+/// `timeout` or `stop`, and reports whether the quiet period was reached.
 async fn wait_for_quiet(
     changes: impl Fn() -> u64,
-    idle: impl Fn() -> bool,
     stop: &AtomicBool,
     quiet: Duration,
     timeout: Duration,
-) -> QuietOutcome {
+) -> bool {
     let started = Instant::now();
     let mut tracker = QuietTracker::new(changes(), started);
     let poll = (quiet / 4).clamp(Duration::from_millis(20), Duration::from_millis(250));
     loop {
         let now = Instant::now();
         tracker.observe(changes(), now);
-        let is_quiet = tracker.is_quiet(now, quiet) && idle();
+        let is_quiet = tracker.is_quiet(now, quiet);
         if is_quiet || deadline_expired(started, now, timeout) || stop.load(Ordering::Relaxed) {
-            return QuietOutcome {
-                elapsed: started.elapsed(),
-                quiet: is_quiet,
-            };
+            return is_quiet;
         }
         tokio::time::sleep(poll).await;
     }
@@ -383,36 +420,35 @@ fn seed_and_settle(
         ));
         return Err(error.into());
     }
-    // Garbage collection also changes the stored state, so every fork would
-    // otherwise carry work that its cell does while it measures. A hinted
-    // candidate waits longer than a short quiet period before its first check,
-    // so quiet counters alone do not prove that no work is left.
     let databases = std::slice::from_ref(&database);
-    let changes = || structural_changes(databases) + gc_progress(databases);
-    let idle = || gc_backlog(databases) == 0;
-    let outcome = handle.block_on(wait_for_quiet(
-        changes,
-        idle,
+    let started = Instant::now();
+    let settled = handle.block_on(wait_for_quiet(
+        || structural_changes(databases),
         &AtomicBool::new(false),
         config.quiet_period,
         config.timeout,
     ));
+    // Garbage collection also changes the stored state, so every fork would
+    // otherwise carry work that its cell does while it measures.
+    let collected = handle.block_on(collect_garbage_until_clean(&database, config.gc_timeout));
     let settlement = Settlement {
         splits: database.stats().restructurer.splits,
-        elapsed: outcome.elapsed,
+        elapsed: started.elapsed(),
     };
     handle.block_on(shutdown_databases_until(
         databases,
         tokio::time::Instant::now() + config.drain_timeout,
     ))?;
-    if !outcome.quiet {
+    if !settled {
         return Err(format!(
-            "setup splits, merges, and garbage collection did not stay quiet for {:?} \
-             within {:?} (completed splits={})",
+            "setup splits and merges did not stay quiet for {:?} within {:?} \
+             (completed splits={})",
             config.quiet_period, config.timeout, settlement.splits
         )
         .into());
     }
+    let collected = collected?;
+    eprintln!("{}", result::garbage_collected(&collected));
     eprintln!(
         "{}",
         result::setup_settled(settlement.elapsed, settlement.splits, config.quiet_period)
@@ -465,6 +501,7 @@ mod tests {
                 pool_size: 3,
                 quiet_period: Duration::from_millis(20),
                 timeout: Duration::from_secs(1),
+                gc_timeout: Duration::from_secs(120),
                 drain_timeout: Duration::from_secs(1),
             },
         )?;

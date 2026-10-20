@@ -339,6 +339,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         mon.protocol_timing(),
         hints.clone(),
         DEFAULT_GC_PARALLELISM,
+        None,
     );
     Ctx {
         gc,
@@ -443,6 +444,32 @@ async fn is_gone(tx_records: &TxRecordStore, id: &TxId) -> bool {
     )
 }
 
+impl Gc {
+    /// Checks `tids` through the pipeline that background GC and full GCs use,
+    /// and returns the outcomes in the order of `tids`.
+    async fn check_through_pipeline(
+        self,
+        tids: Vec<TxId>,
+        limit: NonZeroUsize,
+    ) -> Vec<(TxId, Result<GcOutcome, TransError>)> {
+        let mut checks = pipeline::CheckPipeline::new(self, limit);
+        for tid in &tids {
+            checks.push(*tid);
+        }
+        checks.flush();
+        let mut done = BTreeMap::new();
+        while let Some((tid, result)) = checks.next().await {
+            done.insert(tid, result);
+        }
+        tids.into_iter()
+            .map(|tid| {
+                let result = done.remove(&tid).expect("each candidate completes once");
+                (tid, result)
+            })
+            .collect()
+    }
+}
+
 async fn check_candidate(gc: &Gc, tid: &TxId) -> Result<GcOutcome, TransError> {
     let status = gc
         .filter_candidate(tid, gc.timeline.currentness_barrier())
@@ -452,6 +479,7 @@ async fn check_candidate(gc: &Gc, tid: &TxId) -> Result<GcOutcome, TransError> {
         GcEligibility::Ready(observation) => gc.try_reclaim(tid, &observation, barrier).await,
         GcEligibility::Deferred(delay) => Ok(GcOutcome::Deferred(delay)),
         GcEligibility::Retained => Ok(GcOutcome::Retained),
+        GcEligibility::Missing => Ok(GcOutcome::Missing),
     }
 }
 
@@ -909,7 +937,7 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
         let outcomes = ctx
             .gc
             .clone()
-            .check_batch(vec![id], NonZeroUsize::MIN)
+            .check_through_pipeline(vec![id], NonZeroUsize::MIN)
             .await;
         assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
         assert!(!is_gone(&peer.tx_records, &id).await);
@@ -934,7 +962,7 @@ async fn reference_checks_refresh_leaves_without_refreshing_indexes() {
         let outcomes = ctx
             .gc
             .clone()
-            .check_batch(vec![id], NonZeroUsize::MIN)
+            .check_through_pipeline(vec![id], NonZeroUsize::MIN)
             .await;
         assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Reclaimed);
         assert!(is_gone(&ctx.tx_records, &id).await);
@@ -1009,7 +1037,7 @@ async fn reference_checks_follow_a_split_behind_a_cached_parent() {
         let outcomes = ctx
             .gc
             .clone()
-            .check_batch(vec![id], NonZeroUsize::MIN)
+            .check_through_pipeline(vec![id], NonZeroUsize::MIN)
             .await;
         assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
         assert!(!is_gone(&peer.tx_records, &id).await);
@@ -1075,7 +1103,7 @@ async fn reference_checks_refresh_a_cached_leaf_that_became_an_index() {
     let outcomes = ctx
         .gc
         .clone()
-        .check_batch(vec![id], NonZeroUsize::MIN)
+        .check_through_pipeline(vec![id], NonZeroUsize::MIN)
         .await;
     assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Retained);
     assert!(!is_gone(&peer.tx_records, &id).await);
@@ -3370,7 +3398,7 @@ async fn cached_candidate_converges_after_a_peer_deletes_it() {
 
     assert_eq!(
         check_candidate(&ctx.gc, &id).await.unwrap(),
-        GcOutcome::Retained
+        GcOutcome::Missing
     );
 }
 
@@ -3461,7 +3489,7 @@ async fn young_final_candidates_complete_without_a_reference_pass() {
     let outcomes = ctx
         .gc
         .clone()
-        .check_batch(ids.clone(), NonZeroUsize::new(2).unwrap())
+        .check_through_pipeline(ids.clone(), NonZeroUsize::new(2).unwrap())
         .now_or_never()
         .expect("ineligible cached candidates must not schedule reference work");
 
@@ -3489,7 +3517,7 @@ async fn reference_checks_reuse_a_concurrent_writer_observation() {
     // Poll GC first so the writer refreshes the leaf after the reference bound.
     let (outcomes, ()) = tokio::join!(
         biased;
-        ctx.gc.clone().check_batch(vec![id], NonZeroUsize::MIN),
+        ctx.gc.clone().check_through_pipeline(vec![id], NonZeroUsize::MIN),
         store_entry(&ctx, b"k", writer_entry(b"k", &tx(3))),
     );
 
@@ -3596,6 +3624,111 @@ async fn reference_checks_follow_candidate_filtering() {
     assert!(lookup_entry(&ctx, b"k").await.unwrap().is_locked_by(&id));
 }
 
+// One epoch shares one barrier. A barrier captured before a record's status
+// read completes must not serve it: the record can commit after the barrier, so
+// a leaf read at that barrier can miss its lock (ADR-079).
+#[tokio::test(start_paused = true)]
+async fn an_epoch_barrier_follows_every_status_read_it_serves() {
+    let backend = Arc::new(MemoryBackend::new());
+    let hooked = HookBackend::new(backend.clone());
+    let ctx = new_ctx_with(hooked.clone()).await;
+    let (early, late) = (tx(20), tx(21));
+    ctx.tx_records
+        .set(&committed(early, PAST_HORIZON, &[b"e"], &[]))
+        .await
+        .unwrap();
+    store_entry(&ctx, b"e", writer_entry(b"e", &tx(22))).await;
+    let mut record = committed(late, Duration::ZERO, &[b"k"], &[b"k"]);
+    record.status = TxCommitStatus::Pending;
+    ctx.tx_records.set(&record).await.unwrap();
+    store_entry(&ctx, b"k", writer_entry(b"k", &tx(23))).await;
+    let entered = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    hooked.set_before({
+        let path = ObjectPath::Transaction {
+            db_prefix: DbPrefix::try_from("db").unwrap(),
+            id: late,
+        }
+        .to_string();
+        let entered = entered.clone();
+        let resume = resume.clone();
+        move |op| {
+            let pause = op.path() == path
+                && matches!(
+                    op,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                );
+            let entered = entered.clone();
+            let resume = resume.clone();
+            Box::pin(async move {
+                if pause {
+                    entered.notify_one();
+                    resume.notified().await;
+                }
+                Ok(())
+            })
+        }
+    });
+
+    let checks = tokio::spawn(
+        ctx.gc
+            .clone()
+            .check_through_pipeline(vec![early, late], NonZeroUsize::new(2).unwrap()),
+    );
+    entered.notified().await;
+    // The early record's status read completed, so its epoch seals at the end
+    // of its wait and its barrier serves its check while the late read waits.
+    tokio::time::advance(pipeline::EPOCH_WAIT).await;
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
+    assert!(is_gone(&ctx.tx_records, &early).await);
+    // Read the leaf of the late record at a barrier from now, before the late
+    // record commits.
+    ctx.nodes
+        .load_leaf(
+            &root_path(),
+            Requirement::after(ctx.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    let peer = AssemblyFixture::new(
+        backend,
+        DbPrefix::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let mut edit = peer
+        .nodes
+        .load_leaf(&root_path(), Requirement::ANY)
+        .await
+        .unwrap()
+        .into_edit();
+    let mut entries: BTreeMap<Vec<u8>, LeafEntry> = edit
+        .entries()
+        .entries()
+        .cloned()
+        .map(|entry| (entry.key.clone(), entry))
+        .collect();
+    entries.insert(b"k".to_vec(), locked_entry(b"k", &late));
+    edit.set_entries(LeafBody::from_entries(entries.into_values()));
+    assert!(peer.nodes.commit_leaf(edit).await.unwrap().is_applied());
+    record.status = TxCommitStatus::Committed;
+    record.timestamp = Some(base() - PAST_HORIZON);
+    let pending = peer
+        .tx_records
+        .get_at(&late, Requirement::ANY)
+        .await
+        .unwrap();
+    peer.tx_records.set_if(&record, &pending).await.unwrap();
+    resume.notify_one();
+    let outcomes = checks.await.unwrap();
+
+    assert_eq!(outcomes[0].1.as_ref().unwrap(), &GcOutcome::Reclaimed);
+    assert_eq!(outcomes[1].1.as_ref().unwrap(), &GcOutcome::Retained);
+    assert!(is_gone(&ctx.tx_records, &early).await);
+    assert!(!is_gone(&ctx.tx_records, &late).await);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_transient_failure_keeps_the_candidate_until_retry() {
     let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
@@ -3670,6 +3803,12 @@ async fn a_ready_hint_queue_does_not_starve_the_scan() {
     for _ in 0..64 {
         rt::yield_now().await;
     }
+    // Hint checks keep status reads in flight, so the scan candidate's epoch
+    // closes when its wait ends.
+    tokio::time::advance(pipeline::EPOCH_WAIT).await;
+    for _ in 0..64 {
+        rt::yield_now().await;
+    }
     assert!(ctx.gc.stats_and_reset().lists > 0);
     assert!(is_gone(&ctx.tx_records, &id).await);
     assert!(reclaimed_with_ready_hints.load(Ordering::SeqCst));
@@ -3682,6 +3821,7 @@ fn hint_producers_share_capacity_and_keep_the_latest_reports() {
         let hints = GcHints::new(GcLimits {
             max_pending_hints: capacity,
             max_hint_candidates: 0,
+            ..GcLimits::default()
         });
         let clone = hints.clone();
         let ids: Vec<_> = (0..5).map(tx).collect();
@@ -3700,40 +3840,41 @@ fn hint_producers_share_capacity_and_keep_the_latest_reports() {
 
 #[test]
 fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
-    for capacity in [1, 3, HINT_CAPACITY] {
+    for capacity in [1, 3, MIN_HINT_CAPACITY] {
         let now = rt::Instant::now();
-        let counters = Counters::default();
+        let counters = Arc::new(Counters::default());
         let mut candidates = Candidates::new(
             Duration::ZERO,
             GcLimits {
                 max_hint_candidates: capacity,
                 ..GcLimits::default()
             },
+            counters.clone(),
         );
         let ids: Vec<_> = (0u64..capacity as u64)
             .map(|i| TxId::with_priority(0, &i.to_be_bytes()))
             .collect();
         for id in &ids {
-            candidates.admit(*id, false, now, &counters);
+            candidates.admit(*id, false, now);
         }
         let overflow = TxId::with_priority(0, b"overflow");
-        candidates.admit(overflow, false, now, &counters);
+        candidates.admit(overflow, false, now);
         assert_eq!(counters.take().dropped_candidates, 1);
         for _ in 0..capacity {
             let id = candidates.take_ready().unwrap();
-            candidates.admit(overflow, false, now, &counters);
+            candidates.admit(overflow, false, now);
             assert_eq!(counters.take().dropped_candidates, 1);
             let candidate = candidates.complete(&id);
             candidates.defer(id, candidate, now + Duration::from_secs(1));
         }
-        candidates.record_backlog(&counters);
+        candidates.record_backlog(0, 0);
         assert_eq!(counters.diagnostics().deferred, capacity as u64);
         assert_eq!(counters.diagnostics().ready, 0);
-        candidates.admit(overflow, false, now, &counters);
+        candidates.admit(overflow, false, now);
         assert_eq!(counters.take().dropped_candidates, 1);
 
         candidates.promote_due(now + Duration::from_secs(1));
-        candidates.record_backlog(&counters);
+        candidates.record_backlog(0, 0);
         let promoted = capacity.min(ADMISSION_BATCH);
         assert_eq!(counters.diagnostics().ready, promoted as u64);
         assert_eq!(
@@ -3742,7 +3883,7 @@ fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
         );
         let id = candidates.take_ready().unwrap();
         candidates.complete(&id);
-        candidates.admit(overflow, false, now, &counters);
+        candidates.admit(overflow, false, now);
         assert_eq!(counters.take().dropped_candidates, 0);
         assert_eq!(candidates.oldest_ready(), Some(now));
     }
@@ -3751,31 +3892,31 @@ fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
 #[test]
 fn scan_reports_preserve_candidates_in_each_scheduling_state() {
     let now = rt::Instant::now();
-    let counters = Counters::default();
-    let mut candidates = Candidates::default();
+    let counters = Arc::new(Counters::default());
+    let mut candidates = Candidates::new(Duration::ZERO, GcLimits::default(), counters.clone());
     let hint = tx(1);
     let ready_scan = tx(2);
     let deferred_scan = tx(3);
-    candidates.admit(hint, false, now, &counters);
-    candidates.admit(ready_scan, false, now, &counters);
-    candidates.admit(ready_scan, true, now, &counters);
+    candidates.admit(hint, false, now);
+    candidates.admit(ready_scan, false, now);
+    candidates.admit(ready_scan, true, now);
     assert_eq!(candidates.take_ready(), Some(ready_scan));
     candidates.complete(&ready_scan);
 
     let running = candidates.take_ready().unwrap();
     assert_eq!(running, hint);
-    candidates.admit(running, true, now, &counters);
+    candidates.admit(running, true, now);
     let candidate = candidates.complete(&running);
     assert!(!candidate.reported_again);
     candidates.defer(running, candidate, now + Duration::from_secs(1));
 
-    candidates.admit(deferred_scan, false, now, &counters);
+    candidates.admit(deferred_scan, false, now);
     assert_eq!(candidates.take_ready(), Some(deferred_scan));
     let candidate = candidates.complete(&deferred_scan);
     candidates.defer(deferred_scan, candidate, now + Duration::from_secs(2));
-    candidates.admit(deferred_scan, true, now, &counters);
-    candidates.admit(deferred_scan, false, now, &counters);
-    candidates.record_backlog(&counters);
+    candidates.admit(deferred_scan, true, now);
+    candidates.admit(deferred_scan, false, now);
+    candidates.record_backlog(0, 0);
     assert_eq!(counters.diagnostics().in_flight, 0);
     assert_eq!(counters.diagnostics().deferred, 2);
     candidates.promote_due(now + Duration::from_secs(1));
@@ -3785,7 +3926,7 @@ fn scan_reports_preserve_candidates_in_each_scheduling_state() {
     candidates.promote_due(now + Duration::from_secs(2));
     assert_eq!(candidates.take_ready(), Some(deferred_scan));
     candidates.complete(&deferred_scan);
-    candidates.record_backlog(&counters);
+    candidates.record_backlog(0, 0);
     assert_eq!(counters.diagnostics(), GcDiagnostics::default());
     assert_eq!(candidates.next_due(), None);
 }
@@ -3796,30 +3937,22 @@ async fn only_a_hint_during_a_check_requests_a_delayed_follow_up() {
     let mut scheduler = Scheduler::new(&ctx.gc);
     let now = rt::Instant::now();
     let id = tx(20);
-    scheduler
-        .candidates
-        .admit(id, true, now, &scheduler.counters);
+    scheduler.candidates.admit(id, true, now);
     assert_eq!(scheduler.candidates.take_ready(), Some(id));
-    scheduler
-        .candidates
-        .admit(id, true, now, &scheduler.counters);
-    scheduler.complete_checks(vec![(id, Ok(GcOutcome::Retained))]);
+    scheduler.candidates.admit(id, true, now);
+    scheduler.complete_check(id, Ok(GcOutcome::Retained));
     assert_eq!(scheduler.candidates.next_due(), None);
 
-    scheduler
-        .candidates
-        .admit(id, true, now, &scheduler.counters);
+    scheduler.candidates.admit(id, true, now);
     assert_eq!(scheduler.candidates.take_ready(), Some(id));
-    scheduler
-        .candidates
-        .admit(id, false, now, &scheduler.counters);
-    scheduler.complete_checks(vec![(id, Ok(GcOutcome::Retained))]);
+    scheduler.candidates.admit(id, false, now);
+    scheduler.complete_check(id, Ok(GcOutcome::Retained));
     let delay = ctx.gc.timing.pending_timeout() + ctx.gc.timing.max_clock_skew();
     let due = now + delay;
     assert_eq!(scheduler.candidates.next_due(), Some(due));
     scheduler
         .candidates
-        .admit(id, false, now + Duration::from_secs(1), &scheduler.counters);
+        .admit(id, false, now + Duration::from_secs(1));
     assert_eq!(scheduler.candidates.next_due(), Some(due));
     scheduler
         .candidates
@@ -3833,13 +3966,170 @@ async fn only_a_hint_during_a_check_requests_a_delayed_follow_up() {
 fn scan_admission_does_not_advance_a_hint_deadline() {
     let now = rt::Instant::now();
     let delay = Duration::from_secs(45);
-    let mut candidates = Candidates::new(delay, GcLimits::default());
-    let counters = Counters::default();
+    let mut candidates = Candidates::new(delay, GcLimits::default(), Arc::default());
     let id = tx(21);
-    candidates.admit(id, false, now, &counters);
-    candidates.admit(id, true, now + delay / 2, &counters);
+    candidates.admit(id, false, now);
+    candidates.admit(id, true, now + delay / 2);
     assert_eq!(candidates.next_due(), Some(now + delay));
     assert_eq!(candidates.take_ready(), None);
     candidates.promote_due(now + delay);
     assert_eq!(candidates.take_ready(), Some(id));
+}
+
+#[test]
+fn candidate_capacities_follow_the_spend_limit() {
+    let delay = Duration::from_secs(45);
+    let mut candidates = Candidates::new(delay, GcLimits::default(), Arc::default());
+    // A small budget keeps the lower capacities.
+    candidates.set_capacities(10.0, Duration::from_secs(15));
+    assert_eq!(
+        (candidates.hint_capacity, candidates.scan_capacity),
+        (MIN_HINT_CAPACITY, MIN_SCAN_CAPACITY)
+    );
+    // 500 writes in each second check about 22,500 hints in a retention period
+    // and 30,000 scan candidates in a retention period and a progress delay.
+    candidates.set_capacities(500.0, Duration::from_secs(15));
+    assert_eq!(
+        (candidates.hint_capacity, candidates.scan_capacity),
+        (22_500, 30_000)
+    );
+    // The limits cap a large budget.
+    candidates.set_capacities(1e9, Duration::from_secs(15));
+    assert_eq!(
+        (candidates.hint_capacity, candidates.scan_capacity),
+        (MAX_CANDIDATES, MAX_CANDIDATES)
+    );
+    // A scan always has room for two pages, even with a lower limit.
+    let mut small = Candidates::new(
+        delay,
+        GcLimits {
+            max_hint_candidates: 10,
+            max_scan_candidates: 10,
+            ..GcLimits::default()
+        },
+        Arc::default(),
+    );
+    small.set_capacities(1e9, Duration::from_secs(15));
+    assert_eq!(
+        (small.hint_capacity, small.scan_capacity),
+        (10, MIN_SCAN_CAPACITY)
+    );
+}
+
+// Checks that only read, of records that stay live, lower the concurrency to the
+// read-only limit, also right after checks that wrote raised it. Checks that
+// write raise it up to the parallelism, and an idle GC returns to one check.
+#[tokio::test(start_paused = true)]
+async fn concurrency_rises_above_the_read_only_limit_only_while_checks_write() {
+    let ctx = new_ctx().await;
+    // A large base rate keeps the write budget from limiting the checks.
+    let gc = Gc {
+        max_checks: NonZeroUsize::new(64).unwrap(),
+        hints: GcHints::new(GcLimits {
+            base_write_rate: 1e9,
+            ..GcLimits::default()
+        }),
+        ..ctx.gc.clone()
+    };
+    let mut scheduler = Scheduler::new(&gc);
+    // Aborted records past their retention period are deleted, which is a
+    // write; pending records are only read. The read-only records follow the
+    // writing ones without a pause, so GC does not go idle between them.
+    let mut ids = Vec::new();
+    for (index, writes) in [(0u8, true), (1, false)] {
+        for i in 0..512u32 {
+            let mut prefix = [index; 8];
+            prefix[4..].copy_from_slice(&i.to_be_bytes());
+            let id = TxId::with_priority(0, &prefix);
+            let mut record = committed(id, PAST_HORIZON, &[], &[]);
+            record.status = if writes {
+                TxCommitStatus::Aborted
+            } else {
+                TxCommitStatus::Pending
+            };
+            ctx.tx_records.set(&record).await.unwrap();
+            ids.push(id);
+        }
+    }
+    let mut pending = ids.into_iter();
+    let mut seen = Vec::new();
+    let mut completed = 0;
+    loop {
+        // Keep a backlog of a few rounds, in order, so that read-only checks
+        // also see ready work behind them.
+        let now = rt::Instant::now();
+        while scheduler.candidates.ready_len() < 256
+            && let Some(id) = pending.next()
+        {
+            scheduler.candidates.admit(id, true, now);
+        }
+        scheduler.start_checks(&gc, now);
+        seen.push((completed, scheduler.concurrency));
+        let Some((id, result)) = scheduler.checks.next().await else {
+            break;
+        };
+        scheduler.complete_check(id, result);
+        completed += 1;
+    }
+    let during = |range: std::ops::Range<usize>| {
+        seen.iter()
+            .filter(|(done, _)| range.contains(done))
+            .map(|(_, concurrency)| *concurrency)
+            .max()
+    };
+
+    assert_eq!(during(256..512), Some(64), "checks that write raise it");
+    assert_eq!(
+        during(800..900),
+        Some(READ_ONLY_CONCURRENCY),
+        "checks that only read lower it to the read-only limit"
+    );
+    scheduler.start_checks(&gc, rt::Instant::now());
+    assert_eq!(scheduler.concurrency, 1, "an idle GC returns to one check");
+}
+
+// Scans that find nothing to reclaim slow down, unless hints were dropped since
+// the last scan: those name records that can have GC work that only a scan can
+// find (ADR-078).
+#[tokio::test(start_paused = true)]
+async fn dropped_hints_keep_scans_fast() {
+    for drop_hints in [false, true] {
+        let ctx = new_ctx().await;
+        let bg = Arc::new(glassdb_concurr::Background::new());
+        ctx.gc.start(&bg);
+        let mut next = 0u64;
+        // The first scan starts after the pending timeout.
+        tokio::time::advance(ctx.gc.timing.pending_timeout()).await;
+        let before = ctx.gc.stats_and_reset().lists;
+        for _ in 0..120 {
+            if drop_hints {
+                // A zero-capacity producer drops each report, as a full queue
+                // or a locked one does.
+                let producer = GcHints {
+                    limits: GcLimits {
+                        max_pending_hints: 0,
+                        ..GcLimits::default()
+                    },
+                    ..ctx.hints.clone()
+                };
+                producer.schedule(TxId::with_priority(0, &next.to_be_bytes()));
+                next += 1;
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+            for _ in 0..16 {
+                rt::yield_now().await;
+            }
+        }
+        let lists = ctx.gc.stats_and_reset().lists + before;
+        bg.shutdown().await;
+
+        if drop_hints {
+            assert!(
+                lists >= 60,
+                "scans slowed down while hints were dropped: {lists}"
+            );
+        } else {
+            assert!(lists < 20, "idle scans did not back off: {lists}");
+        }
+    }
 }

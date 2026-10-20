@@ -305,7 +305,7 @@ async fn seed(
     policy: Policy,
     execution: Execution,
 ) -> Result<(), Box<dyn Error>> {
-    let mut builder = Database::builder(name, backend.clone());
+    let mut builder = crate::database_builder(name, backend.clone());
     if policy == Policy::FixedTwo {
         builder = builder
             .topology_policy(TopologyPolicy::SizeCauses)
@@ -352,7 +352,7 @@ async fn open(
     name: &str,
     policy: Policy,
 ) -> Result<Database, Box<dyn Error>> {
-    let builder = Database::builder(name, backend.clone());
+    let builder = crate::database_builder(name, backend.clone());
     let builder = match policy {
         Policy::Avoidable => builder.topology_policy(TopologyPolicy::AvoidableTime),
         // The size causes do not change a leaf below the soft caps, above the

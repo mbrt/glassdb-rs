@@ -67,6 +67,13 @@ pub(crate) struct Options {
     /// Maximum wall time for the seed to settle. The run fails after it.
     #[arg(long, default_value = "180s", value_parser = glassdb_bench_scale::parse_duration)]
     pub(super) seed_timeout: Duration,
+    /// Maximum time for the full GCs after the seed and after each warm-up.
+    /// The records of the last safety horizon of a load wait for it, so this
+    /// must be longer than the pending timeout plus the clock skew allowance
+    /// of the database. The seed fails after it; a cell measures with the
+    /// garbage that is left.
+    #[arg(long, default_value = "600s", value_parser = glassdb_bench_scale::parse_duration)]
+    pub(super) gc_timeout: Duration,
     /// Maximum wall time of a cell's warm-up. The cell measures after it, also
     /// when topology changes continue, and its result says so.
     #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]

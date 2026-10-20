@@ -17,7 +17,7 @@ pub mod memory;
 pub mod middleware;
 mod stats;
 
-pub use stats::{BackendStats, StatsBackend};
+pub use stats::{BackendStats, StatsBackend, WriteMeter};
 
 /// A type-erased, cheaply cloneable underlying cause.
 #[derive(Clone)]

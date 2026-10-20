@@ -32,7 +32,7 @@ pub use collections::{
 };
 pub use engine::{Engine, EngineConfig, EngineDiagnostics, EngineStats, EngineTransaction};
 pub use error::TransError;
-pub use gc::{GcDiagnostics, GcLimits, GcStats};
+pub use gc::{GcDiagnostics, GcLimits, GcReport, GcStats};
 pub use key_resolver::ScanResult;
 pub use leaf_coord::LeafCoordinatorStats;
 pub use monitor::{MonitorStats, ProtocolTiming};

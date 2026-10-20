@@ -4,7 +4,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb::backend::{BackendError, memory::MemoryBackend};
 use glassdb::middleware::{BackendOp, HookBackend};
-use glassdb::{Backend, Database};
+use glassdb::{Backend, Database, GcLimits};
 use glassdb_data::{DbPrefix, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxRecord, TxRecordStore};
 use glassdb_storage::{CachedStore, Requirement, StorageError, Timeline};
@@ -87,14 +87,17 @@ async fn separate_instances_find_orphans_without_local_hints() {
 
 #[tokio::test(start_paused = true)]
 async fn writers_complete_while_gc_is_saturated_and_stalled() {
+    // The default parallelism is above the 100 stalled records, so GC runs at
+    // most all of them at once. Checks that stall before their writes do not
+    // raise the concurrency above the read-only limit of 8.
     for configured_limit in [None, Some(1), Some(3), Some(12)] {
-        let limit = configured_limit.unwrap_or(8);
+        let limit = configured_limit.unwrap_or(256).min(8);
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let tx_records = tx_record_store(backend.clone());
         old_objects(&tx_records, 100).await;
         let mut builder = Database::builder("gc", backend.clone());
-        if let Some(limit) = configured_limit {
-            builder = builder.gc_parallelism(NonZeroUsize::new(limit).unwrap());
+        if let Some(configured) = configured_limit {
+            builder = builder.gc_parallelism(NonZeroUsize::new(configured).unwrap());
         }
         let db = builder.open().await.unwrap();
         backend.set_before(|operation| {
@@ -167,5 +170,252 @@ async fn list_failures_do_not_look_like_an_idle_database() {
             .await,
         Err(StorageError::NotFound)
     ));
+    db.shutdown().await;
+}
+
+fn record_path(id: &TxId) -> String {
+    glassdb_data::ObjectPath::Transaction {
+        db_prefix: DbPrefix::try_from("gc").unwrap(),
+        id: *id,
+    }
+    .to_string()
+}
+
+async fn record_exists(backend: Arc<dyn Backend>, id: &TxId) -> bool {
+    !matches!(
+        tx_record_store(backend).get_at(id, Requirement::ANY).await,
+        Err(StorageError::NotFound)
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_gc_checks_every_page_and_reports_records_it_keeps() {
+    let backend = Arc::new(MemoryBackend::new());
+    let db = Database::open("gc", backend.clone()).await.unwrap();
+    let tx_records = tx_record_store(backend.clone());
+    // More than one LIST page.
+    let aborted = old_objects(&tx_records, 1_001).await;
+    let pending = TxId::with_priority(1, b"pending");
+    let mut record = TxRecord::new(pending, TxCommitStatus::Pending);
+    record.timestamp = Some(UNIX_EPOCH);
+    tx_records.set(&record).await.unwrap();
+    let young = TxId::with_priority(2, b"young");
+    let mut record = TxRecord::new(young, TxCommitStatus::Aborted);
+    record.timestamp = Some(glassdb_concurr::rt::system_now());
+    tx_records.set(&record).await.unwrap();
+
+    let before = db.stats().gc;
+    let report = db
+        .collect_garbage(NonZeroUsize::new(16).unwrap())
+        .await
+        .unwrap();
+    let gc = db.stats().gc - before;
+
+    assert_eq!(report.deleted, 1_001);
+    // Each listed record is one check; the young record is the deferred one,
+    // and each deleted record is one estimated write.
+    assert_eq!(
+        (gc.checks, gc.deferred_checks, gc.writes),
+        (1_003, 1, 1_001)
+    );
+    assert_eq!(report.retained, 1);
+    assert_eq!(report.deferred, 1);
+    assert_eq!(
+        (report.missing, report.reclaimed_effects, report.failed),
+        (0, 0, 0)
+    );
+    let retry_after = report.retry_after.unwrap();
+    assert!(retry_after > Duration::ZERO && retry_after <= Duration::from_secs(45));
+    for id in aborted {
+        assert!(!record_exists(backend.clone(), &id).await);
+    }
+    assert!(record_exists(backend.clone(), &pending).await);
+    assert!(record_exists(backend.clone(), &young).await);
+    db.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_gc_counts_failed_checks_and_continues() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let db = Database::open("gc", backend.clone()).await.unwrap();
+    let ids = old_objects(&tx_record_store(backend.clone()), 3).await;
+    let failing = record_path(&ids[0]);
+    backend.set_before(move |operation| {
+        let fail = matches!(operation, BackendOp::Read { path } if *path == failing);
+        Box::pin(async move {
+            if fail {
+                Err(BackendError::Unavailable("offline".into()))
+            } else {
+                Ok(())
+            }
+        })
+    });
+
+    let report = db.collect_garbage(NonZeroUsize::MIN).await.unwrap();
+
+    assert_eq!((report.deleted, report.failed), (2, 1));
+    assert!(record_exists(backend.clone(), &ids[0]).await);
+    backend.clear_before();
+    db.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_full_gc_completes_the_checks_of_a_dropped_one() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let db = Database::open("gc", backend.clone()).await.unwrap();
+    let ids = old_objects(&tx_record_store(backend.clone()), 1).await;
+    backend.set_before(|operation| {
+        let stall = matches!(operation, BackendOp::DeleteIf { path, .. } if path.contains("/_t/"));
+        Box::pin(async move {
+            if stall {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Ok(())
+        })
+    });
+
+    let dropped = tokio::time::timeout(
+        Duration::from_secs(1),
+        db.collect_garbage(NonZeroUsize::MIN),
+    )
+    .await;
+    assert!(dropped.is_err(), "the delete stalls past the timeout");
+    // The dropped check stopped before its delete. Background GC starts its
+    // first scan after the pending timeout, so it cannot delete the record yet.
+    step(6).await;
+    assert!(record_exists(backend.clone(), &ids[0]).await);
+    backend.clear_before();
+
+    let report = db.collect_garbage(NonZeroUsize::MIN).await.unwrap();
+
+    assert_eq!(report.deleted, 1);
+    assert!(!record_exists(backend.clone(), &ids[0]).await);
+    db.shutdown().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_gc_is_refused_after_shutdown() {
+    let db = Database::open("gc", Arc::new(MemoryBackend::new()))
+        .await
+        .unwrap();
+    db.shutdown().await;
+
+    let result = db.collect_garbage(NonZeroUsize::MIN).await;
+
+    assert!(
+        matches!(result, Err(glassdb::Error::ShuttingDown)),
+        "{result:?}"
+    );
+}
+
+// Background GC writes at most at its base rate, 100 writes in each second,
+// when its instance runs no transactions (ADR-078).
+#[tokio::test(start_paused = true)]
+async fn background_gc_without_transactions_keeps_to_the_base_rate() {
+    let backend = Arc::new(MemoryBackend::new());
+    let tx_records = tx_record_store(backend.clone());
+    old_objects(&tx_records, 2_000).await;
+    let db = Database::builder("gc", backend.clone())
+        .gc_parallelism(NonZeroUsize::new(512).unwrap())
+        .open()
+        .await
+        .unwrap();
+    // A paused clock advances only when every task waits, so GC is limited by
+    // its budget and not by the test.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let before = db.stats().gc.progress;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let deleted = db.stats().gc.progress - before;
+
+    // Each deleted aborted record is one write. The allowance holds one second
+    // of writes, so ten seconds allow up to eleven seconds of the base rate.
+    assert!(
+        (900..=1_100).contains(&deleted),
+        "deleted {deleted} records in 10 s"
+    );
+    db.shutdown().await;
+}
+
+// The writes of a full GC do not spend the budget of background GC, which
+// keeps its base rate afterwards (ADR-078).
+#[tokio::test(start_paused = true)]
+async fn a_full_gc_does_not_spend_the_background_budget() {
+    let backend = Arc::new(MemoryBackend::new());
+    let tx_records = tx_record_store(backend.clone());
+    old_objects(&tx_records, 3_000).await;
+    let db = Database::builder("gc", backend.clone())
+        .gc_parallelism(NonZeroUsize::new(512).unwrap())
+        .open()
+        .await
+        .unwrap();
+    let report = db
+        .collect_garbage(NonZeroUsize::new(64).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, 3_000, "{report:?}");
+    // New records, which only background GC deletes. They are more than its
+    // base rate can delete in the measured time.
+    for i in 0..5_000u64 {
+        let id = TxId::with_priority(i, &(i + 1_000_000).to_be_bytes());
+        let mut record = TxRecord::new(id, TxCommitStatus::Aborted);
+        record.timestamp = Some(UNIX_EPOCH);
+        tx_records.set(&record).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let before = db.stats().gc.progress;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let deleted = db.stats().gc.progress - before;
+
+    assert!(
+        (900..=1_100).contains(&deleted),
+        "deleted {deleted} records in 10 s"
+    );
+    db.shutdown().await;
+}
+
+// A burst of transaction writes raises the budget of background GC above its
+// base rate for some time after the burst (ADR-078).
+#[tokio::test(start_paused = true)]
+async fn a_burst_of_writes_raises_the_gc_budget_after_it() {
+    let backend = Arc::new(MemoryBackend::new());
+    let tx_records = tx_record_store(backend.clone());
+    old_objects(&tx_records, 3_000).await;
+    // A low base rate makes the budget of the burst visible.
+    let db = Database::builder("gc", backend.clone())
+        .gc_limits(GcLimits {
+            base_write_rate: 1.0,
+            ..GcLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let collection = db.root_collection();
+    let deleted_in = |seconds: u64| {
+        let db = db.clone();
+        async move {
+            let before = db.stats().gc.progress;
+            tokio::time::sleep(Duration::from_secs(seconds)).await;
+            db.stats().gc.progress - before
+        }
+    };
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let quiet = deleted_in(20).await;
+
+    // 500 separate commits make about 500 writes. Over the 600 s spend time,
+    // they allow about 0.8 more GC writes in each second, on top of the base
+    // rate of 1.
+    for i in 0..500u32 {
+        collection.write(&i.to_be_bytes(), b"v").await.unwrap();
+    }
+    let after_burst = deleted_in(20).await;
+
+    assert!(
+        quiet <= 25,
+        "deleted {quiet} records in 20 s at a base rate of 1"
+    );
+    assert!(
+        after_burst >= quiet + 10,
+        "deleted {after_burst} records in 20 s after the burst, against {quiet} before"
+    );
     db.shutdown().await;
 }

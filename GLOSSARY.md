@@ -474,7 +474,15 @@ A claim on a collection record, held by the transaction identity that prepares a
 Work that completes or reverts the durable effects of an interrupted operation from durable state alone, for example after a transaction owner stops.
 
 **GC**:
-Background work that reclaims the durable effects of transactions, and deletes the transaction records that no stored object names.
+Work that reclaims the durable effects of transactions, and deletes the transaction records that no stored object names.
+
+**Full GC**:
+One GC run that a caller starts and waits for. It checks every transaction record that one listing of the database finds, and ends when each check is done.
+_Avoid_: Forced GC, GC drain
+
+**Garbage**:
+The durable effects and transaction records that GC can eventually reclaim, including those inside their retention period, whether or not a database instance knows about them.
+_Avoid_: GC backlog (which is only known work)
 
 **GC hint**:
 A report within one database instance that a transaction identity can have GC work. It makes the identity a GC candidate without a GC scan.
@@ -488,9 +496,9 @@ _Avoid_: Cleanup candidate
 The check of one GC candidate's recovery manifest and committed writes against the current stored objects. It decides which effects GC can reclaim and whether GC can delete the transaction record.
 _Avoid_: Reverse liveness check, reverse check, reference check
 
-**Safety horizon**:
-The time after the last refresh of a transaction record during which GC keeps the record and its effects, unless the record is wounded. It is the lease plus the allowed clock skew.
-_Avoid_: Cleanup horizon, sweep horizon, retention horizon, lease horizon, safety lease
+**Retention period**:
+The time after the last update of a committed or aborted transaction record during which GC keeps the record and its effects. It is the pending timeout plus the allowed clock skew. It makes false in-doubt outcomes rarer, and GC safety does not depend on it.
+_Avoid_: Safety horizon, cleanup horizon, sweep horizon, retention horizon, lease horizon, safety lease
 
 **Pinned wound**:
 A wounded transaction record that GC keeps until the owner proves protocol-clean retirement and changes it to aborted.
@@ -498,7 +506,11 @@ _Avoid_: Pinned transaction marker, pinned wound marker
 
 **GC backlog**:
 Known GC work that is ready to run but has not completed. Transaction records that stored objects still name, pinned wounds, and work that waits for its next permitted check are not GC backlog by themselves.
-_Avoid_: Cleanup backlog, transaction-object count, garbage count
+_Avoid_: Cleanup backlog, transaction-object count
+
+**GC write budget**:
+The limit on the rate of conditional mutations that background GC of one database instance sends. It follows the conditional mutations of the instance's transactions, with a minimum rate.
+_Avoid_: GC budget, GC rate limit
 
 **GC scan**:
 A traversal of stored transaction records to find GC candidates independently of GC hints. Scans of structural intents belong to structural recovery.
