@@ -80,8 +80,10 @@ target/release/perfbench --config my.toml --experiment probe \
 
 The options that are the same for all experiments are command-line options:
 `--backend`, `--delays`, `--delay-scale`, `--prefix-depth`, `--latency-jitter`,
-`--enable-throttling`, `--runs`, `--run-cooldown`, `--drain-timeout`, and
-`--output`. The result records them.
+`--enable-throttling`, `--runs`, `--run-cooldown`, `--drain-timeout`,
+`--progress`, and `--output`. The result records them, except `--progress`.
+`--progress[=auto|always|never]` controls a progress bar on stderr with the
+number of the cell and the estimated time left.
 
 All experiments support `--backend=memory|fakes3|s3|gcs`. Real S3 and GCS use
 the bucket in `$BUCKET` and always run at real time. For `memory` and `fakes3`,

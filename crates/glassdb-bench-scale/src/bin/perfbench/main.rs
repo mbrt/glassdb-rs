@@ -4,6 +4,7 @@
 //! layered TOML configuration; the README of this crate explains it.
 
 mod backend;
+mod progress;
 mod runner;
 mod scenarios;
 
@@ -13,11 +14,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::error::Error;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use glassdb::ProtocolTiming;
 use glassdb_concurr::rt;
 use serde::Serialize;
@@ -65,9 +66,38 @@ struct Cli {
     /// Maximum time for in-flight work and Database shutdown.
     #[arg(long, default_value = "30s", value_parser = glassdb_bench_scale::parse_duration)]
     drain_timeout: Duration,
+    /// Show a progress bar on stderr, with the estimated time left. Without a
+    /// value, it is always shown. By default, it is shown only on a terminal.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "auto",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "always"
+    )]
+    progress: ProgressMode,
     /// Write JSON to this path instead of stdout.
     #[arg(long)]
     output: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ProgressMode {
+    /// Show the bar if stderr is a terminal.
+    Auto,
+    Always,
+    Never,
+}
+
+impl ProgressMode {
+    fn enabled(self) -> bool {
+        match self {
+            Self::Auto => io::stderr().is_terminal(),
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -124,7 +154,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         run_cooldown: cli.run_cooldown,
         drain_timeout: cli.drain_timeout,
     };
-    let runs = runner::run(&runtime, &factory, &resolved, execution)?;
+    if cli.progress.enabled() {
+        progress::enable(runner::plan(&resolved)?.0.len() * cli.runs);
+    }
+    let runs = runner::run(&runtime, &factory, &resolved, execution);
+    progress::finish();
+    let runs = runs?;
     let report = Report {
         schema_version: SCHEMA_VERSION,
         scenario: resolved.name.clone(),
