@@ -34,7 +34,8 @@ Two original use cases are both covered by this generic shape:
 
 * engine versions: ``--a out/v1 --label-a v1 --b out/v2 --label-b v2`` (see
   ``compare_refs.sh``);
-* fake vs real S3: ``--a out --label-a real --b out-fake --label-b fake``.
+* real vs simulated S3: ``--a hack/aws-bench/out --label-a s3 --b out-model
+  --label-b model``.
 
 It also writes overlay PNGs (``cmp-tx-throughput.png``, ``cmp-tx-latency.png``,
 ``cmp-replays.png``, ``cmp-contention-latency.png``) into ``--out`` so the curves
@@ -1011,9 +1012,8 @@ def _save(fig: plt.Figure, out_dir: Path, name: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    base = Path(__file__).resolve().parent
-    parser.add_argument("--a", type=Path, default=base / "out")
-    parser.add_argument("--b", type=Path, default=base / "out-fake")
+    parser.add_argument("--a", type=Path, required=True)
+    parser.add_argument("--b", type=Path, required=True)
     parser.add_argument("--label-a", default="a")
     parser.add_argument("--label-b", default="b")
     parser.add_argument(

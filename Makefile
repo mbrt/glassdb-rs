@@ -20,7 +20,7 @@ test-unit:
 
 test-bench:
 	python3 -m unittest hack.ci.test_perf_report hack.ci.test_perf_compare
-	cd hack/aws-bench && python3 -m unittest test_perfbench_results test_compare test_plot_results
+	cd hack/perf && python3 -m unittest test_perfbench_results test_compare test_plot_results
 	cargo test -p glassdb-bench-scale
 	cargo test --workspace --bench '*'
 

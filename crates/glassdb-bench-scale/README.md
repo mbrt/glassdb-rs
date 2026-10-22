@@ -374,7 +374,7 @@ All database instances use the production pending timeout and no clock skew
 allowance, because they read one clock. Full GCs after a seed or a warm-up
 stop after 600 s. Every cell runs on one multi-thread runtime.
 
-`hack/aws-bench/perfbench_results.py` reads the result files for the
+`hack/perf/perfbench_results.py` reads the result files for the
 comparison and plot tools.
 
 ## Built-in experiments
@@ -430,15 +430,16 @@ cargo build --release -p glassdb-bench-scale --bin perfbench
 common=(--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
   --runs=3 --drain-timeout=90s)
 target/release/perfbench "${common[@]}" --experiment=workers \
-  --output=hack/aws-bench/out-sweeps/workers.json
+  --output=hack/perf/out-sweeps/workers.json
 target/release/perfbench "${common[@]}" --experiment=affinity \
-  --output=hack/aws-bench/out-sweeps/affinity.json
-uv run hack/aws-bench/plot_results.py --canonical
+  --output=hack/perf/out-sweeps/affinity.json
+uv run hack/perf/plot_results.py --canonical
 ```
 
 A chain of cells that continue each other shares one seed. The seed writes the
 collections of the largest cell of the chain, and each cell uses the first of
-them. `hack/aws-bench/README.md` explains the plots and the comparison tools.
+them. `hack/perf/README.md` explains the plots and the comparison tools, and
+`hack/aws-bench/README.md` the real-S3 runner.
 
 ### Diagnostics
 

@@ -2,3 +2,8 @@
 flamegraph.svg
 flamegraph.folded
 perf.data*
+profile.json
+# Generated benchmark results and plots (see README.md); never committed.
+out-sweeps/
+*.png
+__pycache__/
