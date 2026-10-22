@@ -107,6 +107,7 @@ async fn merge_l0(sp: &Restructurer) -> Result<(), TransError> {
         &MaintenanceCandidate {
             path: node_path("L0"),
             priority: TxId::new_at(rt::system_now()),
+            requested: rt::Instant::now(),
             cause: CandidateCause::Merge(MergeReason::Underfull),
         },
         MergeReason::Underfull,
@@ -152,6 +153,7 @@ async fn demand_merge_l0(sp: &Restructurer, rate: Duration) -> Result<(), TransE
         &MaintenanceCandidate {
             path: node_path("L0"),
             priority: TxId::new_at(rt::system_now()),
+            requested: rt::Instant::now(),
             cause: CandidateCause::Merge(MergeReason::Demand { rate }),
         },
         MergeReason::Demand { rate },

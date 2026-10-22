@@ -4,6 +4,8 @@
 
 Accepted — implemented. [ADR-075](075-avoidable-time-is-the-default-topology-policy.md)
 makes the avoidable time policy the default.
+[ADR-083](083-drop-stale-topology-requests.md) drops the changes that the
+rule asked for more than three windows before.
 
 Refines [ADR-073](073-merge-nodes-into-right-sibling.md)'s maintenance policy.
 With the avoidable time policy, leaves get demand causes for splits and merges,

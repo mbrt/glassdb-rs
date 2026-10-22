@@ -288,9 +288,10 @@ impl AvoidableTimeRule {
                 }
                 _ => ChangeRequest::Split(id.clone()),
             };
-            // A split can take more than one window to land. If the average
-            // stays, the next window asks for a second split of the same
-            // leaf. The engine retries a deferred split itself.
+            // A split can take more than one window to land. The average
+            // starts again, so that the next windows do not ask for a second
+            // split of the same leaf. The engine retries a deferred split
+            // itself for some windows (ADR-083).
             leaves.remove(id);
             let rate = split_rates[id].mean(windows);
             requests.push(RuleRequest {

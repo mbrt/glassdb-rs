@@ -9,6 +9,7 @@ pub(super) struct Stats {
     pub(super) candidates: AtomicU64,
     pub(super) splits: AtomicU64,
     pub(super) deferred: AtomicU64,
+    pub(super) stale_demand: AtomicU64,
     pub(super) tombstones_reclaimed: AtomicU64,
     pub(super) splits_avoided: AtomicU64,
     pub(super) merges: AtomicU64,
@@ -32,6 +33,9 @@ pub struct RestructurerStats {
     pub splits: u64,
     /// Retryable candidate attempts requeued for any cause.
     pub deferred: u64,
+    /// Candidates of a topology rule dropped because they were too old to
+    /// still show the current load (ADR-083).
+    pub stale_demand: u64,
     /// Holder-free tombstone entries removed by acknowledged leaf rewrites.
     pub tombstones_reclaimed: u64,
     /// Actionable splits cancelled after tombstone reclamation removed the need.
@@ -64,6 +68,7 @@ impl Stats {
             candidates: take(&self.candidates),
             splits: take(&self.splits),
             deferred: take(&self.deferred),
+            stale_demand: take(&self.stale_demand),
             tombstones_reclaimed: take(&self.tombstones_reclaimed),
             splits_avoided: take(&self.splits_avoided),
             merges: take(&self.merges),
@@ -114,6 +119,7 @@ impl AddAssign for RestructurerStats {
         self.candidates += rhs.candidates;
         self.splits += rhs.splits;
         self.deferred += rhs.deferred;
+        self.stale_demand += rhs.stale_demand;
         self.tombstones_reclaimed += rhs.tombstones_reclaimed;
         self.splits_avoided += rhs.splits_avoided;
         self.merges += rhs.merges;
@@ -129,6 +135,7 @@ impl Sub for RestructurerStats {
             candidates: self.candidates.saturating_sub(rhs.candidates),
             splits: self.splits.saturating_sub(rhs.splits),
             deferred: self.deferred.saturating_sub(rhs.deferred),
+            stale_demand: self.stale_demand.saturating_sub(rhs.stale_demand),
             tombstones_reclaimed: self
                 .tombstones_reclaimed
                 .saturating_sub(rhs.tombstones_reclaimed),
