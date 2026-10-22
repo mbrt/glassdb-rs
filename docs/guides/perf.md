@@ -7,6 +7,12 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+The commands of the entries before 2026-10-21 use the perfbench subcommands and
+the Criterion suites that the experiments of
+[crates/glassdb-bench-scale/README.md](../../crates/glassdb-bench-scale/README.md)
+replaced. Their results are of schema version 1, which the current tools do
+not read.
+
 The s3 delay profile limits each prefix of 3 path segments since 2026-10-20:
 each collection and each first symbol of a transaction ID has its own request
 limit. Earlier entries that do not pass `--prefix-depth` used 2 segments, where
@@ -217,7 +223,7 @@ reproduce reliably enough to report as the implementation result.
 - canonical command: `BASE=v0.1.0 LABEL_A=v010 LABEL_B=current
   DELAY_SCALE=0.02 DB_LIST=1,10,20 NUM_KEYS=5000 DURATION=5s NUM_RUNS=3
   DEADLOCK_DURATION=1s COUNT=5 DRAIN_TIMEOUT=90s COMMAND_TIMEOUT=15m
-  hack/aws-bench/compare_refs.sh --summary`
+  hack/perf/compare_refs.sh --summary`
 - the v0.1.0 binary predates simulated-time reporting. Its compressed
   `rtbench` latency and duration fields are multiplied by `50` before
   comparison; operation counts and the autoresearch score require no
@@ -260,7 +266,7 @@ reproduce reliably enough to report as the implementation result.
   MIX_DURATION=1s MIX_MAX_DURATION=30s MIX_TARGET_CI=0.15 MIX_MODES=hi
   MIX_TOPOLOGIES=shared,per-shape MIX_WORKERS=8 MIX_CLIENTS=4
   MIX_HOT_KEYS=8 MIX_MULTI_KEYS=8 DRAIN_TIMEOUT=90s COMMAND_TIMEOUT=15m
-  hack/aws-bench/compare_refs.sh --summary`
+  hack/perf/compare_refs.sh --summary`
 - rw9010 aggregate-throughput geomeans are `1.13` balanced, `0.97` read-heavy,
   and `1.04` write-heavy. Backend operations/transaction geomeans are `1.15`,
   `1.14`, and `1.22`, respectively
@@ -358,7 +364,7 @@ Direct commits retain authoritative inline values.
 - base: `ed590a8c` (accepted ADR, before implementation); target: this worktree
 - ratio = target / base (throughput >1 good; latency/ops/cost <1 good)
 - command: `BASE=ed590a8c LABEL_A=before LABEL_B=adr054
-  DRAIN_TIMEOUT=90s hack/aws-bench/compare_refs.sh --summary`
+  DRAIN_TIMEOUT=90s hack/perf/compare_refs.sh --summary`
 - summary defaults: 5,000 keys, two paired 3-second rw9010 and deadlock runs,
   three deterministic efficiency repeats, and adaptive mixbench cells with a
   20% relative-CI target and 20-second cap
@@ -410,7 +416,7 @@ a holder, and removes ADR-027's separate locked single-RW fallback.
   MIX_TARGET_CI=0.1 MIX_MODES=lo,hi
   MIX_TOPOLOGIES=shared,per-shape MIX_WORKERS=8 MIX_CLIENTS=4
   MIX_NUM_KEYS=5000 MIX_HOT_KEYS=8 MIX_MULTI_KEYS=8 DRAIN_TIMEOUT=60s
-  COMMAND_TIMEOUT=10m hack/aws-bench/compare_refs.sh --summary`
+  COMMAND_TIMEOUT=10m hack/perf/compare_refs.sh --summary`
 - rw9010 and the one-key workload use three paired, interleaved repetitions.
   Autoresearch uses five internal repeats. The first mixbench sweep uses one
   adaptive pair; the high-contention guardrails were then repeated as three
@@ -482,7 +488,7 @@ estimator and should not be compared directly without reprocessing their CSVs.
   DEADLOCK_DURATION=500ms COUNT=3 RW_MIX="balanced readheavy writeheavy"
   MIX_DURATION=1s MIX_MAX_DURATION=20s MIX_TARGET_CI=0.2 MIX_MODES=hi
   MIX_TOPOLOGIES=shared MIX_WORKERS=8 MIX_CLIENTS=4
-  DRAIN_TIMEOUT=90s hack/aws-bench/compare_refs.sh --summary`
+  DRAIN_TIMEOUT=90s hack/perf/compare_refs.sh --summary`
 - the three rw9010 and deadlock repetitions are paired and interleaved, with
   execution order reversed on the second repetition
 - all cells complete with zero transaction failures

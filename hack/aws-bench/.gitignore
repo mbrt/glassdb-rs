@@ -1,6 +1,2 @@
-# Downloaded / generated benchmark artifacts (not committed).
-out-fake/
-out-refs/
-out-sweeps/
+# Plots that hack/perf/plot_results.py writes beside downloaded results.
 *.png
-__pycache__/

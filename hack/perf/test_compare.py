@@ -31,6 +31,7 @@ def load_compare():
 
 compare = load_compare()
 pd = compare.pd
+from perfbench_fixtures import contention_cell, mixed_cell, report as envelope  # noqa: E402
 
 
 class CompareTest(unittest.TestCase):
@@ -213,12 +214,10 @@ class CompareTest(unittest.TestCase):
         )
 
     def test_perfbench_mixed_envelope_preserves_run_identity(self) -> None:
-        cell = {
-            "mode": "hi",
-            "affinityPct": 100,
-            "failures": 0,
-            "aggregateOps": {"totalOpsPerTx": 2, "replaysPerTx": 0},
-            "shapes": [
+        cell = mixed_cell(
+            mode="hi",
+            aggregateOps={"totalOpsPerTx": 2, "replaysPerTx": 0},
+            shapes=[
                 {
                     "shape": "rwSingle",
                     "committed": 100,
@@ -228,17 +227,14 @@ class CompareTest(unittest.TestCase):
                     "p90Ms": 2,
                 }
             ],
-        }
-        report = {
-            "schemaVersion": 1,
-            "scenario": "mixed",
-            "runs": [{"run": 2, "cells": [cell]}],
-        }
+        )
+        report = envelope("mixed", [{"run": 2, "cells": [cell]}])
 
         table = compare.mixed_shape_table(report, report)
 
         self.assertEqual(table.loc[0, "run"], 2)
         self.assertEqual(table.loc[0, "layout"], "100%")
+        self.assertEqual(table.loc[0, "shape"], "rwSingle")
 
     def test_multidimensional_mixed_report_is_not_silently_collapsed(self) -> None:
         cells = [
@@ -257,71 +253,29 @@ class CompareTest(unittest.TestCase):
             compare.mixed_shape_table(cells, cells)
 
     def test_perfbench_contention_envelope_converts_to_legacy_frames(self) -> None:
-        report = {
-            "schemaVersion": 1,
-            "scenario": "contention",
-            "runs": [
-                {
-                    "run": 1,
-                    "cells": [
-                        {
-                            "numKeys": 1,
-                            "overlap": 1,
-                            "overlapPct": 100,
-                            "committed": 2,
-                            "durationMs": 1000,
-                            "txPerSec": 2,
-                            "samplesMs": [10, 20],
-                            "replays": 1,
-                            "directCandidates": 2,
-                            "directLanded": 1,
-                            "workerDrainMs": 3,
-                            "failures": 0,
-                        }
-                    ],
-                }
-            ],
-        }
+        cell = contention_cell(
+            1,
+            1,
+            committed=2,
+            tx_per_sec=2,
+            p50_ms=10,
+            p90_ms=20,
+            replays=1,
+            direct_candidates=2,
+            direct_landed=1,
+            worker_drain_ms=3,
+        )
+        report = envelope("contention", [{"run": 1, "cells": [cell]}])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             (path / "contention.json").write_text(json.dumps(report))
-            samples, stats = compare.perfbench_contention_frames(path)
+            stats = compare.perfbench_contention_frames(path)
+            table = compare.contention_table(stats, stats)
 
-        self.assertEqual(samples["latency-ms"].tolist(), [10, 20])
+        self.assertEqual(table.loc[0, "p50_a"], 10)
+        self.assertEqual(table.loc[0, "p90-ratio"], 1.0)
         self.assertEqual(stats.loc[0, "direct-landed"], 1)
-
-    def test_perfbench_contention_envelope_accepts_legacy_replay_keys(self) -> None:
-        report = {
-            "schemaVersion": 1,
-            "scenario": "contention",
-            "runs": [
-                {
-                    "run": 1,
-                    "cells": [
-                        {
-                            "numKeys": 1,
-                            "overlap": 1,
-                            "overlapPct": 100,
-                            "committed": 2,
-                            "durationMs": 1000,
-                            "txPerSec": 2,
-                            "samplesMs": [10],
-                            "retries": 3,
-                            "directCandidates": 0,
-                            "directLanded": 0,
-                            "workerDrainMs": 0,
-                            "failures": 0,
-                        }
-                    ],
-                }
-            ],
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            (path / "contention.json").write_text(json.dumps(report))
-            _, stats = compare.perfbench_contention_frames(path)
-
-        self.assertEqual(stats.loc[0, "num-replays"], 3)
+        self.assertEqual(stats.loc[0, "num-replays"], 1)
 
     def test_mixed_aggregate_table_accepts_legacy_replays_per_tx(self) -> None:
         def cells(replays_per_tx: float):

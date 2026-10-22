@@ -21,6 +21,7 @@ from unittest import mock
 
 import perfbench_results
 import plot_results as plotter
+from perfbench_fixtures import contention_cell, mixed_cell
 
 
 def read_canonical(path: Path):
@@ -49,26 +50,26 @@ def shape_rows(run: int, affinity: int, databases: int, workers: int) -> list[di
     return rows
 
 
-def cell(run: int, affinity: int, database_limit: int, workers: int) -> dict:
+def cell(
+    run: int, affinity: int, database_limit: int, workers: int, mode: str = "lo"
+) -> dict:
     databases = min(database_limit, workers)
-    return {
-        "mode": "lo",
-        "affinityPct": affinity,
-        "databaseLimit": database_limit,
-        "databases": databases,
-        "workersPerShape": workers,
-        "setupSplits": 0,
-        "splitSettleWallMs": 10,
-        "failures": 0,
-        "shapes": shape_rows(run, affinity, databases, workers),
-        "aggregateOps": {},
-        "aggregateProtocol": {},
-    }
+    return mixed_cell(
+        mode=mode,
+        affinity=affinity,
+        database_limit=database_limit,
+        workers=workers,
+        shapes=shape_rows(run, affinity, databases, workers),
+        setupSplits=0,
+        splitSettleWallMs=10,
+        aggregateOps={},
+        aggregateProtocol={},
+    )
 
 
 def report(runs: list[dict]) -> dict:
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "scenario": "mixed",
         "backend": "memory",
         "modelTimeSpeedup": 5.0,
@@ -311,24 +312,19 @@ class GenericPlotterTest(unittest.TestCase):
         return value
 
     def contention_report(self, overlap_pct: list[int]) -> dict:
-        def contention_cell(num_keys: int, overlap_pct: int) -> dict:
-            return {
-                "numKeys": num_keys,
-                "overlap": 1,
-                "overlapPct": overlap_pct,
-                "committed": 2,
-                "durationMs": 1000,
-                "txPerSec": 2.0,
-                "samplesMs": [10.0, 20.0],
-                "replays": 0,
-                "directCandidates": 2,
-                "directLanded": 2,
-                "workerDrainMs": 1,
-                "failures": 0,
-            }
+        def one(num_keys: int, overlap_pct: int) -> dict:
+            return contention_cell(
+                num_keys,
+                max(1, num_keys * overlap_pct // 100),
+                committed=2,
+                tx_per_sec=2.0,
+                direct_candidates=2,
+                direct_landed=2,
+                worker_drain_ms=1,
+            )
 
         return {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "scenario": "contention",
             "backend": "s3",
             "modelTimeSpeedup": 1.0,
@@ -336,8 +332,8 @@ class GenericPlotterTest(unittest.TestCase):
                 {
                     "run": 1,
                     "cells": [
-                        contention_cell(num_keys, pct)
-                        for num_keys in (1, 2, 3)
+                        one(num_keys, pct)
+                        for num_keys in (2, 4, 6)
                         for pct in overlap_pct
                     ],
                 }
@@ -348,7 +344,7 @@ class GenericPlotterTest(unittest.TestCase):
         cells = []
         for mode in ("lo", "hi"):
             for affinity in (0, 50, 100):
-                cells.append({**cell(1, affinity, 4, 8), "mode": mode})
+                cells.append(cell(1, affinity, 4, 8, mode))
         with tempfile.TemporaryDirectory() as directory_name:
             directory = Path(directory_name)
             path = self.write_report(
@@ -502,7 +498,7 @@ class GenericPlotterTest(unittest.TestCase):
             path = self.write_report(
                 directory,
                 "inline-pressure.json",
-                {"schemaVersion": 1, "scenario": "inline-pressure", "runs": []},
+                {"schemaVersion": 2, "scenario": "inline-pressure", "runs": []},
             )
             with self.assertRaisesRegex(plotter.ReportError, "no plots"):
                 plotter.plot_file(path, directory)

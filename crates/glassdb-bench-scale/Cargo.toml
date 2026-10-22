@@ -31,6 +31,9 @@ rand = "0.10.1"
 # perfbench emits versioned JSON result envelopes.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# perfbench reads its experiments from layered TOML configurations.
+toml = { version = "1.1.6", features = ["preserve_order"] }
+indexmap = { version = "2.14.0", features = ["serde"] }
 aws-config = "1.8.17"
 # See glassdb-backend-s3: drop the default legacy `rustls` feature to keep the
 # vulnerable rustls-webpki 0.101.x (RUSTSEC-2026-0104) out of the build.

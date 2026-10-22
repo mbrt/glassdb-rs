@@ -1,11 +1,11 @@
-//! Database-level GlassDB performance scenarios.
+//! Database-level GlassDB performance experiments.
+//!
+//! One runner runs every experiment. An experiment is a named entry of a
+//! layered TOML configuration; the README of this crate explains it.
 
 mod backend;
-mod contention;
-mod inline_pressure;
-mod membership_churn;
-mod mixed;
-mod split_merge_fight;
+mod runner;
+mod scenarios;
 
 #[cfg(target_env = "musl")]
 #[global_allocator]
@@ -17,14 +17,14 @@ use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
-use glassdb::{Backend, Database, DatabaseBuilder, ProtocolTiming};
+use clap::Parser;
+use glassdb::ProtocolTiming;
 use glassdb_concurr::rt;
 use serde::Serialize;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
-/// The protocol timing of every database that a scenario creates.
+/// The protocol timing of every database instance.
 ///
 /// All instances run on one machine and read one clock, so they need no
 /// clock skew allowance, and GC can check the records of a load 30 s sooner.
@@ -33,114 +33,56 @@ const SCHEMA_VERSION: u32 = 1;
 const TIMING: ProtocolTiming = ProtocolTiming::new(Duration::from_secs(15), Duration::ZERO);
 
 #[derive(Parser)]
-#[command(about = "Run GlassDB database-level performance scenarios")]
+#[command(about = "Run GlassDB database-level performance experiments")]
 struct Cli {
     #[command(flatten)]
     backend: backend::Options,
-    /// Repeat the complete selected scenario.
-    #[arg(long, default_value_t = 1, global = true)]
+    /// A configuration file. It can be given more than once, and a later file
+    /// changes the values of an earlier one. The built-in configuration is
+    /// always the first.
+    #[arg(long = "config")]
+    configs: Vec<PathBuf>,
+    /// The experiment to run.
+    #[arg(long, default_value = "mixed")]
+    experiment: String,
+    /// Give a parameter of the experiment a fixed value, as `PATH=VALUE` with a
+    /// TOML value. It removes the axis that sets `PATH`. It can be given more
+    /// than once, and the last one wins.
+    #[arg(long = "set")]
+    set: Vec<String>,
+    /// Keep only one value of an axis, as `AXIS=LABEL`.
+    #[arg(long = "only")]
+    only: Vec<String>,
+    /// List the experiments of the configuration and exit.
+    #[arg(long)]
+    list: bool,
+    /// Repeat the complete experiment.
+    #[arg(long, default_value_t = 1)]
     runs: usize,
-    /// Real wall time between repeated scenario runs.
-    #[arg(long, default_value = "0s", value_parser = glassdb_bench_scale::parse_duration, global = true)]
+    /// Real wall time between repeated runs.
+    #[arg(long, default_value = "0s", value_parser = glassdb_bench_scale::parse_duration)]
     run_cooldown: Duration,
     /// Maximum time for in-flight work and Database shutdown.
-    #[arg(long, default_value = "30s", value_parser = glassdb_bench_scale::parse_duration, global = true)]
+    #[arg(long, default_value = "30s", value_parser = glassdb_bench_scale::parse_duration)]
     drain_timeout: Duration,
     /// Write JSON to this path instead of stdout.
-    #[arg(long, global = true)]
+    #[arg(long)]
     output: Option<PathBuf>,
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Sweep mixed transaction shapes across contention and collection affinity.
-    Mixed(mixed::Options),
-    /// Measure overlapping multi-key read-modify-write contention.
-    Contention(contention::Options),
-    /// Measure how leaves adapt to aggregate inline-admission pressure.
-    InlinePressure(inline_pressure::Options),
-    /// Measure database instances whose topology policies split and merge
-    /// the same leaf under a stable load.
-    SplitMergeFight(split_merge_fight::Options),
-    /// Measure creates and deletes that change the key membership of one leaf
-    /// while other transactions scan it.
-    MembershipChurn(membership_churn::Options),
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Report<T> {
     schema_version: u32,
-    scenario: &'static str,
+    /// The experiment.
+    scenario: String,
     backend: String,
     model_time_speedup: f64,
     latency_jitter: bool,
+    /// The command-line options of the backend and of the run.
+    options: serde_json::Value,
+    experiment: serde_json::Value,
     runs: Vec<T>,
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
-    let cli = Cli::parse();
-    if cli.runs == 0 {
-        return Err("--runs must be greater than zero".into());
-    }
-    let configured_speedup = cli.backend.model_time_speedup()?;
-    if let Some(speedup) = configured_speedup {
-        rt::set_model_time_speedup(speedup)?;
-    }
-    let model_time_speedup = configured_speedup.unwrap_or(1.0);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    let factory = runtime.block_on(cli.backend.initialize())?;
-    let handle = runtime.handle();
-    let backend = cli.backend.label().to_string();
-    let execution = execution(&cli);
-
-    let value = match &cli.command {
-        Command::Mixed(options) => serde_json::to_value(Report {
-            schema_version: SCHEMA_VERSION,
-            scenario: "mixed",
-            backend: backend.clone(),
-            model_time_speedup,
-            latency_jitter: cli.backend.latency_jitter,
-            runs: mixed::run(handle, &factory, options, execution)?,
-        })?,
-        Command::Contention(options) => serde_json::to_value(Report {
-            schema_version: SCHEMA_VERSION,
-            scenario: "contention",
-            backend: backend.clone(),
-            model_time_speedup,
-            latency_jitter: cli.backend.latency_jitter,
-            runs: contention::run(handle, &factory, options, execution)?,
-        })?,
-        Command::InlinePressure(options) => serde_json::to_value(Report {
-            schema_version: SCHEMA_VERSION,
-            scenario: "inline-pressure",
-            backend: backend.clone(),
-            model_time_speedup,
-            latency_jitter: cli.backend.latency_jitter,
-            runs: inline_pressure::run(handle, &factory, options, execution)?,
-        })?,
-        Command::SplitMergeFight(options) => serde_json::to_value(Report {
-            schema_version: SCHEMA_VERSION,
-            scenario: "split-merge-fight",
-            backend: backend.clone(),
-            model_time_speedup,
-            latency_jitter: cli.backend.latency_jitter,
-            runs: split_merge_fight::run(handle, &factory, options, execution)?,
-        })?,
-        Command::MembershipChurn(options) => serde_json::to_value(Report {
-            schema_version: SCHEMA_VERSION,
-            scenario: "membership-churn",
-            backend,
-            model_time_speedup,
-            latency_jitter: cli.backend.latency_jitter,
-            runs: membership_churn::run(handle, &factory, options, execution)?,
-        })?,
-    };
-    write_json(cli.output, &value)
 }
 
 #[derive(Clone, Copy)]
@@ -150,17 +92,50 @@ struct Execution {
     drain_timeout: Duration,
 }
 
-fn execution(cli: &Cli) -> Execution {
-    Execution {
+fn main() -> Result<(), Box<dyn Error>> {
+    let cli = Cli::parse();
+    if cli.runs == 0 {
+        return Err("--runs must be greater than zero".into());
+    }
+    let selection = runner::config::Selection {
+        configs: cli.configs.clone(),
+        experiment: cli.experiment.clone(),
+        set: cli.set.clone(),
+        only: cli.only.clone(),
+    };
+    if cli.list {
+        for name in selection.experiment_names()? {
+            println!("{name}");
+        }
+        return Ok(());
+    }
+    let resolved = selection.resolve()?;
+    let configured_speedup = cli.backend.model_time_speedup()?;
+    if let Some(speedup) = configured_speedup {
+        rt::set_model_time_speedup(speedup)?;
+    }
+    let model_time_speedup = configured_speedup.unwrap_or(1.0);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let factory = runtime.block_on(cli.backend.initialize())?;
+    let execution = Execution {
         runs: cli.runs,
         run_cooldown: cli.run_cooldown,
         drain_timeout: cli.drain_timeout,
-    }
-}
-
-/// Starts a database builder with the protocol timing of perfbench.
-fn database_builder<B: Backend + 'static>(name: &str, backend: B) -> DatabaseBuilder {
-    Database::builder(name, backend).protocol_timing(TIMING)
+    };
+    let runs = runner::run(&runtime, &factory, &resolved, execution)?;
+    let report = Report {
+        schema_version: SCHEMA_VERSION,
+        scenario: resolved.name.clone(),
+        backend: cli.backend.label().to_string(),
+        model_time_speedup,
+        latency_jitter: cli.backend.latency_jitter,
+        options: cli.backend.describe(),
+        experiment: resolved.describe(),
+        runs,
+    };
+    write_json(cli.output, &serde_json::to_value(report)?)
 }
 
 fn write_json(path: Option<PathBuf>, value: &serde_json::Value) -> Result<(), Box<dyn Error>> {

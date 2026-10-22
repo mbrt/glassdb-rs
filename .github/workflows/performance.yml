@@ -36,6 +36,9 @@ jobs:
           . -> target/performance/main
           . -> target/performance/pr
 
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+
     - name: Test benchmarks and comparison tools
       run: make test-bench
 

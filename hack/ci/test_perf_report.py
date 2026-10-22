@@ -21,86 +21,72 @@ class PerfReportTest(unittest.TestCase):
         for side in ("main", "pr"):
             for repetition in range(1, 4):
                 path = self.root / side / f"{repetition:02d}"
-                self.write(
-                    path / "criterion/diagnostic/example/new/estimates.json",
-                    {
-                        "mean": {
-                            "point_estimate": 100,
-                            "standard_error": 0.05,
-                            "confidence_interval": {
-                                "lower_bound": 99.9,
-                                "upper_bound": 100.1,
-                            },
-                        }
-                    },
-                )
-                counters = {
-                    key: 0
-                    for key in (
-                        "reads",
-                        "writes",
-                        "lists",
-                        "readBodyBytes",
-                        "writeBodyBytes",
-                        "coordinatorSubmissions",
-                        "coordinatorRounds",
-                    )
-                }
-                self.write(
-                    path / "criterion.log",
-                    {
-                        "schemaVersion": 1,
-                        "cases": [
-                            {
-                                "name": "example",
-                                "transactions": 30,
-                                **{
-                                    window: counters.copy()
-                                    for window in ("workload", "shutdown", "combined")
-                                },
-                            }
-                        ],
-                    },
-                )
+                self.write(path / "example.json", self.diagnostic(100, 0.05))
                 self.write(
                     path / "mixed.json",
-                    {
-                        "schemaVersion": 1,
-                        "scenario": "mixed",
-                        "backend": "memory",
-                        "modelTimeSpeedup": 5,
-                        "runs": [
-                            {
-                                "cells": [
-                                    {
-                                        "mode": "lo",
-                                        "affinityPct": 100,
-                                        "databases": 1,
-                                        "workersPerShape": 1,
-                                        "failures": 0,
-                                        "shapes": [
-                                            {
-                                                "shape": name,
-                                                "committed": 200,
-                                                "converged": True,
-                                                "meanMs": 10,
-                                                "p50Ms": 10,
-                                                "p90Ms": 20,
-                                                "txPerSec": 100,
-                                            }
-                                            for name in (
-                                                "rwSingle",
-                                                "rwMany",
-                                                "roSingle",
-                                                "roMulti",
-                                            )
-                                        ],
-                                    }
-                                ]
-                            }
-                        ],
-                    },
+                    self.envelope(
+                        "ci",
+                        {
+                            "workload": "low-conflict",
+                            "affinityPct": 100,
+                            "databases": 1,
+                            "workersPerShape": 1,
+                            "failures": 0,
+                            "shapes": [
+                                {
+                                    "shape": name,
+                                    "committed": 200,
+                                    "converged": True,
+                                    "meanMs": 10,
+                                    "p50Ms": 10,
+                                    "p90Ms": 20,
+                                    "txPerSec": 100,
+                                }
+                                for name in perf_report.MIXED_SHAPES
+                            ],
+                        },
+                    ),
                 )
+
+    @staticmethod
+    def envelope(experiment, cell):
+        return {
+            "schemaVersion": 2,
+            "scenario": experiment,
+            "backend": "memory",
+            "modelTimeSpeedup": 5,
+            "runs": [{"run": 1, "cells": [cell]}],
+        }
+
+    @classmethod
+    def diagnostic(cls, mean, error):
+        counters = {
+            key: 0
+            for key in (
+                "reads",
+                "writes",
+                "lists",
+                "readBodyBytes",
+                "writeBodyBytes",
+                "coordinatorSubmissions",
+                "coordinatorRounds",
+            )
+        }
+        return cls.envelope(
+            "diagnostics",
+            {
+                "labels": {"case": "example"},
+                "failures": 0,
+                "shapes": [{"shape": "example", "meanMs": mean, "meanSeMs": error}],
+                "costs": {
+                    "transactions": 30,
+                    **{
+                        window: counters.copy()
+                        for window in ("workload", "shutdown", "combined")
+                    },
+                },
+            },
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -108,24 +94,22 @@ class PerfReportTest(unittest.TestCase):
     @staticmethod
     def write(path, value):
         path.parent.mkdir(parents=True, exist_ok=True)
-        if path.name == "criterion.log":
-            path.write_text(
-                "Benchmarking diagnostic/example\n\ndiagnostic-costs: "
-                + json.dumps(value)
-                + "\nFinal summary\n"
-            )
-        else:
-            path.write_text(json.dumps(value))
+        path.write_text(json.dumps(value))
 
     def edit(self, relative, change):
         for repetition in range(1, 4):
             path = self.root / "pr" / f"{repetition:02d}" / relative
-            raw = path.read_text()
-            if path.name == "criterion.log":
-                raw = raw.split("diagnostic-costs: ", 1)[1].splitlines()[0]
-            value = json.loads(raw)
+            value = json.loads(path.read_text())
             change(value)
             self.write(path, value)
+
+    @staticmethod
+    def shape(value):
+        return value["runs"][0]["cells"][0]["shapes"][0]
+
+    @staticmethod
+    def costs(value):
+        return value["runs"][0]["cells"][0]["costs"]
 
     def report(self):
         return perf_report.render_report(self.root, "base", "candidate")
@@ -133,20 +117,8 @@ class PerfReportTest(unittest.TestCase):
     def timing_pair(self, repetition, before, after):
         for side, value in (("main", before), ("pr", after)):
             self.write(
-                self.root
-                / side
-                / f"{repetition:02d}"
-                / "criterion/diagnostic/example/new/estimates.json",
-                {
-                    "mean": {
-                        "point_estimate": value,
-                        "standard_error": value * 0.0005,
-                        "confidence_interval": {
-                            "lower_bound": value * 0.999,
-                            "upper_bound": value * 1.001,
-                        },
-                    }
-                },
+                self.root / side / f"{repetition:02d}" / "example.json",
+                self.diagnostic(value, value * 0.0005),
             )
 
     def test_process_variation_prevents_a_regression_claim(self):
@@ -158,7 +130,7 @@ class PerfReportTest(unittest.TestCase):
         self.assertNotIn("| Metric", report)
         self.assertRegex(
             report,
-            r"example: mean group time: noisy or inconclusive\s*"
+            r"example: mean transaction time: noisy or inconclusive\s*"
             r"\[-\d+\.\d+%, \+\d+\.\d+%\]",
         )
         self.assertIn("No conclusive changes", report)
@@ -168,7 +140,7 @@ class PerfReportTest(unittest.TestCase):
         for repetition, after in enumerate((102.8, 103.0, 103.2), 1):
             self.timing_pair(repetition, 100, after)
         report = self.report()
-        self.assertIn("example: mean group time |", report)
+        self.assertIn("example: mean transaction time |", report)
         self.assertIn("regressed", report)
         self.assertNotIn("inconclusive", report)
 
@@ -230,13 +202,7 @@ class PerfReportTest(unittest.TestCase):
         self.assertNotIn("No meaningful changes detected", report)
 
     def test_matching_estimates_with_wide_process_intervals_remain_uncertain(self):
-        self.edit(
-            "criterion/diagnostic/example/new/estimates.json",
-            lambda value: value["mean"].update(
-                standard_error=15,
-                confidence_interval={"lower_bound": 70, "upper_bound": 130},
-            ),
-        )
+        self.edit("example.json", lambda value: self.shape(value).update(meanSeMs=15))
         report = self.report()
         self.assertIn("inconclusive", report)
         self.assertNotIn("No meaningful changes detected", report)
@@ -259,20 +225,8 @@ class PerfReportTest(unittest.TestCase):
         for repetition, after in enumerate((102.8, 103.0, 103.2, 103.0) * 2, 1):
             for side, mean in (("main", 100), ("pr", after)):
                 self.write(
-                    self.root
-                    / side
-                    / f"{repetition:02d}"
-                    / "criterion/diagnostic/example/new/estimates.json",
-                    {
-                        "mean": {
-                            "point_estimate": mean,
-                            "standard_error": mean * 0.008,
-                            "confidence_interval": {
-                                "lower_bound": mean * 0.984,
-                                "upper_bound": mean * 1.016,
-                            },
-                        }
-                    },
+                    self.root / side / f"{repetition:02d}" / "example.json",
+                    self.diagnostic(mean, mean * 0.008),
                 )
         report = self.report()
         self.assertIn("+3.0%", report)
@@ -329,9 +283,6 @@ class PerfReportTest(unittest.TestCase):
                 directory = self.root / side / f"{repetition:02d}"
                 if repetition > 3:
                     shutil.copytree(self.root / side / "03", directory)
-                shutil.copy2(
-                    directory / "criterion.log", directory / "criterion-example.log"
-                )
         manifest = {
             "schemaVersion": 2,
             "cases": ["example"],
@@ -352,7 +303,7 @@ class PerfReportTest(unittest.TestCase):
         self.write(self.root / "manifest.json", manifest)
         report = self.report()
         self.assertNotIn("regressed", report)
-        self.assertIn("example: mean group time: noisy or inconclusive", report)
+        self.assertIn("example: mean transaction time: noisy or inconclusive", report)
         self.assertFalse(
             perf_report.analyze_benchmark(self.root, manifest, "example").resolved
         )
@@ -422,7 +373,7 @@ class PerfReportTest(unittest.TestCase):
             shutil.copytree(self.root / side / "03", self.root / side / "04")
             (self.root / side / "04/mixed.json").unlink()
         self.assertNotIn("Measurement warnings", self.report())
-        (self.root / "pr/04/criterion/diagnostic/example/new/estimates.json").unlink()
+        (self.root / "pr/04/example.json").unlink()
         self.assertIn("incomplete paired measurements", self.report())
 
     def test_unchanged_rows_are_hidden(self):
@@ -468,7 +419,7 @@ class PerfReportTest(unittest.TestCase):
             value["runs"][0]["cells"][0]["shapes"][0]["p50Ms"] = p50
             self.write(path, value)
         before = self.report()
-        self.assertIn("mixed/rwSingle: p50Ms: noisy or inconclusive", before)
+        self.assertIn("mixed/rw-single: p50Ms: noisy or inconclusive", before)
         self.assertNotIn("| Metric", before)
         self.edit(
             "mixed.json",
@@ -497,12 +448,12 @@ class PerfReportTest(unittest.TestCase):
 
         self.edit("mixed.json", change)
         report = self.report()
-        self.assertIn("mixed/rwSingle: p90Ms | 20.000 | 30.000", report)
-        self.assertIn("mixed/rwMany: txPerSec | 100.000 | 120.000", report)
-        self.assertIn("mixed/roSingle: p50Ms | 10.000 | 8.000", report)
+        self.assertIn("mixed/rw-single: p90Ms | 20.000 | 30.000", report)
+        self.assertIn("mixed/rw-many: txPerSec | 100.000 | 120.000", report)
+        self.assertIn("mixed/ro-single: p50Ms | 10.000 | 8.000", report)
         self.assertIn("regressed", report)
         self.assertIn("improved", report)
-        self.assertNotIn("mixed/roMulti:", report)
+        self.assertNotIn("mixed/ro-multi:", report)
 
     def test_small_timing_change_is_hidden(self):
         self.edit(
@@ -513,16 +464,10 @@ class PerfReportTest(unittest.TestCase):
         )
         self.assertNotIn("| Metric", self.report())
 
-    def test_criterion_interval_prevents_false_regression(self):
+    def test_process_interval_prevents_false_regression(self):
         self.edit(
-            "criterion/diagnostic/example/new/estimates.json",
-            lambda value: value.update(
-                mean={
-                    "point_estimate": 110,
-                    "standard_error": 6,
-                    "confidence_interval": {"lower_bound": 98, "upper_bound": 122},
-                }
-            ),
+            "example.json",
+            lambda value: self.shape(value).update(meanMs=110, meanSeMs=6),
         )
         report = self.report()
         self.assertNotIn("| Metric", report)
@@ -532,24 +477,22 @@ class PerfReportTest(unittest.TestCase):
         for error in (None, -1, float("nan")):
             with self.subTest(error=error):
                 self.timing_pair(1, 100, 102)
-                path = (
-                    self.root / "pr/01/criterion/diagnostic/example/new/estimates.json"
-                )
+                path = self.root / "pr/01/example.json"
                 value = json.loads(path.read_text())
                 if error is None:
-                    del value["mean"]["standard_error"]
+                    del self.shape(value)["meanSeMs"]
                 else:
-                    value["mean"]["standard_error"] = error
+                    self.shape(value)["meanSeMs"] = error
                 self.write(path, value)
                 report = self.report()
-                self.assertIn("missing or invalid Criterion measurement", report)
+                self.assertIn("missing or invalid latency", report)
                 self.assertIn("incomplete paired measurements", report)
                 self.assertNotIn("No meaningful changes detected", report)
 
     def test_repeatable_cost_change_from_zero_is_visible(self):
         self.edit(
-            "criterion.log",
-            lambda value: value["cases"][0]["shutdown"].update(writeBodyBytes=0.125),
+            "example.json",
+            lambda value: self.costs(value)["shutdown"].update(writeBodyBytes=0.125),
         )
         report = self.report()
         self.assertIn("example/shutdown: writeBodyBytes", report)
@@ -601,9 +544,12 @@ class PerfReportTest(unittest.TestCase):
         self.assertIn("Measurement warnings", report)
         self.assertIn("incomplete paired measurements", report)
 
-    def test_missing_case_is_not_silently_intersected(self):
-        self.edit("criterion.log", lambda value: value.update(cases=[]))
-        self.assertIn("cost case set changed", self.report())
+    def test_another_case_is_not_compared(self):
+        self.edit(
+            "example.json",
+            lambda value: value["runs"][0]["cells"][0].update(labels={"case": "other"}),
+        )
+        self.assertIn("its case changed", self.report())
 
     def test_invalid_numbers_and_low_sample_counts_are_warnings(self):
         self.edit(
@@ -614,73 +560,48 @@ class PerfReportTest(unittest.TestCase):
         )
         self.assertIn("insufficient latency/throughput observations", self.report())
         self.edit(
-            "criterion.log",
-            lambda value: value["cases"][0]["workload"].update(reads=float("nan")),
+            "example.json",
+            lambda value: self.costs(value)["workload"].update(reads=float("nan")),
         )
         self.assertIn("invalid cost measurements", self.report())
 
-    def test_missing_malformed_or_duplicate_cost_records_are_warnings(self):
-        for contents in (
-            "Benchmark failed before costs\n",
-            "diagnostic-costs: invalid JSON\n",
-            "diagnostic-costs: {}\ndiagnostic-costs: {}\n",
-        ):
+    def test_missing_or_malformed_diagnostic_results_are_warnings(self):
+        for contents in ("", "invalid JSON", "{}"):
             with self.subTest(contents=contents):
-                (self.root / "pr/03/criterion.log").write_text(contents)
-                self.assertIn("invalid cost measurements", self.report())
+                (self.root / "pr/03/example.json").write_text(contents)
+                self.assertIn("invalid diagnostic measurement", self.report())
 
     def test_diagnostic_models_must_match_before_timing_is_compared(self):
         directory = self.root / "pr/01"
-        path = directory / "criterion.log"
-        costs = perf_report.read_costs(path)
-        costs.update(schemaVersion=2, model=perf_report.DIAGNOSTIC_MODEL.copy())
-        self.write(path, costs)
-        options = {
-            "legacy_cases": {"example"},
-            "diagnostic_model": perf_report.DIAGNOSTIC_MODEL,
-        }
-        metrics, warnings = perf_report.read_measurement(
-            directory, "example", **options
-        )
+        metrics, warnings = perf_report.read_measurement(directory, "example")
         self.assertFalse(warnings)
-        self.assertIn("example: mean group time", metrics)
+        self.assertIn("example: mean transaction time", metrics)
         self.assertIn("example/workload: reads", metrics)
-        metrics, warnings = perf_report.read_measurement(
-            directory, "example", legacy_cases={"example"}
-        )
-        self.assertFalse(metrics)
-        self.assertIn("unsupported cost schema for diagnostic model", warnings[0])
         for key, value in (
-            ("latencyProfile", "none"),
+            ("backend", "s3"),
             ("modelTimeSpeedup", 20),
-            ("warmupMs", 500),
-            ("latencyJitter", True),
-            ("costWindow", "separatePass"),
+            ("schemaVersion", 1),
+            ("scenario", "mixed"),
         ):
             with self.subTest(key=key):
-                costs["model"] = {**perf_report.DIAGNOSTIC_MODEL, key: value}
-                self.write(path, costs)
-                metrics, warnings = perf_report.read_measurement(
-                    directory, "example", **options
-                )
+                result = self.diagnostic(100, 0.05)
+                result[key] = value
+                self.write(directory / "example.json", result)
+                metrics, warnings = perf_report.read_measurement(directory, "example")
                 self.assertFalse(metrics)
-                self.assertIn("invalid diagnostic model", warnings[0])
-        for contents in (
-            "Benchmark failed before costs\n",
-            'diagnostic-costs: {"schemaVersion": 1, "cases": []}\n',
-            'diagnostic-costs: {"schemaVersion": 2, "cases": []}\n',
-        ):
-            with self.subTest(contents=contents):
-                path.write_text(contents)
-                metrics, warnings = perf_report.read_measurement(
-                    directory, "example", **options
-                )
-                self.assertFalse(metrics)
-                self.assertIn("invalid diagnostic model", warnings[0])
+                self.assertIn("invalid diagnostic measurement", warnings[0])
+        result = self.diagnostic(100, 0.05)
+        result["latencyJitter"] = True
+        self.write(directory / "example.json", result)
+        metrics, warnings = perf_report.read_measurement(
+            directory, "example", mixed_args=["--latency-jitter=false"]
+        )
+        self.assertFalse(metrics)
+        self.assertIn("latency profile", warnings[0])
 
     def test_model_mismatch_is_not_compared(self):
         self.edit("mixed.json", lambda value: value.update(modelTimeSpeedup=1))
-        self.assertIn("unsupported mixed schema or backend model", self.report())
+        self.assertIn("unsupported ci schema or backend model", self.report())
 
 
 if __name__ == "__main__":

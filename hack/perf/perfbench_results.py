@@ -1,4 +1,4 @@
-"""Read `perfbench` result files (schema version 1) into pandas frames.
+"""Read `perfbench` result files (schema version 2) into pandas frames.
 
 This module is the only place that knows the on-disk layout of the `perfbench`
 JSON envelope. `compare.py` and `plot_results.py` both build on it, so a schema
@@ -18,8 +18,19 @@ from typing import Any, Sequence
 
 import pandas as pd
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SHAPES = ("rwSingle", "rwMany", "roSingle", "roMulti")
+# The shapes of the mixed workloads, by their names in the configuration.
+SHAPE_NAMES = {
+    "rw-single": "rwSingle",
+    "rw-many": "rwMany",
+    "ro-single": "roSingle",
+    "ro-multi": "roMulti",
+}
+# The mixed workloads, and the mode that the plots and tables name them by.
+MIXED_MODES = {"low-conflict": "lo", "high-conflict": "hi"}
+# The experiments whose cells are mixed workloads.
+MIXED_EXPERIMENTS = ("mixed", "ci", "workers", "affinity")
 
 
 class ReportError(ValueError):
@@ -52,10 +63,11 @@ def check_envelope(
 ) -> dict[str, Any]:
     """Return `report` when it is a supported envelope, optionally of `scenario`."""
     if not isinstance(report, dict) or report.get("schemaVersion") != SCHEMA_VERSION:
-        raise ReportError(f"{source}: expected a schema-version 1 perfbench report")
+        raise ReportError(f"{source}: expected a schema-version 2 perfbench report")
     if not isinstance(report.get("scenario"), str):
         raise ReportError(f"{source}: scenario must be a string")
-    if scenario is not None and report["scenario"] != scenario:
+    accepted = MIXED_EXPERIMENTS if scenario == "mixed" else (scenario,)
+    if scenario is not None and report["scenario"] not in accepted:
         raise ReportError(
             f"{source}: expected a {scenario} report, got {report['scenario']}"
         )
@@ -90,7 +102,11 @@ def runs(report: dict[str, Any], source: str) -> list[tuple[int, dict[str, Any]]
 
 
 def mixed_cells(report: dict[str, Any], source: str) -> list[dict[str, Any]]:
-    """Flatten a mixed report into cells that each carry their `run` id."""
+    """Flatten a mixed report into cells that each carry their `run` id.
+
+    Each cell also carries the `mode` of its workload, and its shapes the
+    names of the mixed shapes, as the plots and tables name them.
+    """
     check_envelope(report, source, "mixed")
     cells: list[dict[str, Any]] = []
     for run_id, run in runs(report, source):
@@ -101,7 +117,27 @@ def mixed_cells(report: dict[str, Any], source: str) -> list[dict[str, Any]]:
             failures = _integer(cell.get("failures"), f"{label}.failures")
             if failures:
                 raise ReportError(f"{label}: contains {failures} failures")
-            cells.append({**cell, "run": run_id})
+            mode = MIXED_MODES.get(cell.get("workload"))
+            if mode is None:
+                raise ReportError(
+                    f"{label}: workload {cell.get('workload')!r} is not a mixed workload"
+                )
+            shapes = [
+                {**shape, "shape": SHAPE_NAMES.get(shape.get("shape"), shape.get("shape"))}
+                for shape in _array(cell.get("shapes"), f"{label}.shapes")
+                if isinstance(shape, dict)
+            ]
+            ops = cell.get("aggregateOps")
+            cells.append(
+                {
+                    **cell,
+                    "run": run_id,
+                    "mode": mode,
+                    "shapes": shapes,
+                    "sharedPct": _shared_pct(report, cell),
+                    **({"aggregateOps": ops} if ops is not None else {}),
+                }
+            )
     return cells
 
 
@@ -126,27 +162,18 @@ def read_mixed(
     for cell_index, cell in enumerate(mixed_cells(report, source)):
         run_id = cell["run"]
         label = f"{source}: run {run_id} cell {cell_index}"
-        mode = cell.get("mode")
-        if mode not in ("lo", "hi"):
-            raise ReportError(f"{label}: mode must be lo or hi")
+        mode = cell["mode"]
         affinity = _integer(cell.get("affinityPct"), f"{label}.affinityPct")
         if affinity > 100:
             raise ReportError(f"{label}.affinityPct must not exceed 100")
         databases = _integer(cell.get("databases"), f"{label}.databases", minimum=1)
-        # Reports written before the Database limit and worker count were
-        # recorded omit both. Such a cell ran one Database per limit, and its
-        # worker count is unknown.
-        database_limit = (
-            _integer(cell["databaseLimit"], f"{label}.databaseLimit", minimum=1)
-            if "databaseLimit" in cell
-            else databases
+        database_limit = _integer(
+            cell.get("databaseLimit"), f"{label}.databaseLimit", minimum=1
         )
-        workers = (
-            _integer(cell["workersPerShape"], f"{label}.workersPerShape", minimum=1)
-            if "workersPerShape" in cell
-            else None
+        workers = _integer(
+            cell.get("workersPerShape"), f"{label}.workersPerShape", minimum=1
         )
-        if workers is not None and databases != min(database_limit, workers):
+        if databases != min(database_limit, workers):
             raise ReportError(
                 f"{label}: databases={databases} does not equal "
                 f"min(databaseLimit={database_limit}, workersPerShape={workers})"
@@ -196,13 +223,13 @@ def read_mixed(
     return meta, pd.DataFrame(rows)
 
 
-def read_contention(paths: Sequence[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load contention reports into `(latency samples, per-cell stats)`.
+def read_contention(paths: Sequence[Path]) -> pd.DataFrame:
+    """Load contention reports into one row of stats per run and cell.
 
     Several files are numbered as consecutive runs, so independently produced
     single-run files can be pooled.
     """
-    samples, stats = [], []
+    stats = []
     for run_id, source, run in _numbered_runs(paths, "contention"):
         cells = _array(run.get("cells"), f"{source}: run {run_id}.cells")
         for index, value in enumerate(cells):
@@ -210,37 +237,51 @@ def read_contention(paths: Sequence[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
             cell = _object(value, label)
             if _integer(cell.get("failures"), f"{label}.failures"):
                 raise ReportError(f"{label}: contention cell did not complete cleanly")
+            num_keys, overlap = _overlap(cell, label)
+            shapes = _array(cell.get("shapes"), f"{label}.shapes")
+            if len(shapes) != 1:
+                raise ReportError(f"{label}: expected one contention shape")
+            shape = _object(shapes[0], f"{label}.shapes[0]")
+            protocol = _object(cell.get("aggregateProtocol"), f"{label}.aggregateProtocol")
+            measure = _object(cell.get("measure"), f"{label}.measure")
+            committed = _integer(shape.get("committed"), f"{label}.committed")
             identity = {
                 "run": run_id,
-                "num-keys": _integer(cell.get("numKeys"), f"{label}.numKeys"),
-                "overlap": _integer(cell.get("overlap"), f"{label}.overlap"),
-                "overlap-pct": _integer(cell.get("overlapPct"), f"{label}.overlapPct"),
+                "num-keys": num_keys,
+                "overlap": overlap,
+                "overlap-pct": 100 * overlap // num_keys,
             }
-            samples.extend(
-                {**identity, "latency-ms": _number(latency, f"{label}.samplesMs")}
-                for latency in _array(cell.get("samplesMs", []), f"{label}.samplesMs")
-            )
+            tx_per_sec = _number(shape.get("txPerSec"), f"{label}.txPerSec")
             stats.append(
                 {
                     **identity,
-                    "count": _integer(cell.get("committed"), f"{label}.committed"),
-                    "cell-duration-ms": _number(
-                        cell.get("durationMs"), f"{label}.durationMs"
+                    "count": committed,
+                    "cell-duration-ms": (
+                        committed * 1000.0 / tx_per_sec if tx_per_sec else 0.0
                     ),
-                    "tx-per-sec": _number(cell.get("txPerSec"), f"{label}.txPerSec"),
-                    "num-replays": body_replays(cell),
-                    "direct-candidates": _integer(
-                        cell.get("directCandidates"), f"{label}.directCandidates"
+                    "tx-per-sec": tx_per_sec,
+                    "p50-ms": _number(shape.get("p50Ms"), f"{label}.p50Ms"),
+                    "p90-ms": _number(shape.get("p90Ms"), f"{label}.p90Ms"),
+                    "num-replays": _integer(protocol.get("replays"), f"{label}.replays"),
+                    "direct-candidates": round(
+                        _number(
+                            protocol.get("directCandidatesPerTx"),
+                            f"{label}.directCandidatesPerTx",
+                        )
+                        * committed
                     ),
-                    "direct-landed": _integer(
-                        cell.get("directLanded"), f"{label}.directLanded"
+                    "direct-landed": round(
+                        _number(
+                            protocol.get("directLandedPerTx"), f"{label}.directLandedPerTx"
+                        )
+                        * committed
                     ),
                     "worker-drain-ms": _number(
-                        cell.get("workerDrainMs"), f"{label}.workerDrainMs"
+                        measure.get("workerDrainMs"), f"{label}.workerDrainMs"
                     ),
                 }
             )
-    return pd.DataFrame(samples), pd.DataFrame(stats)
+    return pd.DataFrame(stats)
 
 
 def read_inline_pressure(paths: Sequence[Path]) -> pd.DataFrame:
@@ -270,9 +311,9 @@ def read_inline_pressure(paths: Sequence[Path]) -> pd.DataFrame:
     }
     rows = []
     for run_id, source, run in _numbered_runs(paths, "inline-pressure"):
-        phases = _array(run.get("phases"), f"{source}: run {run_id}.phases")
-        for index, value in enumerate(phases):
-            phase = _object(value, f"{source}: run {run_id} phase {index}")
+        cells = _array(run.get("cells"), f"{source}: run {run_id}.cells")
+        for index, value in enumerate(cells):
+            phase = _inline_phase(_object(value, f"{source}: run {run_id} cell {index}"))
             row = {"run": run_id, "phase": phase.get("phase")}
             row.update(
                 {
@@ -284,6 +325,57 @@ def read_inline_pressure(paths: Sequence[Path]) -> pd.DataFrame:
             )
             rows.append(row)
     return pd.DataFrame(rows)
+
+
+def _inline_phase(cell: dict[str, Any]) -> dict[str, Any]:
+    """Return the fields of one phase of an inline-pressure cell."""
+    shape = (cell.get("shapes") or [{}])[0]
+    ops = cell.get("aggregateOps") or {}
+    protocol = cell.get("aggregateProtocol") or {}
+    committed = shape.get("committed", 0)
+    instances = [
+        instance
+        for group in cell.get("groups", [])
+        for instance in group.get("instances", [])
+    ]
+
+    def total(field: str) -> int:
+        return sum(instance.get(field, 0) for instance in instances)
+
+    return {
+        "phase": (cell.get("labels") or {}).get("phase"),
+        "logicalTx": committed,
+        "wallMs": (cell.get("measure") or {}).get("wallMs"),
+        "txPerSec": shape.get("txPerSec") if committed else None,
+        "p50Ms": shape.get("p50Ms") if committed else None,
+        "p90Ms": shape.get("p90Ms") if committed else None,
+        "replays": protocol.get("replays", 0),
+        "lockCalls": protocol.get("lockCalls", 0),
+        "directCandidates": total("directCandidates"),
+        "directLanded": total("directLanded"),
+        "backendOps": ops.get("backendOps"),
+        "writeBytes": ops.get("writeBytes"),
+        "splitCandidates": total("splitCandidates"),
+        "splitCompleted": total("splits"),
+        "splitDeferred": total("splitDeferred"),
+        "merges": total("merges"),
+    }
+
+
+def _overlap(cell: dict[str, Any], label: str) -> tuple[int, int]:
+    """Return the keys and the shared keys of a contention cell."""
+    experiment = cell.get("parameters") or {}
+    keys = experiment.get("keys")
+    shared = experiment.get("shared")
+    return (
+        _integer(keys, f"{label}.parameters.keys", minimum=1),
+        _integer(shared, f"{label}.parameters.shared", minimum=1),
+    )
+
+
+def _shared_pct(report: dict[str, Any], cell: dict[str, Any]) -> int | None:
+    """Return the shared percentage of the stripes of a mixed cell."""
+    return (cell.get("parameters") or {}).get("sharedPct")
 
 
 def _numbered_runs(

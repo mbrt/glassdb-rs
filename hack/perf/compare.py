@@ -34,7 +34,8 @@ Two original use cases are both covered by this generic shape:
 
 * engine versions: ``--a out/v1 --label-a v1 --b out/v2 --label-b v2`` (see
   ``compare_refs.sh``);
-* fake vs real S3: ``--a out --label-a real --b out-fake --label-b fake``.
+* real vs simulated S3: ``--a hack/aws-bench/out --label-a s3 --b out-model
+  --label-b model``.
 
 It also writes overlay PNGs (``cmp-tx-throughput.png``, ``cmp-tx-latency.png``,
 ``cmp-replays.png``, ``cmp-contention-latency.png``) into ``--out`` so the curves
@@ -127,10 +128,8 @@ def scenario_paths(input_dir: Path, name: str) -> list[Path]:
     return sorted(input_dir.glob(f"runs/*/{name}"))
 
 
-def perfbench_contention_frames(
-    input_dir: Path,
-) -> tuple[pd.DataFrame, pd.DataFrame] | None:
-    """Convert a current contention envelope to the historical table shapes."""
+def perfbench_contention_frames(input_dir: Path) -> pd.DataFrame | None:
+    """Convert a current contention envelope to the historical stats table."""
     paths = scenario_paths(input_dir, "contention.json")
     return perfbench_results.read_contention(paths) if paths else None
 
@@ -551,17 +550,26 @@ def inline_pressure_table(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
 
 
 def contention_table(a: pd.DataFrame, b: pd.DataFrame):
+    """Pair the latency percentiles at 100% overlap by run and key count.
+
+    A frame has either the latency samples of the historical CSVs, or the p50
+    and p90 of each perfbench cell.
+    """
+
     def agg(df: pd.DataFrame) -> pd.DataFrame:
         df = with_run_identity(df, [])
         d = df[df["overlap-pct"] == 100]
         if d.empty:
             d = df
-        g = (
-            d.groupby(["run", "num-keys"])["latency-ms"]
-            .quantile([0.5, 0.9])
-            .unstack()
-            .reset_index()
-        )
+        if "p50-ms" in d.columns:
+            g = d[["run", "num-keys", "p50-ms", "p90-ms"]].copy()
+        else:
+            g = (
+                d.groupby(["run", "num-keys"])["latency-ms"]
+                .quantile([0.5, 0.9])
+                .unstack()
+                .reset_index()
+            )
         g.columns = ["run", "num-keys", "p50", "p90"]
         return g
 
@@ -969,7 +977,7 @@ def plot_overlay_contention(data, out_dir: Path) -> None:
     sns.lineplot(
         data=data,
         x="num-keys",
-        y="latency-ms",
+        y="latency-ms" if "latency-ms" in data.columns else "p50-ms",
         style="source",
         estimator="median",
         errorbar=("pi", 80),
@@ -1004,9 +1012,8 @@ def _save(fig: plt.Figure, out_dir: Path, name: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    base = Path(__file__).resolve().parent
-    parser.add_argument("--a", type=Path, default=base / "out")
-    parser.add_argument("--b", type=Path, default=base / "out-fake")
+    parser.add_argument("--a", type=Path, required=True)
+    parser.add_argument("--b", type=Path, required=True)
     parser.add_argument("--label-a", default="a")
     parser.add_argument("--label-b", default="b")
     parser.add_argument(
@@ -1288,10 +1295,10 @@ def main() -> int:
     b_contention = perfbench_contention_frames(args.b)
     a_contention_samples = read_csv(args.a, "deadlock.csv")
     b_contention_samples = read_csv(args.b, "deadlock.csv")
-    if a_contention_samples is None and a_contention is not None:
-        a_contention_samples = a_contention[0]
-    if b_contention_samples is None and b_contention is not None:
-        b_contention_samples = b_contention[0]
+    if a_contention_samples is None:
+        a_contention_samples = a_contention
+    if b_contention_samples is None:
+        b_contention_samples = b_contention
     a_dl = normalize_rtbench_time(
         a_contention_samples,
         "deadlock.csv",
@@ -1324,10 +1331,10 @@ def main() -> int:
 
     a_contention_stats = read_csv(args.a, "deadlock-stats.csv")
     b_contention_stats = read_csv(args.b, "deadlock-stats.csv")
-    if a_contention_stats is None and a_contention is not None:
-        a_contention_stats = a_contention[1]
-    if b_contention_stats is None and b_contention is not None:
-        b_contention_stats = b_contention[1]
+    if a_contention_stats is None:
+        a_contention_stats = a_contention
+    if b_contention_stats is None:
+        b_contention_stats = b_contention
     a_ds = normalize_rtbench_time(
         a_contention_stats,
         "deadlock-stats.csv",

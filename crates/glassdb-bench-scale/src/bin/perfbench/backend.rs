@@ -12,25 +12,25 @@ use glassdb_backend::Backend;
 #[derive(Clone, Args)]
 pub(super) struct Options {
     /// Storage backend. The cloud backends use the bucket named by $BUCKET.
-    #[arg(long, default_value = "memory", value_parser = ["memory", "gcs", "s3", "fakes3"], global = true)]
+    #[arg(long, default_value = "memory", value_parser = ["memory", "gcs", "s3", "fakes3"])]
     backend: String,
     /// Cloud latency profile simulated by memory and fakes3.
-    #[arg(long, default_value = "s3", value_parser = ["gcs", "s3"], global = true)]
+    #[arg(long, default_value = "s3", value_parser = ["gcs", "s3"])]
     delays: String,
     /// Vary simulated provider latency around its mean.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, global = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub(super) latency_jitter: bool,
     /// Enable simulated per-object and per-prefix throttling.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, global = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     enable_throttling: bool,
     /// Override the simulated prefix partition depth; zero uses the profile.
-    #[arg(long, default_value_t = 0, global = true)]
+    #[arg(long, default_value_t = 0)]
     prefix_depth: usize,
     /// Compress process-wide model time for synthetic backends.
-    #[arg(long, default_value_t = 0.2, global = true)]
+    #[arg(long, default_value_t = 0.2)]
     delay_scale: f64,
     /// S3 connection-pool strategy. `churn` applies only to fakes3.
-    #[arg(long, default_value = "tuned", value_parser = ["default", "tuned", "churn"], global = true)]
+    #[arg(long, default_value = "tuned", value_parser = ["default", "tuned", "churn"])]
     http_pool: String,
 }
 
@@ -75,6 +75,19 @@ impl Options {
 
     pub(super) fn label(&self) -> &str {
         &self.backend
+    }
+
+    /// Returns the options, for the result.
+    pub(super) fn describe(&self) -> serde_json::Value {
+        serde_json::json!({
+            "backend": self.backend,
+            "delays": self.delays,
+            "latencyJitter": self.latency_jitter,
+            "enableThrottling": self.enable_throttling,
+            "prefixDepth": self.prefix_depth,
+            "delayScale": self.delay_scale,
+            "httpPool": self.http_pool,
+        })
     }
 
     /// Returns the model-time speedup for a synthetic backend. Real providers
@@ -229,12 +242,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn fixed_latency_keeps_backend_waits_and_throttling() -> Result<(), Box<dyn Error>> {
-        let cli = crate::Cli::try_parse_from([
-            "perfbench",
-            "--delays=gcs",
-            "--latency-jitter=false",
-            "mixed",
-        ])?;
+        let cli =
+            crate::Cli::try_parse_from(["perfbench", "--delays=gcs", "--latency-jitter=false"])?;
         let backend = cli.backend.initialize().await?.backend();
         let revision = backend.write_if_not_exists("db/key", vec![7]).await?;
         let mut elapsed = Vec::new();

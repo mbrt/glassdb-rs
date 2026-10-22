@@ -2286,7 +2286,7 @@ efficiency samples, and three-second contention cells:
 ```console
 BASE=v0.1.0 LABEL_A=v010 LABEL_B=current DELAY_SCALE=1 NUM_RUNS=3 \
   CONTENTION_DURATION=3s COUNT=5 DRAIN_TIMEOUT=90s \
-  hack/aws-bench/compare_refs.sh --summary
+  hack/perf/compare_refs.sh --summary
 ```
 
 The current and v0.1.0 binaries therefore use their unmodified production

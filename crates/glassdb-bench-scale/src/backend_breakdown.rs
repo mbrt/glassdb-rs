@@ -1,6 +1,6 @@
 //! Opt-in backend-operation attribution for performance diagnostics.
 
-use std::ops::Sub;
+use std::ops::{Add, Sub};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,6 +23,20 @@ pub struct OperationCounts {
 impl OperationCounts {
     pub fn total(self) -> u64 {
         self.reads + self.writes + self.lists
+    }
+}
+
+impl Add for OperationCounts {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            reads: self.reads + other.reads,
+            writes: self.writes + other.writes,
+            lists: self.lists + other.lists,
+            read_bytes: self.read_bytes + other.read_bytes,
+            write_bytes: self.write_bytes + other.write_bytes,
+        }
     }
 }
 
@@ -76,6 +90,21 @@ impl BackendBreakdown {
             .into_iter()
             .map(|(_, ops)| ops.write_bytes)
             .sum()
+    }
+}
+
+impl Add for BackendBreakdown {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            database_metadata: self.database_metadata + other.database_metadata,
+            collection_record: self.collection_record + other.collection_record,
+            node: self.node + other.node,
+            transaction_record: self.transaction_record + other.transaction_record,
+            structural_intent: self.structural_intent + other.structural_intent,
+            other: self.other + other.other,
+        }
     }
 }
 

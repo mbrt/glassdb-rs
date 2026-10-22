@@ -1,4 +1,4 @@
-.PHONY: test test-unit test-sim test-bench lint format build clean fuzz fuzz-min bench bench-diagnostics flamegraph
+.PHONY: test test-unit test-sim test-bench lint format build clean fuzz fuzz-min bench flamegraph
 
 # Flags for every build under the in-repo deterministic simulation executor:
 # `--cfg sim` routes spawn/time/randomness through it, and `--cfg tokio_unstable`
@@ -20,6 +20,10 @@ test-unit:
 
 test-bench:
 	python3 -m unittest hack.ci.test_perf_report hack.ci.test_perf_compare
+	# The plot and comparison tools declare their dependencies as uv scripts.
+	cd hack/perf && for test in test_perfbench_results test_compare test_plot_results; do \
+		uv run --script $$test.py || exit 1; \
+	done
 	cargo test -p glassdb-bench-scale
 	cargo test --workspace --bench '*'
 
@@ -36,23 +40,17 @@ lint:
 format:
 	cargo fmt --all
 
-# Run the Criterion transaction microbenchmarks (memory + simulated S3/GCS).
-# The concurrency/throughput "scale" benchmarks (real or simulated cloud
-# backends) live in the `glassdb-bench-scale` crate; run them directly, e.g.:
-#   cargo run --release -p glassdb-bench-scale --bin perfbench -- mixed --modes hi --affinities 0,50,100
-#   cargo run --release -p glassdb-bench-scale --bin backendbench -- --backend memory
-# See hack/aws-bench/README.md for cross-reference comparisons and real S3.
+# Run the perfbench experiments. The default runs the mixed workloads; select
+# another with EXPERIMENT, for example `make bench EXPERIMENT=diagnostics`.
+# crates/glassdb-bench-scale/README.md explains the experiments.
 bench:
-	cargo bench -p glassdb
-
-# Run the selected Criterion cases and a separate backend-cost pass.
-bench-diagnostics:
-	cargo bench -p glassdb --bench diagnostics -- --noplot
+	cargo run --release -p glassdb-bench-scale --bin perfbench -- \
+		--experiment=$(or $(EXPERIMENT),mixed)
 
 # Record a CPU flamegraph to guide profiling work (a diagnostic aid only -
 # excluded from `test` and benchmarks; it changes no
-# source and is not part of any metric). Tunable via FILTER/SECONDS_PER_CASE/OUT; see
-# hack/perf/README.md.
+# source and is not part of any metric). Tunable via
+# EXPERIMENT/CASE/SECONDS_PER_CASE/OUT; see hack/perf/README.md.
 flamegraph:
 	hack/perf/profile.sh
 
