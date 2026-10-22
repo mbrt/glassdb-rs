@@ -63,7 +63,7 @@ use stats::Stats;
 pub use candidates::StructuralHintSink;
 pub(crate) use measurements::TypicalTime;
 pub use rule::TopologyPolicy;
-pub use stats::{InlinePressureStats, RestructurerStats};
+pub use stats::{DemandMergeStats, InlinePressureStats, RestructurerStats, TopologyTimeStats};
 pub(crate) use topology::TopologyMembership;
 
 /// Back off empty structural-intent listings independently of candidates.
@@ -165,9 +165,15 @@ impl Restructurer {
         self.candidates.hint_sink()
     }
 
-    /// Returns and resets background split and merge activity counters.
+    /// Returns and resets the counters of background split and merge
+    /// activity, and of the time that transactions reported to the topology
+    /// rule.
     pub fn stats_and_reset(&self) -> RestructurerStats {
-        self.stats.take()
+        let mut stats = self.stats.take();
+        if let Some(measurements) = self.candidates.measurements() {
+            stats.topology_time = measurements.take_totals();
+        }
+        stats
     }
 
     /// Starts independent candidate, structural-recovery, and topology rule
@@ -317,7 +323,9 @@ impl Restructurer {
         let mut splits = Vec::new();
         let mut merges = Vec::new();
         let (candidates, stale) = self.candidates.drain();
-        self.stats.stale_demand.fetch_add(stale, Ordering::Relaxed);
+        for candidate in &stale {
+            self.count_stale(candidate);
+        }
         for candidate in candidates {
             self.count_candidate(&candidate);
             match &candidate.cause {
@@ -499,9 +507,22 @@ impl Restructurer {
     fn drop_if_stale(&self, candidate: &MaintenanceCandidate) -> bool {
         let stale = candidate.is_stale();
         if stale {
-            self.stats.stale_demand.fetch_add(1, Ordering::Relaxed);
+            self.count_stale(candidate);
         }
         stale
+    }
+
+    /// Counts one stale demand candidate that a sweep dropped.
+    fn count_stale(&self, candidate: &MaintenanceCandidate) {
+        self.stats.stale_demand.fetch_add(1, Ordering::Relaxed);
+        if matches!(
+            candidate.cause,
+            CandidateCause::Merge(MergeReason::Demand { .. })
+        ) {
+            self.stats
+                .demand_merge_stale
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Requeues `candidate` when a transient error deferred its change.

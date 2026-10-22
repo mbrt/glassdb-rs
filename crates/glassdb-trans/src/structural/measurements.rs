@@ -15,9 +15,10 @@ use glassdb_data::{NodeId, ObjectPath};
 use glassdb_storage::LeafBody;
 
 use crate::access::AccessSet;
-use crate::leaf_coord::upper_half;
+use crate::leaf_coord::{LeafDelayKind, upper_half};
 
 use super::rule::{LeafId, LeafWindow, PairWindow, TopologyWindow};
+use super::stats::TopologyTimeStats;
 
 /// The time of one split or merge until this database instance measures one.
 const DEFAULT_CHANGE_TIME: Duration = Duration::from_millis(500);
@@ -50,6 +51,9 @@ struct State {
     pairs: BTreeMap<(ObjectPath, ObjectPath), PairTimes>,
     changes: Vec<(ObjectPath, ChangeKind)>,
     changes_last_window: Vec<(ObjectPath, ChangeKind)>,
+    // The totals share the lock of the window, so that they cost no second
+    // lock in the transactions that report time.
+    totals: TopologyTimeStats,
 }
 
 /// The measurements of two adjacent leaves in the current window.
@@ -118,6 +122,7 @@ impl TopologyMeasurements {
                 pairs: BTreeMap::new(),
                 changes: Vec::new(),
                 changes_last_window: Vec::new(),
+                totals: TopologyTimeStats::default(),
             }),
             split_time: TypicalTime::default(),
             merge_time: TypicalTime::default(),
@@ -126,11 +131,23 @@ impl TopologyMeasurements {
 
     /// Adds leaf delay time of the leaf at `path`, which a split at
     /// `split_key` removes.
-    pub(super) fn add_leaf_delay(&self, path: &ObjectPath, time: Duration, split_key: &[u8]) {
+    pub(super) fn add_leaf_delay(
+        &self,
+        path: &ObjectPath,
+        time: Duration,
+        split_key: &[u8],
+        kind: LeafDelayKind,
+    ) {
         if time.is_zero() {
             return;
         }
         let mut state = self.state.lock().unwrap();
+        let totals = &mut state.totals;
+        *match kind {
+            LeafDelayKind::LostCas => &mut totals.lost_cas,
+            LeafDelayKind::QueueWait => &mut totals.queue_wait,
+            LeafDelayKind::SlowCas => &mut totals.slow_cas,
+        } += time;
         let leaf = state.leaf(path);
         leaf.delay_time += time;
         leaf.split_key = Some(split_key.to_vec());
@@ -140,7 +157,9 @@ impl TopologyMeasurements {
     /// median removes.
     pub(super) fn add_inline_pressure(&self, path: &ObjectPath, time: Duration) {
         if !time.is_zero() {
-            self.state.lock().unwrap().leaf(path).inline_pressure_time += time;
+            let mut state = self.state.lock().unwrap();
+            state.totals.inline_pressure += time;
+            state.leaf(path).inline_pressure_time += time;
         }
     }
 
@@ -149,9 +168,9 @@ impl TopologyMeasurements {
         if time.is_zero() {
             return;
         }
-        self.state
-            .lock()
-            .unwrap()
+        let mut state = self.state.lock().unwrap();
+        state.totals.merge_side += time;
+        state
             .pairs
             .entry((left.clone(), right.clone()))
             .or_default()
@@ -168,10 +187,12 @@ impl TopologyMeasurements {
         let mut state = self.state.lock().unwrap();
         for (path, read) in reads {
             if read.divided() {
+                state.totals.divided_conflict += time;
                 state.leaf(path).divided_conflict_time += time;
             }
         }
         if let Some(pair) = pair {
+            state.totals.crossing_conflict += time;
             state.pairs.entry(pair).or_default().crossing_conflict_time += time;
         }
     }
@@ -195,6 +216,11 @@ impl TopologyMeasurements {
             ChangeKind::Split => self.split_time.record(took),
             ChangeKind::Merge => self.merge_time.record(took),
         }
+    }
+
+    /// Returns the time of each kind since the last call, and resets it.
+    pub(super) fn take_totals(&self) -> TopologyTimeStats {
+        std::mem::take(&mut self.state.lock().unwrap().totals)
     }
 
     /// Returns the measurements since the last call, and starts a new window.
@@ -300,6 +326,7 @@ mod tests {
     use glassdb_data::{CollectionAddress, NodeId, ObjectPath};
 
     use super::{ChangeKind, TopologyMeasurements, TypicalTime};
+    use crate::leaf_coord::LeafDelayKind;
     use crate::structural::rule::LeafId;
 
     fn node(byte: u8) -> ObjectPath {
@@ -316,12 +343,12 @@ mod tests {
     #[test]
     fn a_change_drops_the_earlier_time_of_its_leaves_and_holds_them_for_two_windows() {
         let measurements = TopologyMeasurements::new();
-        measurements.add_leaf_delay(&node(1), ms(900), b"a");
-        measurements.add_leaf_delay(&node(3), ms(700), b"c");
+        measurements.add_leaf_delay(&node(1), ms(900), b"a", LeafDelayKind::QueueWait);
+        measurements.add_leaf_delay(&node(3), ms(700), b"c", LeafDelayKind::QueueWait);
         measurements.add_merge_time(&node(1), &node(2), ms(800));
         measurements.add_merge_time(&node(3), &node(4), ms(600));
         measurements.record_changed(node(1), ChangeKind::Split);
-        measurements.add_leaf_delay(&node(1), ms(100), b"a");
+        measurements.add_leaf_delay(&node(1), ms(100), b"a", LeafDelayKind::QueueWait);
 
         let first = measurements.take_window();
         let second = measurements.take_window();
@@ -341,10 +368,10 @@ mod tests {
     #[test]
     fn a_window_keeps_the_last_split_key_of_each_leaf_since_its_last_change() {
         let measurements = TopologyMeasurements::new();
-        measurements.add_leaf_delay(&node(1), ms(100), b"a");
-        measurements.add_leaf_delay(&node(1), ms(100), b"b");
+        measurements.add_leaf_delay(&node(1), ms(100), b"a", LeafDelayKind::QueueWait);
+        measurements.add_leaf_delay(&node(1), ms(100), b"b", LeafDelayKind::QueueWait);
         measurements.add_inline_pressure(&node(1), ms(100));
-        measurements.add_leaf_delay(&node(2), ms(100), b"c");
+        measurements.add_leaf_delay(&node(2), ms(100), b"c", LeafDelayKind::QueueWait);
         measurements.record_changed(node(2), ChangeKind::Split);
         measurements.add_inline_pressure(&node(2), ms(100));
 
@@ -353,6 +380,32 @@ mod tests {
         let split_key = |byte| window.leaves[&LeafId::new(node(byte))].split_key.clone();
         assert_eq!(split_key(1), Some(b"b".to_vec()));
         assert_eq!(split_key(2), None);
+    }
+
+    // The totals show which kind of time drives the rule. A change of a leaf
+    // drops its time from the window, but not from the totals.
+    #[test]
+    fn the_totals_keep_each_kind_of_time_until_they_are_taken() {
+        let measurements = TopologyMeasurements::new();
+        measurements.add_leaf_delay(&node(1), ms(100), b"a", LeafDelayKind::LostCas);
+        measurements.add_leaf_delay(&node(1), ms(200), b"a", LeafDelayKind::QueueWait);
+        measurements.add_leaf_delay(&node(1), ms(300), b"a", LeafDelayKind::SlowCas);
+        measurements.add_merge_time(&node(1), &node(2), ms(400));
+        measurements.record_changed(node(1), ChangeKind::Split);
+        measurements.take_window();
+
+        let totals = measurements.take_totals();
+
+        assert_eq!(
+            (
+                totals.lost_cas,
+                totals.queue_wait,
+                totals.slow_cas,
+                totals.merge_side
+            ),
+            (ms(100), ms(200), ms(300), ms(400))
+        );
+        assert_eq!(measurements.take_totals(), Default::default());
     }
 
     #[test]

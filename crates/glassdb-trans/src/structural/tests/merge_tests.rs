@@ -175,6 +175,13 @@ async fn a_demand_merge_must_pay_more_than_the_paid_rate_of_the_split() {
         .await
         .unwrap();
     assert_not_merged(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
+    assert_eq!(
+        sp.stats_and_reset().demand_merges,
+        DemandMergeStats {
+            unpaid: 1,
+            ..DemandMergeStats::default()
+        }
+    );
 
     demand_merge_l0(&sp, Duration::from_millis(1600))
         .await
@@ -278,6 +285,53 @@ async fn merge_is_vetoed_when_the_merged_leaf_would_split_soon() {
     merge_l0(&sp).await.unwrap();
 
     assert_not_merged(&s, &[b"a"], &[b"m", b"n", b"o", b"p"]).await;
+    assert_eq!(
+        sp.stats_and_reset().demand_merges,
+        DemandMergeStats::default(),
+        "only the merges of a topology rule count"
+    );
+}
+
+// The size veto of ADR-073 also stops the merges of a topology rule, and the
+// stats show it.
+#[tokio::test]
+async fn a_demand_merge_that_would_split_soon_counts_as_too_large() {
+    let s = store();
+    seed_two_leaves(&s, &[b"a"], &[b"m", b"n", b"o", b"p"]).await;
+    let bg = Arc::new(Background::new());
+    let sp = rule_restructurer(&s, &bg);
+
+    demand_merge_l0(&sp, Duration::from_secs(1)).await.unwrap();
+
+    assert_not_merged(&s, &[b"a"], &[b"m", b"n", b"o", b"p"]).await;
+    assert_eq!(
+        sp.stats_and_reset().demand_merges,
+        DemandMergeStats {
+            too_large: 1,
+            ..DemandMergeStats::default()
+        }
+    );
+}
+
+// ADR-083: a sweep drops a merge that a topology rule asked for more than
+// three windows before.
+#[tokio::test(start_paused = true)]
+async fn a_sweep_drops_a_stale_demand_merge() {
+    let s = store();
+    seed_two_leaves(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
+    let bg = Arc::new(Background::new());
+    let sp = rule_restructurer(&s, &bg);
+
+    sp.candidates.push_request(RuleRequest {
+        change: ChangeRequest::Merge(LeafId::new(node_path("L0"))),
+        rate: Duration::from_secs(1),
+    });
+    tokio::time::advance(Duration::from_secs(4)).await;
+    sp.run_once().await;
+
+    assert_not_merged(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
+    let stats = sp.stats_and_reset();
+    assert_eq!((stats.stale_demand, stats.demand_merges.stale), (1, 1));
 }
 
 // After a bulk delete, the target holds mostly cold tombstones. Counted as

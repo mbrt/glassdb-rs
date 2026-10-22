@@ -359,7 +359,10 @@ axes. Each run has its cells. Each cell has:
   the throughput windows with their `relCi`, the mean latency with its
   standard error, and the p50 and p90;
 - `groups`: the counters of each instance in the measurement, with its
-  shutdown, unless the next cell continues on the same instances;
+  shutdown, unless the next cell continues on the same instances. They include
+  the time that the topology rule measured, by kind (`topologyTimeMs`), and
+  the merges that the rule asked for and that did not go ahead, by cause
+  (`demandMerges`);
 - `aggregateOps` and `aggregateProtocol`: the backend operations, bytes, and
   protocol counters of the cell, for each transaction;
 - `costs`: the backend requests, the body bytes, and the coordinator counters

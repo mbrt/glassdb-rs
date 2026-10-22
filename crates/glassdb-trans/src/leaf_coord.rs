@@ -483,6 +483,19 @@ impl MergeRequest for CasReq {
     }
 }
 
+/// The kind of time of one leaf delay. A split removes each kind in the same
+/// way. The kinds show which delay of the leaf is the cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafDelayKind {
+    /// A leaf CAS lost to keys in the other half of the leaf.
+    LostCas,
+    /// A wait for an earlier round on keys in the other half of the leaf.
+    QueueWait,
+    /// A leaf CAS after such a round that took more time than a leaf CAS that
+    /// the backend does not delay.
+    SlowCas,
+}
+
 /// Sink for stored-leaf observations and capacity rejections, so a background
 /// maintenance policy can decide whether to split (ADR-031) or merge (ADR-073).
 /// The coordinator depends only on this seam. The restructurer supplies the
@@ -502,8 +515,15 @@ pub trait StructuralHinter: Send + Sync {
     /// is of a leaf CAS that lost to keys in the other half, of a wait for an
     /// earlier round on keys in the other half, or of a leaf CAS after such a
     /// round that took more time than a leaf CAS that the backend does not
-    /// delay.
-    fn leaf_delay(&self, _path: &ObjectPath, _time: Duration, _split_key: &[u8]) {}
+    /// delay. `kind` tells which.
+    fn leaf_delay(
+        &self,
+        _path: &ObjectPath,
+        _time: Duration,
+        _split_key: &[u8],
+        _kind: LeafDelayKind,
+    ) {
+    }
 
     /// Tells if the hinter uses measurements, such as [`Self::leaf_delay`].
     /// Only then does the coordinator measure the delays of its rounds.
@@ -814,7 +834,12 @@ impl LostTime {
         if lost.is_zero() {
             return;
         }
-        hinter.leaf_delay(path, lost.saturating_mul(self.members), &self.split_key);
+        hinter.leaf_delay(
+            path,
+            lost.saturating_mul(self.members),
+            &self.split_key,
+            LeafDelayKind::LostCas,
+        );
         self.since = until;
     }
 }
@@ -952,7 +977,9 @@ impl CasWorker {
                 && !wait.is_zero()
                 && let Some(split_key) = round.separating_key(&keys)
             {
-                self.core.hinter.leaf_delay(&round.path, wait, split_key);
+                self.core
+                    .hinter
+                    .leaf_delay(&round.path, wait, split_key, LeafDelayKind::QueueWait);
             }
             round.keys.extend(keys.into_iter().map(<[u8]>::to_vec));
         }
@@ -1251,6 +1278,7 @@ impl CasWorker {
                         path,
                         slow.saturating_mul(separated.count),
                         separated.split_key,
+                        LeafDelayKind::SlowCas,
                     );
                 }
                 Ok(PersistResult::Applied(receipt))
@@ -3245,7 +3273,13 @@ mod tests {
 
         fn capacity_rejected(&self, _path: &ObjectPath) {}
 
-        fn leaf_delay(&self, path: &ObjectPath, time: Duration, split_key: &[u8]) {
+        fn leaf_delay(
+            &self,
+            path: &ObjectPath,
+            time: Duration,
+            split_key: &[u8],
+            _kind: LeafDelayKind,
+        ) {
             assert_eq!(path, &leaf_path());
             self.delays.lock().unwrap().push(time);
             self.split_keys.lock().unwrap().push(split_key.to_vec());

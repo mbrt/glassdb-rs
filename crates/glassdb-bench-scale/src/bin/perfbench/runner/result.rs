@@ -1,7 +1,7 @@
 //! The result of a cell, in the fields that the comparison and plot tools
 //! read.
 
-use glassdb::{GcStats, Stats};
+use glassdb::{GcStats, Stats, TopologyTimeStats};
 use glassdb_bench_scale::backend_breakdown::BackendBreakdown;
 use glassdb_bench_scale::bench::Results;
 use serde::Serialize;
@@ -135,6 +135,33 @@ pub(crate) struct InstanceResult {
     split_deferred: u64,
     stale_demand: u64,
     merges: u64,
+    /// The time that the topology rule of the instance measured, by kind,
+    /// in milliseconds.
+    topology_time_ms: TopologyTimeMs,
+    /// The merge attempts of the topology rule that did not go ahead.
+    demand_merges: DemandMerges,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DemandMerges {
+    unpaid: u64,
+    too_large: u64,
+    busy: u64,
+    other: u64,
+    stale: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TopologyTimeMs {
+    lost_cas: f64,
+    queue_wait: f64,
+    slow_cas: f64,
+    inline_pressure: f64,
+    divided_conflict: f64,
+    merge_side: f64,
+    crossing_conflict: f64,
 }
 
 /// Backend-op counters normalized per transaction.
@@ -247,6 +274,29 @@ impl InstanceResult {
             split_deferred: stats.restructurer.deferred,
             stale_demand: stats.restructurer.stale_demand,
             merges: stats.restructurer.merges,
+            topology_time_ms: TopologyTimeMs::of(stats.restructurer.topology_time),
+            demand_merges: DemandMerges {
+                unpaid: stats.restructurer.demand_merges.unpaid,
+                too_large: stats.restructurer.demand_merges.too_large,
+                busy: stats.restructurer.demand_merges.busy,
+                other: stats.restructurer.demand_merges.other,
+                stale: stats.restructurer.demand_merges.stale,
+            },
+        }
+    }
+}
+
+impl TopologyTimeMs {
+    fn of(time: TopologyTimeStats) -> Self {
+        let ms = |time: std::time::Duration| time.as_secs_f64() * 1e3;
+        Self {
+            lost_cas: ms(time.lost_cas),
+            queue_wait: ms(time.queue_wait),
+            slow_cas: ms(time.slow_cas),
+            inline_pressure: ms(time.inline_pressure),
+            divided_conflict: ms(time.divided_conflict),
+            merge_side: ms(time.merge_side),
+            crossing_conflict: ms(time.crossing_conflict),
         }
     }
 }
