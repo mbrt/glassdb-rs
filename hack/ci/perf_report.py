@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report meaningful changes from Criterion, backend-cost, and perfbench artifacts."""
+"""Report meaningful changes from the perfbench artifacts of two revisions."""
 
 from __future__ import annotations
 
@@ -11,16 +11,14 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
+# The backend model of every compared process.
 DIAGNOSTIC_MODEL = {
     "backend": "memory",
-    "latencyProfile": "s3",
     "latencyJitter": False,
     "modelTimeSpeedup": 5,
-    "warmupMs": 250,
-    "costWindow": "benchmarkIterationsIncludingWarmup",
 }
 
-MIXED_SHAPES = ("rwSingle", "rwMany", "roSingle", "roMulti")
+MIXED_SHAPES = ("rw-single", "rw-many", "ro-single", "ro-multi")
 MIXED_METRICS = (
     ("p50Ms", "model ms/tx", "time"),
     ("p90Ms", "model ms/tx", "time"),
@@ -80,19 +78,19 @@ def read_json(path: Path):
         raise ReportError(f"cannot read {path}: {error}") from error
 
 
-def read_costs(path: Path):
-    prefix = "diagnostic-costs: "
-    try:
-        records = [
-            line[len(prefix) :]
-            for line in path.read_text().splitlines()
-            if line.startswith(prefix)
-        ]
-        if len(records) != 1:
-            raise ReportError("expected one diagnostic cost record")
-        return json.loads(records[0])
-    except (OSError, ValueError) as error:
-        raise ReportError(f"cannot read costs from {path}: {error}") from error
+def read_report(path: Path, experiment: str) -> dict:
+    """Read one perfbench result of `experiment` on the compared backend model."""
+    report = read_json(path)
+    if (
+        report.get("schemaVersion") != 2
+        or report.get("scenario") != experiment
+        or report.get("backend") != DIAGNOSTIC_MODEL["backend"]
+        or report.get("modelTimeSpeedup") != DIAGNOSTIC_MODEL["modelTimeSpeedup"]
+    ):
+        raise ReportError(f"unsupported {experiment} schema or backend model")
+    if len(report["runs"]) != 1 or len(report["runs"][0]["cells"]) != 1:
+        raise ReportError(f"expected one {experiment} cell")
+    return report
 
 
 def add(
@@ -116,135 +114,81 @@ def read_measurement(
     directory: Path,
     name: str,
     *,
-    legacy_cases: set[str] | None = None,
     mixed_args: list[str] | tuple[str, ...] = (),
-    diagnostic_model: dict | None = None,
 ) -> tuple[dict, list[str]]:
     """Read and validate one benchmark process's artifacts."""
     metrics, warnings = {}, []
     side, repetition = directory.parent.name, directory.name
+    latency_jitter = "--latency-jitter=false" not in mixed_args
     if name == "mixed":
         load_mixed(
-            directory,
-            metrics,
-            warnings,
-            side,
-            repetition,
-            latency_jitter="--latency-jitter=false" not in mixed_args,
+            directory, metrics, warnings, side, repetition, latency_jitter=latency_jitter
         )
     else:
         load_diagnostics(
-            directory,
-            {name},
-            metrics,
-            warnings,
-            side,
-            repetition,
-            cost_log=(
-                "criterion.log" if legacy_cases is not None else f"criterion-{name}.log"
-            ),
-            cost_cases=legacy_cases,
-            diagnostic_model=diagnostic_model,
+            directory, name, metrics, warnings, side, repetition, latency_jitter=latency_jitter
         )
     return metrics, warnings
 
 
 def load_diagnostics(
-    directory,
-    expected,
-    metrics,
-    warnings,
-    side,
-    repetition,
-    *,
-    cost_log="criterion.log",
-    cost_cases=None,
-    diagnostic_model=None,
+    directory, name, metrics, warnings, side, repetition, *, latency_jitter=False
 ):
     try:
-        costs = read_costs(directory / cost_log)
-        if costs["schemaVersion"] != (2 if diagnostic_model is not None else 1):
-            raise ReportError("unsupported cost schema for diagnostic model")
-        if diagnostic_model is not None and costs["model"] != diagnostic_model:
-            raise ReportError("diagnostic model differs from comparison settings")
-    except (ReportError, KeyError, TypeError) as error:
-        kind = (
-            "diagnostic model" if diagnostic_model is not None else "cost measurements"
-        )
-        warnings.append(f"{side}/{repetition}: invalid {kind} ({error})")
+        report = read_report(directory / f"{name}.json", "diagnostics")
+        if report.get("latencyJitter", True) is not latency_jitter:
+            raise ReportError("diagnostic latency profile differs from comparison settings")
+        cell = report["runs"][0]["cells"][0]
+        if cell["failures"] or cell["labels"].get("case") != name:
+            raise ReportError("diagnostic cell failed or its case changed")
+        (shape,) = cell["shapes"]
+        costs = cell["probes"]["costs"]
+    except (ReportError, KeyError, TypeError, ValueError) as error:
+        warnings.append(f"{side}/{repetition}/{name}: invalid diagnostic measurement ({error})")
         return
-    for name in sorted(expected):
-        try:
-            # These private Criterion 0.8.2 artifacts must be checked on upgrades.
-            estimate = read_json(
-                directory / "criterion/diagnostic" / name / "new/estimates.json"
-            )["mean"]
-            interval = estimate["confidence_interval"]
-            add(
-                metrics,
-                f"{name}: mean group time",
-                "ns/group",
-                "time",
-                estimate["point_estimate"],
-                interval["lower_bound"],
-                interval["upper_bound"],
-                estimate["standard_error"],
-            )
-        except (ReportError, KeyError, TypeError) as error:
-            warnings.append(
-                f"{side}/{repetition}/{name}: missing or invalid Criterion measurement ({error})"
-            )
     try:
-        rows = {row["name"]: row for row in costs["cases"]}
-        if set(rows) != (expected if cost_cases is None else cost_cases) or len(
-            rows
-        ) != len(costs["cases"]):
-            raise ReportError("cost case set changed")
-        for name, row in rows.items():
-            if name not in expected:
-                continue
-            if number(row["transactions"]) == 0:
-                raise ReportError("no completed transactions")
-            for window in ("workload", "shutdown", "combined"):
-                for counter in (
-                    "reads",
-                    "writes",
-                    "lists",
-                    "readBodyBytes",
-                    "writeBodyBytes",
-                    "coordinatorSubmissions",
-                    "coordinatorRounds",
-                ):
-                    unit = "bytes/tx" if "Bytes" in counter else "count/tx"
-                    add(
-                        metrics,
-                        f"{name}/{window}: {counter}",
-                        unit,
-                        "cost",
-                        row[window][counter],
-                    )
+        mean, error = number(shape["meanMs"]), number(shape["meanSeMs"])
+        # The interval of the mean latency within one process, from its samples.
+        add(
+            metrics,
+            f"{name}: mean transaction time",
+            "model ms/tx",
+            "time",
+            mean,
+            max(mean - 1.96 * error, 0),
+            mean + 1.96 * error,
+            error,
+        )
+    except (ReportError, KeyError, TypeError) as error:
+        warnings.append(f"{side}/{repetition}/{name}: missing or invalid latency ({error})")
+    try:
+        if number(costs["transactions"]) == 0:
+            raise ReportError("no completed transactions")
+        for window in ("workload", "shutdown", "combined"):
+            for counter in (
+                "reads",
+                "writes",
+                "lists",
+                "readBodyBytes",
+                "writeBodyBytes",
+                "coordinatorSubmissions",
+                "coordinatorRounds",
+            ):
+                unit = "bytes/tx" if "Bytes" in counter else "count/tx"
+                add(metrics, f"{name}/{window}: {counter}", unit, "cost", costs[window][counter])
     except (ReportError, KeyError, TypeError) as error:
         warnings.append(f"{side}/{repetition}: invalid cost measurements ({error})")
 
 
 def load_mixed(directory, metrics, warnings, side, repetition, *, latency_jitter=True):
     try:
-        mixed = read_json(directory / "mixed.json")
-        if (
-            mixed["schemaVersion"] != 1
-            or mixed["scenario"] != "mixed"
-            or mixed["backend"] != "memory"
-            or mixed["modelTimeSpeedup"] != 5
-        ):
-            raise ReportError("unsupported mixed schema or backend model")
+        mixed = read_report(directory / "mixed.json", "ci")
         if mixed.get("latencyJitter", True) is not latency_jitter:
             raise ReportError("mixed latency profile differs from comparison settings")
-        if len(mixed["runs"]) != 1 or len(mixed["runs"][0]["cells"]) != 1:
-            raise ReportError("expected one mixed cell")
         cell = mixed["runs"][0]["cells"][0]
         if (
             cell["failures"]
-            or cell["mode"] != "lo"
+            or cell["workload"] != "low-conflict"
             or cell["affinityPct"] != 100
             or cell["databases"] != 1
             or cell["workersPerShape"] != 1
@@ -338,14 +282,14 @@ def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison
             (before != after and not separated and not small) or noisy,
         )
 
-    # Each fresh process pair is one observation. Criterion's narrow intervals
-    # within a process do not measure variation between independent repetitions.
+    # Each fresh process pair is one observation. The narrow intervals within a
+    # process do not measure variation between independent repetitions.
     ratios = [
         math.log(b / a) for a, b in zip(base.values, candidate.values, strict=True)
     ]
     mean = statistics.mean(ratios)
     count = len(ratios)
-    # Criterion's bootstrap SE estimates uncertainty within each process.
+    # The standard error of the mean estimates uncertainty within each process.
     # The delta method gives log-SE ≈ SE/mean. Use this as a variance floor:
     # repeated point estimates can agree by chance despite imprecise samples.
     # Between-pair variance already includes sampling noise, so do not add it
@@ -467,9 +411,7 @@ def analyze_benchmark(root: Path, manifest: dict, name: str) -> BenchmarkResult:
             samples, warnings = read_measurement(
                 directory,
                 name,
-                legacy_cases=None if adaptive else set(manifest["cases"]),
                 mixed_args=manifest.get("mixedArgs", ()),
-                diagnostic_model=manifest.get("diagnosticModel"),
             )
             result.warnings.extend(warnings)
             for key, sample in samples.items():

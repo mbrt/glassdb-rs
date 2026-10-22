@@ -1,7 +1,7 @@
 # Profiling glassdb-rs (hack/perf)
 
 A CPU-profiling recipe. Use it to identify where CPU time goes. The profiler
-attaches to a compiled benchmark executable.
+attaches to the compiled `perfbench` executable.
 
 Manual experiments that use this or other performance tooling are recorded in
 [`investigations.md`](investigations.md).
@@ -10,7 +10,7 @@ Manual experiments that use this or other performance tooling are recorded in
 
 ```bash
 hack/perf/profile.sh
-FILTER=diagnostic/rmw_inline_1024 hack/perf/profile.sh
+CASE=rmw_inline_1024 hack/perf/profile.sh
 make flamegraph
 ```
 
@@ -23,23 +23,24 @@ sample count per line).
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `FILTER` | `diagnostic` | Criterion case filter. |
-| `SECONDS_PER_CASE` | `10` | Profiling duration per selected case. |
+| `EXPERIMENT` | `diagnostics` | The perfbench experiment. |
+| `CASE` | all cases | One case of the `diagnostics` experiment. |
+| `SECONDS_PER_CASE` | `10` | Measured time of each `diagnostics` case. |
 | `OUT` | `hack/perf` | Output directory for artifacts. |
 
 ## Target
 
-The script profiles the self-contained `diagnostics` Criterion target.
-Preparation and the cost pass appear in the profile; use the transaction
-stacks to inspect measured work.
-`FILTER` selects cases within this target.
+The script profiles one perfbench experiment, by default `diagnostics`: the
+single transactions of one worker with warm caches. The seed and the warm-up
+appear in the profile; use the transaction stacks to inspect measured work.
+`CASE` selects one case of the experiment.
 
 ## The in-memory caveat
 
-These diagnostics use memory without provider delay and a 20× engine model
-clock. A CPU profile explains local execution costs; it does not predict
-object-storage latency or waiting time. Use `perfbench` and real-provider
-measurements for workload behavior.
+The experiments use the memory backend with the S3 delay profile and a 5×
+model clock. A CPU profile explains local execution costs; it does not predict
+object-storage latency or waiting time. Use real-provider measurements for
+workload behavior.
 
 ## Profiler
 

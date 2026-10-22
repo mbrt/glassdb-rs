@@ -317,3 +317,135 @@ async fn diagnostics_returns_typed_snapshot() {
         "unexpected dump: {rendered}",
     );
 }
+
+// A warm database instance updates inline values with direct commits. Neither
+// the inline value of a single key nor the three keys of one leaf that other
+// transactions update at the same time need a read of a transaction record.
+#[tokio::test(start_paused = true)]
+async fn warm_inline_updates_read_no_transaction_record() {
+    const ITERATIONS: u64 = 30;
+    // Keep one task runnable, so that the paused clock does not auto-advance
+    // to a GC deadline whose scan would add unrelated reads.
+    let keep_time = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    for keys in [1, 3] {
+        let backend = mem();
+        let writer = Database::open("inlinereads", backend.clone())
+            .await
+            .unwrap();
+        let coll = writer
+            .root_collection()
+            .create_collection_if_absent(b"c0")
+            .await
+            .unwrap();
+        for key in 0..keys {
+            coll.write(format!("k{key:04}").as_bytes(), &[0; 256])
+                .await
+                .unwrap();
+        }
+        writer.shutdown().await;
+
+        let db = Database::open("inlinereads", backend).await.unwrap();
+        let coll = db.open_collection("c0").await.unwrap();
+        let names: Vec<Vec<u8>> = (0..keys)
+            .map(|key| format!("k{key:04}").into_bytes())
+            .collect();
+        for name in &names {
+            coll.read(name).await.unwrap();
+        }
+        let before = db.stats();
+        for _ in 0..ITERATIONS {
+            let updates = names.iter().map(|name| {
+                coll.update(name, |mut value| {
+                    value[0] = value[0].wrapping_add(1);
+                    Ok(value)
+                })
+            });
+            futures::future::try_join_all(updates).await.unwrap();
+        }
+        let workload = db.stats() - before;
+        assert_eq!(workload.transactions.completed, ITERATIONS * keys);
+        assert_eq!(
+            workload.backend.obj_reads, 0,
+            "warmed inline writes of {keys} keys must not read transaction records"
+        );
+        db.shutdown().await;
+    }
+    keep_time.abort();
+}
+
+// A value outside the inline policy lives in its transaction record. The first
+// read of a reader loads the record, and repeated reads use its cached
+// contents: they validate the leaf, but do not read the record again.
+#[tokio::test]
+async fn repeated_reads_of_an_external_value_use_the_cached_record() {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    use glassdb::backend::middleware::RecordingBackend;
+    use glassdb::memory::MemoryBackend;
+
+    const READS: u64 = 30;
+    let backend = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+    let operations = backend.log();
+    let writer = Database::builder("recordcache", backend.clone())
+        .inline_policy(InlinePolicy::none())
+        .open()
+        .await
+        .unwrap();
+    let value = vec![7; 1025];
+    writer
+        .root_collection()
+        .write(b"key", &value)
+        .await
+        .unwrap();
+    writer.shutdown().await;
+
+    let reader = Database::open("recordcache", backend).await.unwrap();
+    let collection = reader.root_collection();
+    let is_record_read = |operation: &glassdb::backend::middleware::OpRecord| {
+        matches!(operation.op, "read" | "read_if_modified") && operation.path.contains("/_t/")
+    };
+    operations.lock().unwrap().clear();
+    assert_eq!(collection.read(b"key").await.unwrap().unwrap(), value);
+    let records: BTreeSet<_> = operations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|operation| is_record_read(operation))
+        .map(|operation| operation.path.clone())
+        .collect();
+    assert!(
+        !records.is_empty(),
+        "the cold read must load a transaction record"
+    );
+    operations.lock().unwrap().clear();
+
+    let before = reader.stats();
+    for _ in 0..READS {
+        assert_eq!(collection.read(b"key").await.unwrap().unwrap(), value);
+    }
+    let warm = reader.stats() - before;
+    assert_eq!(warm.transactions.completed, READS);
+    assert!(
+        warm.backend.obj_reads > 0,
+        "reads must still validate leaves"
+    );
+    // Count backend reads, including conditional requests that transfer no
+    // body. Other transaction records can belong to background work.
+    let repeated: Vec<_> = operations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|operation| records.contains(&operation.path) && is_record_read(operation))
+        .map(|operation| operation.path.clone())
+        .collect();
+    assert!(
+        repeated.is_empty(),
+        "cached transaction records were read again: {repeated:?}"
+    );
+    reader.shutdown().await;
+}

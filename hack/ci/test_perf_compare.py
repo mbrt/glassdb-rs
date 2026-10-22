@@ -17,39 +17,20 @@ class HarnessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for side in ("base", "candidate"):
-                for relative in (
-                    "crates/glassdb/benches",
-                    "crates/glassdb-bench-scale",
-                ):
-                    path = root / side / relative
-                    path.mkdir(parents=True)
-                    (path / "example.rs").write_text(side)
-                (root / side / "crates/glassdb/Cargo.toml").write_text(
-                    f'[package]\nname = "{side}"\n[dev-dependencies]\ncriterion = "{side}"\n[[bench]]\nname = "transactions"\n'
-                    + (
-                        '[[bench]]\nname = "diagnostics"\nharness = false\ntest = false\n'
-                        if side == "candidate"
-                        else ""
-                    )
-                    + "[features]\ndefault = []\n"
-                )
+                path = root / side / "crates/glassdb-bench-scale"
+                path.mkdir(parents=True)
+                (path / "example.rs").write_text(side)
+                (root / side / "crates/glassdb").mkdir()
+                (root / side / "crates/glassdb/lib.rs").write_text(side)
                 (root / side / "Cargo.lock").write_text(side)
             digest = perf_compare.use_harness(root / "candidate", root / "base")
             self.assertEqual(len(digest), 64)
             self.assertEqual(
-                (root / "base/crates/glassdb/benches/example.rs").read_text(),
+                (root / "base/crates/glassdb-bench-scale/example.rs").read_text(),
                 "candidate",
             )
+            self.assertEqual((root / "base/crates/glassdb/lib.rs").read_text(), "base")
             self.assertEqual((root / "base/Cargo.lock").read_text(), "base")
-            manifest = (root / "base/crates/glassdb/Cargo.toml").read_text()
-            self.assertIn('name = "base"', manifest)
-            self.assertIn('criterion = "candidate"', manifest)
-            self.assertIn(
-                '[[bench]]\nname = "diagnostics"\nharness = false\ntest = false',
-                manifest,
-            )
-            self.assertIn("[features]\ndefault = []", manifest)
-            self.assertEqual(manifest.count("[[bench]]"), 2)
 
     def test_current_snapshot_includes_edits_but_not_deleted_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -94,11 +75,9 @@ class MeasurementTest(unittest.TestCase):
             "completedPairs": {name: 0 for name in (*cases, "mixed")},
             "processTimeoutSeconds": 30,
             "warnings": [],
-            "mixedArgs": [],
-            **{
-                side: {"diagnostics": str(self.fixture), "perfbench": str(self.fixture)}
-                for side in ("main", "pr")
-            },
+            "mixedArgs": ["--experiment=ci"],
+            "diagnosticArgs": ["--experiment=diagnostics"],
+            **{side: {"perfbench": str(self.fixture)} for side in ("main", "pr")},
         }
 
     def order(self):
@@ -150,7 +129,8 @@ class MeasurementTest(unittest.TestCase):
 
     def test_fixed_latency_measurements_use_the_requested_profile(self):
         manifest = self.manifest(cases=("a",))
-        manifest["mixedArgs"] = ["--latency-jitter=false"]
+        manifest["mixedArgs"] = ["--latency-jitter=false", "--experiment=ci"]
+        manifest["diagnosticArgs"] = ["--latency-jitter=false", "--experiment=diagnostics"]
         perf_compare.measure(self.root, manifest)
         self.assertFalse(manifest["warnings"])
         for side in ("main", "pr"):
@@ -160,7 +140,8 @@ class MeasurementTest(unittest.TestCase):
     def test_wrong_latency_profile_fails_before_counting_the_pair(self):
         self.configure(latencyJitter=True)
         manifest = self.manifest(cases=("a",))
-        manifest["mixedArgs"] = ["--latency-jitter=false"]
+        manifest["mixedArgs"] = ["--latency-jitter=false", "--experiment=ci"]
+        manifest["diagnosticArgs"] = ["--latency-jitter=false", "--experiment=diagnostics"]
         with self.assertRaisesRegex(
             perf_compare.perf_report.ReportError, "latency profile"
         ):
@@ -191,12 +172,9 @@ class MeasurementTest(unittest.TestCase):
                         shapes = result["runs"][0]["cells"][0]["shapes"]
                         self.assertEqual(len(shapes), 4)
                     else:
-                        costs = perf_compare.perf_report.read_costs(
-                            directory / f"criterion-{case}.log"
-                        )
-                        self.assertEqual(
-                            [row["name"] for row in costs["cases"]], [case]
-                        )
+                        result = json.loads((directory / f"{case}.json").read_text())
+                        cell = result["runs"][0]["cells"][0]
+                        self.assertEqual(cell["labels"], {"case": case})
         report = (self.root / "report.md").read_text()
         self.assertIn("regressed", report)
         self.assertNotIn("Measurement warnings", report)
@@ -306,7 +284,8 @@ root = Path(__file__).resolve().parent
 settings = json.loads((root / 'settings.json').read_text())
 side = Path.cwd().parent.name
 repetition = int(Path.cwd().name)
-case = 'mixed' if '--output' in sys.argv else sys.argv[-1].removeprefix('^diagnostic/').removesuffix('$')
+only = [arg.split('=', 2)[2] for arg in sys.argv if arg.startswith('--only=case=')]
+case = only[0] if only else 'mixed'
 factors = settings.get('factors', {}).get(case, [1])
 factor = factors[(repetition - 1) % len(factors)] if side == 'pr' else 1
 with (root / 'order.jsonl').open('a') as log:
@@ -317,34 +296,32 @@ if settings.get('failAt') == [repetition, case, side]:
 if settings.get('hangAt') == [repetition, case, side]:
     # Bound the fixture even if the driver's timeout is accidentally removed.
     time.sleep(5)
+jitter = settings.get('latencyJitter', '--latency-jitter=false' not in sys.argv)
+output = Path([arg for arg in sys.argv if arg.startswith('--output=')][0].split('=', 1)[1])
 if case == 'mixed':
     shapes = [{'shape': name, 'committed': 200, 'converged': True,
         'p50Ms': 10, 'p90Ms': 20, 'txPerSec': 100}
-        for name in ('rwSingle', 'rwMany', 'roSingle', 'roMulti')]
+        for name in ('rw-single', 'rw-many', 'ro-single', 'ro-multi')]
     shapes[0]['p50Ms'] *= factor
-    result = {'schemaVersion': 1, 'scenario': 'mixed', 'backend': 'memory',
-        'latencyJitter': settings.get('latencyJitter', '--latency-jitter=false' not in sys.argv),
-        'modelTimeSpeedup': 5, 'runs': [{'cells': [{'mode': 'lo',
-            'affinityPct': 100, 'databases': 1, 'workersPerShape': 1,
-            'failures': 0, 'shapes': shapes}]}]}
-    Path(sys.argv[sys.argv.index('--output') + 1]).write_text(json.dumps(result))
+    cell = {'workload': 'low-conflict', 'affinityPct': 100, 'databases': 1,
+        'workersPerShape': 1, 'failures': 0, 'shapes': shapes}
+    experiment = 'ci'
 else:
-    path = Path(os.environ['CRITERION_HOME']) / 'diagnostic' / case / 'new'
-    path.mkdir(parents=True)
-    mean = 100 * factor
-    (path / 'estimates.json').write_text(json.dumps({'mean': {
-        'point_estimate': mean, 'standard_error': 0.05,
-        'confidence_interval': {'lower_bound': mean - 1, 'upper_bound': mean + 1}}}))
     counters = {name: 0 for name in ('reads', 'writes', 'lists', 'readBodyBytes',
         'writeBodyBytes', 'coordinatorSubmissions', 'coordinatorRounds')}
-    row = {'name': case, 'transactions': 30,
+    costs = {'transactions': 30,
         **{window: counters for window in ('workload', 'shutdown', 'combined')}}
-    record = settings.get('costRecord', {'schemaVersion': 1, 'cases': [row]})
-    if 'diagnosticModel' in settings:
-        record.update(schemaVersion=2, model=settings['diagnosticModel'])
+    costs = settings.get('costRecord', costs)
     if settings.get('badCostAt') == [repetition, case, side]:
-        record = {}
-    print('diagnostic-costs: ' + json.dumps(record))
+        costs = {}
+    mean = 100 * factor
+    cell = {'labels': {'case': case}, 'failures': 0, 'probes': {'costs': costs},
+        'shapes': [{'shape': case, 'meanMs': mean, 'meanSeMs': 0.05}]}
+    experiment = 'diagnostics'
+result = {'schemaVersion': 2, 'scenario': experiment, 'backend': 'memory',
+    'latencyJitter': jitter, 'modelTimeSpeedup': 5,
+    'runs': [{'run': 1, 'cells': [cell]}]}
+output.write_text(json.dumps(result))
 """
 
 

@@ -19,6 +19,7 @@
 - When needing to explain what is done, consider whether the code can be refactored to make it self-explanatory instead
 - When code has to be complex and hard to understand, it must be for a good reason, and the reason must be commented
 - Functions' docstring should describe the function's purpose, not its implementation, nor callers
+- In comments and docs, do not mention Linear issues, local paths or anything that wouldn't be visible from a machine that only sees this repository (public URLs are OK)
 - Use `make format` to auto-format the code
 
 ### Tests

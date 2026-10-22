@@ -15,14 +15,16 @@ import unittest
 from pathlib import Path
 
 import perfbench_results
+from perfbench_fixtures import contention_cell, mixed_cell, report as envelope
 
 
-def inline_report(run: int, total_tps: float) -> dict:
-    return {
-        "schemaVersion": 1,
-        "scenario": "inline-pressure",
-        "runs": [{"run": run, "phases": [{"phase": "total", "txPerSec": total_tps}]}],
+def inline_report(run: int, tps: float) -> dict:
+    cell = {
+        "labels": {"phase": "recovery"},
+        "measure": {"wallMs": 10},
+        "shapes": [{"shape": "pressure", "committed": 4, "txPerSec": tps}],
     }
+    return envelope("inline-pressure", [{"run": run, "cells": [cell]}])
 
 
 class PerfbenchResultsTest(unittest.TestCase):
@@ -32,31 +34,22 @@ class PerfbenchResultsTest(unittest.TestCase):
         return path
 
     def test_mixed_cells_carry_their_run_identity(self) -> None:
-        report = {
-            "schemaVersion": 1,
-            "scenario": "mixed",
-            "runs": [{"run": 2, "cells": [{"failures": 0}]}],
-        }
+        report = envelope("mixed", [{"run": 2, "cells": [mixed_cell(mode="hi")]}])
 
         cells = perfbench_results.mixed_cells(report, "report")
 
         self.assertEqual(cells[0]["run"], 2)
+        self.assertEqual(cells[0]["mode"], "hi")
 
     def test_cell_with_failures_is_rejected(self) -> None:
-        report = {
-            "schemaVersion": 1,
-            "scenario": "mixed",
-            "runs": [{"run": 1, "cells": [{"failures": 3}]}],
-        }
+        report = envelope("mixed", [{"run": 1, "cells": [mixed_cell(failures=3)]}])
         with self.assertRaisesRegex(perfbench_results.ReportError, "3 failures"):
             perfbench_results.mixed_cells(report, "report")
 
     def test_duplicate_run_is_rejected(self) -> None:
-        report = {
-            "schemaVersion": 1,
-            "scenario": "mixed",
-            "runs": [{"run": 1, "cells": []}, {"run": 1, "cells": []}],
-        }
+        report = envelope(
+            "mixed", [{"run": 1, "cells": []}, {"run": 1, "cells": []}]
+        )
         with self.assertRaisesRegex(perfbench_results.ReportError, "duplicate run"):
             perfbench_results.mixed_cells(report, "report")
 
@@ -73,62 +66,41 @@ class PerfbenchResultsTest(unittest.TestCase):
         )
 
     def test_malformed_contention_cell_is_a_report_error(self) -> None:
-        report = {
-            "schemaVersion": 1,
-            "scenario": "contention",
-            "runs": [{"run": 1, "cells": [{"failures": 0}]}],
-        }
+        report = envelope("contention", [{"run": 1, "cells": [{"failures": 0}]}])
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write(Path(directory_name), "contention.json", report)
-            with self.assertRaisesRegex(perfbench_results.ReportError, "numKeys"):
+            with self.assertRaisesRegex(perfbench_results.ReportError, "keys"):
                 perfbench_results.read_contention([path])
 
     def test_failed_contention_cell_is_rejected(self) -> None:
-        report = {
-            "schemaVersion": 1,
-            "scenario": "contention",
-            "runs": [{"run": 1, "cells": [{"failures": 2}]}],
-        }
+        report = envelope("contention", [{"run": 1, "cells": [{"failures": 2}]}])
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write(Path(directory_name), "contention.json", report)
             with self.assertRaisesRegex(perfbench_results.ReportError, "cleanly"):
                 perfbench_results.read_contention([path])
 
     def test_duplicate_run_in_one_contention_file_is_rejected(self) -> None:
-        report = {
-            "schemaVersion": 1,
-            "scenario": "contention",
-            "runs": [{"run": 1, "cells": []}, {"run": 1, "cells": []}],
-        }
+        report = envelope(
+            "contention", [{"run": 1, "cells": []}, {"run": 1, "cells": []}]
+        )
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write(Path(directory_name), "contention.json", report)
             with self.assertRaisesRegex(perfbench_results.ReportError, "duplicate"):
                 perfbench_results.read_contention([path])
 
-    def test_report_without_worker_counts_still_loads(self) -> None:
-        legacy_cell = {
-            "mode": "lo",
-            "affinityPct": 50,
-            "databases": 4,
-            "failures": 0,
-            "shapes": [
-                {"shape": shape, "txPerSec": 1, "p50Ms": 1, "p90Ms": 2}
-                for shape in perfbench_results.SHAPES
-            ],
-        }
-        report = {
-            "schemaVersion": 1,
-            "scenario": "mixed",
-            "backend": "s3",
-            "modelTimeSpeedup": 1.0,
-            "runs": [{"run": 1, "cells": [legacy_cell]}],
-        }
+    def test_contention_cell_gives_its_keys_and_overlap(self) -> None:
+        cell = contention_cell(
+            4, 2, committed=10, tx_per_sec=5.0, samples_ms=[1.0, 2.0], direct_landed=3
+        )
+        report = envelope("contention", [{"run": 1, "cells": [cell]}])
         with tempfile.TemporaryDirectory() as directory_name:
-            path = self.write(Path(directory_name), "mixed.json", report)
-            _, frame = perfbench_results.read_mixed(path, require_converged=False)
+            path = self.write(Path(directory_name), "contention.json", report)
+            samples, stats = perfbench_results.read_contention([path])
 
-        self.assertEqual(frame["database_limit"].unique().tolist(), [4])
-        self.assertTrue(frame["workers"].isna().all())
+        self.assertEqual(stats.loc[0, "overlap-pct"], 50)
+        self.assertEqual(stats.loc[0, "direct-landed"], 3)
+        self.assertEqual(stats.loc[0, "cell-duration-ms"], 2000)
+        self.assertEqual(samples["latency-ms"].tolist(), [1.0, 2.0])
 
     def test_throughput_band_comes_from_window_percentiles(self) -> None:
         shapes = [
@@ -138,26 +110,12 @@ class PerfbenchResultsTest(unittest.TestCase):
         # Windows of 500 ms with 1 to 11 commits: 2 to 22 tx/s.
         shapes[0].update(windowMs=500, windowCounts=list(range(1, 12)))
         shapes[1].update(windowMs=0, windowCounts=[])
-        report = {
-            "schemaVersion": 1,
-            "scenario": "mixed",
-            "backend": "s3",
-            "modelTimeSpeedup": 1.0,
-            "runs": [
-                {
-                    "run": 1,
-                    "cells": [
-                        {
-                            "mode": "lo",
-                            "affinityPct": 50,
-                            "databases": 4,
-                            "failures": 0,
-                            "shapes": shapes,
-                        }
-                    ],
-                }
-            ],
-        }
+        report = envelope(
+            "mixed",
+            [{"run": 1, "cells": [mixed_cell(affinity=50, shapes=shapes)]}],
+            backend="s3",
+            modelTimeSpeedup=1.0,
+        )
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write(Path(directory_name), "mixed.json", report)
             _, frame = perfbench_results.read_mixed(path, require_converged=False)

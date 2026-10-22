@@ -276,7 +276,7 @@ Correctness depends on these properties:
 
 The in-memory backend and the middleware wrappers are for tests and debugging.
 The PR benchmarks add modeled provider latency and throttling to the in-memory
-backend. See [the benchmark conditions](../crates/glassdb/benches/README.md).
+backend. See [the benchmark conditions](../crates/glassdb-bench-scale/README.md).
 
 ## Transaction algorithm
 

@@ -55,19 +55,7 @@ features = ["s3", "gcs"]
 glob = "0.3"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "rt-multi-thread", "test-util"] }
 proptest = "1.9.0"
-criterion = "=0.8.2"
-serde_json = "1"
-async-trait = "0.1.92"
 rayon = "1.12.0"
 proc-macro2 = { version = "1", features = ["span-locations"] }
 syn = { version = "2", features = ["full", "visit"] }
 
-# Criterion owns benchmark entry points. `make test-bench` runs these targets
-# in Criterion test mode.
-[[bench]]
-name = "transactions"
-harness = false
-
-[[bench]]
-name = "diagnostics"
-harness = false

@@ -7,6 +7,12 @@ version.
 Keep this document sorted by the most recent changes first. Each entry should
 include a reference to the commit or ADR that introduced the change.
 
+The commands of the entries before 2026-10-21 use the perfbench subcommands and
+the Criterion suites that the experiments of
+[crates/glassdb-bench-scale/README.md](../../crates/glassdb-bench-scale/README.md)
+replaced. Their results are of schema version 1, which the current tools do
+not read.
+
 The s3 delay profile limits each prefix of 3 path segments since 2026-10-20:
 each collection and each first symbol of a transaction ID has its own request
 limit. Earlier entries that do not pass `--prefix-depth` used 2 segments, where

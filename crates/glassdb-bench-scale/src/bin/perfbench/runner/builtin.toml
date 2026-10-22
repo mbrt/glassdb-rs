@@ -1,0 +1,489 @@
+# The built-in configuration of perfbench. It is always the first layer, and
+# `--config` files change it. The README of this crate explains the schema.
+
+# Key pools. The seed writes each pool that a cell uses, once in each
+# collection of the cell.
+
+[pools.wide]
+keys = 5000
+
+[pools.hot]
+keys = 8
+
+# Transaction shapes.
+
+[shapes.rw-single]
+kind = "read-modify-write"
+pool = "wide"
+keys = 1
+
+[shapes.rw-many]
+kind = "read-modify-write"
+pool = "wide"
+keys = 10
+
+[shapes.ro-single]
+kind = "read"
+pool = "wide"
+keys = 1
+
+[shapes.ro-multi]
+kind = "read"
+pool = "wide"
+keys = 10
+
+[shapes.rw-adjacent]
+kind = "read-modify-write"
+pool = "wide"
+source = "adjacent"
+keys = 2
+
+# Workloads: the groups of database instances, and the workers of each shape.
+
+[workloads.low-conflict.groups.all]
+shapes = { rw-single = "cell", rw-many = "cell", ro-single = "cell", ro-multi = "cell" }
+
+# The same shapes on 8 keys that all workers share. A shape with more keys
+# than the pool uses all keys of the pool.
+[workloads.high-conflict]
+pool = "hot"
+source = "pool"
+[workloads.high-conflict.groups.all]
+shapes = { rw-single = "cell", rw-many = "cell", ro-single = "cell", ro-multi = "cell" }
+
+# Transactions over adjacent keys, which cross leaf boundaries.
+[workloads.crossing.groups.all]
+shapes = { rw-single = "cell", rw-adjacent = "cell" }
+
+[seed]
+quiet-period = "10s"
+timeout = "180s"
+gc-timeout = "600s"
+
+[cell]
+workload = "low-conflict"
+collections = "databases"
+databases = 4
+workers = 8
+affinity = 100
+gc = true
+gc-timeout = "600s"
+samples = false
+timeline = false
+
+[cell.warm-up]
+minimum = "5s"
+quiet = "10s"
+timeout = "60s"
+
+[cell.measure]
+until = "converged"
+duration = "2s"
+max-duration = "60s"
+window-commits = 50
+
+# The default experiment: both conflict levels at five collection affinities.
+[experiments.mixed]
+[[experiments.mixed.axes]]
+path = "cell.workload"
+values = ["low-conflict", "high-conflict"]
+[[experiments.mixed.axes]]
+path = "cell.affinity"
+values = [0, 25, 50, 75, 100]
+
+# The cell of the CI comparison: short and of fixed length.
+[experiments.ci.set]
+pools.wide.keys = 128
+seed.quiet-period = "250ms"
+seed.timeout = "5s"
+cell.databases = 1
+cell.workers = 1
+cell.warm-up.quiet = "250ms"
+cell.warm-up.timeout = "5s"
+cell.measure.until = "duration"
+cell.measure.duration = "10s"
+cell.measure.max-duration = "10s"
+
+# The worker grid of the canonical plots. Each worker count continues from the
+# tree after the warm-up of the count before it.
+[experiments.workers.set]
+pools.wide.keys = 20000
+seed.quiet-period = "5s"
+cell.databases = 5
+cell.warm-up.quiet = "5s"
+cell.warm-up.timeout = "180s"
+[[experiments.workers.axes]]
+path = "cell.workers"
+values = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100,
+          110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
+start = "previous-warm-up"
+
+# The affinity grid of the canonical plots.
+[experiments.affinity.set]
+cell.workers = 20
+[[experiments.affinity.axes]]
+path = "cell.affinity"
+values = [0, 25, 50, 75, 100]
+[[experiments.affinity.axes]]
+path = "cell.databases"
+values = [1, 3, 5, 7]
+
+# A change of the load on one tree. Each cell continues on the database
+# instances of the cell before it, and its warm-up shows whether the topology
+# becomes quiet again.
+[experiments.load-shift.set]
+pools.wide.keys = 20000
+cell.collections = 1
+cell.databases = 5
+cell.workers = 200
+cell.gc = false
+cell.warm-up.timeout = "300s"
+cell.measure.duration = "10s"
+cell.measure.max-duration = "20s"
+[[experiments.load-shift.axes]]
+path = "cell.workload"
+values = ["low-conflict", "crossing", "low-conflict"]
+start = "previous"
+
+# Five writers of `keys` keys each, of which `shared` are the same for all
+# writers.
+
+[pools.contention]
+value-bytes = 1024
+
+[shapes.contention-rmw]
+kind = "read-modify-write"
+pool = "contention"
+source = { overlap = { shared = 1 } }
+keys = 1
+
+[workloads.contention.groups.all]
+instances = 1
+shapes = { contention-rmw = 5 }
+
+[experiments.contention.set]
+cell.workload = "contention"
+cell.collections = 1
+seed.quiet-period = "0s"
+cell.gc = false
+cell.samples = true
+cell.warm-up.timeout = "0s"
+cell.measure.until = "duration"
+cell.measure.duration = "60s"
+cell.measure.max-duration = "120s"
+# One cell for each key count from 1 to 6, and each count of shared keys up
+# to it, labeled `keys<K>-shared<S>`.
+[[experiments.contention.axes]]
+name = "overlap"
+generate = { contention-overlaps = { shape = "contention-rmw", max-keys = 6 } }
+
+# How the leaves adapt when their aggregate inline budget is full (ADR-056,
+# ADR-074). One worker fills the inline budget of the leaf, then updates the
+# next keys until one pass takes no locked commit. The pressure cell ends with
+# that pass, and the recovery cell repeats it.
+
+[pools.inline]
+keys = 192
+value-bytes = 1024
+seed-batch = 192
+
+[shapes.fill]
+kind = "read-modify-write"
+pool = "inline"
+source = { sequence = { start = 0, count = 64, order = "ascending" } }
+keys = 1
+
+[shapes.pressure]
+kind = "read-modify-write"
+pool = "inline"
+source = { sequence = { start = 64, count = 64, order = "alternate-halves" } }
+keys = 1
+
+[workloads.fill.groups.all]
+instances = 1
+shapes = { fill = 1 }
+
+[workloads.pressure.groups.all]
+instances = 1
+shapes = { pressure = 1 }
+
+[experiments.inline-pressure.set]
+cell.collections = 1
+seed.quiet-period = "0s"
+seed.database.inline-max-value-bytes = 1024
+seed.database.inline-max-leaf-bytes = 65536
+cell.database.inline-max-value-bytes = 1024
+cell.database.inline-max-leaf-bytes = 65536
+cell.gc = false
+cell.warm-up.timeout = "0s"
+cell.measure.max-duration = "30s"
+[[experiments.inline-pressure.axes]]
+name = "phase"
+start = "previous"
+values = [
+  { label = "saturation", set = { "cell.workload" = "fill", "cell.measure.until" = "passes" } },
+  { label = "pressure", set = { "cell.workload" = "pressure", "cell.measure.until" = "no-locked-pass" } },
+  { label = "recovery", set = { "cell.workload" = "pressure", "cell.measure.until" = "passes" } },
+]
+
+# A stable load under which the topology policies of database instances
+# disagree. Two writers of one key each lose leaf CASes to each other, so their
+# policy splits the leaf. A scanner then crosses into the right leaf, so its
+# policy merges the leaves again. The fixed policies keep one or two leaves.
+
+[pools.fight]
+keys = 2
+
+[shapes.write-left]
+kind = "write"
+pool = "fight"
+source = { index = { keys = [0] } }
+
+[shapes.write-right]
+kind = "write"
+pool = "fight"
+source = { index = { keys = [1] } }
+
+[shapes.scan-all]
+kind = "scan"
+pool = "fight"
+source = { index = { keys = [0] } }
+
+[workloads.fight.groups.left-splitter]
+instances = 1
+shapes = { write-left = 4 }
+
+[workloads.fight.groups.right-splitter]
+instances = 1
+shapes = { write-right = 4 }
+
+[workloads.fight.groups.merger]
+instances = 1
+shapes = { scan-all = 8 }
+
+[experiments.split-merge-fight.set]
+cell.workload = "fight"
+cell.collections = 1
+seed.quiet-period = "1s"
+cell.gc = false
+cell.timeline = true
+cell.warm-up.quiet = "never"
+cell.warm-up.timeout = "10s"
+cell.measure.until = "duration"
+cell.measure.duration = "60s"
+cell.measure.max-duration = "120s"
+[[experiments.split-merge-fight.axes]]
+name = "policy"
+
+[[experiments.split-merge-fight.axes.values]]
+label = "avoidable"
+
+# The size causes with no underfull threshold keep the one leaf of the seed.
+[[experiments.split-merge-fight.axes.values]]
+label = "fixed-1"
+[experiments.split-merge-fight.axes.values.set]
+"cell.database.topology" = "size"
+"cell.database.leaf-min-entries" = 0
+"cell.database.index-min-children" = 0
+
+# The seed splits the leaf between the two keys, and the cells keep both leaves.
+[[experiments.split-merge-fight.axes.values]]
+label = "fixed-2"
+[experiments.split-merge-fight.axes.values.set]
+"seed.database.topology" = "size"
+"seed.database.leaf-max-entries" = 1
+"seed.database.leaf-min-entries" = 0
+"seed.database.index-min-children" = 0
+"cell.database.topology" = "size"
+"cell.database.leaf-min-entries" = 0
+"cell.database.index-min-children" = 0
+
+# Creates and deletes that change the key membership of one leaf while other
+# transactions scan it. A direct churner commits direct. A locked churner scans
+# first, so it takes key locks and the membership lock of the leaf.
+
+[pools.churn]
+# 6 churn workers with 4 own keys each.
+keys = 24
+seeded = false
+
+# Each worker owns a block of keys, so that the keys of the direct churners
+# sort before the keys of the locked churner, and a split can separate them.
+[shapes.direct-churn]
+kind = "create-delete"
+pool = "churn"
+source = "adjacent"
+
+[shapes.locked-churn]
+kind = "create-delete"
+pool = "churn"
+source = "adjacent"
+locked = true
+
+[shapes.scan-churn]
+kind = "scan"
+pool = "churn"
+source = { index = { keys = [0] } }
+
+[workloads.churn.groups.direct-churner]
+instances = 1
+shapes = { direct-churn = 4 }
+
+[workloads.churn.groups.locked-churner]
+instances = 1
+shapes = { locked-churn = 2 }
+
+[workloads.churn.groups.scanner]
+instances = 1
+shapes = { scan-churn = 8 }
+
+[experiments.membership-churn.set]
+cell.workload = "churn"
+cell.collections = 1
+seed.quiet-period = "0s"
+cell.gc = false
+cell.warm-up.quiet = "never"
+cell.warm-up.timeout = "5s"
+cell.measure.until = "duration"
+cell.measure.duration = "60s"
+cell.measure.max-duration = "120s"
+
+# Single transactions of one worker with warm caches, and their backend costs.
+# Each case is one value of the axis, and the CI comparison runs one case in
+# each process with `--only case=NAME`. The cases are the ones of the former
+# Criterion suite, with their names.
+
+[pools.diag-256]
+keys = 1
+value-bytes = 256
+key-bytes = 5
+
+[pools.diag-external]
+keys = 1
+value-bytes = 1025
+key-bytes = 5
+
+[pools.diag-1024]
+keys = 1
+value-bytes = 1024
+key-bytes = 5
+
+[pools.diag-large]
+keys = 1024
+value-bytes = 256
+key-bytes = 256
+seed-batch = 64
+
+[pools.diag-shared]
+keys = 3
+value-bytes = 256
+key-bytes = 5
+
+[shapes.diag-read]
+kind = "read"
+pool = "diag-256"
+source = { index = { keys = [0] } }
+keys = 1
+
+[shapes.diag-read-external]
+kind = "read"
+pool = "diag-external"
+source = { index = { keys = [0] } }
+keys = 1
+
+[shapes.diag-fresh-read]
+kind = "fresh-client-read"
+pool = "diag-256"
+source = { index = { keys = [0] } }
+keys = 1
+
+[shapes.diag-rmw-inline]
+kind = "read-modify-write"
+pool = "diag-1024"
+source = { index = { keys = [0] } }
+keys = 1
+
+[shapes.diag-rmw-external]
+kind = "read-modify-write"
+pool = "diag-external"
+source = { index = { keys = [0] } }
+keys = 1
+
+[shapes.diag-rmw-five]
+kind = "read-modify-write"
+pool = "diag-256"
+source = { index = { keys = [0] } }
+keys = 1
+collections = 5
+
+[shapes.diag-read-large]
+kind = "read"
+pool = "diag-large"
+source = { index = { keys = [512] } }
+keys = 1
+
+[shapes.diag-rmw-shared]
+kind = "read-modify-write"
+pool = "diag-shared"
+source = { stripe = { shared-pct = 0 } }
+keys = 1
+
+[workloads.diag-read.groups.all]
+instances = 1
+shapes = { diag-read = 1 }
+
+[workloads.diag-read-external.groups.all]
+instances = 1
+shapes = { diag-read-external = 1 }
+
+[workloads.diag-fresh-read.groups.all]
+instances = 1
+shapes = { diag-fresh-read = 1 }
+
+[workloads.diag-rmw-inline.groups.all]
+instances = 1
+shapes = { diag-rmw-inline = 1 }
+
+[workloads.diag-rmw-external.groups.all]
+instances = 1
+shapes = { diag-rmw-external = 1 }
+
+[workloads.diag-rmw-five.groups.all]
+instances = 1
+shapes = { diag-rmw-five = 1 }
+
+[workloads.diag-read-large.groups.all]
+instances = 1
+shapes = { diag-read-large = 1 }
+
+[workloads.diag-rmw-shared.groups.all]
+instances = 1
+shapes = { diag-rmw-shared = 3 }
+
+[experiments.diagnostics.set]
+cell.runtime = "current-thread"
+cell.database.protocol-timing = "default"
+seed.database.protocol-timing = "default"
+seed.quiet-period = "1200ms"
+seed.timeout = "15s"
+seed.gc = false
+cell.gc = false
+cell.probes = ["costs"]
+cell.warm-up.minimum = "0s"
+cell.warm-up.quiet = "never"
+cell.warm-up.timeout = "250ms"
+cell.measure.until = "duration"
+cell.measure.duration = "2s"
+cell.measure.max-duration = "2s"
+[[experiments.diagnostics.axes]]
+name = "case"
+values = [
+  { label = "warm_read", set = { "cell.workload" = "diag-read" } },
+  { label = "warm_read_external", set = { "cell.workload" = "diag-read-external" } },
+  { label = "fresh_client_read", set = { "cell.workload" = "diag-fresh-read" } },
+  { label = "rmw_inline_1024", set = { "cell.workload" = "diag-rmw-inline" } },
+  { label = "rmw_external_1025", set = { "cell.workload" = "diag-rmw-external" } },
+  { label = "rmw_five_leaves", set = { "cell.workload" = "diag-rmw-five", "cell.collections" = 5 } },
+  { label = "read_long_keys_large_collection", set = { "cell.workload" = "diag-read-large" } },
+  { label = "rmw_shared_leaf_three_transactions", set = { "cell.workload" = "diag-rmw-shared" } },
+]

@@ -9,7 +9,6 @@ import json
 import os
 import platform
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -37,7 +36,9 @@ CASES = (
     "read_long_keys_large_collection",
     "rmw_shared_leaf_three_transactions",
 )
-MIXED_ARGS = [
+# The options of every compared process. The experiments come from the
+# built-in configuration of the candidate harness.
+COMMON_ARGS = [
     "--backend=memory",
     "--delays=s3",
     # Random provider delays obscure code changes in short percentile samples.
@@ -49,20 +50,8 @@ MIXED_ARGS = [
     "--prefix-depth=3",
     "--runs=1",
     "--drain-timeout=10s",
-    "mixed",
-    "--modes=lo",
-    "--affinities=100",
-    "--databases=1",
-    "--workers-per-shape=1",
-    "--num-keys=128",
-    "--multi-keys=10",
-    "--duration=10s",
-    "--max-duration=10s",
-    "--window-commits=0",
-    "--quiet-period=250ms",
-    "--seed-timeout=5s",
-    "--warmup-timeout=5s",
 ]
+MIXED_ARGS = [*COMMON_ARGS, "--experiment=ci"]
 
 
 def capture(command: list[str], cwd: Path) -> str:
@@ -94,8 +83,8 @@ def snapshot(repo: Path, destination: Path, revision: str | None) -> None:
 
 
 def use_harness(candidate: Path, base: Path) -> str:
-    """Copy benchmark sources and declarations, retaining engine dependencies and locks."""
-    paths = [Path("crates/glassdb/benches"), Path("crates/glassdb-bench-scale")]
+    """Copy the benchmark sources, retaining engine dependencies and locks."""
+    paths = [Path("crates/glassdb-bench-scale")]
     digest = hashlib.sha256()
     for relative in paths:
         source = candidate / relative
@@ -109,33 +98,12 @@ def use_harness(candidate: Path, base: Path) -> str:
             if path.is_file():
                 digest.update(str(path.relative_to(candidate)).encode())
                 digest.update(path.read_bytes())
-    relative = Path("crates/glassdb/Cargo.toml")
-    candidate_manifest = (candidate / relative).read_text()
-    base_manifest = (base / relative).read_text()
-    pattern = r"(?ms)^\[dev-dependencies\]\n.*?(?=^\[|\Z)"
-    section = re.search(pattern, candidate_manifest)
-    if section is None or re.search(pattern, base_manifest) is None:
-        raise RuntimeError("unsupported comparison: missing benchmark dev dependencies")
-    base_manifest = re.sub(pattern, lambda _: section[0], base_manifest)
-    digest.update(section[0].encode())
-    pattern = r"(?ms)^\[\[bench\]\]\n.*?(?=^\[|\Z)"
-    benchmarks = re.findall(pattern, candidate_manifest)
-    if not benchmarks:
-        raise RuntimeError("unsupported comparison: missing benchmark declarations")
-    base_manifest = re.sub(pattern, "", base_manifest).rstrip() + "\n\n"
-    for benchmark in benchmarks:
-        base_manifest += benchmark.rstrip() + "\n\n"
-        digest.update(benchmark.encode())
-    (base / relative).write_text(base_manifest)
     return digest.hexdigest()
 
 
 def build(source: Path, target: Path, output: Path, side: str) -> dict:
     result = {}
-    for package, selector, name in (
-        ("glassdb", "--bench", "diagnostics"),
-        ("glassdb-bench-scale", "--bin", "perfbench"),
-    ):
+    for package, selector, name in (("glassdb-bench-scale", "--bin", "perfbench"),):
         command = [
             "cargo",
             "build",
@@ -173,8 +141,7 @@ def build(source: Path, target: Path, output: Path, side: str) -> dict:
         (source / "Cargo.lock").read_bytes()
     ).hexdigest()
     result["executableSha256"] = {
-        name: hashlib.sha256(Path(result[name]).read_bytes()).hexdigest()
-        for name in ("diagnostics", "perfbench")
+        "perfbench": hashlib.sha256(Path(result["perfbench"]).read_bytes()).hexdigest()
     }
     return result
 
@@ -187,7 +154,7 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         "completedPairs": {name: 0 for name in (*CASES, "mixed")},
         "cases": CASES,
         "mixedArgs": MIXED_ARGS,
-        "diagnosticModel": perf_report.DIAGNOSTIC_MODEL,
+        "diagnosticArgs": [*COMMON_ARGS, "--experiment=diagnostics"],
         "processTimeoutSeconds": PROCESS_TIMEOUT,
         "base": base,
         "candidate": candidate or "working tree",
@@ -253,7 +220,6 @@ def measure(output: Path, manifest: dict) -> None:
             subprocess.run(
                 command,
                 cwd=directory,
-                env={**os.environ, "CRITERION_HOME": str(directory / "criterion")},
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 timeout=process_timeout,
@@ -263,8 +229,9 @@ def measure(output: Path, manifest: dict) -> None:
 
     try:
         if affinity:
-            # CPU diagnostics need no migration. Mixed measurements retain the
-            # CI runner's four-CPU width so runtime contention stays comparable.
+            # Diagnostics run on one thread and need no migration. Mixed
+            # measurements retain the CI runner's four-CPU width so runtime
+            # contention stays comparable.
             manifest["cpuAffinity"] = sorted(affinity)[:4]
             manifest["diagnosticCpu"] = min(affinity)
         active = set(manifest["completedPairs"])
@@ -283,28 +250,24 @@ def measure(output: Path, manifest: dict) -> None:
                         ("main", "pr") if (repetition + index) % 2 else ("pr", "main")
                     )
                     for side in sides:
+                        result_path = output / side / f"{repetition:02d}" / f"{name}.json"
                         if name == "mixed":
-                            command = [
-                                manifest[side]["perfbench"],
-                                "--output",
-                                str(output / side / f"{repetition:02d}" / "mixed.json"),
-                                *manifest["mixedArgs"],
-                            ]
-                            log_name = "mixed"
+                            arguments = manifest["mixedArgs"]
                         else:
-                            command = [
-                                manifest[side]["diagnostics"],
-                                "--bench",
-                                "--noplot",
-                                f"^diagnostic/{re.escape(name)}$",
+                            arguments = [
+                                *manifest["diagnosticArgs"],
+                                f"--only=case={name}",
                             ]
-                            log_name = f"criterion-{name}"
-                        directory = run(side, repetition, log_name, command)
+                        command = [
+                            manifest[side]["perfbench"],
+                            f"--output={result_path}",
+                            *arguments,
+                        ]
+                        directory = run(side, repetition, name, command)
                         _, warnings = perf_report.read_measurement(
                             directory,
                             name,
                             mixed_args=manifest["mixedArgs"],
-                            diagnostic_model=manifest.get("diagnosticModel"),
                         )
                         if warnings:
                             raise perf_report.ReportError("; ".join(warnings))

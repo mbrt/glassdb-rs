@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 #
 # CPU profiling recipe for glassdb-rs. The profiler attaches to the compiled
-# binary to measure CPU use. See hack/perf/README.md for the limits of profiling
-# the in-memory Criterion target.
+# perfbench binary to measure CPU use. See hack/perf/README.md for the limits of
+# profiling the in-memory backend.
 #
 # Usage:
 #   hack/perf/profile.sh
-#   FILTER=diagnostic/rmw_inline_1024 hack/perf/profile.sh
+#   CASE=rmw_inline_1024 hack/perf/profile.sh
+#   EXPERIMENT=ci hack/perf/profile.sh
 #
 # Tunables (env):
-#   FILTER    Criterion case filter (default diagnostic)
-#   SECONDS_PER_CASE  profiling time per case (default 10)
-#   OUT       output directory for artifacts (default hack/perf)
+#   EXPERIMENT        perfbench experiment (default diagnostics)
+#   CASE              one case of the diagnostics experiment (default: all)
+#   SECONDS_PER_CASE  measured time of each case (default 10)
+#   OUT               output directory for artifacts (default hack/perf)
 
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-FILTER="${FILTER:-diagnostic}"
+EXPERIMENT="${EXPERIMENT:-diagnostics}"
+CASE="${CASE:-}"
 SECONDS_PER_CASE="${SECONDS_PER_CASE:-10}"
 OUT="${OUT:-hack/perf}"
 
@@ -25,8 +28,21 @@ mkdir -p "$OUT"
 svg="$OUT/flamegraph.svg"
 folded="$OUT/flamegraph.folded"
 
-cargo_sel=(-p glassdb --bench diagnostics)
-run_args=(--bench "$FILTER" --profile-time "$SECONDS_PER_CASE")
+cargo_sel=(-p glassdb-bench-scale --bin perfbench)
+run_args=(
+	--latency-jitter=false
+	--experiment="$EXPERIMENT"
+	--output="$OUT/profile.json"
+)
+if [[ "$EXPERIMENT" == "diagnostics" ]]; then
+	run_args+=(
+		--set="cell.measure.duration=\"${SECONDS_PER_CASE}s\""
+		--set="cell.measure.max-duration=\"${SECONDS_PER_CASE}s\""
+	)
+	if [[ -n "$CASE" ]]; then
+		run_args+=(--only="case=$CASE")
+	fi
+fi
 
 if ! cargo flamegraph --version >/dev/null 2>&1; then
 	echo "cargo-flamegraph not found; install it with:" >&2
@@ -39,12 +55,12 @@ fi
 # the collapse tool is available.
 if ! cargo flamegraph --profile profiling "${cargo_sel[@]}" \
 	--output "$svg" -- "${run_args[@]}"; then
-	cat >&2 <<'EOF'
+	cat >&2 <<'MSG'
 
 profiling failed. On Linux, perf-based profiling needs kernel access:
   sudo sysctl kernel.perf_event_paranoid=1
   sudo sysctl kernel.kptr_restrict=0      # if stacks show only addresses
-EOF
+MSG
 	exit 1
 fi
 

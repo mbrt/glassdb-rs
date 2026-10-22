@@ -38,36 +38,17 @@
 #   RUN_COOLDOWN     cooldown between repetitions    (default: 60s)
 #   DRAIN_TIMEOUT    worker/shutdown deadline         (default: 90s)
 #
-# Mixed-workload affinity sweep:
-#   MIX_MODES        contention modes                 (default: lo,hi)
-#   MIX_AFFINITIES   home-affinity percentages       (default: 0,25,50,75,100)
-#   MIX_DATABASES    clients and home collections    (default: 4)
-#   MIX_WORKERS      workers per transaction shape   (default: 8)
-#   MIX_NUM_KEYS     keys per low-contention home    (default: 5000); each
-#                    worker draws from a stripe, so it must be at least
-#                    4 x max MIX_WORKERS x MIX_MULTI_KEYS
-#   MIX_SHARED_PCT   low-contention transactions outside their stripe
-#                    (default: 1)
-#   MIX_HOT_KEYS     keys per high-contention home   (default: 8)
-#   MIX_MULTI_KEYS   keys per multi-key transaction  (default: 10)
-#   MIX_DURATION     minimum measured cell window    (default: 5s)
-#   MIX_MAX_DURATION maximum measured cell window    (default: 120s)
-#   MIX_WINDOW_COMMITS mean commits per throughput window (default: 50)
-#   MIX_QUIET_PERIOD time without topology changes that settles the seed
-#                    and ends a cell's warm-up        (default: 10s)
-#   MIX_SEED_TIMEOUT limit of the seed settlement; each cell seeds again on
-#                    S3                               (default: 120s)
-#   MIX_WARMUP_TIMEOUT limit of each cell's warm-up   (default: 120s)
-#
-# Focused scenarios:
-#   CONTENTION_KEYS     key counts to sweep           (default: 1,2,3,4,5,6)
-#   CONTENTION_DURATION measured window per cell      (default: 20s)
-#   RUN_INLINE_PRESSURE run the inline-pressure scenario (default: false)
-#   INLINE_PRESSURE_SETTLE_TIMEOUT pressure phase limit (default: 30s)
+# Experiments:
+#   EXPERIMENTS      perfbench experiments to run, comma-separated; each one
+#                    writes out/<experiment>.json (default: mixed,contention)
+#   PERFBENCH_CONFIG path of a perfbench configuration file that changes the
+#                    built-in experiments, after aws.toml (default: none). See
+#                    crates/glassdb-bench-scale/README.md.
+#   CONTENTION_DURATION measured window of each contention cell (default: 20s)
 #
 # The provisioned instance polls S3 for the three uploaded artifacts, runs the
-# mixed and contention scenarios (plus inline-pressure when enabled), uploads
-# versioned JSON and its bootstrap log, and optionally stops itself. User data
+# experiments, uploads versioned JSON and its bootstrap log, and optionally
+# stops itself. User data
 # runs only when the instance is first provisioned; tear down a completed stack
 # before starting another run. The bucket and VPC endpoints continue to incur
 # charges until `deploy.sh teardown` completes.
@@ -88,24 +69,9 @@ CONFIG_S3_KEY="${CONFIG_S3_KEY:-bin/perfbench.env}"
 RUNS="${RUNS:-1}"
 RUN_COOLDOWN="${RUN_COOLDOWN:-60s}"
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-90s}"
-MIX_MODES="${MIX_MODES:-lo,hi}"
-MIX_AFFINITIES="${MIX_AFFINITIES:-0,25,50,75,100}"
-MIX_DATABASES="${MIX_DATABASES:-4}"
-MIX_WORKERS="${MIX_WORKERS:-8}"
-MIX_NUM_KEYS="${MIX_NUM_KEYS:-5000}"
-MIX_SHARED_PCT="${MIX_SHARED_PCT:-1}"
-MIX_HOT_KEYS="${MIX_HOT_KEYS:-8}"
-MIX_MULTI_KEYS="${MIX_MULTI_KEYS:-10}"
-MIX_DURATION="${MIX_DURATION:-5s}"
-MIX_MAX_DURATION="${MIX_MAX_DURATION:-120s}"
-MIX_WINDOW_COMMITS="${MIX_WINDOW_COMMITS:-50}"
-MIX_QUIET_PERIOD="${MIX_QUIET_PERIOD:-10s}"
-MIX_SEED_TIMEOUT="${MIX_SEED_TIMEOUT:-120s}"
-MIX_WARMUP_TIMEOUT="${MIX_WARMUP_TIMEOUT:-120s}"
-CONTENTION_KEYS="${CONTENTION_KEYS:-1,2,3,4,5,6}"
+EXPERIMENTS="${EXPERIMENTS:-mixed,contention}"
+PERFBENCH_CONFIG="${PERFBENCH_CONFIG:-}"
 CONTENTION_DURATION="${CONTENTION_DURATION:-20s}"
-RUN_INLINE_PRESSURE="${RUN_INLINE_PRESSURE:-false}"
-INLINE_PRESSURE_SETTLE_TIMEOUT="${INLINE_PRESSURE_SETTLE_TIMEOUT:-30s}"
 
 region_args=()
 if [[ -n "${AWS_REGION:-}" ]]; then
@@ -120,17 +86,16 @@ stack_output() {
 }
 
 write_config() {
-  local path="$1" name
-  : >"$path"
-  for name in \
-    RUNS RUN_COOLDOWN DRAIN_TIMEOUT MIX_MODES MIX_AFFINITIES MIX_DATABASES \
-    MIX_WORKERS MIX_NUM_KEYS MIX_SHARED_PCT MIX_HOT_KEYS MIX_MULTI_KEYS MIX_DURATION \
-    MIX_MAX_DURATION MIX_WINDOW_COMMITS MIX_QUIET_PERIOD MIX_SEED_TIMEOUT \
-    MIX_WARMUP_TIMEOUT \
-    CONTENTION_KEYS CONTENTION_DURATION RUN_INLINE_PRESSURE \
-    INLINE_PRESSURE_SETTLE_TIMEOUT; do
+  local path="$1" name config=""
+  # aws.toml is always a layer, so it travels in the environment file too.
+  printf 'AWS_CONFIG=%q\n' "$(<"$SCRIPT_DIR/aws.toml")" >"$path"
+  for name in RUNS RUN_COOLDOWN DRAIN_TIMEOUT EXPERIMENTS CONTENTION_DURATION; do
     printf '%s=%q\n' "$name" "${!name}" >>"$path"
   done
+  if [[ -n "$PERFBENCH_CONFIG" ]]; then
+    config="$(<"$PERFBENCH_CONFIG")"
+  fi
+  printf 'PERFBENCH_CONFIG=%q\n' "$config" >>"$path"
 }
 
 deploy() {
