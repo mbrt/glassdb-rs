@@ -28,9 +28,10 @@ use indexmap::IndexMap;
 use serde_json::{Map, Value as Json};
 
 use super::backend::Factory;
-use super::{Execution, cooldown};
+use super::{Execution, cooldown, progress};
 use config::{CellPoint, Resolved, Start};
 use model::CellSpec;
+use progress::Stage;
 use result::{
     CellResult, GroupResult, InstanceResult, MeasureResult, OpsPerTx, ProtocolPerTx, RunResult,
     ShapeResult, THROUGHPUT_WINDOWS, TimelineEntry, WarmupResult,
@@ -108,10 +109,11 @@ pub(crate) fn run(
         let mut carry: Option<Carry> = None;
         let mut cells = Vec::with_capacity(points.len());
         for (index, (point, spec)) in points.iter().zip(&specs).enumerate() {
-            eprintln!("{}: run={run} {}", resolved.name, describe(point));
+            crate::progress::log!("{}: run={run} {}", resolved.name, describe(point));
             let next_continues = points
                 .get(index + 1)
                 .is_some_and(|next| next.start == Start::Previous);
+            progress::start_cell();
             let (cell, next) = runtime.block_on(run_cell(
                 &mut seeds,
                 carry.take(),
@@ -120,6 +122,7 @@ pub(crate) fn run(
                 next_continues,
                 execution,
             ))?;
+            progress::finish_cell();
             cells.push(cell);
             carry = next;
         }
@@ -311,6 +314,11 @@ async fn run_cell(
     let changes_start = restructurer_stats(&databases);
     let gc_start = gc_stats(&databases);
     let warm_up = &spec.params.warm_up;
+    let (warm_stage, mut measure_stage) = Stage::split(
+        warm_start,
+        warm_up.minimum.min(warm_up.timeout),
+        spec.params.measure.duration,
+    );
     let quiet = if warm_up.timeout.is_zero() {
         true
     } else {
@@ -321,7 +329,9 @@ async fn run_cell(
                 () = tokio::time::sleep(warm_up.timeout) => {}
             }
         };
-        timeline.sample_during(&databases, minimum, false).await;
+        timeline
+            .sample_during(&databases, minimum, false, warm_stage)
+            .await;
         let remaining = warm_up.timeout.saturating_sub(warm_start.elapsed());
         match warm_up.quiet {
             Some(quiet) => {
@@ -331,11 +341,13 @@ async fn run_cell(
                     quiet,
                     remaining,
                 );
-                timeline.sample_during(&databases, wait, false).await
+                timeline
+                    .sample_during(&databases, wait, false, warm_stage)
+                    .await
             }
             None => {
                 timeline
-                    .sample_during(&databases, tokio::time::sleep(remaining), false)
+                    .sample_during(&databases, tokio::time::sleep(remaining), false, warm_stage)
                     .await;
                 false
             }
@@ -349,7 +361,7 @@ async fn run_cell(
         quiet,
         gc: (gc_stats(&databases) - gc_start).into(),
     };
-    eprintln!(
+    crate::progress::log!(
         "  warm-up took {}ms: {} splits and {} merges{}",
         warmup.wall_ms,
         warmup.splits,
@@ -365,14 +377,15 @@ async fn run_cell(
     let full_gc = if spec.params.gc {
         match seed::collect_garbage(&databases[0]).await {
             Ok(collected) => {
-                eprintln!(
+                crate::progress::log!(
                     "  full GC took {}ms: {} transaction records deleted",
-                    collected.wall_ms, collected.deleted
+                    collected.wall_ms,
+                    collected.deleted
                 );
                 Some(collected)
             }
             Err(error) => {
-                eprintln!("  note: {error}");
+                crate::progress::log!("  note: {error}");
                 None
             }
         }
@@ -384,6 +397,7 @@ async fn run_cell(
     let breakdown_start = storage.breakdown.snapshot();
     let measure_start = Instant::now();
     let measure_model_start = rt::Instant::now();
+    measure_stage.started = measure_start;
     for (_, _, shape) in &shapes {
         shape.bench.start();
     }
@@ -398,7 +412,9 @@ async fn run_cell(
         .map(|(_, _, shape)| shape.bench.clone())
         .collect();
     let drive = workers::drive(&shared, &benches, target, spec.params.measure.duration, max);
-    let outcome = timeline.sample_during(&databases, drive, true).await;
+    let outcome = timeline
+        .sample_during(&databases, drive, true, measure_stage)
+        .await;
     // The windows end when the workers stop, so the drain of the transactions
     // in flight does not lower the last window.
     for bench in &benches {
@@ -418,7 +434,9 @@ async fn run_cell(
         return Err("benchmark worker stopped without reporting its error".into());
     }
     if outcome == Outcome::Capped {
-        eprintln!("  note: the measurement reached its maximum duration before its end condition");
+        crate::progress::log!(
+            "  note: the measurement reached its maximum duration before its end condition"
+        );
     }
     let mut measured: Vec<Stats> = databases.iter().map(Database::stats).collect();
     let mut breakdown_measured = storage.breakdown.snapshot();
@@ -648,6 +666,7 @@ impl Timeline {
         databases: &[Database],
         future: impl std::future::Future<Output = T>,
         measured: bool,
+        stage: Stage,
     ) -> T {
         tokio::pin!(future);
         let mut ticks = tokio::time::interval(TIMELINE_INTERVAL);
@@ -655,7 +674,10 @@ impl Timeline {
         loop {
             tokio::select! {
                 output = &mut future => return output,
-                _ = ticks.tick() => self.sample(databases, measured),
+                _ = ticks.tick() => {
+                    self.sample(databases, measured);
+                    progress::advance(stage);
+                }
             }
         }
     }

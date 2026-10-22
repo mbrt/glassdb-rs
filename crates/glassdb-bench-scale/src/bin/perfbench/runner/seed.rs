@@ -230,9 +230,10 @@ async fn seed(
             let collected = collect_garbage(&db).await;
             match collected {
                 Ok(collected) => {
-                    eprintln!(
+                    crate::progress::log!(
                         "  full GC took {}ms: {} transaction records deleted",
-                        collected.wall_ms, collected.deleted
+                        collected.wall_ms,
+                        collected.deleted
                     );
                     report.full_gc = Some(collected);
                 }
@@ -253,9 +254,10 @@ async fn seed(
         )
         .into());
     }
-    eprintln!(
+    crate::progress::log!(
         "  setup settled after {}ms: {} completed splits",
-        report.settle_wall_ms, report.splits
+        report.settle_wall_ms,
+        report.splits
     );
     Ok(report)
 }
