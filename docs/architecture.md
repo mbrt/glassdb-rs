@@ -627,6 +627,8 @@ size causes policy, the underfull threshold and inline pressure decide. A new
 candidate wakes the restructurer after a short delay, so that one sweep takes a
 burst of writes. A deferred candidate waits for the next sweep, which comes at
 most a fixed interval later, so a busy node cannot cause a tight retry loop. A
+sweep does not start a change that a rule asked for more than three windows
+before ([ADR-083](adr/083-drop-stale-topology-requests.md)). A
 merge defers while a live transaction holds a lock on its source or target.
 
 Under load, a rule asks for many more leaf splits than one split at a time can

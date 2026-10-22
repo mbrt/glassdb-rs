@@ -133,6 +133,7 @@ pub(crate) struct InstanceResult {
     split_candidates: u64,
     splits: u64,
     split_deferred: u64,
+    stale_demand: u64,
     merges: u64,
 }
 
@@ -244,6 +245,7 @@ impl InstanceResult {
             split_candidates: stats.restructurer.candidates,
             splits: stats.restructurer.splits,
             split_deferred: stats.restructurer.deferred,
+            stale_demand: stats.restructurer.stale_demand,
             merges: stats.restructurer.merges,
         }
     }

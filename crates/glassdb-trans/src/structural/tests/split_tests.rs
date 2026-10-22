@@ -1,4 +1,5 @@
 use super::*;
+use crate::structural::rule::{ChangeRequest, LeafId, RuleRequest};
 
 use glassdb_storage::PaidChange;
 
@@ -439,6 +440,7 @@ async fn queued_demand_splits_of_a_leaf_divide_it_at_the_newest_key() {
         candidates.push(MaintenanceCandidate {
             path: root_path(),
             priority: candidates.new_id(),
+            requested: rt::Instant::now(),
             cause: CandidateCause::Split(SplitReason::Demand {
                 at: Some(at.to_vec()),
                 rate: Duration::from_secs(1),
@@ -450,6 +452,68 @@ async fn queued_demand_splits_of_a_leaf_divide_it_at_the_newest_key() {
     sp.run_once().await;
 
     assert_eq!(leaf_keys(&s).await, a_then_bcd());
+}
+
+// The restructurer can make fewer splits than a topology rule asks for. Then
+// the queue keeps requests for a load that stopped, and splits after it
+// (ADR-083).
+#[tokio::test(start_paused = true)]
+async fn a_sweep_drops_a_demand_split_older_than_three_windows() {
+    let s = store();
+    s.create_root(COLL, &abcd_leaf()).await.unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+
+    sp.candidates.push_request(root_split_request());
+    tokio::time::advance(Duration::from_secs(4)).await;
+    sp.run_once().await;
+
+    assert_eq!(sp.stats_and_reset().stale_demand, 1);
+    assert_eq!(leaf_keys(&s).await.len(), 1, "the stale split did not land");
+}
+
+// A new request for the same change shows that the load continues, so the
+// queued change is not stale.
+#[tokio::test(start_paused = true)]
+async fn a_new_request_keeps_a_queued_demand_split() {
+    let s = store();
+    s.create_root(COLL, &abcd_leaf()).await.unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+
+    sp.candidates.push_request(root_split_request());
+    tokio::time::advance(Duration::from_secs(4)).await;
+    sp.candidates.push_request(root_split_request());
+    sp.run_once().await;
+
+    let stats = sp.stats_and_reset();
+    assert_eq!((stats.splits, stats.stale_demand), (1, 0));
+}
+
+// The cause of a size split stays in the node until a change removes it, so
+// its age does not matter.
+#[tokio::test(start_paused = true)]
+async fn a_sweep_keeps_an_old_soft_cap_split() {
+    let s = store();
+    s.create_root(COLL, &abcd_leaf()).await.unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, tiny());
+
+    sp.candidates
+        .observe_leaf(&root_path(), abcd_leaf().as_leaf().unwrap());
+    tokio::time::advance(Duration::from_secs(60)).await;
+    sp.run_once().await;
+
+    let stats = sp.stats_and_reset();
+    assert_eq!(stats.stale_demand, 0);
+    assert!(stats.splits > 0, "the soft cap split landed");
+}
+
+fn root_split_request() -> RuleRequest {
+    RuleRequest {
+        change: ChangeRequest::Split(LeafId::new(root_path())),
+        rate: Duration::from_secs(1),
+    }
 }
 
 fn abcd_leaf() -> Node {
@@ -1069,7 +1133,7 @@ async fn feed_drives_run_once() {
         &LeafBody::from_entries([live(b"a"), live(b"b")]),
     );
     assert!(
-        candidates.drain().is_empty(),
+        candidates.drain().0.is_empty(),
         "at-cap leaf is not a candidate"
     );
     // Over the cap: enqueued and split by a sweep.
@@ -2077,7 +2141,11 @@ async fn a_batch_that_cannot_join_the_topology_leaves_nothing_behind() {
             ..RestructurerStats::default()
         }
     );
-    assert_eq!(sp.candidates.drain().len(), 3, "each candidate is requeued");
+    assert_eq!(
+        sp.candidates.drain().0.len(),
+        3,
+        "each candidate is requeued"
+    );
     let (record, _) = s
         .records
         .load_record(
@@ -2129,6 +2197,7 @@ async fn two_causes_split_one_node_one_after_the_other() {
         candidates.push(MaintenanceCandidate {
             path: node_path("L"),
             priority: candidates.new_id(),
+            requested: rt::Instant::now(),
             cause,
         });
     }
@@ -2176,6 +2245,7 @@ fn push_soft_cap_splits(candidates: &MaintenanceCandidates, count: usize) {
         candidates.push(MaintenanceCandidate {
             path: node_path(&format!("L{leaf}")),
             priority: candidates.new_id(),
+            requested: rt::Instant::now(),
             cause: CandidateCause::Split(SplitReason::SoftCap),
         });
     }
@@ -2190,6 +2260,7 @@ fn a_sweep_orders_splits_by_cause_and_rate() {
         candidates.push(MaintenanceCandidate {
             path: node_path(name),
             priority: candidates.new_id(),
+            requested: rt::Instant::now(),
             cause,
         })
     };
@@ -2201,6 +2272,7 @@ fn a_sweep_orders_splits_by_cause_and_rate() {
 
     let order: Vec<_> = candidates
         .drain()
+        .0
         .into_iter()
         .map(|candidate| candidate.path)
         .collect();
