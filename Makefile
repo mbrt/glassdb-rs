@@ -20,7 +20,10 @@ test-unit:
 
 test-bench:
 	python3 -m unittest hack.ci.test_perf_report hack.ci.test_perf_compare
-	cd hack/perf && python3 -m unittest test_perfbench_results test_compare test_plot_results
+	# The plot and comparison tools declare their dependencies as uv scripts.
+	cd hack/perf && for test in test_perfbench_results test_compare test_plot_results; do \
+		uv run --script $$test.py || exit 1; \
+	done
 	cargo test -p glassdb-bench-scale
 	cargo test --workspace --bench '*'
 
