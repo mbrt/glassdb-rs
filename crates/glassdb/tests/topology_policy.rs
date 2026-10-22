@@ -233,6 +233,10 @@ async fn a_leaf_splits_between_the_instances_that_contend_on_it() {
     let stats = contend(HALVES).await;
 
     assert!(stats.splits >= 1, "{stats:?}");
+    assert!(
+        !stats.topology_time.lost_cas.is_zero(),
+        "the stats show the time that paid for the split: {stats:?}"
+    );
 }
 
 // A split at the median leaves writers of both instances in each half, so the

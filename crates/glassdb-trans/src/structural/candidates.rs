@@ -11,7 +11,7 @@ use glassdb_storage::{InlinePolicy, LeafBody, Node, NodeSizePolicy};
 use tokio::sync::Notify;
 
 use crate::access::AccessSet;
-use crate::leaf_coord::StructuralHinter;
+use crate::leaf_coord::{LeafDelayKind, StructuralHinter};
 
 use super::measurements::{ChangeKind, TopologyMeasurements};
 use super::merge::MergeReason;
@@ -244,12 +244,12 @@ impl MaintenanceCandidates {
     }
 
     /// Drains every queued candidate, de-duplicated by path and cause, for one
-    /// sweep cycle, and the number of stale demand candidates that it dropped.
+    /// sweep cycle, and the stale demand candidates that it dropped.
     /// Splits come before merges (ADR-073). The splits that a size cause asks
     /// for come first, and then the demand splits with the highest rate, so
     /// that while the queue is long the splits that remove the most avoidable
     /// time land first.
-    pub(super) fn drain(&self) -> (Vec<MaintenanceCandidate>, u64) {
+    pub(super) fn drain(&self) -> (Vec<MaintenanceCandidate>, Vec<MaintenanceCandidate>) {
         let mut q = self.queue.lock().unwrap();
         let mut by_path = BTreeMap::<(ObjectPath, u8), MaintenanceCandidate>::new();
         while let Some(candidate) = q.pop_front() {
@@ -261,10 +261,9 @@ impl MaintenanceCandidates {
                 }
             }
         }
-        let mut candidates: Vec<_> = by_path.into_values().collect();
-        let before = candidates.len();
-        candidates.retain(|candidate| !candidate.is_stale());
-        let stale = (before - candidates.len()) as u64;
+        let (mut candidates, stale): (Vec<_>, Vec<_>) = by_path
+            .into_values()
+            .partition(|candidate| !candidate.is_stale());
         candidates.sort_by_key(|candidate| match &candidate.cause {
             CandidateCause::Split(SplitReason::Demand { rate, .. }) => (false, Reverse(*rate)),
             CandidateCause::Split(_) => (false, Reverse(Duration::MAX)),
@@ -486,9 +485,9 @@ impl StructuralHinter for MaintenanceCandidates {
         });
     }
 
-    fn leaf_delay(&self, path: &ObjectPath, time: Duration, split_key: &[u8]) {
+    fn leaf_delay(&self, path: &ObjectPath, time: Duration, split_key: &[u8], kind: LeafDelayKind) {
         if let Some(measurements) = &self.measurements {
-            measurements.add_leaf_delay(path, time, split_key);
+            measurements.add_leaf_delay(path, time, split_key, kind);
         }
     }
 
