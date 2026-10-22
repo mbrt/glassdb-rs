@@ -48,6 +48,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use glassdb_concurr::rt;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::{
     IndexNode, LeafEntry, LeafObservation, Node, NodeStore, PaidChange, Payment, Requirement,
@@ -506,6 +507,7 @@ impl Splitter {
                 id: *id,
             },
             priority: self.candidates.new_id(),
+            requested: rt::Instant::now(),
             cause: CandidateCause::Split(SplitReason::SoftCap),
         });
     }

@@ -16,7 +16,7 @@ use crate::leaf_coord::StructuralHinter;
 use super::measurements::{ChangeKind, TopologyMeasurements};
 use super::merge::MergeReason;
 use super::paid_rate::PaidRates;
-use super::rule::{ChangeRequest, RuleRequest};
+use super::rule::{ChangeRequest, RuleRequest, TOPOLOGY_WINDOW};
 use super::split::SplitReason;
 
 /// Interval of the sweep when no new candidate arrives. Such a sweep retries
@@ -32,6 +32,12 @@ const CANDIDATE_COALESCING_DELAY: Duration = Duration::from_millis(50);
 /// restructurer reloads and re-checks each one, so dropping the oldest when
 /// full merely delays a structural change, never causes an unsafe one.
 const CANDIDATE_QUEUE_CAP: usize = 4096;
+
+/// The age after which a sweep drops a change that a topology rule asked for
+/// (ADR-083). An older request can be for a load that stopped, or for a leaf
+/// that changed since. The rule asks again when its time pays for the change
+/// again.
+const DEMAND_MAX_AGE: Duration = TOPOLOGY_WINDOW.saturating_mul(3);
 
 /// The feed of nodes that may need a split (ADR-031) or a merge (ADR-073),
 /// owned by the [`Restructurer`](super::Restructurer). The coordinator observes
@@ -65,6 +71,9 @@ pub struct StructuralHintSink {
 pub(super) struct MaintenanceCandidate {
     pub(super) path: ObjectPath,
     pub(super) priority: TxId,
+    /// When the newest observation of the cause was queued. The priority
+    /// cannot tell, because it keeps the oldest observation.
+    pub(super) requested: rt::Instant,
     pub(super) cause: CandidateCause,
 }
 
@@ -88,6 +97,7 @@ impl StructuralHintSink {
         self.candidates.push(MaintenanceCandidate {
             path: path.clone(),
             priority: self.candidates.new_id(),
+            requested: rt::Instant::now(),
             cause: CandidateCause::Split(SplitReason::InlinePressure {
                 key: key.to_vec(),
                 value_len,
@@ -161,6 +171,14 @@ impl CandidateCause {
         )
     }
 
+    fn is_demand(&self) -> bool {
+        matches!(
+            self,
+            CandidateCause::Split(SplitReason::Demand { .. })
+                | CandidateCause::Merge(MergeReason::Demand { .. })
+        )
+    }
+
     fn class(&self) -> u8 {
         match self {
             CandidateCause::Split(reason) => reason.class(),
@@ -226,11 +244,12 @@ impl MaintenanceCandidates {
     }
 
     /// Drains every queued candidate, de-duplicated by path and cause, for one
-    /// sweep cycle. Splits come before merges (ADR-073). The splits that a
-    /// size cause asks for come first, and then the demand splits with the
-    /// highest rate, so that while the queue is long the splits that remove
-    /// the most avoidable time land first.
-    pub(super) fn drain(&self) -> Vec<MaintenanceCandidate> {
+    /// sweep cycle, and the number of stale demand candidates that it dropped.
+    /// Splits come before merges (ADR-073). The splits that a size cause asks
+    /// for come first, and then the demand splits with the highest rate, so
+    /// that while the queue is long the splits that remove the most avoidable
+    /// time land first.
+    pub(super) fn drain(&self) -> (Vec<MaintenanceCandidate>, u64) {
         let mut q = self.queue.lock().unwrap();
         let mut by_path = BTreeMap::<(ObjectPath, u8), MaintenanceCandidate>::new();
         while let Some(candidate) = q.pop_front() {
@@ -243,12 +262,15 @@ impl MaintenanceCandidates {
             }
         }
         let mut candidates: Vec<_> = by_path.into_values().collect();
+        let before = candidates.len();
+        candidates.retain(|candidate| !candidate.is_stale());
+        let stale = (before - candidates.len()) as u64;
         candidates.sort_by_key(|candidate| match &candidate.cause {
             CandidateCause::Split(SplitReason::Demand { rate, .. }) => (false, Reverse(*rate)),
             CandidateCause::Split(_) => (false, Reverse(Duration::MAX)),
             CandidateCause::Merge(_) => (true, Reverse(Duration::ZERO)),
         });
-        candidates
+        (candidates, stale)
     }
 
     /// Records that the index node at `path`, now `node`, may be a merge
@@ -261,6 +283,7 @@ impl MaintenanceCandidates {
             self.push(MaintenanceCandidate {
                 path: path.clone(),
                 priority: self.new_id(),
+                requested: rt::Instant::now(),
                 cause: CandidateCause::Merge(MergeReason::Underfull),
             });
         }
@@ -324,13 +347,15 @@ impl MaintenanceCandidates {
         self.push(MaintenanceCandidate {
             path: leaf.into_path(),
             priority: self.new_id(),
+            requested: rt::Instant::now(),
             cause,
         });
     }
 
-    /// Requeues a deferred candidate without changing its wound-wait priority.
-    /// It does not wake the sweep loop, so that a candidate that fails again
-    /// and again does not retry in a tight loop.
+    /// Requeues a deferred candidate without changing its wound-wait priority
+    /// or its request time, so that a deferred demand candidate also gets
+    /// stale (ADR-083). It does not wake the sweep loop, so that a candidate
+    /// that fails again and again does not retry in a tight loop.
     pub(super) fn requeue(&self, candidate: MaintenanceCandidate) {
         self.enqueue(candidate);
     }
@@ -372,15 +397,23 @@ impl MaintenanceCandidates {
 }
 
 impl MaintenanceCandidate {
+    /// Tells if the candidate is a change that a topology rule asked for
+    /// longer ago than the measurements that it can still trust (ADR-083).
+    pub(super) fn is_stale(&self) -> bool {
+        self.cause.is_demand()
+            && rt::Instant::now().saturating_duration_since(self.requested) > DEMAND_MAX_AGE
+    }
+
     /// Coalesces same-path, same-cause observations of `other`, which is newer,
     /// without sacrificing the oldest structural priority or the largest
-    /// requested headroom. A demand change keeps the newest rate, and a demand
-    /// split the newest split key, because the leaf changes after each
-    /// measurement.
+    /// requested headroom. A demand change keeps the newest rate and request
+    /// time, and a demand split the newest split key, because the leaf changes
+    /// after each measurement.
     fn coalesce(&mut self, other: MaintenanceCandidate) {
         if other.priority.older(&self.priority) {
             self.priority = other.priority;
         }
+        self.requested = self.requested.max(other.requested);
         match (&mut self.cause, other.cause) {
             (
                 CandidateCause::Split(SplitReason::InlinePressure { key, value_len }),
@@ -439,6 +472,7 @@ impl StructuralHinter for MaintenanceCandidates {
         self.push(MaintenanceCandidate {
             path: path.clone(),
             priority: self.new_id(),
+            requested: rt::Instant::now(),
             cause,
         });
     }
@@ -447,6 +481,7 @@ impl StructuralHinter for MaintenanceCandidates {
         self.push(MaintenanceCandidate {
             path: path.clone(),
             priority: self.new_id(),
+            requested: rt::Instant::now(),
             cause: CandidateCause::Split(SplitReason::Capacity),
         });
     }

@@ -316,7 +316,9 @@ impl Restructurer {
     async fn run_once(&self) {
         let mut splits = Vec::new();
         let mut merges = Vec::new();
-        for candidate in self.candidates.drain() {
+        let (candidates, stale) = self.candidates.drain();
+        self.stats.stale_demand.fetch_add(stale, Ordering::Relaxed);
+        for candidate in candidates {
             self.count_candidate(&candidate);
             match &candidate.cause {
                 CandidateCause::Split(reason) => {
@@ -333,6 +335,9 @@ impl Restructurer {
         // A merge changes two nodes and reserves its target (ADR-073), so the
         // merges run in sequence after the splits.
         for (candidate, reason) in merges {
+            if self.drop_if_stale(&candidate) {
+                continue;
+            }
             let result = self.merge(&candidate, reason).await;
             self.settle_candidate(candidate, result);
         }
@@ -398,8 +403,11 @@ impl Restructurer {
             // that run at the same time.
             let mut round = round.into_iter().peekable();
             while round.peek().is_some() {
+                // One sweep can take longer than the age of a stale request,
+                // so each batch checks the age again.
                 let batch: Vec<_> = round
                     .by_ref()
+                    .filter(|split| !self.drop_if_stale(&split.candidate))
                     .take(STRUCTURAL_CHANGE_PARALLELISM.get())
                     .collect();
                 self.split_batch(batch).await;
@@ -484,6 +492,16 @@ impl Restructurer {
                 .inline_pressure_candidates
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Counts `candidate` as dropped if it is stale (ADR-083), and tells if it
+    /// is.
+    fn drop_if_stale(&self, candidate: &MaintenanceCandidate) -> bool {
+        let stale = candidate.is_stale();
+        if stale {
+            self.stats.stale_demand.fetch_add(1, Ordering::Relaxed);
+        }
+        stale
     }
 
     /// Requeues `candidate` when a transient error deferred its change.
