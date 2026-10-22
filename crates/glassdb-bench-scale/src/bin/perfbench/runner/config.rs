@@ -100,15 +100,6 @@ pub(crate) struct Resolved {
     pub(crate) axes: Vec<Axis>,
 }
 
-/// The Tokio runtime of an experiment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum Runtime {
-    MultiThread,
-    /// One thread for the workers and the database instances.
-    CurrentThread,
-}
-
 /// Options of the command line that select and change the experiment.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Selection {
@@ -198,18 +189,6 @@ impl Selection {
 }
 
 impl Resolved {
-    /// Returns the runtime of the experiment. All cells use one runtime, so
-    /// no axis can change it.
-    pub(crate) fn runtime(&self) -> Result<Runtime, Box<dyn Error>> {
-        if self.axes.iter().any(|axis| axis.sets("cell.runtime")) {
-            return Err("cell.runtime cannot be in an axis".into());
-        }
-        match self.base.get("cell").and_then(|cell| cell.get("runtime")) {
-            None => Ok(Runtime::MultiThread),
-            Some(value) => typed(value, "cell.runtime"),
-        }
-    }
-
     /// Returns the points of the experiment: the cartesian product of the axes,
     /// the first axis outermost, each with its start rule.
     pub(crate) fn points(&self) -> Vec<CellPoint> {
@@ -667,7 +646,6 @@ mod tests {
                 ..Selection::default()
             }
             .resolve()?;
-            resolved.runtime()?;
             crate::runner::plan(&resolved).map_err(|e| format!("{name}: {e}"))?;
         }
         Ok(())

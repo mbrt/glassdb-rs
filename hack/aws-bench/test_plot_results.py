@@ -318,7 +318,6 @@ class GenericPlotterTest(unittest.TestCase):
                 max(1, num_keys * overlap_pct // 100),
                 committed=2,
                 tx_per_sec=2.0,
-                samples_ms=[10.0, 20.0],
                 direct_candidates=2,
                 direct_landed=2,
                 worker_drain_ms=1,

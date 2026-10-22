@@ -315,7 +315,7 @@ else:
     if settings.get('badCostAt') == [repetition, case, side]:
         costs = {}
     mean = 100 * factor
-    cell = {'labels': {'case': case}, 'failures': 0, 'probes': {'costs': costs},
+    cell = {'labels': {'case': case}, 'failures': 0, 'costs': costs,
         'shapes': [{'shape': case, 'meanMs': mean, 'meanSeMs': 0.05}]}
     experiment = 'diagnostics'
 result = {'schemaVersion': 2, 'scenario': experiment, 'backend': 'memory',

@@ -142,7 +142,7 @@ def load_diagnostics(
         if cell["failures"] or cell["labels"].get("case") != name:
             raise ReportError("diagnostic cell failed or its case changed")
         (shape,) = cell["shapes"]
-        costs = cell["probes"]["costs"]
+        costs = cell["costs"]
     except (ReportError, KeyError, TypeError, ValueError) as error:
         warnings.append(f"{side}/{repetition}/{name}: invalid diagnostic measurement ({error})")
         return

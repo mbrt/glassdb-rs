@@ -50,12 +50,10 @@ pub(crate) struct PoolSpec {
     /// The size of each value that the seed writes.
     #[serde(default = "default_value_bytes")]
     pub(crate) value_bytes: usize,
-    /// The minimum size of each key name.
+    /// The minimum size of each key name. Long keys make the leaves larger,
+    /// so that a pool splits with fewer keys.
     #[serde(default)]
     pub(crate) key_bytes: usize,
-    /// The keys that one seed transaction writes.
-    #[serde(default = "default_seed_batch")]
-    pub(crate) seed_batch: usize,
 }
 
 /// Database instances that run the same shapes.
@@ -88,11 +86,6 @@ pub(crate) struct SeedSpec {
     pub(crate) quiet_period: Duration,
     #[serde(deserialize_with = "duration")]
     pub(crate) timeout: Duration,
-    #[serde(deserialize_with = "duration")]
-    pub(crate) gc_timeout: Duration,
-    /// Whether full GCs run after the quiet period.
-    #[serde(default = "yes")]
-    pub(crate) gc: bool,
     #[serde(default)]
     pub(crate) database: DatabaseOptions,
 }
@@ -108,8 +101,6 @@ pub(crate) struct DatabaseOptions {
     pub(crate) index_min_children: Option<usize>,
     pub(crate) inline_max_value_bytes: Option<usize>,
     pub(crate) inline_max_leaf_bytes: Option<usize>,
-    #[serde(default)]
-    pub(crate) protocol_timing: ProtocolTimingChoice,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -118,17 +109,6 @@ pub(crate) enum Topology {
     #[default]
     Avoidable,
     Size,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum ProtocolTimingChoice {
-    /// The production pending timeout and no clock skew allowance, because all
-    /// instances read one clock.
-    #[default]
-    Perfbench,
-    /// The engine default.
-    Default,
 }
 
 /// The parameters of a cell that are not part of its workload.
@@ -143,13 +123,6 @@ pub(crate) struct CellParams {
     pub(crate) workers: usize,
     pub(crate) affinity: u8,
     pub(crate) gc: bool,
-    #[serde(deserialize_with = "duration")]
-    pub(crate) gc_timeout: Duration,
-    pub(crate) samples: bool,
-    pub(crate) timeline: bool,
-    #[serde(default)]
-    pub(crate) probes: Vec<String>,
-
     #[serde(default)]
     pub(crate) database: DatabaseOptions,
     pub(crate) warm_up: WarmUpParams,
@@ -193,8 +166,6 @@ pub(crate) struct MeasureParams {
     #[serde(deserialize_with = "duration")]
     pub(crate) max_duration: Duration,
     pub(crate) window_commits: u64,
-    #[serde(default = "one")]
-    pub(crate) passes: u64,
 }
 
 /// The workload table: its groups, and the pool and source that replace those
@@ -240,12 +211,7 @@ impl CellSpec {
                 .cloned()
                 .unwrap_or_else(|| Value::Table(Table::new()))
         };
-        let mut cell = section("cell");
-        // The runtime is of the whole experiment, and not of one cell.
-        if let Some(table) = cell.as_table_mut() {
-            table.remove("runtime");
-        }
-        let params: CellParams = typed(&cell, "cell")?;
+        let params: CellParams = typed(&section("cell"), "cell")?;
         let seed: SeedSpec = typed(&section("seed"), "seed")?;
         let workloads = section("workloads");
         let workload_value = workloads
@@ -450,13 +416,12 @@ impl DatabaseOptions {
         &self,
         mut builder: DatabaseBuilder,
     ) -> Result<DatabaseBuilder, Box<dyn Error>> {
-        if self.protocol_timing == ProtocolTimingChoice::Perfbench {
-            builder = builder.protocol_timing(crate::TIMING);
-        }
-        builder = builder.topology_policy(match self.topology {
-            Topology::Avoidable => TopologyPolicy::AvoidableTime,
-            Topology::Size => TopologyPolicy::SizeCauses,
-        });
+        builder = builder
+            .protocol_timing(crate::TIMING)
+            .topology_policy(match self.topology {
+                Topology::Avoidable => TopologyPolicy::AvoidableTime,
+                Topology::Size => TopologyPolicy::SizeCauses,
+            });
         if self.leaf_max_entries.is_some()
             || self.leaf_min_entries.is_some()
             || self.index_min_children.is_some()
@@ -518,14 +483,6 @@ fn yes() -> bool {
     true
 }
 
-fn one() -> u64 {
-    1
-}
-
 fn default_value_bytes() -> usize {
     128
-}
-
-fn default_seed_batch() -> usize {
-    100
 }

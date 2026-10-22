@@ -14,7 +14,7 @@ pub(crate) enum Until {
     Converged,
     /// Exactly the measurement duration.
     Duration,
-    /// Each worker with a `sequence` source makes this many passes.
+    /// Each worker with a `sequence` source makes one pass.
     Passes,
     /// Each worker with a `sequence` source makes passes until one pass meets
     /// the condition.

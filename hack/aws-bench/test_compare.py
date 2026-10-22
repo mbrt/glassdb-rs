@@ -258,7 +258,8 @@ class CompareTest(unittest.TestCase):
             1,
             committed=2,
             tx_per_sec=2,
-            samples_ms=[10, 20],
+            p50_ms=10,
+            p90_ms=20,
             replays=1,
             direct_candidates=2,
             direct_landed=1,
@@ -268,9 +269,11 @@ class CompareTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
             (path / "contention.json").write_text(json.dumps(report))
-            samples, stats = compare.perfbench_contention_frames(path)
+            stats = compare.perfbench_contention_frames(path)
+            table = compare.contention_table(stats, stats)
 
-        self.assertEqual(samples["latency-ms"].tolist(), [10, 20])
+        self.assertEqual(table.loc[0, "p50_a"], 10)
+        self.assertEqual(table.loc[0, "p90-ratio"], 1.0)
         self.assertEqual(stats.loc[0, "direct-landed"], 1)
         self.assertEqual(stats.loc[0, "num-replays"], 1)
 

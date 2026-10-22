@@ -90,17 +90,18 @@ class PerfbenchResultsTest(unittest.TestCase):
 
     def test_contention_cell_gives_its_keys_and_overlap(self) -> None:
         cell = contention_cell(
-            4, 2, committed=10, tx_per_sec=5.0, samples_ms=[1.0, 2.0], direct_landed=3
+            4, 2, committed=10, tx_per_sec=5.0, p50_ms=1.0, p90_ms=2.0, direct_landed=3
         )
         report = envelope("contention", [{"run": 1, "cells": [cell]}])
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write(Path(directory_name), "contention.json", report)
-            samples, stats = perfbench_results.read_contention([path])
+            stats = perfbench_results.read_contention([path])
 
         self.assertEqual(stats.loc[0, "overlap-pct"], 50)
         self.assertEqual(stats.loc[0, "direct-landed"], 3)
         self.assertEqual(stats.loc[0, "cell-duration-ms"], 2000)
-        self.assertEqual(samples["latency-ms"].tolist(), [1.0, 2.0])
+        self.assertEqual(stats.loc[0, "p50-ms"], 1.0)
+        self.assertEqual(stats.loc[0, "p90-ms"], 2.0)
 
     def test_throughput_band_comes_from_window_percentiles(self) -> None:
         shapes = [

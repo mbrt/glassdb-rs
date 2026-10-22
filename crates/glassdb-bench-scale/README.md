@@ -22,15 +22,14 @@ The built-in configuration is
    | Kind (`runner/kinds.rs`) | Runs one transaction with the selected keys. | `read-modify-write`, `read`, `write`, `scan`, `create-delete` |
    | Key source (`runner/sources.rs`) | Selects the keys of one transaction. | `stripe`, `pool`, `adjacent`, `index`, `sequence`, `overlap` |
    | End condition (`runner/until.rs`) | Decides when a measurement ends. | `converged`, `duration`, `passes` |
-   | Probe | Adds fields to the result of a cell. | none |
+   | Axis generator | Gives the values of a coupled axis. | none |
 
 3. **Scenario parts** (`scenarios/`). A part for one scenario is one Rust type
    in the file of its scenario, registered by name in `scenarios/mod.rs`. Its
    parameters are a serde type, so the loader checks them like the parameters
    of a built-in part. The runner, the loop, and the result do not change. The
    scenario parts are the kind `fresh-client-read`, the end condition
-   `no-locked-pass`, the probe `costs`, and the axis generator
-   `contention-overlaps`.
+   `no-locked-pass`, and the axis generator `contention-overlaps`.
 
 A scenario never needs its own subcommand.
 
@@ -42,7 +41,7 @@ A scenario never needs its own subcommand.
 | Parameter | One value in the configuration, named by its path, for example `cell.workers` or `shapes.rw-many.keys`. |
 | Seed parameter | A parameter that changes what the seed writes or how the seed database opens. |
 | Cell parameter | A parameter that changes only the load, the databases, or the timing of a cell. |
-| Part | A named piece of code that the configuration selects: a kind, a key source, an end condition, or a probe. |
+| Part | A named piece of code that the configuration selects: a kind, a key source, an end condition, or an axis generator. |
 | Kind | A part that runs one transaction. |
 | Key source | A part that selects the keys of a transaction from a pool. |
 | Shape | A named kind with its parameters, its pool, and its key source. |
@@ -191,7 +190,6 @@ make a topology that the cells then keep:
 | `<db>.index-min-children` | engine default | Underfull threshold of index nodes. |
 | `<db>.inline-max-value-bytes` | engine default | Largest value that a leaf can carry inline. |
 | `<db>.inline-max-leaf-bytes` | engine default | Aggregate inline budget of a leaf. |
-| `<db>.protocol-timing` | `"perfbench"` | `"perfbench"`: the production pending timeout and no clock skew allowance, because all instances read one clock. `"default"`: the engine default. |
 
 `<db>` is `seed.database` or `cell.database`. `seed.database.*` are seed
 parameters, and `cell.database.*` are cell parameters. The seed waits until its
@@ -208,11 +206,10 @@ A measurement ends on its end condition, or at `max-duration`:
 | `cell.warm-up.minimum` | `"5s"` | Minimum model time. |
 | `cell.warm-up.quiet` | `"10s"` | Wall time without splits and merges that ends the warm-up. `"never"` runs until `timeout`. |
 | `cell.warm-up.timeout` | `"60s"` | Maximum wall time. `"0s"` is no warm-up. |
-| `cell.measure.until` | `"converged"` | The end condition. `"converged"`: every shape has `window-commits` commits in each throughput window on average. `"duration"`: exactly `duration`. `"passes"`: each worker makes `passes` passes of its `sequence` source. `"no-locked-pass"`: each such worker makes passes until one pass takes no lock; that pass is not in the measurement. |
+| `cell.measure.until` | `"converged"` | The end condition. `"converged"`: every shape has `window-commits` commits in each throughput window on average. `"duration"`: exactly `duration`. `"passes"`: each worker makes one pass of its `sequence` source. `"no-locked-pass"`: each such worker makes passes until one pass takes no lock; that pass is not in the measurement. |
 | `cell.measure.duration` | `"2s"` | Minimum measurement for `converged`, the measurement for `duration`. |
 | `cell.measure.max-duration` | `"60s"` | Maximum wall time for all conditions. |
 | `cell.measure.window-commits` | 50 | For `converged`. |
-| `cell.measure.passes` | 1 | For `passes`. |
 
 `timeout` wins over `minimum`. A warm-up that ends at its timeout without a
 quiet period, and a measurement that ends at `max-duration` before its
@@ -227,18 +224,11 @@ All other parameters, with their scope and the default of the built-in file:
 | `cell.collections` | seed | `"databases"` | Collections of each pool. `"databases"` gives one for each instance of the cell. |
 | `seed.quiet-period` | seed | `"10s"` | Time without splits and merges that ends the seed. `"0s"` ends the seed after its writes, without a wait and without full GCs. |
 | `seed.timeout` | seed | `"180s"` | The run fails after this. |
-| `seed.gc` | seed | `true` | Run full GCs after the quiet period. |
-| `seed.gc-timeout` | seed | `"600s"` | Limit of the full GCs after the seed. |
 | `cell.workload` | cell | `"low-conflict"` | The workload. |
 | `cell.databases` | cell | 4 | Instances of a group that does not give `instances`. |
 | `cell.workers` | cell | 8 | Workers of a shape whose value is `"cell"`. |
 | `cell.affinity` | cell | 100 | Percent of transactions on the home collection. The others select a collection at random. |
 | `cell.gc` | cell | `true` | Pause the workers after the warm-up, and run full GCs until the GC backlog is gone. Without it, the measurement follows the warm-up with no pause. |
-| `cell.gc-timeout` | cell | `"600s"` | Limit of the full GCs after the warm-up. |
-| `cell.samples` | cell | `false` | Record the latency of each transaction in the result. |
-| `cell.probes` | cell | `[]` | The probes that add fields to the result. |
-| `cell.runtime` | experiment | `"multi-thread"` | `"current-thread"` runs the whole experiment on one thread. No axis can set it. |
-| `cell.timeline` | cell | `false` | Record the splits and merges of each instance in each wall second. |
 
 The scope of a parameter is what it changes, not its path:
 
@@ -367,12 +357,22 @@ axes. Each run has its cells. Each cell has:
   merges, and the worker drain time after it;
 - `shapes`: for each shape of each group, its commits, whether it converged,
   the throughput windows with their `relCi`, the mean latency with its
-  standard error, the p50 and p90, and the samples if `cell.samples`;
+  standard error, and the p50 and p90;
 - `groups`: the counters of each instance in the measurement, with its
   shutdown, unless the next cell continues on the same instances;
 - `aggregateOps` and `aggregateProtocol`: the backend operations, bytes, and
   protocol counters of the cell, for each transaction;
-- `timeline` if `cell.timeline`, and `probes` with the fields of each probe.
+- `costs`: the backend requests, the body bytes, and the coordinator counters
+  of each transaction, in three windows: `workload`, the shutdown of the
+  instances, and both (`combined`). Body bytes are the bodies of successful
+  reads and of attempted writes, without paths, headers, LIST responses, and
+  transport;
+- `timeline`: the splits and merges of each instance in each wall second of the
+  warm-up and the measurement.
+
+All database instances use the production pending timeout and no clock skew
+allowance, because they read one clock. Full GCs after a seed or a warm-up
+stop after 600 s. Every cell runs on one multi-thread runtime.
 
 `hack/aws-bench/perfbench_results.py` reads the result files for the
 comparison and plot tools.
@@ -444,9 +444,8 @@ them. `hack/aws-bench/README.md` explains the plots and the comparison tools.
 
 The `diagnostics` experiment replaces the Criterion suite of `glassdb`. Each
 case runs one worker on one instance with warm caches, the S3 delay profile
-without variance, the 5× model clock, and the default protocol timing, on a
-current-thread runtime. A case warms up for 250 ms and measures for 2 s. Most
-cases are built-in parts:
+without variance, and the 5× model clock. A case warms up for 250 ms and
+measures for 2 s. Most cases are built-in parts:
 
 | Case | Shape |
 | --- | --- |
@@ -459,8 +458,4 @@ cases are built-in parts:
 | `read_long_keys_large_collection` | A read in a collection of 1,024 keys of 256 bytes (`key-bytes = 256`), after its splits. |
 | `rmw_shared_leaf_three_transactions` | Three workers that update their own key of one leaf. |
 
-The probe `costs` adds the backend requests, the body bytes, and the
-coordinator counters of each transaction in three windows: `workload`, the
-shutdown of the instances, and both (`combined`). Body bytes are the bodies of
-successful reads and of attempted writes, without paths, headers, LIST
-responses, and transport.
+The `costs` of each cell are the numbers that the CI comparison checks.

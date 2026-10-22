@@ -44,7 +44,8 @@ def contention_cell(
     *,
     committed: int,
     tx_per_sec: float,
-    samples_ms: list[float],
+    p50_ms: float = 10.0,
+    p90_ms: float = 20.0,
     replays: int = 0,
     direct_candidates: int = 0,
     direct_landed: int = 0,
@@ -66,7 +67,8 @@ def contention_cell(
                 "shape": "contention-rmw",
                 "committed": committed,
                 "txPerSec": tx_per_sec,
-                "samplesMs": samples_ms,
+                "p50Ms": p50_ms,
+                "p90Ms": p90_ms,
             }
         ],
     }

@@ -24,8 +24,7 @@ use serde::Serialize;
 
 const SCHEMA_VERSION: u32 = 2;
 
-/// The protocol timing of the database instances, unless an experiment asks
-/// for the engine default.
+/// The protocol timing of every database instance.
 ///
 /// All instances run on one machine and read one clock, so they need no
 /// clock skew allowance, and GC can check the records of a load 30 s sooner.
@@ -116,14 +115,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         rt::set_model_time_speedup(speedup)?;
     }
     let model_time_speedup = configured_speedup.unwrap_or(1.0);
-    let runtime = match resolved.runtime()? {
-        runner::config::Runtime::MultiThread => tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?,
-        runner::config::Runtime::CurrentThread => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?,
-    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     let factory = runtime.block_on(cli.backend.initialize())?;
     let execution = Execution {
         runs: cli.runs,

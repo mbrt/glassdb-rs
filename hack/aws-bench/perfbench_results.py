@@ -223,13 +223,13 @@ def read_mixed(
     return meta, pd.DataFrame(rows)
 
 
-def read_contention(paths: Sequence[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load contention reports into `(latency samples, per-cell stats)`.
+def read_contention(paths: Sequence[Path]) -> pd.DataFrame:
+    """Load contention reports into one row of stats per run and cell.
 
     Several files are numbered as consecutive runs, so independently produced
     single-run files can be pooled.
     """
-    samples, stats = [], []
+    stats = []
     for run_id, source, run in _numbered_runs(paths, "contention"):
         cells = _array(run.get("cells"), f"{source}: run {run_id}.cells")
         for index, value in enumerate(cells):
@@ -251,10 +251,6 @@ def read_contention(paths: Sequence[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
                 "overlap": overlap,
                 "overlap-pct": 100 * overlap // num_keys,
             }
-            samples.extend(
-                {**identity, "latency-ms": _number(latency, f"{label}.samplesMs")}
-                for latency in _array(shape.get("samplesMs", []), f"{label}.samplesMs")
-            )
             tx_per_sec = _number(shape.get("txPerSec"), f"{label}.txPerSec")
             stats.append(
                 {
@@ -264,6 +260,8 @@ def read_contention(paths: Sequence[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
                         committed * 1000.0 / tx_per_sec if tx_per_sec else 0.0
                     ),
                     "tx-per-sec": tx_per_sec,
+                    "p50-ms": _number(shape.get("p50Ms"), f"{label}.p50Ms"),
+                    "p90-ms": _number(shape.get("p90Ms"), f"{label}.p90Ms"),
                     "num-replays": _integer(protocol.get("replays"), f"{label}.replays"),
                     "direct-candidates": round(
                         _number(
@@ -283,7 +281,7 @@ def read_contention(paths: Sequence[Path]) -> tuple[pd.DataFrame, pd.DataFrame]:
                     ),
                 }
             )
-    return pd.DataFrame(samples), pd.DataFrame(stats)
+    return pd.DataFrame(stats)
 
 
 def read_inline_pressure(paths: Sequence[Path]) -> pd.DataFrame:

@@ -58,7 +58,6 @@ shapes = { rw-single = "cell", rw-adjacent = "cell" }
 [seed]
 quiet-period = "10s"
 timeout = "180s"
-gc-timeout = "600s"
 
 [cell]
 workload = "low-conflict"
@@ -67,9 +66,6 @@ databases = 4
 workers = 8
 affinity = 100
 gc = true
-gc-timeout = "600s"
-samples = false
-timeline = false
 
 [cell.warm-up]
 minimum = "5s"
@@ -166,7 +162,6 @@ cell.workload = "contention"
 cell.collections = 1
 seed.quiet-period = "0s"
 cell.gc = false
-cell.samples = true
 cell.warm-up.timeout = "0s"
 cell.measure.until = "duration"
 cell.measure.duration = "60s"
@@ -185,7 +180,6 @@ generate = { contention-overlaps = { shape = "contention-rmw", max-keys = 6 } }
 [pools.inline]
 keys = 192
 value-bytes = 1024
-seed-batch = 192
 
 [shapes.fill]
 kind = "read-modify-write"
@@ -266,7 +260,6 @@ cell.workload = "fight"
 cell.collections = 1
 seed.quiet-period = "1s"
 cell.gc = false
-cell.timeline = true
 cell.warm-up.quiet = "never"
 cell.warm-up.timeout = "10s"
 cell.measure.until = "duration"
@@ -356,28 +349,23 @@ cell.measure.max-duration = "120s"
 [pools.diag-256]
 keys = 1
 value-bytes = 256
-key-bytes = 5
 
 [pools.diag-external]
 keys = 1
 value-bytes = 1025
-key-bytes = 5
 
 [pools.diag-1024]
 keys = 1
 value-bytes = 1024
-key-bytes = 5
 
 [pools.diag-large]
 keys = 1024
 value-bytes = 256
 key-bytes = 256
-seed-batch = 64
 
 [pools.diag-shared]
 keys = 3
 value-bytes = 256
-key-bytes = 5
 
 [shapes.diag-read]
 kind = "read"
@@ -461,14 +449,9 @@ instances = 1
 shapes = { diag-rmw-shared = 3 }
 
 [experiments.diagnostics.set]
-cell.runtime = "current-thread"
-cell.database.protocol-timing = "default"
-seed.database.protocol-timing = "default"
 seed.quiet-period = "1200ms"
 seed.timeout = "15s"
-seed.gc = false
 cell.gc = false
-cell.probes = ["costs"]
 cell.warm-up.minimum = "0s"
 cell.warm-up.quiet = "never"
 cell.warm-up.timeout = "250ms"

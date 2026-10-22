@@ -6,6 +6,7 @@ use glassdb_bench_scale::backend_breakdown::BackendBreakdown;
 use glassdb_bench_scale::bench::Results;
 use serde::Serialize;
 
+use super::Window;
 use super::seed::{Collected, SeedReport};
 
 /// Number of equal windows that split each cell's measured interval. Their
@@ -64,11 +65,10 @@ pub(crate) struct CellResult {
     pub(crate) aggregate_protocol: ProtocolPerTx,
     /// The activity of background GC during the measurement.
     pub(crate) gc: GcResult,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) timeline: Vec<TimelineEntry>,
-    /// The fields that the probes of the cell add.
-    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
-    pub(crate) probes: serde_json::Map<String, serde_json::Value>,
+    /// The backend requests, body bytes, and coordinator counters of each
+    /// transaction.
+    pub(crate) costs: serde_json::Value,
 }
 
 /// The structural changes and wall time of a cell's warm-up.
@@ -199,8 +199,6 @@ pub(crate) struct ShapeResult {
     /// means the cell hit its maximum duration first, so read this shape's
     /// throughput as indicative and its distribution as noisier.
     pub(crate) converged: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) samples_ms: Option<Vec<f64>>,
 }
 
 /// The structural changes of each instance in one wall second.
@@ -310,7 +308,6 @@ impl ShapeResult {
         workers: usize,
         results: &Results,
         target: u64,
-        samples: bool,
     ) -> Self {
         let count = results.samples.len();
         let duration = results.tot_duration;
@@ -341,15 +338,34 @@ impl ShapeResult {
             window_ms: duration.as_secs_f64() * 1000.0 / THROUGHPUT_WINDOWS as f64,
             converged: target == 0 || windowed >= target,
             window_counts,
-            samples_ms: samples.then(|| {
-                results
-                    .samples
-                    .iter()
-                    .map(|sample| sample.as_secs_f64() * 1000.0)
-                    .collect()
-            }),
         }
     }
+}
+
+/// Returns the backend requests, the body bytes, and the coordinator counters
+/// of each of `transactions`, in the windows of the workload, of the shutdown
+/// of the instances, and of both.
+pub(crate) fn costs(workload: Window, shutdown: Window, transactions: u64) -> serde_json::Value {
+    let n = transactions.max(1) as f64;
+    let window = |window: &Window| {
+        serde_json::json!({
+            "reads": window.stats.backend.obj_reads as f64 / n,
+            "writes": window.stats.backend.obj_writes as f64 / n,
+            "lists": window.stats.backend.obj_lists as f64 / n,
+            "readBodyBytes": window.breakdown.read_bytes() as f64 / n,
+            "writeBodyBytes": window.breakdown.write_bytes() as f64 / n,
+            "coordinatorSubmissions": window.stats.coordinator.submissions as f64 / n,
+            "coordinatorRounds": window.stats.coordinator.rounds as f64 / n,
+        })
+    };
+    let mut combined = workload;
+    combined.add(shutdown);
+    serde_json::json!({
+        "transactions": transactions,
+        "workload": window(&workload),
+        "shutdown": window(&shutdown),
+        "combined": window(&combined),
+    })
 }
 
 /// Returns the standard error of the mean of the samples, in milliseconds.
@@ -432,10 +448,10 @@ mod tests {
             completions: (0..4).map(|i| Duration::from_millis(100 * i)).collect(),
             tot_duration: Duration::from_secs(1),
         };
-        let shape = ShapeResult::summarize("s", "g", 1, &results, 4, false);
+        let shape = ShapeResult::summarize("s", "g", 1, &results, 4);
         assert!(shape.converged);
         assert_eq!(shape.committed, 4);
         assert_eq!(shape.mean_se_ms, 0.0);
-        assert!(!ShapeResult::summarize("s", "g", 1, &results, 5, false).converged);
+        assert!(!ShapeResult::summarize("s", "g", 1, &results, 5).converged);
     }
 }

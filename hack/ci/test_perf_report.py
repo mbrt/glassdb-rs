@@ -78,14 +78,12 @@ class PerfReportTest(unittest.TestCase):
                 "labels": {"case": "example"},
                 "failures": 0,
                 "shapes": [{"shape": "example", "meanMs": mean, "meanSeMs": error}],
-                "probes": {
-                    "costs": {
-                        "transactions": 30,
-                        **{
-                            window: counters.copy()
-                            for window in ("workload", "shutdown", "combined")
-                        },
-                    }
+                "costs": {
+                    "transactions": 30,
+                    **{
+                        window: counters.copy()
+                        for window in ("workload", "shutdown", "combined")
+                    },
                 },
             },
         )
@@ -111,7 +109,7 @@ class PerfReportTest(unittest.TestCase):
 
     @staticmethod
     def costs(value):
-        return value["runs"][0]["cells"][0]["probes"]["costs"]
+        return value["runs"][0]["cells"][0]["costs"]
 
     def report(self):
         return perf_report.render_report(self.root, "base", "candidate")

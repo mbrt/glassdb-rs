@@ -229,7 +229,6 @@ async fn run_cell(
         warm_bench: Bench::new(Duration::ZERO),
         affinity: spec.params.affinity,
         until: until.clone(),
-        passes: spec.params.measure.passes,
         breakdown: storage.breakdown.clone(),
         boundary: Mutex::new(None),
     });
@@ -307,7 +306,7 @@ async fn run_cell(
         return Err("the end condition needs passes, but no worker has a sequence source".into());
     }
 
-    let mut timeline = Timeline::new(&databases, spec.params.timeline);
+    let mut timeline = Timeline::new(&databases);
     let warm_start = Instant::now();
     let changes_start = restructurer_stats(&databases);
     let gc_start = gc_stats(&databases);
@@ -364,7 +363,7 @@ async fn run_cell(
         .close_and_wait(handles.len(), &shared.stop)
         .await;
     let full_gc = if spec.params.gc {
-        match seed::collect_garbage(&databases[0], spec.params.gc_timeout).await {
+        match seed::collect_garbage(&databases[0]).await {
             Ok(collected) => {
                 eprintln!(
                     "  full GC took {}ms: {} transaction records deleted",
@@ -492,14 +491,7 @@ async fn run_cell(
                 results.completions.truncate(cut.samples);
                 results.tot_duration = cut.model.duration_since(measure_model_start);
             }
-            ShapeResult::summarize(
-                &shape.name,
-                group,
-                *workers,
-                &results,
-                target,
-                spec.params.samples,
-            )
+            ShapeResult::summarize(&shape.name, group, *workers, &results, target)
         })
         .collect();
     let logical: u64 = shape_results
@@ -524,18 +516,7 @@ async fn run_cell(
         breakdown: after_shutdown - breakdown_measured,
     };
     shutdown_window.add(own_shutdown);
-    let mut probes = Map::new();
-    for name in &spec.params.probes {
-        let value = crate::scenarios::probe(
-            name,
-            &crate::scenarios::ProbeInput {
-                workload,
-                shutdown: shutdown_window,
-                transactions: logical,
-            },
-        )?;
-        probes.insert(name.clone(), value);
-    }
+    let costs = result::costs(workload, shutdown_window, logical);
     let mut groups = Vec::new();
     let mut index = 0;
     for group in &spec.groups {
@@ -597,7 +578,7 @@ async fn run_cell(
         aggregate_protocol: ProtocolPerTx::of(&total, logical),
         gc: total.gc.into(),
         timeline: timeline.entries,
-        probes,
+        costs,
     };
     Ok((
         cell,
@@ -648,15 +629,13 @@ const TIMELINE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The structural changes of each instance in each wall second.
 struct Timeline {
-    enabled: bool,
     last: Vec<Stats>,
     entries: Vec<TimelineEntry>,
 }
 
 impl Timeline {
-    fn new(databases: &[Database], enabled: bool) -> Self {
+    fn new(databases: &[Database]) -> Self {
         Self {
-            enabled,
             last: databases.iter().map(Database::stats).collect(),
             entries: Vec::new(),
         }
@@ -670,9 +649,6 @@ impl Timeline {
         future: impl std::future::Future<Output = T>,
         measured: bool,
     ) -> T {
-        if !self.enabled {
-            return future.await;
-        }
         tokio::pin!(future);
         let mut ticks = tokio::time::interval(TIMELINE_INTERVAL);
         ticks.tick().await;

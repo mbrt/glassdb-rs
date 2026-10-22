@@ -451,32 +451,35 @@ def plot_contention_report(
     Only full-overlap cells are drawn: partial overlaps form a second matrix
     dimension that would turn each figure into a dozen crossing lines.
     """
-    sample_frames, stat_frames = [], []
+    frames = []
     for label, path in series.items():
-        samples, stats = perfbench_results.read_contention([path])
+        stats = perfbench_results.read_contention([path])
         if stats.empty or not (stats["overlap-pct"] == 100).any():
             raise ReportError(f"{path}: report has no 100% overlap cells")
-        sample_frames.append(
-            samples[samples["overlap-pct"] == 100].assign(source=label)
-        )
-        stat_frames.append(stats[stats["overlap-pct"] == 100].assign(source=label))
-    samples = pd.concat(sample_frames, ignore_index=True)
-    stats = pd.concat(stat_frames, ignore_index=True)
+        frames.append(stats[stats["overlap-pct"] == 100].assign(source=label))
+    stats = pd.concat(frames, ignore_index=True)
     style = "source" if len(series) > 1 else None
 
+    percentiles = stats.melt(
+        id_vars=["source", "num-keys"],
+        value_vars=["p50-ms", "p90-ms"],
+        var_name="percentile",
+        value_name="latency-ms",
+    )
     latency, ax = plt.subplots(figsize=(8, 5))
     sns.lineplot(
-        data=samples,
+        data=percentiles,
         x="num-keys",
         y="latency-ms",
+        hue="percentile",
         style=style,
         estimator="median",
-        errorbar=("pi", 80),
+        errorbar=None,
         marker="o",
         ax=ax,
     )
     ax.set_yscale("log")
-    ax.set_title("Latency under contention\nmedian line; p10–p90 band")
+    ax.set_title("Latency under contention\nmedian over runs of each percentile")
     ax.set_xlabel("Contended keys (100% overlap)")
     ax.set_ylabel("Transaction latency (ms, log scale)")
 

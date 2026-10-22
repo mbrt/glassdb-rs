@@ -37,7 +37,6 @@ pub(crate) struct Shared {
     pub(crate) warm_bench: Bench,
     pub(crate) affinity: u8,
     pub(crate) until: Until,
-    pub(crate) passes: u64,
     /// The storage counters, for the start of a pass.
     pub(crate) breakdown: BackendBreakdownHandle,
     /// The start of the pass that ended the measurement, when the end
@@ -226,7 +225,6 @@ impl Worker {
         let pass_len = self.keys.pass_len().filter(|_| shared.until.by_passes());
         let mut round = 0u64;
         let mut measured = 0u64;
-        let mut passes = 0u64;
         let mut pass_start: Option<(Stats, Boundary)> = None;
         let mut collection = self.home;
         let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -279,14 +277,13 @@ impl Worker {
             if !measured.is_multiple_of(pass_len) {
                 continue;
             }
-            passes += 1;
             let start = pass_start.take();
             let pass = match (self.instance_stats(), start) {
                 (Some(end), Some((start, _))) => end - start,
                 _ => Stats::default(),
             };
             let ended = match &shared.until {
-                Until::Passes => passes >= shared.passes,
+                Until::Passes => true,
                 Until::Pass(condition) => condition.ends(&pass),
                 Until::Converged | Until::Duration => false,
             };

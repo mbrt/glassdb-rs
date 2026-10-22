@@ -17,6 +17,9 @@ use serde::Serialize;
 use super::super::backend::{Factory, ForkableBackend};
 use super::model::{CellSpec, DatabaseOptions, PoolSpec, SeedSpec};
 
+/// The keys that one seed transaction writes.
+const SEED_BATCH: usize = 64;
+
 // The full GCs run while no worker runs, so they can use many more checks than
 // background GC. A full GC checks one LIST page of 1,000 records at a time, and
 // each check waits mostly for backend latency, so the limit lets a whole page
@@ -223,8 +226,8 @@ async fn seed(
         .await;
         // Garbage collection also changes the stored state, so every copy would
         // otherwise carry work that its cell does while it measures.
-        if spec.gc {
-            let collected = collect_garbage(&db, spec.gc_timeout).await;
+        {
+            let collected = collect_garbage(&db).await;
             match collected {
                 Ok(collected) => {
                     eprintln!(
@@ -272,7 +275,7 @@ async fn write_pools(db: &Database, cell: &CellSpec) -> Result<(), GError> {
             let value = vec![0x5a; pool.value_bytes];
             let mut start = 0;
             while start < keys {
-                let end = (start + pool.seed_batch.max(1)).min(keys);
+                let end = (start + SEED_BATCH).min(keys);
                 let batch: Vec<Vec<u8>> = (start..end).map(|index| pool.key(index)).collect();
                 let collection = &collection;
                 let (batch, value) = (&batch, &value);
@@ -354,15 +357,18 @@ pub(crate) async fn wait_for_quiet(
     }
 }
 
+/// The limit of the full GCs after a seed or a warm-up. The records of the last
+/// safety horizon of a load wait for it, so it is longer than the pending
+/// timeout of the protocol timing.
+const GC_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Runs full GCs on `database` until no garbage that a full GC can find is
-/// left, or until `timeout`.
+/// left, or until [`GC_TIMEOUT`].
 ///
 /// The records of the last safety horizon are deferred, and a check that only
 /// reclaims some effects of a record can delete it the next time.
-pub(crate) async fn collect_garbage(
-    database: &Database,
-    timeout: Duration,
-) -> Result<Collected, GError> {
+pub(crate) async fn collect_garbage(database: &Database) -> Result<Collected, GError> {
+    let timeout = GC_TIMEOUT;
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
     let mut deleted = 0;
