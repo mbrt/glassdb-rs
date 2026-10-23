@@ -101,7 +101,9 @@ def use_harness(candidate: Path, base: Path) -> str:
     return digest.hexdigest()
 
 
-def build(source: Path, target: Path, output: Path, side: str) -> dict:
+def build(
+    source: Path, target: Path, output: Path, side: str, log: str | None = None
+) -> dict:
     result = {}
     for package, selector, name in (("glassdb-bench-scale", "--bin", "perfbench"),):
         command = [
@@ -119,7 +121,7 @@ def build(source: Path, target: Path, output: Path, side: str) -> dict:
         try:
             messages = capture(command, source)
         except subprocess.CalledProcessError as error:
-            (output / f"{side}-build.jsonl").write_text(error.output or "")
+            (output / f"{log or side}-build.jsonl").write_text(error.output or "")
             raise RuntimeError(
                 f"unsupported comparison: candidate harness does not build against {side}; see build log"
             ) from error
@@ -173,11 +175,30 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         snapshot(
             repo, snapshots / "pr", manifest["candidateCommit"] if candidate else None
         )
+        # Keep a pristine copy for the fallback below, as use_harness overwrites.
+        shutil.copytree(snapshots / "main", snapshots / "main-own")
         manifest["harnessSha256"] = use_harness(snapshots / "pr", snapshots / "main")
-        for side in ("main", "pr"):
-            manifest[side] = build(
-                snapshots / side, repo / "target/performance" / side, output, side
+        targets = repo / "target/performance"
+        try:
+            manifest["main"] = build(
+                snapshots / "main", targets / "main", output, "main", "main-shared"
             )
+        except RuntimeError as error:
+            # The candidate harness needs APIs that the base lacks. Measure both
+            # engines with the base harness, so that the sides stay comparable.
+            print(f"{error}; retrying with the base harness", file=sys.stderr)
+            manifest["harnessSha256"] = use_harness(
+                snapshots / "main-own", snapshots / "pr"
+            )
+            manifest["harness"] = "base"
+            manifest["warnings"].append(
+                f"The candidate harness does not build against {base}; "
+                "both revisions were measured with the harness of the base."
+            )
+            manifest["main"] = build(
+                snapshots / "main-own", targets / "main", output, "main"
+            )
+        manifest["pr"] = build(snapshots / "pr", targets / "pr", output, "pr")
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return manifest
 

@@ -32,6 +32,36 @@ class HarnessTest(unittest.TestCase):
             self.assertEqual((root / "base/crates/glassdb/lib.rs").read_text(), "base")
             self.assertEqual((root / "base/Cargo.lock").read_text(), "base")
 
+    def test_both_sides_use_the_base_harness_when_the_candidate_one_fails(self):
+        built = []
+
+        def fake_snapshot(repo, destination, revision):
+            harness = destination / "crates/glassdb-bench-scale"
+            harness.mkdir(parents=True)
+            (harness / "main.rs").write_text(destination.name)
+
+        def fake_build(source, target, output, side, log=None):
+            harness = (source / "crates/glassdb-bench-scale/main.rs").read_text()
+            built.append((side, harness))
+            if side == "main" and harness == "pr":
+                raise RuntimeError("unsupported comparison")
+            return {"perfbench": f"{side}-perfbench"}
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            perf_compare, "capture", return_value="abc\n"
+        ), mock.patch.object(
+            perf_compare, "snapshot", fake_snapshot
+        ), mock.patch.object(perf_compare, "build", fake_build):
+            manifest = perf_compare.prepare(
+                Path(directory), Path(directory) / "out", "main", None
+            )
+
+        self.assertEqual(
+            built, [("main", "pr"), ("main", "main"), ("pr", "main")]
+        )
+        self.assertEqual(manifest["harness"], "base")
+        self.assertEqual(len(manifest["warnings"]), 1)
+
     def test_current_snapshot_includes_edits_but_not_deleted_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
