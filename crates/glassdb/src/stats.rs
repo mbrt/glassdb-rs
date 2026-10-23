@@ -162,6 +162,8 @@ mod tests {
                     deferred: 1,
                     discarded: 0,
                 },
+                topology_time: Default::default(),
+                demand_merges: Default::default(),
             },
         };
         let after = Stats {
@@ -211,6 +213,8 @@ mod tests {
                     deferred: 1,
                     discarded: 1,
                 },
+                topology_time: Default::default(),
+                demand_merges: Default::default(),
             },
         };
         assert_eq!(
@@ -262,6 +266,8 @@ mod tests {
                         deferred: 0,
                         discarded: 1,
                     },
+                    topology_time: Default::default(),
+                    demand_merges: Default::default(),
                 },
             }
         );

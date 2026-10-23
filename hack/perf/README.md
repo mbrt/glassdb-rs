@@ -113,7 +113,7 @@ sample count per line).
 |-----|---------|---------|
 | `EXPERIMENT` | `diagnostics` | The perfbench experiment. |
 | `CASE` | all cases | One case of the `diagnostics` experiment. |
-| `SECONDS_PER_CASE` | `10` | Measured time of each `diagnostics` case. |
+| `SECONDS_PER_CASE` | `10` | Measured wall time of each `diagnostics` case. |
 | `OUT` | `hack/perf` | Output directory for artifacts. |
 
 ### Target

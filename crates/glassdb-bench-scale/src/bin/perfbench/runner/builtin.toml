@@ -70,6 +70,7 @@ gc = true
 [cell.warm-up]
 minimum = "5s"
 quiet = "10s"
+quiet-rate = 0.2
 timeout = "60s"
 
 [cell.measure]
@@ -87,18 +88,20 @@ values = ["low-conflict", "high-conflict"]
 path = "cell.affinity"
 values = [0, 25, 50, 75, 100]
 
-# The cell of the CI comparison: short and of fixed length.
+# The cell of the CI comparison: short and of fixed length. It runs only on the
+# accelerated memory backend, and its values keep about 10 s of wall time there,
+# because fewer samples make the comparison noisier.
 [experiments.ci.set]
 pools.wide.keys = 128
-seed.quiet-period = "250ms"
-seed.timeout = "5s"
+seed.quiet-period = "1250ms"
+seed.timeout = "25s"
 cell.databases = 1
 cell.workers = 1
-cell.warm-up.quiet = "250ms"
-cell.warm-up.timeout = "5s"
+cell.warm-up.quiet = "1250ms"
+cell.warm-up.timeout = "25s"
 cell.measure.until = "duration"
-cell.measure.duration = "10s"
-cell.measure.max-duration = "10s"
+cell.measure.duration = "50s"
+cell.measure.max-duration = "50s"
 
 # The worker grid of the canonical plots. Each worker count continues from the
 # tree after the warm-up of the count before it.
@@ -449,15 +452,15 @@ instances = 1
 shapes = { diag-rmw-shared = 3 }
 
 [experiments.diagnostics.set]
-seed.quiet-period = "1200ms"
-seed.timeout = "15s"
+seed.quiet-period = "6s"
+seed.timeout = "75s"
 cell.gc = false
 cell.warm-up.minimum = "0s"
 cell.warm-up.quiet = "never"
-cell.warm-up.timeout = "250ms"
+cell.warm-up.timeout = "1250ms"
 cell.measure.until = "duration"
-cell.measure.duration = "2s"
-cell.measure.max-duration = "2s"
+cell.measure.duration = "10s"
+cell.measure.max-duration = "10s"
 [[experiments.diagnostics.axes]]
 name = "case"
 values = [

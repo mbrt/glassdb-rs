@@ -311,45 +311,48 @@ async fn run_cell(
 
     let mut timeline = Timeline::new(&databases);
     let warm_start = Instant::now();
+    let warm_model_start = rt::Instant::now();
     let changes_start = restructurer_stats(&databases);
     let gc_start = gc_stats(&databases);
     let warm_up = &spec.params.warm_up;
     let (warm_stage, mut measure_stage) = Stage::split(
-        warm_start,
+        warm_model_start,
         warm_up.minimum.min(warm_up.timeout),
         spec.params.measure.duration,
     );
-    let quiet = if warm_up.timeout.is_zero() {
-        true
+    let (quiet, change_rate) = if warm_up.timeout.is_zero() {
+        (true, None)
     } else {
         shared.pause.open();
         let minimum = async {
             tokio::select! {
                 () = rt::sleep(warm_up.minimum) => {}
-                () = tokio::time::sleep(warm_up.timeout) => {}
+                () = rt::sleep(warm_up.timeout) => {}
             }
         };
         timeline
             .sample_during(&databases, minimum, false, warm_stage)
             .await;
-        let remaining = warm_up.timeout.saturating_sub(warm_start.elapsed());
+        let remaining = warm_up.timeout.saturating_sub(warm_model_start.elapsed());
         match warm_up.quiet {
             Some(quiet) => {
                 let wait = seed::wait_for_quiet(
                     || structural_changes(&databases),
                     &shared.stop,
                     quiet,
+                    warm_up.quiet_rate,
                     remaining,
                 );
-                timeline
+                let wait = timeline
                     .sample_during(&databases, wait, false, warm_stage)
-                    .await
+                    .await;
+                (wait.quiet, wait.rate)
             }
             None => {
                 timeline
-                    .sample_during(&databases, tokio::time::sleep(remaining), false, warm_stage)
+                    .sample_during(&databases, rt::sleep(remaining), false, warm_stage)
                     .await;
-                false
+                (false, None)
             }
         }
     };
@@ -359,13 +362,17 @@ async fn run_cell(
         merges: changes_end.merges - changes_start.merges,
         wall_ms: millis(warm_start.elapsed()),
         quiet,
+        change_rate,
         gc: (gc_stats(&databases) - gc_start).into(),
     };
     crate::progress::log!(
-        "  warm-up took {}ms: {} splits and {} merges{}",
+        "  warm-up took {}ms: {} splits and {} merges{}{}",
         warmup.wall_ms,
         warmup.splits,
         warmup.merges,
+        change_rate
+            .map(|rate| format!(", {rate:.2} changes/s at the end"))
+            .unwrap_or_default(),
         if quiet { "" } else { " (not quiet)" }
     );
 
@@ -397,7 +404,7 @@ async fn run_cell(
     let breakdown_start = storage.breakdown.snapshot();
     let measure_start = Instant::now();
     let measure_model_start = rt::Instant::now();
-    measure_stage.started = measure_start;
+    measure_stage.started = measure_model_start;
     for (_, _, shape) in &shapes {
         shape.bench.start();
     }
@@ -645,7 +652,7 @@ fn describe(point: &CellPoint) -> String {
 /// The time between two samples of the structural changes in the timeline.
 const TIMELINE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The structural changes of each instance in each wall second.
+/// The structural changes of each instance in each second of model time.
 struct Timeline {
     last: Vec<Stats>,
     entries: Vec<TimelineEntry>,
@@ -669,14 +676,23 @@ impl Timeline {
         stage: Stage,
     ) -> T {
         tokio::pin!(future);
-        let mut ticks = tokio::time::interval(TIMELINE_INTERVAL);
-        ticks.tick().await;
+        // The samples follow model time, so the timeline of a run does not
+        // depend on the speedup.
+        let mut next = rt::Instant::now() + TIMELINE_INTERVAL;
         loop {
+            let wait = next.saturating_duration_since(rt::Instant::now());
             tokio::select! {
                 output = &mut future => return output,
-                _ = ticks.tick() => {
+                () = rt::sleep(wait) => {
                     self.sample(databases, measured);
                     progress::advance(stage);
+                    // After a stall of the host, the next sample is one
+                    // interval later, not a burst of samples with no change.
+                    let now = rt::Instant::now();
+                    next = next + TIMELINE_INTERVAL;
+                    if next < now {
+                        next = now + TIMELINE_INTERVAL;
+                    }
                 }
             }
         }

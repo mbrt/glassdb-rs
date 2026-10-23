@@ -12,7 +12,7 @@
 # Tunables (env):
 #   EXPERIMENT        perfbench experiment (default diagnostics)
 #   CASE              one case of the diagnostics experiment (default: all)
-#   SECONDS_PER_CASE  measured time of each case (default 10)
+#   SECONDS_PER_CASE  measured wall time of each case (default 10)
 #   OUT               output directory for artifacts (default hack/perf)
 
 set -euo pipefail
@@ -35,9 +35,12 @@ run_args=(
 	--output="$OUT/profile.json"
 )
 if [[ "$EXPERIMENT" == "diagnostics" ]]; then
+	# perfbench durations are model time, and the default model clock runs five
+	# times as fast as wall time.
+	model_seconds=$((SECONDS_PER_CASE * 5))
 	run_args+=(
-		--set="cell.measure.duration=\"${SECONDS_PER_CASE}s\""
-		--set="cell.measure.max-duration=\"${SECONDS_PER_CASE}s\""
+		--set="cell.measure.duration=\"${model_seconds}s\""
+		--set="cell.measure.max-duration=\"${model_seconds}s\""
 	)
 	if [[ -n "$CASE" ]]; then
 		run_args+=(--only="case=$CASE")

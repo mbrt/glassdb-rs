@@ -5,13 +5,13 @@
 //! duration; [`Results`] computes the mean and percentiles (using the same R8
 //! interpolation method as the Go code, so the numbers line up).
 //!
-//! Latency samples and throughput duration use process-wide model time. The
-//! stopping window deliberately uses unscaled wall time so acceleration changes
-//! neither experiment length nor the minimum sample requirement.
+//! Latency samples, throughput duration, and the stopping window use
+//! process-wide model time, so a run measures the same model time at each
+//! speedup.
 
 use std::future::Future;
 use std::sync::Mutex;
-use std::time::{Duration, Instant as WallInstant};
+use std::time::Duration;
 
 use glassdb::Error;
 use glassdb_concurr::rt;
@@ -27,15 +27,14 @@ pub struct Bench {
 }
 
 struct Inner {
-    wall_start: Option<WallInstant>,
-    model_start: Option<rt::Instant>,
+    start: Option<rt::Instant>,
     tot_duration: Duration,
     samples: Vec<Duration>,
     completions: Vec<Duration>,
 }
 
 impl Bench {
-    /// Creates a benchmark that runs for `duration` of wall time (or the 10s
+    /// Creates a benchmark that runs for `duration` of model time (or the 10s
     /// default when zero) and reports model-time latency and throughput.
     pub fn new(duration: Duration) -> Self {
         let expected = if duration.is_zero() {
@@ -46,8 +45,7 @@ impl Bench {
         Bench {
             expected_duration: expected,
             inner: Mutex::new(Inner {
-                wall_start: None,
-                model_start: None,
+                start: None,
                 tot_duration: Duration::ZERO,
                 samples: Vec::new(),
                 completions: Vec::new(),
@@ -58,14 +56,13 @@ impl Bench {
     /// Begins the benchmark timer.
     pub fn start(&self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.wall_start = Some(WallInstant::now());
-        inner.model_start = Some(rt::Instant::now());
+        inner.start = Some(rt::Instant::now());
     }
 
     /// Records the model time elapsed since [`Bench::start`].
     pub fn end(&self) {
         let mut g = self.inner.lock().unwrap();
-        if let Some(start) = g.model_start {
+        if let Some(start) = g.start {
             g.tot_duration = start.elapsed();
         }
     }
@@ -74,7 +71,7 @@ impl Bench {
     /// samples.
     pub fn is_finished(&self) -> bool {
         let g = self.inner.lock().unwrap();
-        match g.wall_start {
+        match g.start {
             Some(start) if start.elapsed() >= self.expected_duration => {
                 g.samples.len() >= MIN_SAMPLES
             }
@@ -130,7 +127,7 @@ impl Bench {
         self.inner.lock().unwrap().samples.len()
     }
 
-    /// Returns the configured wall-clock measurement duration.
+    /// Returns the configured model-time measurement duration.
     pub fn expected_duration(&self) -> Duration {
         self.expected_duration
     }
@@ -150,7 +147,7 @@ impl Bench {
     /// system without becoming part of the results.
     fn record(&self, latency: Duration) {
         let mut inner = self.inner.lock().unwrap();
-        if let Some(start) = inner.model_start {
+        if let Some(start) = inner.start {
             inner.samples.push(latency);
             inner.completions.push(start.elapsed());
         }

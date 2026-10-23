@@ -1,7 +1,7 @@
 //! An optional progress bar on stderr.
 //!
 //! The bar shows how many cells of the experiment are done. A cell counts as
-//! partly done while it runs, by the elapsed part of its expected wall time.
+//! partly done while it runs, by the elapsed part of its expected model time.
 //! The expected time is an estimate, so the bar can move faster or slower than
 //! the clock, and the remaining time is only a guide.
 
@@ -10,7 +10,13 @@ use std::io::Write as _;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use glassdb_concurr::rt;
+
 const BAR_WIDTH: usize = 30;
+
+/// The wall time between two updates of the bar. More frequent updates make
+/// the remaining time hard to read.
+const REDRAW_INTERVAL: Duration = Duration::from_secs(1);
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
@@ -22,13 +28,16 @@ struct State {
     cell_fraction: f64,
     /// Whether the bar is on screen now.
     drawn: bool,
+    /// Whether the first stage of a cell started. The setup before it logs its
+    /// own lines, so the bar waits for that stage.
+    visible: bool,
 }
 
 /// The part of a cell that one stage of it takes.
 #[derive(Clone, Copy)]
 pub(crate) struct Stage {
-    pub(crate) started: Instant,
-    /// The estimated wall time of the stage.
+    pub(crate) started: rt::Instant,
+    /// The estimated model time of the stage.
     pub(crate) expected: Duration,
     /// The fraction of the cell at the start and at the end of the stage.
     pub(crate) from: f64,
@@ -37,8 +46,12 @@ pub(crate) struct Stage {
 
 impl Stage {
     /// Splits a cell in a warm-up stage and a measurement stage, by their
-    /// expected wall times. `warm_start` is when the warm-up starts.
-    pub(crate) fn split(warm_start: Instant, warm: Duration, measure: Duration) -> (Self, Self) {
+    /// expected model times. `warm_start` is when the warm-up starts.
+    pub(crate) fn split(
+        warm_start: rt::Instant,
+        warm: Duration,
+        measure: Duration,
+    ) -> (Self, Self) {
         let total = (warm + measure).as_secs_f64();
         let share = if total > 0.0 {
             warm.as_secs_f64() / total
@@ -79,6 +92,18 @@ pub(crate) fn enable(total_cells: usize) {
         done_cells: 0,
         cell_fraction: 0.0,
         drawn: false,
+        visible: false,
+    });
+    // The bar also moves while a cell sets up and no stage reports progress,
+    // so that the elapsed time continues. The thread ends with the bar.
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(REDRAW_INTERVAL);
+            match lock().as_mut() {
+                Some(state) => draw(state),
+                None => return,
+            }
+        }
     });
 }
 
@@ -95,9 +120,12 @@ pub(crate) fn finish_cell() {
     });
 }
 
-/// Moves the bar to the progress of `stage` now.
+/// Records the progress of `stage` now. The bar shows it at its next update.
 pub(crate) fn advance(stage: Stage) {
-    update(|state| state.cell_fraction = stage.fraction());
+    if let Some(state) = lock().as_mut() {
+        state.cell_fraction = stage.fraction();
+        state.visible = true;
+    }
 }
 
 /// Removes the bar from the screen.
@@ -151,6 +179,9 @@ fn clear(state: &mut State) {
 }
 
 fn draw(state: &mut State) {
+    if !state.visible {
+        return;
+    }
     let fraction = if state.total_cells == 0 {
         1.0
     } else {
@@ -206,7 +237,7 @@ mod tests {
 
     #[test]
     fn stages_cover_the_cell() {
-        let now = Instant::now();
+        let now = rt::Instant::now();
         let (warm, measure) = Stage::split(now, Duration::from_secs(10), Duration::from_secs(30));
         assert_eq!(warm.from, 0.0);
         assert_eq!(warm.to, 0.25);

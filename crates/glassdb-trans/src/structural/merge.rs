@@ -7,6 +7,7 @@
 //! the merge.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use glassdb_data::{CollectionAddress, NodeId, StructuralIntentId, TxId};
@@ -31,6 +32,19 @@ use super::stats::Stats;
 /// walks past drained nodes, so a malformed chain can never spin the
 /// restructurer.
 const MAX_TARGET_SEARCH_HOPS: usize = 4096;
+
+/// Why a merge does not go ahead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeVeto {
+    /// The rate of a demand merge does not pay more than the paid rates of
+    /// the two leaves (ADR-076).
+    Unpaid,
+    /// The merged node would be over half of a threshold of a split cause
+    /// (ADR-073).
+    TooLarge,
+    /// The reason does not apply to the nodes.
+    NotNeeded,
+}
 
 /// Decides which merges are necessary, and writes their nodes.
 #[derive(Clone)]
@@ -100,32 +114,39 @@ impl Merger {
         }
     }
 
-    /// Reports whether cached state shows node `source` as an actionable merge
-    /// source for `reason`. Busy nodes defer the merge, so that it does not
-    /// write an intent that the polite gate acquisition would then cancel.
-    pub(super) async fn is_actionable(
+    /// Returns the merge target of node `source` if cached state shows it as
+    /// an actionable merge source for `reason`. Busy nodes defer the merge, so
+    /// that it does not write an intent that the polite gate acquisition would
+    /// then cancel.
+    pub(super) async fn actionable_target(
         &self,
         collection: &CollectionAddress,
         source: &NodeId,
         reason: MergeReason,
-    ) -> Result<bool, TransError> {
+    ) -> Result<Option<NodeId>, TransError> {
         let left = match self
             .nodes
             .load_node(collection, source, Requirement::ANY)
             .await
         {
             Ok((left, _)) => left,
-            Err(StorageError::NotFound) => return Ok(false),
+            Err(StorageError::NotFound) => {
+                self.count_demand(reason, |stats| &stats.demand_merge_other);
+                return Ok(None);
+            }
             Err(error) => return Err(error.into()),
         };
         let Some(boundary) = left.high_key().filter(|_| !left.is_drained()) else {
-            return Ok(false);
+            self.count_demand(reason, |stats| &stats.demand_merge_other);
+            return Ok(None);
         };
         let Some(target) = self.target(collection, &left, Requirement::ANY).await? else {
-            return Ok(false);
+            self.count_demand(reason, |stats| &stats.demand_merge_other);
+            return Ok(None);
         };
-        if !self.need(&left, &target.node, reason) {
-            return Ok(false);
+        if let Err(veto) = self.need(&left, &target.node, reason) {
+            self.count_veto(reason, veto);
+            return Ok(None);
         }
         // Merging the children of two parents would leave the left parent
         // routing through the drained node (ADR-073).
@@ -138,16 +159,18 @@ impl Merger {
             .and_then(|parent| parent.node())
             .is_some_and(|parent| parent.covers(boundary))
         {
-            return Ok(false);
+            self.count_demand(reason, |stats| &stats.demand_merge_other);
+            return Ok(None);
         }
         if left.locks().merge_reservation().is_some()
             || target.node.locks().merge_reservation().is_some()
             || self.has_live_holder(&left).await?
             || self.has_live_holder(&target.node).await?
         {
+            self.count_demand(reason, |stats| &stats.demand_merge_busy);
             return Err(TransError::Retry);
         }
-        Ok(true)
+        Ok(Some(target.id))
     }
 
     /// Checks the merge of the gated source `left` again in current state, and
@@ -263,18 +286,22 @@ impl Merger {
         reason: MergeReason,
     ) -> Result<Option<TargetState>, TransError> {
         if left.is_drained() || left.high_key().is_none() {
+            self.count_demand(reason, |stats| &stats.demand_merge_other);
             return Ok(None);
         }
         let requirement = Requirement::after(self.timeline.currentness_barrier());
         let Some(target) = self.target(collection, left, requirement).await? else {
+            self.count_demand(reason, |stats| &stats.demand_merge_other);
             return Ok(None);
         };
-        if !self.need(left, &target.node, reason) {
+        if let Err(veto) = self.need(left, &target.node, reason) {
+            self.count_veto(reason, veto);
             return Ok(None);
         }
         if target.node.locks().merge_reservation().is_some()
             || self.has_live_holder(&target.node).await?
         {
+            self.count_demand(reason, |stats| &stats.demand_merge_busy);
             return Err(TransError::Retry);
         }
         Ok(Some(target))
@@ -313,7 +340,7 @@ impl Merger {
     /// split cause, so that the merged node does not split again soon
     /// (ADR-073). The merge compacts both nodes, so their holder-free
     /// tombstones do not count. Only an underfull merge applies to index nodes.
-    fn need(&self, left: &Node, right: &Node, reason: MergeReason) -> bool {
+    fn need(&self, left: &Node, right: &Node, reason: MergeReason) -> Result<(), MergeVeto> {
         let (mut left, mut right) = (left.clone(), right.clone());
         reclaim_holder_free_tombstones(&mut left);
         reclaim_holder_free_tombstones(&mut right);
@@ -333,19 +360,32 @@ impl Merger {
                 };
                 let underfull = left.entries().filter(|entry| entry.exists()).count()
                     < self.candidates.leaf_min_live_entries();
-                (pays || underfull)
-                    && left.len() + right.len() <= policy.leaf_max_entries() / 2
+                let fits = left.len() + right.len() <= policy.leaf_max_entries() / 2
                     && inline_len(left) + inline_len(right)
                         <= self.candidates.inline().max_leaf_bytes / 2
-                    && fits_bytes
+                    && fits_bytes;
+                if !(pays || underfull) {
+                    Err(match reason {
+                        MergeReason::Demand { .. } => MergeVeto::Unpaid,
+                        MergeReason::Underfull => MergeVeto::NotNeeded,
+                    })
+                } else if !fits {
+                    Err(MergeVeto::TooLarge)
+                } else {
+                    Ok(())
+                }
             }
             (NodeBody::Index(left), NodeBody::Index(right)) => {
-                reason == MergeReason::Underfull
-                    && left.len() < policy.index_min_children()
-                    && left.len() + right.len() <= policy.index_max_children() / 2
-                    && fits_bytes
+                if reason != MergeReason::Underfull || left.len() >= policy.index_min_children() {
+                    Err(MergeVeto::NotNeeded)
+                } else if left.len() + right.len() > policy.index_max_children() / 2 || !fits_bytes
+                {
+                    Err(MergeVeto::TooLarge)
+                } else {
+                    Ok(())
+                }
             }
-            _ => false,
+            _ => Err(MergeVeto::NotNeeded),
         }
     }
 
@@ -357,6 +397,23 @@ impl Merger {
             rate,
             [left.paid_rate(), right.paid_rate()],
         )
+    }
+
+    /// Counts the veto of one attempt of a merge that a topology rule asked
+    /// for.
+    fn count_veto(&self, reason: MergeReason, veto: MergeVeto) {
+        self.count_demand(reason, |stats| match veto {
+            MergeVeto::Unpaid => &stats.demand_merge_unpaid,
+            MergeVeto::TooLarge => &stats.demand_merge_too_large,
+            MergeVeto::NotNeeded => &stats.demand_merge_other,
+        });
+    }
+
+    /// Counts one outcome of a merge that a topology rule asked for.
+    fn count_demand(&self, reason: MergeReason, counter: impl FnOnce(&Stats) -> &AtomicU64) {
+        if matches!(reason, MergeReason::Demand { .. }) {
+            counter(&self.stats).fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Reports whether a holder of any claim on `node` can still be live.

@@ -89,9 +89,14 @@ All experiments support `--backend=memory|fakes3|s3|gcs`. Real S3 and GCS use
 the bucket in `$BUCKET` and always run at real time. For `memory` and `fakes3`,
 `--delay-scale` selects the inverse process-wide model-time speedup: backend
 latency, rate limits, SDK and engine retries, leases, and background cadence
-advance coherently, while measurement windows and drain deadlines remain wall
-time. The `0.2` default keeps S3-profile sleeps above timer granularity;
-smaller scales are useful only as explicitly approximate probes.
+advance coherently. The parts of an experiment that set what it measures also
+use model time: the seed and warm-up waits and timeouts, the measurement
+duration and its end conditions, and the timeline. So a run measures the same
+model time at each scale. Only the watchdogs (`--drain-timeout` and the limit
+of the full GCs) and `--run-cooldown` use wall time, because they protect the
+host. The `wallMs` fields of the result are wall time. The `0.2` default keeps
+S3-profile sleeps above timer granularity; smaller scales are useful only as
+explicitly approximate probes.
 
 ## Merging files
 
@@ -200,21 +205,25 @@ each leaf.
 
 ## End conditions
 
-A warm-up ends when the splits and merges stop for `quiet`, or at its timeout.
-A measurement ends on its end condition, or at `max-duration`:
+A warm-up ends when the splits and merges of all database instances in the last
+`quiet` window of model time are at most `quiet-rate` in each second of model
+time, or at its timeout. Under a constant load, the topology can keep changing
+slowly near its stable boundaries, so a warm-up does not wait for no change at
+all. A measurement ends on its end condition, or at `max-duration`:
 
 | Path | Default | Meaning |
 | --- | --- | --- |
 | `cell.warm-up.minimum` | `"5s"` | Minimum model time. |
-| `cell.warm-up.quiet` | `"10s"` | Wall time without splits and merges that ends the warm-up. `"never"` runs until `timeout`. |
-| `cell.warm-up.timeout` | `"60s"` | Maximum wall time. `"0s"` is no warm-up. |
+| `cell.warm-up.quiet` | `"10s"` | The model time window of the quiet check. `"never"` runs until `timeout`. |
+| `cell.warm-up.quiet-rate` | 0.2 | The splits and merges of all instances in each second of model time of a `quiet` window, at or below which the warm-up ends. 0 waits for a window without changes. |
+| `cell.warm-up.timeout` | `"60s"` | Maximum model time. `"0s"` is no warm-up. |
 | `cell.measure.until` | `"converged"` | The end condition. `"converged"`: every shape has `window-commits` commits in each throughput window on average. `"duration"`: exactly `duration`. `"passes"`: each worker makes one pass of its `sequence` source. `"no-locked-pass"`: each such worker makes passes until one pass takes no lock; that pass is not in the measurement. |
 | `cell.measure.duration` | `"2s"` | Minimum measurement for `converged`, the measurement for `duration`. |
-| `cell.measure.max-duration` | `"60s"` | Maximum wall time for all conditions. |
+| `cell.measure.max-duration` | `"60s"` | Maximum model time for all conditions. |
 | `cell.measure.window-commits` | 50 | For `converged`. |
 
 `timeout` wins over `minimum`. A warm-up that ends at its timeout without a
-quiet period, and a measurement that ends at `max-duration` before its
+quiet window, and a measurement that ends at `max-duration` before its
 condition, are marked in the result.
 
 ## Parameters
@@ -224,8 +233,8 @@ All other parameters, with their scope and the default of the built-in file:
 | Path | Scope | Default | Meaning |
 | --- | --- | --- | --- |
 | `cell.collections` | seed | `"databases"` | Collections of each pool. `"databases"` gives one for each instance of the cell. |
-| `seed.quiet-period` | seed | `"10s"` | Time without splits and merges that ends the seed. `"0s"` ends the seed after its writes, without a wait and without full GCs. |
-| `seed.timeout` | seed | `"180s"` | The run fails after this. |
+| `seed.quiet-period` | seed | `"10s"` | Model time without splits and merges that ends the seed. `"0s"` ends the seed after its writes, without a wait and without full GCs. |
+| `seed.timeout` | seed | `"180s"` | The run fails after this model time. |
 | `cell.workload` | cell | `"low-conflict"` | The workload. |
 | `cell.databases` | cell | 4 | Instances of a group that does not give `instances`. |
 | `cell.workers` | cell | 8 | Workers of a shape whose value is `"cell"`. |
@@ -353,15 +362,17 @@ axes. Each run has its cells. Each cell has:
   `databaseLimit` and `workersPerShape` when the workload uses
   `cell.databases` and `cell.workers`;
 - `seed`: its splits, wall time, and its full GCs;
-- `warmup`: wall time, splits, merges, whether it became quiet, and its GC
-  activity; `fullGc`: the full GCs after the warm-up;
+- `warmup`: wall time, splits, merges, whether it became quiet, the splits
+  and merges in each second of model time of its last `quiet` window
+  (`changeRate`, null
+  with no full window), and its GC activity; `fullGc`: the full GCs after the warm-up;
 - `measure`: wall time, whether its end condition was met, its splits and
   merges, and the worker drain time after it;
 - `shapes`: for each shape of each group, its commits, whether it converged,
   the throughput windows with their `relCi`, the mean latency with its
   standard error, and the p50 and p90;
 - `groups`: the counters of each instance in the measurement, with its
-  shutdown, unless the next cell continues on the same instances;
+  shutdown, unless the next cell continues on the same instances.
 - `aggregateOps` and `aggregateProtocol`: the backend operations, bytes, and
   protocol counters of the cell, for each transaction;
 - `costs`: the backend requests, the body bytes, and the coordinator counters
@@ -369,12 +380,12 @@ axes. Each run has its cells. Each cell has:
   instances, and both (`combined`). Body bytes are the bodies of successful
   reads and of attempted writes, without paths, headers, LIST responses, and
   transport;
-- `timeline`: the splits and merges of each instance in each wall second of the
-  warm-up and the measurement.
+- `timeline`: the splits and merges of each instance in each second of model
+  time of the warm-up and the measurement.
 
 All database instances use the production pending timeout and no clock skew
 allowance, because they read one clock. Full GCs after a seed or a warm-up
-stop after 600 s. Every cell runs on one multi-thread runtime.
+stop after 600 s of wall time. Every cell runs on one multi-thread runtime.
 
 `hack/perf/perfbench_results.py` reads the result files for the
 comparison and plot tools.
@@ -409,8 +420,9 @@ seed share one seed, and each cell gets its own copy. With other backends, each
 cell writes its keys again.
 
 Each cell then runs its load without measuring it. The warm-up lasts at least
-`cell.warm-up.minimum`, and then until splits and merges stop for
-`cell.warm-up.quiet`, or until `cell.warm-up.timeout`. Under load, the tree
+`cell.warm-up.minimum`, and then until the rate of splits and merges in a
+`cell.warm-up.quiet` window of model time is at most `cell.warm-up.quiet-rate`, or until
+`cell.warm-up.timeout`. Under load, the tree
 often keeps splitting, so a loaded cell usually measures after the timeout.
 `hack/perf/investigations.md` explains why the splits continue.
 
@@ -447,8 +459,8 @@ them. `hack/perf/README.md` explains the plots and the comparison tools, and
 
 The `diagnostics` experiment replaces the Criterion suite of `glassdb`. Each
 case runs one worker on one instance with warm caches, the S3 delay profile
-without variance, and the 5× model clock. A case warms up for 250 ms and
-measures for 2 s. Most cases are built-in parts:
+without variance, and the 5× model clock. A case warms up for 1250 ms and
+measures for 10 s of model time. Most cases are built-in parts:
 
 | Case | Shape |
 | --- | --- |

@@ -2251,10 +2251,12 @@ fn push_soft_cap_splits(candidates: &MaintenanceCandidates, count: usize) {
     }
 }
 
-// While the queue is long, the demand splits that remove the most avoidable
-// time must land first, after the splits that a size cause asks for.
+// While the queue is long, the demand changes that remove the most avoidable
+// time must land first, after the splits that a size cause asks for. After a
+// change of the load, a demand merge with a high rate must not wait for all
+// the demand splits of the earlier load.
 #[test]
-fn a_sweep_orders_splits_by_cause_and_rate() {
+fn a_sweep_orders_changes_by_cause_and_rate() {
     let candidates = MaintenanceCandidates::with_policy(NodeSizePolicy::default());
     let push = |name: &str, cause: CandidateCause| {
         candidates.push(MaintenanceCandidate {
@@ -2269,6 +2271,12 @@ fn a_sweep_orders_splits_by_cause_and_rate() {
     push("fast", CandidateCause::Split(demand_split(500)));
     push("cap", CandidateCause::Split(SplitReason::SoftCap));
     push("medium", CandidateCause::Split(demand_split(100)));
+    push(
+        "demand-merge",
+        CandidateCause::Merge(MergeReason::Demand {
+            rate: Duration::from_millis(200),
+        }),
+    );
 
     let order: Vec<_> = candidates
         .drain()
@@ -2279,6 +2287,6 @@ fn a_sweep_orders_splits_by_cause_and_rate() {
 
     assert_eq!(
         order,
-        ["cap", "fast", "medium", "slow", "merge"].map(node_path)
+        ["cap", "fast", "demand-merge", "medium", "slow", "merge"].map(node_path)
     );
 }

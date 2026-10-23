@@ -63,7 +63,7 @@ use stats::Stats;
 pub use candidates::StructuralHintSink;
 pub(crate) use measurements::TypicalTime;
 pub use rule::TopologyPolicy;
-pub use stats::{InlinePressureStats, RestructurerStats};
+pub use stats::{DemandMergeStats, InlinePressureStats, RestructurerStats, TopologyTimeStats};
 pub(crate) use topology::TopologyMembership;
 
 /// Back off empty structural-intent listings independently of candidates.
@@ -74,8 +74,8 @@ const STRUCTURAL_RECOVERY_IDLE_INTERVAL: Duration = Duration::from_secs(600);
 /// attempt tries again.
 const NODE_CAS_ATTEMPTS: usize = 8;
 
-/// The maximum number of splits of different nodes that one sweep makes at
-/// the same time.
+/// The maximum number of splits, or of merges, of different nodes that one
+/// sweep makes at the same time.
 const STRUCTURAL_CHANGE_PARALLELISM: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 
 /// Background executor that halves over-full B-link nodes (ADR-031) and merges
@@ -108,6 +108,37 @@ struct LocatedSplit {
     candidate: MaintenanceCandidate,
     reason: SplitReason,
     path: ObjectPath,
+}
+
+/// A merge candidate and the nodes that its merge changes.
+struct LocatedMerge {
+    candidate: MaintenanceCandidate,
+    reason: MergeReason,
+    collection: CollectionAddress,
+    source: NodeId,
+    target: NodeId,
+}
+
+/// A candidate and the nodes that its change writes.
+enum LocatedChange {
+    Split(LocatedSplit),
+    Merge(LocatedMerge),
+}
+
+/// What the check of one candidate in cached state found.
+enum Location {
+    Found(LocatedChange),
+    /// The change is no longer necessary.
+    NotNeeded,
+    /// The check failed, so the change defers.
+    Failed(MaintenanceCandidate, TransError),
+}
+
+/// The source that a merge drains, and the target that receives its entries.
+struct MergeNodes {
+    collection: CollectionAddress,
+    source: NodeId,
+    target: NodeId,
 }
 
 impl Restructurer {
@@ -165,9 +196,15 @@ impl Restructurer {
         self.candidates.hint_sink()
     }
 
-    /// Returns and resets background split and merge activity counters.
+    /// Returns and resets the counters of background split and merge
+    /// activity, and of the time that transactions reported to the topology
+    /// rule.
     pub fn stats_and_reset(&self) -> RestructurerStats {
-        self.stats.take()
+        let mut stats = self.stats.take();
+        if let Some(measurements) = self.candidates.measurements() {
+            stats.topology_time = measurements.take_totals();
+        }
+        stats
     }
 
     /// Starts independent candidate, structural-recovery, and topology rule
@@ -314,33 +351,14 @@ impl Restructurer {
     /// transient error on one candidate only defers its change to a later
     /// cycle, so it is logged and the sweep continues.
     async fn run_once(&self) {
-        let mut splits = Vec::new();
-        let mut merges = Vec::new();
         let (candidates, stale) = self.candidates.drain();
-        self.stats.stale_demand.fetch_add(stale, Ordering::Relaxed);
-        for candidate in candidates {
-            self.count_candidate(&candidate);
-            match &candidate.cause {
-                CandidateCause::Split(reason) => {
-                    let reason = reason.clone();
-                    splits.push((candidate, reason));
-                }
-                CandidateCause::Merge(reason) => {
-                    let reason = *reason;
-                    merges.push((candidate, reason));
-                }
-            }
+        for candidate in &stale {
+            self.count_stale(candidate);
         }
-        self.split_all(splits).await;
-        // A merge changes two nodes and reserves its target (ADR-073), so the
-        // merges run in sequence after the splits.
-        for (candidate, reason) in merges {
-            if self.drop_if_stale(&candidate) {
-                continue;
-            }
-            let result = self.merge(&candidate, reason).await;
-            self.settle_candidate(candidate, result);
+        for candidate in &candidates {
+            self.count_candidate(candidate);
         }
+        self.change_all(candidates).await;
         // Re-drive reconciliations a previous cycle could not land, so parents
         // eventually agree with their children and descent stops relying on
         // right-links.
@@ -366,66 +384,143 @@ impl Restructurer {
         }
     }
 
-    /// Makes the splits of `candidates` that are still necessary, many at a
-    /// time. The candidates that locate the same node split it one after the
-    /// other, in the order of the candidates.
-    async fn split_all(&self, candidates: Vec<(MaintenanceCandidate, SplitReason)>) {
-        let locating: Vec<_> = candidates
-            .iter()
-            .map(|(candidate, reason)| self.splitter.locate(&candidate.path, reason))
-            .collect();
-        let located = join_all_bounded(locating, STRUCTURAL_CHANGE_PARALLELISM).await;
-        // Splits of the same node compete for its gate, so each round splits
-        // a node at most once.
-        let mut rounds = Vec::<Vec<LocatedSplit>>::new();
-        let mut rounds_of_node = BTreeMap::<ObjectPath, usize>::new();
-        for ((candidate, reason), located) in candidates.into_iter().zip(located) {
-            match located {
-                Ok(Some(path)) => {
-                    let round = rounds_of_node.entry(path.clone()).or_default();
-                    if *round == rounds.len() {
-                        rounds.push(Vec::new());
-                    }
-                    rounds[*round].push(LocatedSplit {
-                        candidate,
-                        reason,
-                        path,
-                    });
-                    *round += 1;
-                }
-                Ok(None) => {}
-                Err(error) => self.settle_candidate(candidate, Err(error)),
-            }
-        }
-        for round in rounds {
-            // A participant stays in the collection record until the changes
-            // of its batch end, so a batch is not larger than the changes
-            // that run at the same time.
-            let mut round = round.into_iter().peekable();
-            while round.peek().is_some() {
-                // One sweep can take longer than the age of a stale request,
-                // so each batch checks the age again.
-                let batch: Vec<_> = round
-                    .by_ref()
-                    .filter(|split| !self.drop_if_stale(&split.candidate))
-                    .take(STRUCTURAL_CHANGE_PARALLELISM.get())
-                    .collect();
-                self.split_batch(batch).await;
+    /// Makes the changes of `candidates` that are still necessary, many at a
+    /// time, in the order of the candidates. The changes of the same node run
+    /// one after the other, and a merge of a node runs after its splits.
+    async fn change_all(&self, candidates: Vec<MaintenanceCandidate>) {
+        let changes = self.locate_all(candidates).await;
+        // A split gates its node, and a merge gates its source and reserves
+        // its target (ADR-073). The gate or the reservation of one change
+        // stops another change of the same node. The nodes come from cached
+        // state, and a change of a later round can locate other nodes, so a
+        // change of a round can still meet another one, and defer. A change
+        // of a later round waits for all of the earlier round, so it can get
+        // stale while it waits.
+        for (index, round) in rounds_of_changes(changes).into_iter().enumerate() {
+            for batch in self.batches(round) {
+                // The changes of an earlier round changed the nodes of this
+                // one. A merge of a drained or split source then stops, or
+                // pays again for the new leaves, before it writes.
+                let batch = if index == 0 {
+                    batch
+                } else {
+                    self.locate_again(batch).await
+                };
+                self.change_batch(batch).await;
             }
         }
     }
 
-    /// Makes the splits of `batch`, each of a different node, at the same
+    /// Returns the changes of `candidates` that cached state shows as
+    /// actionable, in the order of the candidates. Settles the candidates
+    /// whose check failed.
+    async fn locate_all(&self, candidates: Vec<MaintenanceCandidate>) -> Vec<LocatedChange> {
+        let locating: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| self.locate(candidate))
+            .collect();
+        let mut changes = Vec::new();
+        for located in join_all_bounded(locating, STRUCTURAL_CHANGE_PARALLELISM).await {
+            match located {
+                Location::Found(change) => changes.push(change),
+                Location::NotNeeded => {}
+                Location::Failed(candidate, error) => self.settle_candidate(candidate, Err(error)),
+            }
+        }
+        changes
+    }
+
+    /// Finds the nodes that the change of `candidate` writes, or returns the
+    /// candidate with the error that stopped the check.
+    async fn locate(&self, candidate: MaintenanceCandidate) -> Location {
+        match candidate.cause.clone() {
+            CandidateCause::Split(reason) => {
+                match self.splitter.locate(&candidate.path, &reason).await {
+                    Ok(Some(path)) => Location::Found(LocatedChange::Split(LocatedSplit {
+                        candidate,
+                        reason,
+                        path,
+                    })),
+                    Ok(None) => Location::NotNeeded,
+                    Err(error) => Location::Failed(candidate, error),
+                }
+            }
+            CandidateCause::Merge(reason) => {
+                match self.locate_merge(&candidate.path, reason).await {
+                    Ok(Some(nodes)) => Location::Found(LocatedChange::Merge(LocatedMerge {
+                        candidate,
+                        reason,
+                        collection: nodes.collection,
+                        source: nodes.source,
+                        target: nodes.target,
+                    })),
+                    Ok(None) => Location::NotNeeded,
+                    Err(error) => Location::Failed(candidate, error),
+                }
+            }
+        }
+    }
+
+    /// Checks the changes of `batch` again in cached state. The changes of an
+    /// earlier round can have moved their nodes.
+    async fn locate_again(&self, batch: Vec<LocatedChange>) -> Vec<LocatedChange> {
+        let candidates = batch
+            .into_iter()
+            .map(LocatedChange::into_candidate)
+            .collect();
+        self.locate_all(candidates).await
+    }
+
+    /// Returns the nodes that the merge of the node at `path` changes, if
+    /// `reason` still calls for it.
+    async fn locate_merge(
+        &self,
+        path: &ObjectPath,
+        reason: MergeReason,
+    ) -> Result<Option<MergeNodes>, TransError> {
+        let ObjectPath::Node {
+            collection,
+            id: source,
+        } = path
+        else {
+            return Ok(None);
+        };
+        let target = self
+            .merger
+            .actionable_target(collection, source, reason)
+            .await?;
+        Ok(target.map(|target| MergeNodes {
+            collection: collection.clone(),
+            source: *source,
+            target,
+        }))
+    }
+
+    /// Makes the changes of `batch`, which write different nodes, at the same
     /// time.
-    async fn split_batch(&self, batch: Vec<LocatedSplit>) {
+    async fn change_batch(&self, batch: Vec<LocatedChange>) {
         let changes: Vec<_> = batch
             .iter()
-            .map(|split| {
-                PlannedChange::split(&split.path, &split.reason).map(|change| SweepChange {
+            .map(|change| {
+                let (change, candidate) = match change {
+                    LocatedChange::Split(split) => (
+                        PlannedChange::split(&split.path, &split.reason)?,
+                        &split.candidate,
+                    ),
+                    LocatedChange::Merge(merge) => (
+                        PlannedChange::Merge {
+                            collection: &merge.collection,
+                            source: &merge.source,
+                            reason: merge.reason,
+                        },
+                        &merge.candidate,
+                    ),
+                };
+                Ok(SweepChange {
                     change,
                     // The candidate's already-aged wound-wait priority
                     // becomes the identity of the change.
-                    worker: split.candidate.priority.renew(),
+                    worker: candidate.priority.renew(),
                 })
             })
             .collect();
@@ -437,51 +532,36 @@ impl Restructurer {
             .into_iter();
         let results: Vec<_> = changes
             .iter()
-            .map(|change| match change {
-                Ok(_) => results.next().expect("one result for each change"),
-                Err(error) => Err(error.clone()),
-            })
+            .map(
+                |change: &Result<SweepChange<'_>, TransError>| match change {
+                    Ok(_) => results.next().expect("one result for each change"),
+                    Err(error) => Err(error.clone()),
+                },
+            )
             .collect();
-        for (split, result) in batch.into_iter().zip(results) {
-            self.settle_candidate(split.candidate, result);
+        for (change, result) in batch.into_iter().zip(results) {
+            self.settle_candidate(change.into_candidate(), result);
         }
     }
 
-    /// Merges the node of `candidate` into its right sibling, if `reason`
-    /// still calls for it.
-    async fn merge(
-        &self,
-        candidate: &MaintenanceCandidate,
-        reason: MergeReason,
-    ) -> Result<(), TransError> {
-        let ObjectPath::Node {
-            collection,
-            id: source,
-        } = &candidate.path
-        else {
-            return Ok(());
-        };
-        if !self
-            .merger
-            .is_actionable(collection, source, reason)
-            .await?
-        {
-            return Ok(());
-        }
-        let change = PlannedChange::Merge {
-            collection,
-            source,
-            reason,
-        };
-        // The candidate's already-aged wound-wait priority becomes the
-        // identity of the change.
-        self.changes
-            .run(
-                change,
-                candidate.priority.renew(),
-                StructuralTopology::Owned,
+    /// Divides the changes of one round into batches, and drops the stale
+    /// candidates (ADR-083) just before each batch runs.
+    fn batches(&self, round: Vec<LocatedChange>) -> impl Iterator<Item = Vec<LocatedChange>> {
+        // A participant stays in the collection record until the changes of
+        // its batch end, so a batch is not larger than the changes that run
+        // at the same time. One sweep can take longer than the age of a stale
+        // request, so each batch checks the age again.
+        let mut round = round.into_iter().peekable();
+        std::iter::from_fn(move || {
+            round.peek()?;
+            Some(
+                round
+                    .by_ref()
+                    .filter(|change| !self.drop_if_stale(change.candidate()))
+                    .take(STRUCTURAL_CHANGE_PARALLELISM.get())
+                    .collect(),
             )
-            .await
+        })
     }
 
     /// Counts one candidate that a sweep processes.
@@ -499,9 +579,22 @@ impl Restructurer {
     fn drop_if_stale(&self, candidate: &MaintenanceCandidate) -> bool {
         let stale = candidate.is_stale();
         if stale {
-            self.stats.stale_demand.fetch_add(1, Ordering::Relaxed);
+            self.count_stale(candidate);
         }
         stale
+    }
+
+    /// Counts one stale demand candidate that a sweep dropped.
+    fn count_stale(&self, candidate: &MaintenanceCandidate) {
+        self.stats.stale_demand.fetch_add(1, Ordering::Relaxed);
+        if matches!(
+            candidate.cause,
+            CandidateCause::Merge(MergeReason::Demand { .. })
+        ) {
+            self.stats
+                .demand_merge_stale
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Requeues `candidate` when a transient error deferred its change.
@@ -590,6 +683,71 @@ impl TopologySettler for Restructurer {
     ) -> Result<(), TransError> {
         let action = self.recovery.begin_participant_settlement(collection, id);
         self.drive_recovery_action(action).await.map(|_| ())
+    }
+}
+
+/// Puts each of `changes` in the first round after the rounds of the earlier
+/// changes of its nodes, so that a round changes a node at most once. The
+/// changes of one node keep their order, except that a merge runs after the
+/// splits of its nodes. Each round keeps the order of `changes`.
+fn rounds_of_changes(changes: Vec<LocatedChange>) -> Vec<Vec<LocatedChange>> {
+    // A merge of a leaf that also needs a split waits for the split. The
+    // split removes the cause, and the merge then pays again for the leaves
+    // that the split made (ADR-076).
+    let mut changes: Vec<_> = changes.into_iter().enumerate().collect();
+    changes.sort_by_key(|(_, change)| matches!(change, LocatedChange::Merge(_)));
+    let mut rounds = Vec::<Vec<(usize, LocatedChange)>>::new();
+    let mut next_round_of_node = BTreeMap::<ObjectPath, usize>::new();
+    for (order, change) in changes {
+        let nodes = change.nodes();
+        let round = nodes
+            .iter()
+            .filter_map(|node| next_round_of_node.get(node).copied())
+            .max()
+            .unwrap_or_default();
+        for node in nodes {
+            next_round_of_node.insert(node, round + 1);
+        }
+        if round == rounds.len() {
+            rounds.push(Vec::new());
+        }
+        rounds[round].push((order, change));
+    }
+    rounds
+        .into_iter()
+        .map(|mut round| {
+            round.sort_by_key(|(order, _)| *order);
+            round.into_iter().map(|(_, change)| change).collect()
+        })
+        .collect()
+}
+
+impl LocatedChange {
+    fn candidate(&self) -> &MaintenanceCandidate {
+        match self {
+            Self::Split(split) => &split.candidate,
+            Self::Merge(merge) => &merge.candidate,
+        }
+    }
+
+    fn into_candidate(self) -> MaintenanceCandidate {
+        match self {
+            Self::Split(split) => split.candidate,
+            Self::Merge(merge) => merge.candidate,
+        }
+    }
+
+    /// Returns the nodes that the change gates or reserves.
+    fn nodes(&self) -> Vec<ObjectPath> {
+        match self {
+            Self::Split(split) => vec![split.path.clone()],
+            Self::Merge(merge) => [merge.source, merge.target]
+                .map(|id| ObjectPath::Node {
+                    collection: merge.collection.clone(),
+                    id,
+                })
+                .to_vec(),
+        }
     }
 }
 

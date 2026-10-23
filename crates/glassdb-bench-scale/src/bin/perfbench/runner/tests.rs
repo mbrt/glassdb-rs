@@ -168,3 +168,11 @@ fn groups_run_their_shapes_on_their_own_instances() -> Result<(), Box<dyn Error>
     assert_eq!(instances[1]["instances"][0]["directLanded"], 0);
     Ok(())
 }
+
+#[test]
+fn a_negative_quiet_rate_is_an_error() {
+    let mut set = SHORT.to_vec();
+    set.push("cell.warm-up.quiet-rate=-1.0");
+    let error = run("ci", &set).unwrap_err();
+    assert!(error.to_string().contains("quiet-rate"), "{error}");
+}
