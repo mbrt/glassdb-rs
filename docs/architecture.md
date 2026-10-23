@@ -632,13 +632,21 @@ before ([ADR-083](adr/083-drop-stale-topology-requests.md)). A
 merge defers while a live transaction holds a lock on its source or target.
 
 Under load, a rule asks for many more leaf changes than one change at a time
-can make, and the tree does not settle. So a sweep splits different nodes at
-the same time, in batches of a fixed size, and then merges in the same way.
-Each change keeps its own topology participant, but the participants of one
-collection share one CAS. Two changes of the same node go in different
-batches, because the gate or the reservation of one stops the other. The
-batches come from cached state, so a change of a batch can still meet another
-one, and defer.
+can make, and the tree does not settle. So a sweep changes different nodes at
+the same time, in batches of a fixed size. Each change keeps its own topology
+participant, but the participants of one collection share one CAS. Two changes
+of the same node go in different batches, because the gate or the reservation
+of one stops the other. The batches come from cached state, so a change of a
+batch can still meet another one, and defer.
+
+A sweep takes the splits of the size causes first, because a full leaf can
+stop writes. Then it takes the splits and merges of a rule together, the
+highest rate first, and the underfull merges last. So after a change of the
+load, the changes of the new load do not wait behind the old requests until
+they are stale. For the changes of a rule, this order replaces the rule of
+ADR-073 that splits go before merges. A merge of a node that also needs a
+split waits for the split. The merge then pays again for the leaves of the
+split (ADR-076).
 
 The changes of one batch often have the same parent. A batch makes the node
 writes of its changes first, and then reconciles the parent of each collection

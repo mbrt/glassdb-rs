@@ -1212,3 +1212,79 @@ async fn a_second_reason_to_merge_a_drained_leaf_stops_in_the_same_sweep() {
     assert_eq!(keys(&current_node(&s, "L1").await), [b"a", b"b"]);
     assert_no_intents(&s).await;
 }
+
+fn push_demand(sp: &Restructurer, change: ChangeRequest, millis: u64) {
+    sp.candidates.push_request(RuleRequest {
+        change,
+        rate: Duration::from_millis(millis),
+    });
+}
+
+// A split adds a separator to the parent and a merge removes one. When they
+// land in one batch, one reconciliation of the parent must make both
+// changes.
+#[tokio::test(start_paused = true)]
+async fn one_batch_splits_and_merges_under_one_parent() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let s = store_with_backend(backend.clone() as Arc<dyn Backend>);
+    for (name, keys, low, high, right) in [
+        ("L0", &[b"a"][..], &b""[..], Some(&b"b"[..]), Some("L1")),
+        ("L1", &[b"b"][..], b"b", Some(b"m"), Some("L2")),
+        ("L2", &[b"m", b"n", b"o", b"p"][..], b"m", None, None),
+    ] {
+        let keys: Vec<&[u8]> = keys.iter().map(|key| key.as_slice()).collect();
+        let node = leaf_node(&keys, high, right).with_low_key(low.to_vec());
+        assert!(s.store_node(COLL, name, &node, None).await.unwrap());
+    }
+    s.create_root(
+        COLL,
+        &Node::index(test_index(&[(b"", "L0"), (b"b", "L1"), (b"m", "L2")])),
+    )
+    .await
+    .unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = rule_restructurer(&s, &bg);
+    push_demand(&sp, ChangeRequest::Merge(LeafId::new(node_path("L0"))), 500);
+    push_demand(&sp, ChangeRequest::Split(LeafId::new(node_path("L2"))), 100);
+
+    let record_writes = record_writes_of(&backend, sp.run_once()).await;
+
+    let stats = sp.stats_and_reset();
+    assert_eq!((stats.splits, stats.merges, stats.deferred), (1, 1, 0));
+    assert_eq!(record_writes, 2, "one batch");
+    let root = root_children(&s).await;
+    let children: Vec<_> = root.children().collect();
+    assert_eq!(children.len(), 3, "{children:?}");
+    assert_eq!(children[0], (&b""[..], test_node_id("L1")));
+    assert_eq!(children[1], (&b"m"[..], test_node_id("L2")));
+    assert_eq!(children[2].0, b"o");
+    assert_eq!(keys(&current_node(&s, "L1").await), [b"a", b"b"]);
+    assert_eq!(keys(&current_node(&s, "L2").await), [b"m", b"n"]);
+    assert_no_intents(&s).await;
+}
+
+// A merge into a leaf that also needs a split waits for the split, even when
+// the merge has the higher rate. If the merge ran first, the paid rate of the
+// merged leaf would stop the split.
+#[tokio::test(start_paused = true)]
+async fn a_merge_into_a_leaf_that_needs_a_split_waits_for_the_split() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let s = store_with_backend(backend.clone() as Arc<dyn Backend>);
+    seed_two_leaves(&s, &[b"a"], &[b"m", b"n", b"o"]).await;
+    let bg = Arc::new(Background::new());
+    let sp = rule_restructurer(&s, &bg);
+    push_demand(&sp, ChangeRequest::Merge(LeafId::new(node_path("L0"))), 500);
+    push_demand(&sp, ChangeRequest::Split(LeafId::new(node_path("L1"))), 100);
+
+    let record_writes = record_writes_of(&backend, sp.run_once()).await;
+
+    let stats = sp.stats_and_reset();
+    assert_eq!((stats.splits, stats.merges, stats.deferred), (1, 1, 0));
+    assert_eq!(record_writes, 4, "one batch for the split, then the merge");
+    assert!(current_node(&s, "L0").await.is_drained());
+    let merged = current_node(&s, "L1").await;
+    assert_eq!(merged.low_key(), b"");
+    assert_eq!(keys(&merged)[0], b"a");
+    assert!(keys(&merged).len() < 4, "the merge went into one half");
+    assert_no_intents(&s).await;
+}

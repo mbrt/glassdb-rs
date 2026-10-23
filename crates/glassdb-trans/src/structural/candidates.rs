@@ -245,10 +245,11 @@ impl MaintenanceCandidates {
 
     /// Drains every queued candidate, de-duplicated by path and cause, for one
     /// sweep cycle, and the stale demand candidates that it dropped.
-    /// Splits come before merges (ADR-073). The splits that a size cause asks
-    /// for come first, and then the demand splits with the highest rate, so
-    /// that while the queue is long the splits that remove the most avoidable
-    /// time land first.
+    /// The splits that a size cause asks for come first, because a full leaf
+    /// can stop writes. Then come the demand splits and demand merges with the
+    /// highest rate, so that while the queue is long the changes that remove
+    /// the most avoidable time land first, also after a change of the load.
+    /// The underfull merges come last.
     pub(super) fn drain(&self) -> (Vec<MaintenanceCandidate>, Vec<MaintenanceCandidate>) {
         let mut q = self.queue.lock().unwrap();
         let mut by_path = BTreeMap::<(ObjectPath, u8), MaintenanceCandidate>::new();
@@ -265,9 +266,10 @@ impl MaintenanceCandidates {
             .into_values()
             .partition(|candidate| !candidate.is_stale());
         candidates.sort_by_key(|candidate| match &candidate.cause {
-            CandidateCause::Split(SplitReason::Demand { rate, .. }) => (false, Reverse(*rate)),
-            CandidateCause::Split(_) => (false, Reverse(Duration::MAX)),
-            CandidateCause::Merge(_) => (true, Reverse(Duration::ZERO)),
+            CandidateCause::Split(SplitReason::Demand { rate, .. })
+            | CandidateCause::Merge(MergeReason::Demand { rate }) => (1, Reverse(*rate)),
+            CandidateCause::Split(_) => (0, Reverse(Duration::MAX)),
+            CandidateCause::Merge(MergeReason::Underfull) => (2, Reverse(Duration::ZERO)),
         });
         (candidates, stale)
     }
