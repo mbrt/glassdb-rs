@@ -44,10 +44,15 @@ jobs:
 
     - name: Build the same candidate harness against both revisions
       env:
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
-      run: >-
-        python3 hack/ci/perf_compare.py --base "$BASE_SHA"
-        --output "$PERF_RESULTS" --build-only
+      # Compare the PR head to its fork point, not to the moving tip of main or
+      # to the synthetic merge commit that is checked out, so that unrelated
+      # changes on main do not count as changes of the PR.
+      run: |
+        MERGE_BASE=$(git merge-base "$HEAD_SHA" "$BASE_SHA")
+        python3 hack/ci/perf_compare.py --base "$MERGE_BASE" \
+          --candidate "$HEAD_SHA" --output "$PERF_RESULTS" --build-only
 
     - name: Measure paired workloads until resolved or 32 pairs complete
       timeout-minutes: 90
