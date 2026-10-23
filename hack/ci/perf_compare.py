@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import platform
 from pathlib import Path
 import shutil
@@ -23,8 +22,9 @@ else:
 # Planned checks bound the cost of repeated statistical decisions. Each count is
 # even so both revisions run first equally often at every possible stopping point.
 CHECKPOINTS = [8, 16, 32]
-# Measured processes take about 3–11 seconds, including setup and shutdown.
-# Guard each process against hangs without cutting short the planned samples.
+# Measured processes take well under a second, because they run on virtual time.
+# Guard each process against hangs, such as a CPU livelock that virtual time
+# cannot see.
 PROCESS_TIMEOUT = 120
 CASES = (
     "warm_read",
@@ -36,22 +36,38 @@ CASES = (
     "read_long_keys_large_collection",
     "rmw_shared_leaf_three_transactions",
 )
+# The suffix of the file with the counters of a diagnostic case.
+COUNTERS_SUFFIX = perf_report.COUNTERS_SUFFIX
+# Virtual time charges a long window only as CPU time. A long window averages
+# the jitter of the provider latency out of the percentile samples, so that
+# changes of a few percent remain visible. At 120 s, the timings of several
+# cases needed 16 pairs; at 300 s, 8 pairs resolve all but the mixed workload.
+MEASURE_WINDOW = "300s"
 # The options of every compared process. The experiments come from the
 # built-in configuration of the candidate harness.
 COMMON_ARGS = [
     "--backend=memory",
     "--delays=s3",
-    # Random provider delays obscure code changes in short percentile samples.
-    # Keep provider means, throttling, and the full measurement window.
-    "--latency-jitter=false",
-    "--delay-scale=0.2",
+    # Virtual time makes a run independent of the host.
+    "--time=virtual",
     # The delay profile is not part of the copied harness, so pin its prefix
     # partition depth on both sides.
     "--prefix-depth=3",
+    f'--set=cell.measure.duration="{MEASURE_WINDOW}"',
+    f'--set=cell.measure.max-duration="{MEASURE_WINDOW}"',
     "--runs=1",
     "--drain-timeout=10s",
 ]
+# The provider latency keeps its jitter, so that percentiles are realistic.
 MIXED_ARGS = [*COMMON_ARGS, "--experiment=ci"]
+# Jitter moves the counts of background operations by one per process, so the
+# counters of a case come from a second process without it. They repeat exactly,
+# so the default window is enough.
+COUNTER_ARGS = [
+    *(arg for arg in COMMON_ARGS if not arg.startswith("--set=cell.measure")),
+    "--latency-jitter=false",
+]
+MIXED_COUNTER_ARGS = [*COUNTER_ARGS, "--experiment=ci"]
 
 
 def capture(command: list[str], cwd: Path) -> str:
@@ -157,6 +173,8 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         "cases": CASES,
         "mixedArgs": MIXED_ARGS,
         "diagnosticArgs": [*COMMON_ARGS, "--experiment=diagnostics"],
+        "counterArgs": [*COUNTER_ARGS, "--experiment=diagnostics"],
+        "mixedCounterArgs": MIXED_COUNTER_ARGS,
         "processTimeoutSeconds": PROCESS_TIMEOUT,
         "base": base,
         "candidate": candidate or "working tree",
@@ -228,16 +246,12 @@ def measure(output: Path, manifest: dict) -> None:
             ),
             manifest["cpuModel"],
         )
-    affinity = os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else None
 
-    def run(side, repetition, name, command):
-        if affinity:
-            cpus = manifest["cpuAffinity"] if name == "mixed" else [min(affinity)]
-            os.sched_setaffinity(0, cpus)
+    def run(side, repetition, stem, command):
         directory = output / side / f"{repetition:02d}"
         directory.mkdir(parents=True, exist_ok=True)
-        print(f"{side} repetition {repetition}: {name}", flush=True)
-        with (directory / f"{name}.log").open("w") as log:
+        print(f"{side} repetition {repetition}: {stem}", flush=True)
+        with (directory / f"{stem}.log").open("w") as log:
             subprocess.run(
                 command,
                 cwd=directory,
@@ -249,12 +263,6 @@ def measure(output: Path, manifest: dict) -> None:
         return directory
 
     try:
-        if affinity:
-            # Diagnostics run on one thread and need no migration. Mixed
-            # measurements retain the CI runner's four-CPU width so runtime
-            # contention stays comparable.
-            manifest["cpuAffinity"] = sorted(affinity)[:4]
-            manifest["diagnosticCpu"] = min(affinity)
         active = set(manifest["completedPairs"])
         benchmarks = list(enumerate((*manifest["cases"], "mixed")))
         for stage, checkpoint in enumerate(manifest["checkpoints"]):
@@ -271,20 +279,29 @@ def measure(output: Path, manifest: dict) -> None:
                         ("main", "pr") if (repetition + index) % 2 else ("pr", "main")
                     )
                     for side in sides:
-                        result_path = output / side / f"{repetition:02d}" / f"{name}.json"
+                        directory = output / side / f"{repetition:02d}"
                         if name == "mixed":
-                            arguments = manifest["mixedArgs"]
+                            processes = {
+                                name: manifest["mixedArgs"],
+                                f"{name}{COUNTERS_SUFFIX}": manifest["mixedCounterArgs"],
+                            }
                         else:
-                            arguments = [
-                                *manifest["diagnosticArgs"],
-                                f"--only=case={name}",
-                            ]
-                        command = [
-                            manifest[side]["perfbench"],
-                            f"--output={result_path}",
-                            *arguments,
-                        ]
-                        directory = run(side, repetition, name, command)
+                            only = f"--only=case={name}"
+                            processes = {
+                                name: [*manifest["diagnosticArgs"], only],
+                                f"{name}{COUNTERS_SUFFIX}": [*manifest["counterArgs"], only],
+                            }
+                        for stem, arguments in processes.items():
+                            run(
+                                side,
+                                repetition,
+                                stem,
+                                [
+                                    manifest[side]["perfbench"],
+                                    f"--output={directory / f'{stem}.json'}",
+                                    *arguments,
+                                ],
+                            )
                         _, warnings = perf_report.read_measurement(
                             directory,
                             name,
@@ -317,8 +334,6 @@ def measure(output: Path, manifest: dict) -> None:
         )
         raise
     finally:
-        if affinity:
-            os.sched_setaffinity(0, affinity)
         manifest["runtimeSeconds"] = time.monotonic() - start
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
         (output / "report.md").write_text(

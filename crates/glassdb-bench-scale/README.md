@@ -79,7 +79,7 @@ target/release/perfbench --config my.toml --experiment probe \
   for each axis. CI uses it to run one case of `diagnostics` in each process.
 
 The options that are the same for all experiments are command-line options:
-`--backend`, `--delays`, `--delay-scale`, `--prefix-depth`, `--latency-jitter`,
+`--backend`, `--delays`, `--delay-scale`, `--time`, `--prefix-depth`, `--latency-jitter`,
 `--enable-throttling`, `--runs`, `--run-cooldown`, `--drain-timeout`,
 `--progress`, and `--output`. The result records them, except `--progress`.
 `--progress[=auto|always|never]` controls a progress bar on stderr with the
@@ -97,6 +97,34 @@ of the full GCs) and `--run-cooldown` use wall time, because they protect the
 host. The `wallMs` fields of the result are wall time. The `0.2` default keeps
 S3-profile sleeps above timer granularity; smaller scales are useful only as
 explicitly approximate probes.
+
+`--time=virtual` replaces the compression with virtual time. The process runs
+on one thread with a paused Tokio clock, and model time jumps over each wait of
+an idle process. The engine and `rt` are the same as in a real-time run. A run takes the time
+of its CPU work, not of its model duration. With `--latency-jitter=false`, two
+runs of the same revision give the same result. It needs `--backend=memory`
+and does not combine with `--delay-scale`: a paused clock also jumps while a
+task waits for the operating system, as for the socket of `fakes3`. Latencies
+are 10–25% lower than at the 5× scale, because they have no timer rounding, so
+a comparison must use one mode on both sides. The
+comparison of two revisions in CI uses it, because both sides have the same
+effects and the results repeat. Use it also for fast checks and for a first look
+at the shape of a sweep. These effects make it unfit for the canonical plots and
+for the absolute value of a metric:
+
+- CPU and allocation costs take no model time, so a run shows no saturation of
+  the host.
+- Identical concurrent workers never drift apart, so their transactions batch
+  better than in real time. In the diagnostics case with three transactions on
+  one leaf, they always share one coordinator round (0.33 operations per
+  transaction, against 0.63 in real time). `--latency-jitter` does not change
+  this: the transactions resubmit in the same instant that a round ends, and
+  only CPU time separates them in real time.
+- The watchdogs use virtual time, so only a wall-time limit on the process
+  stops a CPU livelock.
+
+The result records the mode as `timeMode`. Results of different modes are not
+comparable.
 
 ## Merging files
 
@@ -351,7 +379,7 @@ The checks before the first seed:
 ## Result
 
 The result has `schemaVersion` 2. Its envelope has `scenario` (the
-experiment), `backend`, `modelTimeSpeedup`, `latencyJitter`, the command-line
+experiment), `backend`, `timeMode`, `modelTimeSpeedup`, `latencyJitter`, the command-line
 `options`, and the resolved `experiment`: the merged configuration and the
 axes. Each run has its cells. Each cell has:
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -107,14 +106,18 @@ class MeasurementTest(unittest.TestCase):
             "warnings": [],
             "mixedArgs": ["--experiment=ci"],
             "diagnosticArgs": ["--experiment=diagnostics"],
+            "counterArgs": ["--latency-jitter=false", "--experiment=diagnostics"],
+            "mixedCounterArgs": ["--latency-jitter=false", "--experiment=ci"],
             **{side: {"perfbench": str(self.fixture)} for side in ("main", "pr")},
         }
 
-    def order(self):
+    def order(self, kind="timing"):
+        """Return the processes of one kind in the order they started."""
         path = self.root / "order.jsonl"
         if not path.exists():
             return []
-        return [json.loads(line) for line in path.read_text().splitlines()]
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        return [row for row in rows if kind is None or row[3] == kind]
 
     def short_timeout_for(self, side, repetition):
         original = subprocess.run
@@ -142,21 +145,6 @@ class MeasurementTest(unittest.TestCase):
                 self.assertFalse((self.root / "pr").exists())
                 self.assertFalse(self.order())
 
-    @unittest.skipUnless(
-        hasattr(os, "sched_getaffinity"), "CPU affinity requires Linux"
-    )
-    def test_measurements_control_cpu_placement_and_restore_driver_affinity(self):
-        affinity = os.sched_getaffinity(0)
-        self.addCleanup(os.sched_setaffinity, 0, affinity)
-        manifest = self.manifest(cases=("a",))
-        perf_compare.measure(self.root, manifest)
-        self.assertEqual(manifest["cpuAffinity"], sorted(affinity)[:4])
-        self.assertEqual(manifest["diagnosticCpu"], min(affinity))
-        for row in self.order():
-            expected = sorted(affinity)[:4] if row[1] == "mixed" else [min(affinity)]
-            self.assertEqual(row[3], expected)
-        self.assertEqual(os.sched_getaffinity(0), affinity)
-
     def test_fixed_latency_measurements_use_the_requested_profile(self):
         manifest = self.manifest(cases=("a",))
         manifest["mixedArgs"] = ["--latency-jitter=false", "--experiment=ci"]
@@ -166,6 +154,26 @@ class MeasurementTest(unittest.TestCase):
         for side in ("main", "pr"):
             result = json.loads((self.root / side / "01/mixed.json").read_text())
             self.assertIs(result["latencyJitter"], False)
+
+    def test_every_benchmark_measures_its_counters_without_latency_jitter(self):
+        manifest = self.manifest(cases=("a",))
+        perf_compare.measure(self.root, manifest)
+        self.assertFalse(manifest["warnings"])
+        for side in ("main", "pr"):
+            for name in ("a", "mixed"):
+                directory = self.root / side / "01"
+                timing = json.loads((directory / f"{name}.json").read_text())
+                counters = json.loads((directory / f"{name}.counters.json").read_text())
+                self.assertIs(timing["latencyJitter"], True)
+                self.assertIs(counters["latencyJitter"], False)
+        started = self.order(kind=None)
+        self.assertEqual([row[3] for row in started[:4]], ["timing", "counters"] * 2)
+
+    def test_the_default_plan_measures_every_process_on_virtual_time(self):
+        self.assertIn("--time=virtual", perf_compare.COMMON_ARGS)
+        self.assertFalse(
+            [arg for arg in perf_compare.COMMON_ARGS if arg.startswith("--delay-scale")]
+        )
 
     def test_wrong_latency_profile_fails_before_counting_the_pair(self):
         self.configure(latencyJitter=True)
@@ -319,8 +327,8 @@ case = only[0] if only else 'mixed'
 factors = settings.get('factors', {}).get(case, [1])
 factor = factors[(repetition - 1) % len(factors)] if side == 'pr' else 1
 with (root / 'order.jsonl').open('a') as log:
-    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None
-    log.write(json.dumps([repetition, case, side, affinity]) + '\n')
+    kind = 'counters' if '.counters.json' in ' '.join(sys.argv) else 'timing'
+    log.write(json.dumps([repetition, case, side, kind]) + '\n')
 if settings.get('failAt') == [repetition, case, side]:
     sys.exit(7)
 if settings.get('hangAt') == [repetition, case, side]:
@@ -328,28 +336,28 @@ if settings.get('hangAt') == [repetition, case, side]:
     time.sleep(5)
 jitter = settings.get('latencyJitter', '--latency-jitter=false' not in sys.argv)
 output = Path([arg for arg in sys.argv if arg.startswith('--output=')][0].split('=', 1)[1])
+counters = {name: 0 for name in ('reads', 'writes', 'lists', 'readBodyBytes',
+    'writeBodyBytes', 'coordinatorSubmissions', 'coordinatorRounds')}
+costs = {'transactions': 30,
+    **{window: counters for window in ('workload', 'shutdown', 'combined')}}
+costs = settings.get('costRecord', costs)
+if settings.get('badCostAt') == [repetition, case, side]:
+    costs = {}
 if case == 'mixed':
     shapes = [{'shape': name, 'committed': 200, 'converged': True,
         'p50Ms': 10, 'p90Ms': 20, 'txPerSec': 100}
         for name in ('rw-single', 'rw-many', 'ro-single', 'ro-multi')]
     shapes[0]['p50Ms'] *= factor
     cell = {'workload': 'low-conflict', 'affinityPct': 100, 'databases': 1,
-        'workersPerShape': 1, 'failures': 0, 'shapes': shapes}
+        'workersPerShape': 1, 'failures': 0, 'shapes': shapes, 'costs': costs}
     experiment = 'ci'
 else:
-    counters = {name: 0 for name in ('reads', 'writes', 'lists', 'readBodyBytes',
-        'writeBodyBytes', 'coordinatorSubmissions', 'coordinatorRounds')}
-    costs = {'transactions': 30,
-        **{window: counters for window in ('workload', 'shutdown', 'combined')}}
-    costs = settings.get('costRecord', costs)
-    if settings.get('badCostAt') == [repetition, case, side]:
-        costs = {}
     mean = 100 * factor
     cell = {'labels': {'case': case}, 'failures': 0, 'costs': costs,
         'shapes': [{'shape': case, 'meanMs': mean, 'meanSeMs': 0.05}]}
     experiment = 'diagnostics'
 result = {'schemaVersion': 2, 'scenario': experiment, 'backend': 'memory',
-    'latencyJitter': jitter, 'modelTimeSpeedup': 5,
+    'latencyJitter': jitter, 'timeMode': 'virtual', 'modelTimeSpeedup': 1,
     'runs': [{'run': 1, 'cells': [cell]}]}
 output.write_text(json.dumps(result))
 """

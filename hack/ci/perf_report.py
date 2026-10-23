@@ -15,8 +15,13 @@ from pathlib import Path
 DIAGNOSTIC_MODEL = {
     "backend": "memory",
     "latencyJitter": False,
-    "modelTimeSpeedup": 5,
+    # Virtual time is not compressed: the paused clock is the model clock.
+    "timeMode": "virtual",
+    "modelTimeSpeedup": 1,
 }
+
+# The suffix of the file with the counters of a diagnostic case.
+COUNTERS_SUFFIX = ".counters"
 
 MIXED_SHAPES = ("rw-single", "rw-many", "ro-single", "ro-multi")
 MIXED_METRICS = (
@@ -85,6 +90,9 @@ def read_report(path: Path, experiment: str) -> dict:
         report.get("schemaVersion") != 2
         or report.get("scenario") != experiment
         or report.get("backend") != DIAGNOSTIC_MODEL["backend"]
+        # A result of an older harness has no time mode and ran on real time,
+        # which measures different latencies.
+        or report.get("timeMode") != DIAGNOSTIC_MODEL["timeMode"]
         or report.get("modelTimeSpeedup") != DIAGNOSTIC_MODEL["modelTimeSpeedup"]
     ):
         raise ReportError(f"unsupported {experiment} schema or backend model")
@@ -131,36 +139,46 @@ def read_measurement(
     return metrics, warnings
 
 
-def load_diagnostics(
-    directory, name, metrics, warnings, side, repetition, *, latency_jitter=False
-):
+def read_diagnostic_cell(path, name, latency_jitter):
+    """Read the cell of one diagnostic case, checking its latency profile."""
+    report = read_report(path, "diagnostics")
+    if report.get("latencyJitter", True) is not latency_jitter:
+        raise ReportError("diagnostic latency profile differs from comparison settings")
+    cell = report["runs"][0]["cells"][0]
+    if cell["failures"] or cell["labels"].get("case") != name:
+        raise ReportError("diagnostic cell failed or its case changed")
+    return cell
+
+
+def read_mixed_cell(path, latency_jitter):
+    """Read the cell of the mixed workload, checking its latency profile."""
+    mixed = read_report(path, "ci")
+    if mixed.get("latencyJitter", True) is not latency_jitter:
+        raise ReportError("mixed latency profile differs from comparison settings")
+    cell = mixed["runs"][0]["cells"][0]
+    if (
+        cell["failures"]
+        or cell["workload"] != "low-conflict"
+        or cell["affinityPct"] != 100
+        or cell["databases"] != 1
+        or cell["workersPerShape"] != 1
+    ):
+        raise ReportError("mixed cell failed or settings changed")
+    return cell
+
+
+def load_costs(read_cell, name, metrics, warnings, side, repetition):
+    """Read the counters of a benchmark from its process without jitter.
+
+    Jitter moves the count of background operations, such as listings of the
+    garbage collector, by one per process, which the counters cannot tell from
+    a change. Without jitter, the counters repeat exactly.
+    """
     try:
-        report = read_report(directory / f"{name}.json", "diagnostics")
-        if report.get("latencyJitter", True) is not latency_jitter:
-            raise ReportError("diagnostic latency profile differs from comparison settings")
-        cell = report["runs"][0]["cells"][0]
-        if cell["failures"] or cell["labels"].get("case") != name:
-            raise ReportError("diagnostic cell failed or its case changed")
-        (shape,) = cell["shapes"]
-        costs = cell["costs"]
-    except (ReportError, KeyError, TypeError, ValueError) as error:
-        warnings.append(f"{side}/{repetition}/{name}: invalid diagnostic measurement ({error})")
+        costs = read_cell()["costs"]
+    except (ReportError, KeyError, TypeError, ValueError, IndexError) as error:
+        warnings.append(f"{side}/{repetition}/{name}: invalid counter measurement ({error})")
         return
-    try:
-        mean, error = number(shape["meanMs"]), number(shape["meanSeMs"])
-        # The interval of the mean latency within one process, from its samples.
-        add(
-            metrics,
-            f"{name}: mean transaction time",
-            "model ms/tx",
-            "time",
-            mean,
-            max(mean - 1.96 * error, 0),
-            mean + 1.96 * error,
-            error,
-        )
-    except (ReportError, KeyError, TypeError) as error:
-        warnings.append(f"{side}/{repetition}/{name}: missing or invalid latency ({error})")
     try:
         if number(costs["transactions"]) == 0:
             raise ReportError("no completed transactions")
@@ -180,20 +198,45 @@ def load_diagnostics(
         warnings.append(f"{side}/{repetition}: invalid cost measurements ({error})")
 
 
+def load_diagnostics(
+    directory, name, metrics, warnings, side, repetition, *, latency_jitter=False
+):
+    try:
+        cell = read_diagnostic_cell(directory / f"{name}.json", name, latency_jitter)
+        (shape,) = cell["shapes"]
+    except (ReportError, KeyError, TypeError, ValueError) as error:
+        warnings.append(f"{side}/{repetition}/{name}: invalid diagnostic measurement ({error})")
+        return
+    try:
+        mean, error = number(shape["meanMs"]), number(shape["meanSeMs"])
+        # The interval of the mean latency within one process, from its samples.
+        add(
+            metrics,
+            f"{name}: mean transaction time",
+            "model ms/tx",
+            "time",
+            mean,
+            max(mean - 1.96 * error, 0),
+            mean + 1.96 * error,
+            error,
+        )
+    except (ReportError, KeyError, TypeError) as error:
+        warnings.append(f"{side}/{repetition}/{name}: missing or invalid latency ({error})")
+    load_costs(
+        lambda: read_diagnostic_cell(
+            directory / f"{name}{COUNTERS_SUFFIX}.json", name, False
+        ),
+        name,
+        metrics,
+        warnings,
+        side,
+        repetition,
+    )
+
+
 def load_mixed(directory, metrics, warnings, side, repetition, *, latency_jitter=True):
     try:
-        mixed = read_report(directory / "mixed.json", "ci")
-        if mixed.get("latencyJitter", True) is not latency_jitter:
-            raise ReportError("mixed latency profile differs from comparison settings")
-        cell = mixed["runs"][0]["cells"][0]
-        if (
-            cell["failures"]
-            or cell["workload"] != "low-conflict"
-            or cell["affinityPct"] != 100
-            or cell["databases"] != 1
-            or cell["workersPerShape"] != 1
-        ):
-            raise ReportError("mixed cell failed or settings changed")
+        cell = read_mixed_cell(directory / "mixed.json", latency_jitter)
         shapes = cell["shapes"]
         if len(shapes) != len(MIXED_SHAPES) or {
             shape["shape"] for shape in shapes
@@ -210,6 +253,14 @@ def load_mixed(directory, metrics, warnings, side, repetition, *, latency_jitter
                 add(metrics, f"mixed/{name}: {key}", unit, kind, shape[key])
     except (ReportError, KeyError, TypeError, IndexError) as error:
         warnings.append(f"{side}/{repetition}: invalid mixed measurements ({error})")
+    load_costs(
+        lambda: read_mixed_cell(directory / f"mixed{COUNTERS_SUFFIX}.json", False),
+        "mixed",
+        metrics,
+        warnings,
+        side,
+        repetition,
+    )
 
 
 @lru_cache(maxsize=None)

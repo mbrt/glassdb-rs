@@ -19,7 +19,7 @@ jobs:
   compare:
     name: Compare to main
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 60
     env:
       PERF_RESULTS: ${{ github.workspace }}/target/performance/results/ci
     steps:
@@ -39,10 +39,10 @@ jobs:
     - name: Install uv
       uses: astral-sh/setup-uv@v6
 
-    - name: Test benchmarks and comparison tools
+    - name: Test benchmarks and tools
       run: make test-bench
 
-    - name: Build the same candidate harness against both revisions
+    - name: Build harness
       env:
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -54,10 +54,12 @@ jobs:
         python3 hack/ci/perf_compare.py --base "$MERGE_BASE" \
           --candidate "$HEAD_SHA" --output "$PERF_RESULTS" --build-only
 
-    - name: Measure paired workloads until resolved or 32 pairs complete
-      timeout-minutes: 90
-      # A full 32-pair comparison takes about 40 minutes. This guards the driver;
-      # individual benchmark processes have their own two-minute timeout.
+    - name: Measure workloads
+      timeout-minutes: 10
+      # The processes run on virtual time. A comparison that resolves at 8 to 16
+      # pairs takes about a minute, and a full 32-pair comparison a few minutes.
+      # This guards the driver; individual benchmark processes have their own
+      # two-minute timeout.
       run: python3 hack/ci/perf_compare.py --output "$PERF_RESULTS" --run-only
 
     - name: Render job summary
@@ -69,7 +71,7 @@ jobs:
           echo 'Performance comparison failed before measurements. See build logs.' >> "$GITHUB_STEP_SUMMARY"
         fi
 
-    - name: Hide old performance comments
+    - name: Hide old comments
       if: >-
         success() && github.event.pull_request.head.repo.full_name == github.repository &&
         github.actor != 'dependabot[bot]'
@@ -99,7 +101,7 @@ jobs:
             `)
           }
 
-    - name: Comment on pull request
+    - name: Comment
       if: >-
         success() && github.event.pull_request.head.repo.full_name == github.repository &&
         github.actor != 'dependabot[bot]'
@@ -111,7 +113,7 @@ jobs:
         gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"
         --body-file "$PERF_RESULTS/report.md"
 
-    - name: Upload performance results
+    - name: Upload results
       if: ${{ always() }}
       uses: actions/upload-artifact@v4
       with:

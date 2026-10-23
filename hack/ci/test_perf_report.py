@@ -22,44 +22,45 @@ class PerfReportTest(unittest.TestCase):
             for repetition in range(1, 4):
                 path = self.root / side / f"{repetition:02d}"
                 self.write(path / "example.json", self.diagnostic(100, 0.05))
+                self.write(path / "mixed.json", self.mixed())
+                # The counters come from a process without latency jitter.
                 self.write(
-                    path / "mixed.json",
-                    self.envelope(
-                        "ci",
-                        {
-                            "workload": "low-conflict",
-                            "affinityPct": 100,
-                            "databases": 1,
-                            "workersPerShape": 1,
-                            "failures": 0,
-                            "shapes": [
-                                {
-                                    "shape": name,
-                                    "committed": 200,
-                                    "converged": True,
-                                    "meanMs": 10,
-                                    "p50Ms": 10,
-                                    "p90Ms": 20,
-                                    "txPerSec": 100,
-                                }
-                                for name in perf_report.MIXED_SHAPES
-                            ],
-                        },
-                    ),
+                    path / "example.counters.json",
+                    {**self.diagnostic(100, 0.05), "latencyJitter": False},
+                )
+                self.write(
+                    path / "mixed.counters.json",
+                    {**self.mixed(), "latencyJitter": False},
                 )
 
-    @staticmethod
-    def envelope(experiment, cell):
-        return {
-            "schemaVersion": 2,
-            "scenario": experiment,
-            "backend": "memory",
-            "modelTimeSpeedup": 5,
-            "runs": [{"run": 1, "cells": [cell]}],
-        }
-
     @classmethod
-    def diagnostic(cls, mean, error):
+    def mixed(cls):
+        return cls.envelope(
+            "ci",
+            {
+                "workload": "low-conflict",
+                "affinityPct": 100,
+                "databases": 1,
+                "workersPerShape": 1,
+                "failures": 0,
+                "shapes": [
+                    {
+                        "shape": name,
+                        "committed": 200,
+                        "converged": True,
+                        "meanMs": 10,
+                        "p50Ms": 10,
+                        "p90Ms": 20,
+                        "txPerSec": 100,
+                    }
+                    for name in perf_report.MIXED_SHAPES
+                ],
+                "costs": cls.costs_record(),
+            },
+        )
+
+    @staticmethod
+    def costs_record():
         counters = {
             key: 0
             for key in (
@@ -72,19 +73,31 @@ class PerfReportTest(unittest.TestCase):
                 "coordinatorRounds",
             )
         }
+        return {
+            "transactions": 30,
+            **{window: counters.copy() for window in ("workload", "shutdown", "combined")},
+        }
+
+    @staticmethod
+    def envelope(experiment, cell):
+        return {
+            "schemaVersion": 2,
+            "scenario": experiment,
+            "backend": "memory",
+            "timeMode": "virtual",
+            "modelTimeSpeedup": 1,
+            "runs": [{"run": 1, "cells": [cell]}],
+        }
+
+    @classmethod
+    def diagnostic(cls, mean, error):
         return cls.envelope(
             "diagnostics",
             {
                 "labels": {"case": "example"},
                 "failures": 0,
                 "shapes": [{"shape": "example", "meanMs": mean, "meanSeMs": error}],
-                "costs": {
-                    "transactions": 30,
-                    **{
-                        window: counters.copy()
-                        for window in ("workload", "shutdown", "combined")
-                    },
-                },
+                "costs": cls.costs_record(),
             },
         )
 
@@ -393,10 +406,11 @@ class PerfReportTest(unittest.TestCase):
             },
         )
         for side in ("main", "pr"):
-            self.write(
-                self.root / side / "04/mixed.json",
-                json.loads((self.root / side / "03/mixed.json").read_text()),
-            )
+            for name in ("mixed.json", "mixed.counters.json"):
+                self.write(
+                    self.root / side / "04" / name,
+                    json.loads((self.root / side / "03" / name).read_text()),
+                )
         self.assertNotIn("Measurement warnings", self.report())
         (self.root / "pr/04/mixed.json").unlink()
         self.assertIn("incomplete paired measurements", self.report())
@@ -491,7 +505,7 @@ class PerfReportTest(unittest.TestCase):
 
     def test_repeatable_cost_change_from_zero_is_visible(self):
         self.edit(
-            "example.json",
+            "example.counters.json",
             lambda value: self.costs(value)["shutdown"].update(writeBodyBytes=0.125),
         )
         report = self.report()
@@ -560,7 +574,7 @@ class PerfReportTest(unittest.TestCase):
         )
         self.assertIn("insufficient latency/throughput observations", self.report())
         self.edit(
-            "example.json",
+            "example.counters.json",
             lambda value: self.costs(value)["workload"].update(reads=float("nan")),
         )
         self.assertIn("invalid cost measurements", self.report())
@@ -579,7 +593,11 @@ class PerfReportTest(unittest.TestCase):
         self.assertIn("example/workload: reads", metrics)
         for key, value in (
             ("backend", "s3"),
-            ("modelTimeSpeedup", 20),
+            ("modelTimeSpeedup", 5),
+            # A result of real time, with or without a time mode, measures
+            # other latencies.
+            ("timeMode", "real"),
+            ("timeMode", None),
             ("schemaVersion", 1),
             ("scenario", "mixed"),
         ):
@@ -600,7 +618,7 @@ class PerfReportTest(unittest.TestCase):
         self.assertIn("latency profile", warnings[0])
 
     def test_model_mismatch_is_not_compared(self):
-        self.edit("mixed.json", lambda value: value.update(modelTimeSpeedup=1))
+        self.edit("mixed.json", lambda value: value.update(modelTimeSpeedup=5))
         self.assertIn("unsupported ci schema or backend model", self.report())
 
 

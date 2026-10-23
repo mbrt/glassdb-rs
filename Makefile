@@ -40,12 +40,15 @@ lint:
 format:
 	cargo fmt --all
 
-# Run the perfbench experiments. The default runs the mixed workloads; select
-# another with EXPERIMENT, for example `make bench EXPERIMENT=diagnostics`.
-# crates/glassdb-bench-scale/README.md explains the experiments.
+# Run the perfbench experiments on virtual time, with the latency jitter of the
+# provider. The default runs the mixed workloads; select another with EXPERIMENT,
+# for example `make bench EXPERIMENT=diagnostics`. Virtual time is fast and
+# repeatable, but it does not show CPU saturation: use real time for the
+# canonical plots (crates/glassdb-bench-scale/README.md explains the
+# experiments and the time modes).
 bench:
 	cargo run --release -p glassdb-bench-scale --bin perfbench -- \
-		--experiment=$(or $(EXPERIMENT),mixed)
+		--time=virtual --experiment=$(or $(EXPERIMENT),mixed)
 
 # Record a CPU flamegraph to guide profiling work (a diagnostic aid only -
 # excluded from `test` and benchmarks; it changes no
