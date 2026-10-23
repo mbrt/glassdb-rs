@@ -639,7 +639,7 @@ mod tests {
     #[test]
     fn every_builtin_experiment_plans_its_cells_and_chains() -> Result<(), Box<dyn Error>> {
         let names = Selection::default().experiment_names()?;
-        assert!(names.len() >= 10, "{names:?}");
+        assert!(names.len() >= 9, "{names:?}");
         for name in names {
             let resolved = Selection {
                 experiment: name.clone(),
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn only_keeps_one_value_of_a_coupled_axis() -> Result<(), Box<dyn Error>> {
         let mut selection = Selection {
-            experiment: "diagnostics".into(),
+            experiment: "suite".into(),
             only: vec!["case=warm_read".into()],
             ..Selection::default()
         };

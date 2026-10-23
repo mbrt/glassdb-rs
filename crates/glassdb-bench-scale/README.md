@@ -76,7 +76,7 @@ target/release/perfbench --config my.toml --experiment probe \
   paths, and they keep the value of `set` or the default. `VALUE` is a TOML
   value, for example `--set 'cell.affinity=50'`.
 - `--only AXIS=LABEL` keeps only one value of an axis. It can be given once
-  for each axis. CI uses it to run one case of `diagnostics` in each process.
+  for each axis. For example, `--experiment=suite --only=case=warm_read` runs one case.
 
 The options that are the same for all experiments are command-line options:
 `--backend`, `--delays`, `--delay-scale`, `--time`, `--prefix-depth`, `--latency-jitter`,
@@ -102,7 +102,11 @@ explicitly approximate probes.
 on one thread with a paused Tokio clock, and model time jumps over each wait of
 an idle process. The engine and `rt` are the same as in a real-time run. A run takes the time
 of its CPU work, not of its model duration. With `--latency-jitter=false`, two
-runs of the same revision give the same result. It needs `--backend=memory`
+runs of the same revision give nearly the same result: the engine randomizes
+the cadence of its background tasks, so a window that holds a pass of the
+garbage collector can count one listing more or less, and records with a
+timestamp can change their size by a byte with the start time of the process.
+This moves the latency of large writes by under 1%. It needs `--backend=memory`
 and does not combine with `--delay-scale`: a paused clock also jumps while a
 task waits for the operating system, as for the socket of `fakes3`. Latencies
 are 10–25% lower than at the 5× scale, because they have no timer rounding, so
@@ -423,7 +427,7 @@ comparison and plot tools.
 | Experiment | What it measures |
 | --- | --- |
 | `mixed` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
-| `ci` | One short `low-conflict` cell of fixed length, for the CI comparison. |
+| `suite` | Single transactions of one worker with warm caches, and their backend costs, and a `shapes_shared_leaf` case of four shapes at the same time on one leaf. Each case is one value of the axis `case`, with the same settings and a fixed length of 10 s. One run measures all of them. It is the experiment of the CI comparison and of `make bench`. |
 | `workers` | The worker grid of the canonical plots: 1 to 200 workers per shape, each count after the warm-up of the count before it. |
 | `affinity` | The affinity grid of the canonical plots: 5 affinities × 1, 3, 5, and 7 database instances. |
 | `load-shift` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
@@ -431,7 +435,6 @@ comparison and plot tools.
 | `inline-pressure` | How leaves adapt when their aggregate inline budget is full (ADR-056, ADR-074): passes over the next keys until one pass commits without locks. |
 | `split-merge-fight` | A stable load under which the topology policies of three instances disagree, with the `avoidable`, `fixed-1`, and `fixed-2` policies. |
 | `membership-churn` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
-| `diagnostics` | Single transactions of one worker with warm caches, and their backend costs. Each case is one value of the axis `case`. |
 
 ### Mixed workloads
 
@@ -483,12 +486,12 @@ collections of the largest cell of the chain, and each cell uses the first of
 them. `hack/perf/README.md` explains the plots and the comparison tools, and
 `hack/aws-bench/README.md` the real-S3 runner.
 
-### Diagnostics
+### Suite cases
 
-The `diagnostics` experiment replaces the Criterion suite of `glassdb`. Each
-case runs one worker on one instance with warm caches, the S3 delay profile
-without variance, and the 5× model clock. A case warms up for 1250 ms and
-measures for 10 s of model time. Most cases are built-in parts:
+The cases of the `suite` experiment replace the Criterion suite of `glassdb`.
+Except for the last one, each case runs one worker on one instance with warm
+caches. A case warms up for 1250 ms and measures for 10 s of model time. Most
+cases are built-in parts:
 
 | Case | Shape |
 | --- | --- |
@@ -500,5 +503,6 @@ measures for 10 s of model time. Most cases are built-in parts:
 | `rmw_five_leaves` | One key in each of five collections (`collections = 5`). |
 | `read_long_keys_large_collection` | A read in a collection of 1,024 keys of 256 bytes (`key-bytes = 256`), after its splits. |
 | `rmw_shared_leaf_three_transactions` | Three workers that update their own key of one leaf. |
+| `shapes_shared_leaf` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time on one leaf, with `low-conflict` keys. |
 
 The `costs` of each cell are the numbers that the CI comparison checks.

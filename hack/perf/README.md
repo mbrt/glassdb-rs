@@ -55,8 +55,8 @@ JSON schema. `make test-bench` runs their tests.
 
 `compare_refs.sh` uses the same comparison driver as CI. It copies the
 candidate's `glassdb-bench-scale` crate into disposable snapshots of both
-revisions, then builds each against its own engine. It runs the `ci` and
-`diagnostics` experiments. The current source tree is not
+revisions, then builds each against its own engine. It runs the `suite`
+experiment. The current source tree is not
 changed. Unsupported engine APIs fail the comparison; old workloads are not
 silently substituted.
 
@@ -111,15 +111,16 @@ sample count per line).
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `EXPERIMENT` | `diagnostics` | The perfbench experiment. |
-| `CASE` | all cases | One case of the `diagnostics` experiment. |
-| `SECONDS_PER_CASE` | `10` | Measured wall time of each `diagnostics` case. |
+| `EXPERIMENT` | `suite` | The perfbench experiment. |
+| `CASE` | all cases | One case of the `suite` experiment. |
+| `SECONDS_PER_CASE` | `10` | Measured wall time of each `suite` case. |
 | `OUT` | `hack/perf` | Output directory for artifacts. |
 
 ### Target
 
-The script profiles one perfbench experiment, by default `diagnostics`: the
-single transactions of one worker with warm caches. The seed and the warm-up
+The script profiles one perfbench experiment, by default `suite`: the
+single transactions of one worker with warm caches, and four shapes at the same
+time on one leaf. The seed and the warm-up
 appear in the profile; use the transaction stacks to inspect measured work.
 `CASE` selects one case of the experiment.
 

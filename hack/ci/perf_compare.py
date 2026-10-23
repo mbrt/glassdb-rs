@@ -7,12 +7,13 @@ import argparse
 import hashlib
 import json
 import platform
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from pathlib import Path
+from typing import Any
 
 if __package__:
     from . import perf_report
@@ -22,7 +23,7 @@ else:
 # Planned checks bound the cost of repeated statistical decisions. Each count is
 # even so both revisions run first equally often at every possible stopping point.
 CHECKPOINTS = [8, 16, 32]
-# Measured processes take well under a second, because they run on virtual time.
+# A process runs all cases on virtual time and takes a few seconds.
 # Guard each process against hangs, such as a CPU livelock that virtual time
 # cannot see.
 PROCESS_TIMEOUT = 120
@@ -35,16 +36,14 @@ CASES = (
     "rmw_five_leaves",
     "read_long_keys_large_collection",
     "rmw_shared_leaf_three_transactions",
+    perf_report.SHARED_LEAF_CASE,
 )
-# The suffix of the file with the counters of a diagnostic case.
-COUNTERS_SUFFIX = perf_report.COUNTERS_SUFFIX
 # Virtual time charges a long window only as CPU time. A long window averages
 # the jitter of the provider latency out of the percentile samples, so that
-# changes of a few percent remain visible. At 120 s, the timings of several
-# cases needed 16 pairs; at 300 s, 8 pairs resolve all but the mixed workload.
+# changes of a few percent remain visible.
 MEASURE_WINDOW = "300s"
-# The options of every compared process. The experiments come from the
-# built-in configuration of the candidate harness.
+# The options of every compared process. The experiment comes from the built-in
+# configuration of the candidate harness, and runs all cases in one process.
 COMMON_ARGS = [
     "--backend=memory",
     "--delays=s3",
@@ -53,21 +52,23 @@ COMMON_ARGS = [
     # The delay profile is not part of the copied harness, so pin its prefix
     # partition depth on both sides.
     "--prefix-depth=3",
-    f'--set=cell.measure.duration="{MEASURE_WINDOW}"',
-    f'--set=cell.measure.max-duration="{MEASURE_WINDOW}"',
     "--runs=1",
     "--drain-timeout=10s",
+    f"--experiment={perf_report.SUITE}",
 ]
-# The provider latency keeps its jitter, so that percentiles are realistic.
-MIXED_ARGS = [*COMMON_ARGS, "--experiment=ci"]
+# The latency comes from a process that keeps the jitter of the provider, so
+# that percentiles are realistic.
+LATENCY_JITTER = True
+TIMING_ARGS = [
+    *COMMON_ARGS,
+    f"--latency-jitter={str(LATENCY_JITTER).lower()}",
+    f'--set=cell.measure.duration="{MEASURE_WINDOW}"',
+    f'--set=cell.measure.max-duration="{MEASURE_WINDOW}"',
+]
 # Jitter moves the counts of background operations by one per process, so the
-# counters of a case come from a second process without it. They repeat exactly,
-# so the default window is enough.
-COUNTER_ARGS = [
-    *(arg for arg in COMMON_ARGS if not arg.startswith("--set=cell.measure")),
-    "--latency-jitter=false",
-]
-MIXED_COUNTER_ARGS = [*COUNTER_ARGS, "--experiment=ci"]
+# counters come from a second process without it. They repeat exactly, so the
+# default window is enough.
+COUNTER_ARGS = [*COMMON_ARGS, "--latency-jitter=false"]
 
 
 def capture(command: list[str], cwd: Path) -> str:
@@ -166,15 +167,14 @@ def build(
 
 def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
     output.mkdir(parents=True, exist_ok=False)
-    manifest = {
-        "schemaVersion": 2,
+    manifest: dict[str, Any] = {
+        "schemaVersion": perf_report.MANIFEST_VERSION,
         "checkpoints": CHECKPOINTS,
-        "completedPairs": {name: 0 for name in (*CASES, "mixed")},
-        "cases": CASES,
-        "mixedArgs": MIXED_ARGS,
-        "diagnosticArgs": [*COMMON_ARGS, "--experiment=diagnostics"],
-        "counterArgs": [*COUNTER_ARGS, "--experiment=diagnostics"],
-        "mixedCounterArgs": MIXED_COUNTER_ARGS,
+        "completedPairs": 0,
+        "cases": list(CASES),
+        "latencyJitter": LATENCY_JITTER,
+        "timingArgs": TIMING_ARGS,
+        "counterArgs": COUNTER_ARGS,
         "processTimeoutSeconds": PROCESS_TIMEOUT,
         "base": base,
         "candidate": candidate or "working tree",
@@ -223,7 +223,7 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
 
 def measure(output: Path, manifest: dict) -> None:
     perf_report.validate_manifest(manifest)
-    if manifest["schemaVersion"] != 2 or any(manifest["completedPairs"].values()):
+    if manifest["completedPairs"]:
         raise ValueError("measurement requires a new checkpoint comparison")
     process_timeout = perf_report.number(manifest.get("processTimeoutSeconds"))
     if process_timeout == 0:
@@ -247,79 +247,58 @@ def measure(output: Path, manifest: dict) -> None:
             manifest["cpuModel"],
         )
 
-    def run(side, repetition, stem, command):
+    def run_suite(side, repetition):
+        """Run the suite twice, for the latency and for the counters."""
         directory = output / side / f"{repetition:02d}"
         directory.mkdir(parents=True, exist_ok=True)
-        print(f"{side} repetition {repetition}: {stem}", flush=True)
-        with (directory / f"{stem}.log").open("w") as log:
-            subprocess.run(
-                command,
-                cwd=directory,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                timeout=process_timeout,
-                check=True,
-            )
+        for stem, arguments in (
+            ("timing", manifest["timingArgs"]),
+            ("counters", manifest["counterArgs"]),
+        ):
+            print(f"{side} repetition {repetition}: {stem}", flush=True)
+            command = [
+                manifest[side]["perfbench"],
+                f"--output={directory / f'{stem}.json'}",
+                *arguments,
+            ]
+            with (directory / f"{stem}.log").open("w") as log:
+                subprocess.run(
+                    command,
+                    cwd=directory,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    timeout=process_timeout,
+                    check=True,
+                )
         return directory
 
     try:
-        active = set(manifest["completedPairs"])
-        benchmarks = list(enumerate((*manifest["cases"], "mixed")))
-        for stage, checkpoint in enumerate(manifest["checkpoints"]):
-            # Alternate order so mixed is not always measured after diagnostics.
-            benchmark_order = benchmarks if stage % 2 == 0 else reversed(benchmarks)
-            for index, name in benchmark_order:
-                if name not in active:
-                    continue
-                for repetition in range(
-                    manifest["completedPairs"][name] + 1, checkpoint + 1
-                ):
-                    # Adjacent pairs limit host drift.
-                    sides = (
-                        ("main", "pr") if (repetition + index) % 2 else ("pr", "main")
+        for checkpoint in manifest["checkpoints"]:
+            for repetition in range(manifest["completedPairs"] + 1, checkpoint + 1):
+                # Adjacent pairs limit host drift.
+                sides = ("main", "pr") if repetition % 2 else ("pr", "main")
+                for side in sides:
+                    directory = run_suite(side, repetition)
+                    _, warnings = perf_report.read_measurement(
+                        directory,
+                        manifest["cases"],
+                        latency_jitter=manifest["latencyJitter"],
                     )
-                    for side in sides:
-                        directory = output / side / f"{repetition:02d}"
-                        if name == "mixed":
-                            processes = {
-                                name: manifest["mixedArgs"],
-                                f"{name}{COUNTERS_SUFFIX}": manifest["mixedCounterArgs"],
-                            }
-                        else:
-                            only = f"--only=case={name}"
-                            processes = {
-                                name: [*manifest["diagnosticArgs"], only],
-                                f"{name}{COUNTERS_SUFFIX}": [*manifest["counterArgs"], only],
-                            }
-                        for stem, arguments in processes.items():
-                            run(
-                                side,
-                                repetition,
-                                stem,
-                                [
-                                    manifest[side]["perfbench"],
-                                    f"--output={directory / f'{stem}.json'}",
-                                    *arguments,
-                                ],
-                            )
-                        _, warnings = perf_report.read_measurement(
-                            directory,
-                            name,
-                            mixed_args=manifest["mixedArgs"],
-                        )
-                        if warnings:
-                            raise perf_report.ReportError("; ".join(warnings))
-                    # A timeout during either side leaves this pair uncounted.
-                    manifest["completedPairs"][name] = repetition
-                result = perf_report.analyze_benchmark(output, manifest, name)
-                if result.warnings:
-                    raise perf_report.ReportError("; ".join(result.warnings))
-                state = "resolved" if result.resolved else "inconclusive"
-                print(f"{name}: {checkpoint} pairs, {state}", flush=True)
-                if result.resolved:
-                    active.remove(name)
-                (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
-            if not active:
+                    if warnings:
+                        raise perf_report.ReportError("; ".join(warnings))
+                # A timeout during either side leaves this pair uncounted.
+                manifest["completedPairs"] = repetition
+            result = perf_report.analyze(output, manifest)
+            if result.warnings:
+                raise perf_report.ReportError("; ".join(result.warnings))
+            state = (
+                "resolved"
+                if result.resolved
+                else f"inconclusive: {len(result.unresolved)} metrics"
+            )
+            print(f"{checkpoint} pairs, {state}", flush=True)
+            (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
+            if result.resolved:
                 break
     except subprocess.TimeoutExpired as error:
         manifest["warnings"].append(

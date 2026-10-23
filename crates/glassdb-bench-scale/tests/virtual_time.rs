@@ -19,18 +19,29 @@ fn perfbench(arguments: &[&str]) -> Output {
         .unwrap()
 }
 
-fn virtual_ci_report() -> Value {
-    let output = perfbench(&[&MEMORY_MODEL[..], &["--time=virtual", "--experiment=ci"]].concat());
+fn virtual_suite_report() -> Value {
+    let output =
+        perfbench(&[&MEMORY_MODEL[..], &["--time=virtual", "--experiment=suite"]].concat());
     assert!(output.status.success(), "{output:?}");
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+/// The cases whose persisted records carry a timestamp. The anchor of the wall
+/// clock is the start time of the process, so the size of these records, and
+/// with it the delay of their writes, moves by under 1% between processes.
+const TIMESTAMPED_CASES: [&str; 2] = ["rmw_external_1025", "rmw_five_leaves"];
+
 /// The numbers that a comparison of two revisions reads.
 fn measured(report: &Value) -> Vec<Value> {
-    report["runs"][0]["cells"][0]["shapes"]
+    report["runs"][0]["cells"]
         .as_array()
         .unwrap()
         .iter()
+        .filter(|cell| {
+            let case = cell["labels"]["case"].as_str().unwrap();
+            !TIMESTAMPED_CASES.contains(&case)
+        })
+        .flat_map(|cell| cell["shapes"].as_array().unwrap())
         .map(|shape| {
             ["shape", "committed", "meanMs", "p50Ms", "p90Ms", "txPerSec"]
                 .map(|field| shape[field].clone())
@@ -43,9 +54,10 @@ fn measured(report: &Value) -> Vec<Value> {
 // reason to use virtual time.
 #[test]
 fn virtual_runs_repeat_exactly() {
-    let first = virtual_ci_report();
-    let second = virtual_ci_report();
+    let first = virtual_suite_report();
+    let second = virtual_suite_report();
 
+    assert_eq!(first["runs"][0]["cells"].as_array().unwrap().len(), 9);
     assert_eq!(first["timeMode"], "virtual");
     assert_eq!(first["modelTimeSpeedup"], 1.0);
     assert_eq!(measured(&first), measured(&second));

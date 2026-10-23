@@ -7,11 +7,11 @@
 # Usage:
 #   hack/perf/profile.sh
 #   CASE=rmw_inline_1024 hack/perf/profile.sh
-#   EXPERIMENT=ci hack/perf/profile.sh
+#   EXPERIMENT=mixed hack/perf/profile.sh
 #
 # Tunables (env):
-#   EXPERIMENT        perfbench experiment (default diagnostics)
-#   CASE              one case of the diagnostics experiment (default: all)
+#   EXPERIMENT        perfbench experiment (default suite)
+#   CASE              one case of the suite experiment (default: all)
 #   SECONDS_PER_CASE  measured wall time of each case (default 10)
 #   OUT               output directory for artifacts (default hack/perf)
 
@@ -19,7 +19,7 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-EXPERIMENT="${EXPERIMENT:-diagnostics}"
+EXPERIMENT="${EXPERIMENT:-suite}"
 CASE="${CASE:-}"
 SECONDS_PER_CASE="${SECONDS_PER_CASE:-10}"
 OUT="${OUT:-hack/perf}"
@@ -34,7 +34,7 @@ run_args=(
 	--experiment="$EXPERIMENT"
 	--output="$OUT/profile.json"
 )
-if [[ "$EXPERIMENT" == "diagnostics" ]]; then
+if [[ "$EXPERIMENT" == "suite" ]]; then
 	# perfbench durations are model time, and the default model clock runs five
 	# times as fast as wall time.
 	model_seconds=$((SECONDS_PER_CASE * 5))

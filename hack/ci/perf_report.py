@@ -12,19 +12,25 @@ from functools import lru_cache
 from pathlib import Path
 
 # The backend model of every compared process.
-DIAGNOSTIC_MODEL = {
+MODEL = {
     "backend": "memory",
-    "latencyJitter": False,
     # Virtual time is not compressed: the paused clock is the model clock.
     "timeMode": "virtual",
     "modelTimeSpeedup": 1,
 }
 
-# The suffix of the file with the counters of a diagnostic case.
-COUNTERS_SUFFIX = ".counters"
+# The experiment that all comparisons measure, and the files of its results.
+SUITE = "suite"
+# The version of the manifest that the driver writes.
+MANIFEST_VERSION = 3
+# The case of the suite with four shapes at the same time on one leaf.
+SHARED_LEAF_CASE = "shapes_shared_leaf"
+TIMING_FILE = "timing.json"
+COUNTERS_FILE = "counters.json"
 
-MIXED_SHAPES = ("rw-single", "rw-many", "ro-single", "ro-multi")
-MIXED_METRICS = (
+SHARED_LEAF_SHAPES = ("rw-single", "rw-many", "ro-single", "ro-multi")
+# The latency metrics of every shape of every case.
+LATENCY_METRICS = (
     ("p50Ms", "model ms/tx", "time"),
     ("p90Ms", "model ms/tx", "time"),
     ("txPerSec", "tx/model s", "rate"),
@@ -43,26 +49,17 @@ class ReportError(ValueError):
 
 @dataclass
 class Metric:
+    """The values of one metric, one for each pair of processes."""
+
     unit: str
     kind: str
     values: list[float] = field(default_factory=list)
-    lower: list[float] = field(default_factory=list)
-    upper: list[float] = field(default_factory=list)
-    standard_errors: list[float] = field(default_factory=list)
 
-    def add(self, value, lower=None, upper=None, standard_error=0) -> None:
+    def add(self, value) -> None:
         value = number(value)
         if self.kind != "cost" and value == 0:
             raise ReportError("timing and rate measurements must be positive")
-        lower = value if lower is None else number(lower)
-        upper = value if upper is None else number(upper)
-        standard_error = number(standard_error)
-        if not lower <= value <= upper:
-            raise ReportError("invalid measurement interval")
         self.values.append(value)
-        self.lower.append(lower)
-        self.upper.append(upper)
-        self.standard_errors.append(standard_error)
 
 
 def number(value) -> float:
@@ -83,102 +80,99 @@ def read_json(path: Path):
         raise ReportError(f"cannot read {path}: {error}") from error
 
 
-def read_report(path: Path, experiment: str) -> dict:
-    """Read one perfbench result of `experiment` on the compared backend model."""
+def read_report(path: Path) -> dict:
+    """Read one perfbench result of the suite on the compared backend model."""
     report = read_json(path)
-    if (
-        report.get("schemaVersion") != 2
-        or report.get("scenario") != experiment
-        or report.get("backend") != DIAGNOSTIC_MODEL["backend"]
-        # A result of an older harness has no time mode and ran on real time,
-        # which measures different latencies.
-        or report.get("timeMode") != DIAGNOSTIC_MODEL["timeMode"]
-        or report.get("modelTimeSpeedup") != DIAGNOSTIC_MODEL["modelTimeSpeedup"]
+    # A result of an older harness has no time mode and ran on real time, which
+    # measures different latencies.
+    if report.get("schemaVersion") != 2 or report.get("scenario") != SUITE or any(
+        report.get(key) != value for key, value in MODEL.items()
     ):
-        raise ReportError(f"unsupported {experiment} schema or backend model")
-    if len(report["runs"]) != 1 or len(report["runs"][0]["cells"]) != 1:
-        raise ReportError(f"expected one {experiment} cell")
+        raise ReportError(f"unsupported {SUITE} schema or backend model")
+    if len(report["runs"]) != 1:
+        raise ReportError(f"expected one run of {SUITE}")
     return report
 
 
-def add(
-    metrics: dict,
-    name: str,
-    unit: str,
-    kind: str,
-    value,
-    lower=None,
-    upper=None,
-    standard_error=0,
-) -> None:
+def read_case(path: Path, case: str, latency_jitter: bool) -> dict:
+    """Read the cell of `case` from a result of the suite.
+
+    The result must have the latency profile of the comparison, and its cell
+    must not have failed.
+    """
+    report = read_report(path)
+    if report.get("latencyJitter", True) is not latency_jitter:
+        raise ReportError(f"{case} latency profile differs from comparison settings")
+    cells = [
+        cell
+        for cell in report["runs"][0]["cells"]
+        if cell["labels"].get("case") == case
+    ]
+    if len(cells) != 1:
+        raise ReportError(f"expected one {case} cell, found {len(cells)}")
+    if cells[0]["failures"]:
+        raise ReportError(f"{case} cell failed")
+    return cells[0]
+
+
+def add(metrics: dict, name: str, unit: str, kind: str, value) -> None:
     metric = metrics.get(name)
     if metric is None:
         metric = Metric(unit, kind)
-    metric.add(value, lower, upper, standard_error)
+    metric.add(value)
     metrics[name] = metric
 
 
 def read_measurement(
-    directory: Path,
-    name: str,
-    *,
-    mixed_args: list[str] | tuple[str, ...] = (),
+    directory: Path, cases: list[str] | tuple[str, ...], *, latency_jitter: bool
 ) -> tuple[dict, list[str]]:
-    """Read and validate one benchmark process's artifacts."""
+    """Read and validate the artifacts of all cases in a repetition.
+
+    The latency of a case comes from the process with the latency profile of the
+    comparison. Its counters come from a process without jitter: jitter moves
+    the count of background operations, such as listings of the garbage
+    collector, by one per process, which the counters cannot tell from a change.
+    Without jitter, the counters repeat exactly.
+    """
     metrics, warnings = {}, []
     side, repetition = directory.parent.name, directory.name
-    latency_jitter = "--latency-jitter=false" not in mixed_args
-    if name == "mixed":
-        load_mixed(
-            directory, metrics, warnings, side, repetition, latency_jitter=latency_jitter
-        )
-    else:
-        load_diagnostics(
-            directory, name, metrics, warnings, side, repetition, latency_jitter=latency_jitter
-        )
+    for name in cases:
+        label = f"{side}/{repetition}/{name}"
+        try:
+            timing = read_case(directory / TIMING_FILE, name, latency_jitter)
+            load_latency(name, timing, metrics, warnings, label)
+        except (ReportError, KeyError, TypeError, ValueError, IndexError) as error:
+            warnings.append(f"{label}: invalid latency measurement ({error})")
+        try:
+            counters = read_case(directory / COUNTERS_FILE, name, False)
+            load_costs(name, counters["costs"], metrics, warnings, label)
+        except (ReportError, KeyError, TypeError, ValueError, IndexError) as error:
+            warnings.append(f"{label}: invalid counter measurement ({error})")
     return metrics, warnings
 
 
-def read_diagnostic_cell(path, name, latency_jitter):
-    """Read the cell of one diagnostic case, checking its latency profile."""
-    report = read_report(path, "diagnostics")
-    if report.get("latencyJitter", True) is not latency_jitter:
-        raise ReportError("diagnostic latency profile differs from comparison settings")
-    cell = report["runs"][0]["cells"][0]
-    if cell["failures"] or cell["labels"].get("case") != name:
-        raise ReportError("diagnostic cell failed or its case changed")
-    return cell
-
-
-def read_mixed_cell(path, latency_jitter):
-    """Read the cell of the mixed workload, checking its latency profile."""
-    mixed = read_report(path, "ci")
-    if mixed.get("latencyJitter", True) is not latency_jitter:
-        raise ReportError("mixed latency profile differs from comparison settings")
-    cell = mixed["runs"][0]["cells"][0]
-    if (
-        cell["failures"]
-        or cell["workload"] != "low-conflict"
-        or cell["affinityPct"] != 100
-        or cell["databases"] != 1
-        or cell["workersPerShape"] != 1
-    ):
-        raise ReportError("mixed cell failed or settings changed")
-    return cell
-
-
-def load_costs(read_cell, name, metrics, warnings, side, repetition):
-    """Read the counters of a benchmark from its process without jitter.
-
-    Jitter moves the count of background operations, such as listings of the
-    garbage collector, by one per process, which the counters cannot tell from
-    a change. Without jitter, the counters repeat exactly.
-    """
+def load_latency(name, cell, metrics, warnings, label):
     try:
-        costs = read_cell()["costs"]
-    except (ReportError, KeyError, TypeError, ValueError, IndexError) as error:
-        warnings.append(f"{side}/{repetition}/{name}: invalid counter measurement ({error})")
-        return
+        if name == SHARED_LEAF_CASE:
+            check_shared_leaf(cell)
+        shapes = cell["shapes"]
+        if not shapes:
+            raise ReportError("no shapes")
+        for shape in shapes:
+            if number(shape["committed"]) < 100 or not shape["converged"]:
+                warnings.append(
+                    f"{label}/{shape['shape']}: insufficient latency/throughput observations"
+                )
+                continue
+            # A case with one shape needs no shape in the name of its metrics.
+            prefix = name if len(shapes) == 1 else f"{name}/{shape['shape']}"
+            for key, unit, kind in LATENCY_METRICS:
+                add(metrics, f"{prefix}: {key}", unit, kind, shape[key])
+    except (ReportError, KeyError, TypeError, IndexError) as error:
+        warnings.append(f"{label}: invalid latency measurements ({error})")
+
+
+def load_costs(name, costs, metrics, warnings, label):
     try:
         if number(costs["transactions"]) == 0:
             raise ReportError("no completed transactions")
@@ -195,72 +189,22 @@ def load_costs(read_cell, name, metrics, warnings, side, repetition):
                 unit = "bytes/tx" if "Bytes" in counter else "count/tx"
                 add(metrics, f"{name}/{window}: {counter}", unit, "cost", costs[window][counter])
     except (ReportError, KeyError, TypeError) as error:
-        warnings.append(f"{side}/{repetition}: invalid cost measurements ({error})")
+        warnings.append(f"{label}: invalid cost measurements ({error})")
 
 
-def load_diagnostics(
-    directory, name, metrics, warnings, side, repetition, *, latency_jitter=False
-):
-    try:
-        cell = read_diagnostic_cell(directory / f"{name}.json", name, latency_jitter)
-        (shape,) = cell["shapes"]
-    except (ReportError, KeyError, TypeError, ValueError) as error:
-        warnings.append(f"{side}/{repetition}/{name}: invalid diagnostic measurement ({error})")
-        return
-    try:
-        mean, error = number(shape["meanMs"]), number(shape["meanSeMs"])
-        # The interval of the mean latency within one process, from its samples.
-        add(
-            metrics,
-            f"{name}: mean transaction time",
-            "model ms/tx",
-            "time",
-            mean,
-            max(mean - 1.96 * error, 0),
-            mean + 1.96 * error,
-            error,
-        )
-    except (ReportError, KeyError, TypeError) as error:
-        warnings.append(f"{side}/{repetition}/{name}: missing or invalid latency ({error})")
-    load_costs(
-        lambda: read_diagnostic_cell(
-            directory / f"{name}{COUNTERS_SUFFIX}.json", name, False
-        ),
-        name,
-        metrics,
-        warnings,
-        side,
-        repetition,
-    )
-
-
-def load_mixed(directory, metrics, warnings, side, repetition, *, latency_jitter=True):
-    try:
-        cell = read_mixed_cell(directory / "mixed.json", latency_jitter)
-        shapes = cell["shapes"]
-        if len(shapes) != len(MIXED_SHAPES) or {
-            shape["shape"] for shape in shapes
-        } != set(MIXED_SHAPES):
-            raise ReportError("mixed shape set changed")
-        for shape in shapes:
-            name = shape["shape"]
-            if number(shape["committed"]) < 100 or not shape["converged"]:
-                warnings.append(
-                    f"{side}/{repetition}/{name}: insufficient latency/throughput observations"
-                )
-                continue
-            for key, unit, kind in MIXED_METRICS:
-                add(metrics, f"mixed/{name}: {key}", unit, kind, shape[key])
-    except (ReportError, KeyError, TypeError, IndexError) as error:
-        warnings.append(f"{side}/{repetition}: invalid mixed measurements ({error})")
-    load_costs(
-        lambda: read_mixed_cell(directory / f"mixed{COUNTERS_SUFFIX}.json", False),
-        "mixed",
-        metrics,
-        warnings,
-        side,
-        repetition,
-    )
+def check_shared_leaf(cell):
+    """Check that the case still has the settings that the comparison assumes."""
+    if (
+        cell["workload"] != "low-conflict"
+        or cell["affinityPct"] != 100
+        or cell["databases"] != 1
+        or cell["workersPerShape"] != 1
+    ):
+        raise ReportError("shared-leaf settings changed")
+    if {shape["shape"] for shape in cell["shapes"]} != set(SHARED_LEAF_SHAPES) or len(
+        cell["shapes"]
+    ) != len(SHARED_LEAF_SHAPES):
+        raise ReportError("shared-leaf shape set changed")
 
 
 @lru_cache(maxsize=None)
@@ -313,16 +257,16 @@ def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison
     """Distinguish repeatable changes from effects the measurements cannot resolve."""
     before, after = statistics.median(base.values), statistics.median(candidate.values)
     if base.kind == "cost":
-        separated = max(base.upper) < min(candidate.lower) or max(
-            candidate.upper
-        ) < min(base.lower)
+        separated = max(base.values) < min(candidate.values) or max(
+            candidate.values
+        ) < min(base.values)
         spread = max(
-            max(base.upper) - min(base.lower),
-            max(candidate.upper) - min(candidate.lower),
+            max(base.values) - min(base.values),
+            max(candidate.values) - min(candidate.values),
         )
         noisy = spread > 0.1 * max(before, after) if max(before, after) else False
-        small = max(*base.upper, *candidate.upper) - min(
-            *base.lower, *candidate.lower
+        small = max(*base.values, *candidate.values) - min(
+            *base.values, *candidate.values
         ) <= COST_NOISE_THRESHOLD * max(before, after)
         # Small overlapping ranges are expected for variable-size objects.
         # Unequal medians alone do not make their costs inconclusive.
@@ -333,27 +277,13 @@ def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison
             (before != after and not separated and not small) or noisy,
         )
 
-    # Each fresh process pair is one observation. The narrow intervals within a
-    # process do not measure variation between independent repetitions.
+    # Each fresh process pair is one observation.
     ratios = [
         math.log(b / a) for a, b in zip(base.values, candidate.values, strict=True)
     ]
     mean = statistics.mean(ratios)
     count = len(ratios)
-    # The standard error of the mean estimates uncertainty within each process.
-    # The delta method gives log-SE ≈ SE/mean. Use this as a variance floor:
-    # repeated point estimates can agree by chance despite imprecise samples.
-    # Between-pair variance already includes sampling noise, so do not add it
-    # a second time. Mixed measurements provide only between-pair variation.
-    sampling_variance = (
-        sum(
-            (error / value) ** 2
-            for metric in (base, candidate)
-            for value, error in zip(metric.values, metric.standard_errors, strict=True)
-        )
-        / count**2
-    )
-    variance = max(statistics.variance(ratios) / count, sampling_variance)
+    variance = statistics.variance(ratios) / count
     half = t_critical(min(count - 1, 30), family_size) * math.sqrt(variance)
     relative = math.expm1(mean)
     lower, upper = math.expm1(mean - half), math.expm1(mean + half)
@@ -375,114 +305,79 @@ def escape(text: str) -> str:
 def validate_manifest(manifest: dict) -> None:
     cases = manifest.get("cases")
     if (
-        not isinstance(cases, (list, tuple))
-        or any(
-            not isinstance(name, str) or not name or name == "mixed" for name in cases
-        )
+        manifest.get("schemaVersion") != MANIFEST_VERSION
+        or not isinstance(cases, list)
+        or any(not isinstance(name, str) or not name for name in cases)
         or len(set(cases)) != len(cases)
-    ):
-        raise ReportError("invalid benchmark case list")
-    if manifest.get("schemaVersion") == 2:
-        checkpoints = manifest.get("checkpoints")
-        counts = manifest.get("completedPairs")
-        if (
-            not isinstance(checkpoints, list)
-            or not checkpoints
-            or any(type(n) is not int or n < 4 or n % 2 for n in checkpoints)
-            or checkpoints != sorted(set(checkpoints))
-            or not isinstance(counts, dict)
-            or set(counts) != {*cases, "mixed"}
-            or any(
-                type(n) is not int or not 0 <= n <= checkpoints[-1]
-                for n in counts.values()
-            )
-        ):
-            raise ReportError("invalid checkpoint plan or completed pair counts")
-        return
-    if (
-        manifest.get("schemaVersion") != 1
-        or type(manifest.get("repetitions")) is not int
-        or manifest["repetitions"] < 3
-        or type(manifest.get("diagnosticRepetitions", manifest["repetitions"]))
-        is not int
-        or manifest.get("diagnosticRepetitions", manifest["repetitions"]) < 3
+        or SHARED_LEAF_CASE not in cases
+        or type(manifest.get("latencyJitter")) is not bool
     ):
         raise ReportError("unsupported comparison manifest")
+    checkpoints = manifest.get("checkpoints")
+    if (
+        not isinstance(checkpoints, list)
+        or not checkpoints
+        or any(type(n) is not int or n < 4 or n % 2 for n in checkpoints)
+        or checkpoints != sorted(set(checkpoints))
+        or type(manifest.get("completedPairs")) is not int
+        or not 0 <= manifest["completedPairs"] <= checkpoints[-1]
+    ):
+        raise ReportError("invalid checkpoint plan or completed pair count")
 
 
 @dataclass
-class BenchmarkResult:
+class Analysis:
     pairs: int
     metrics: dict[str, tuple[Metric, Metric, Comparison]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
     @property
+    def unresolved(self) -> list[str]:
+        """Return the names of the timing metrics whose change is unclear."""
+        return [
+            name
+            for name, (base, _, comparison) in self.metrics.items()
+            if base.kind != "cost" and comparison.uncertain
+        ]
+
+    @property
     def resolved(self) -> bool:
-        return (
-            bool(self.metrics)
-            and not self.warnings
-            and all(
-                not comparison.uncertain
-                for base, _, comparison in self.metrics.values()
-                if base.kind != "cost"
-            )
-        )
+        return bool(self.metrics) and not self.warnings and not self.unresolved
 
 
-def analyze_benchmark(root: Path, manifest: dict, name: str) -> BenchmarkResult:
-    """Evaluate a benchmark at its last completed, planned checkpoint."""
-    adaptive = manifest["schemaVersion"] == 2
-    if adaptive:
-        completed = manifest["completedPairs"][name]
-        repetitions = max(
-            (n for n in manifest["checkpoints"] if n <= completed), default=0
-        )
-    else:
-        repetitions = (
-            manifest["repetitions"]
-            if name == "mixed"
-            else manifest.get("diagnosticRepetitions", manifest["repetitions"])
-        )
-        completed = repetitions
-    result = BenchmarkResult(repetitions)
+def analyze(root: Path, manifest: dict) -> Analysis:
+    """Evaluate all cases at the last completed, planned checkpoint."""
+    completed = manifest["completedPairs"]
+    repetitions = max((n for n in manifest["checkpoints"] if n <= completed), default=0)
+    result = Analysis(repetitions)
     if not repetitions:
-        result.warnings.append(
-            f"{name}: no completed checkpoint ({completed} complete pairs)"
-        )
+        result.warnings.append(f"no completed checkpoint ({completed} complete pairs)")
         return result
     if completed != repetitions:
         result.warnings.append(
-            f"{name}: stopped after {completed} complete pairs; using checkpoint at {repetitions} pairs"
+            f"stopped after {completed} complete pairs; using checkpoint at {repetitions} pairs"
         )
     sides = []
     for side in ("main", "pr"):
         metrics = {}
         for repetition in range(1, repetitions + 1):
-            directory = root / side / f"{repetition:02d}"
             samples, warnings = read_measurement(
-                directory,
-                name,
-                mixed_args=manifest.get("mixedArgs", ()),
+                root / side / f"{repetition:02d}",
+                manifest["cases"],
+                latency_jitter=manifest["latencyJitter"],
             )
             result.warnings.extend(warnings)
             for key, sample in samples.items():
-                add(
-                    metrics,
-                    key,
-                    sample.unit,
-                    sample.kind,
-                    sample.values[0],
-                    sample.lower[0],
-                    sample.upper[0],
-                    sample.standard_errors[0],
-                )
+                add(metrics, key, sample.unit, sample.kind, sample.values[0])
         sides.append(metrics)
     base, candidate = sides
     # Include every planned comparison, even if its measurements are missing.
     # All checkpoints share the error budget; stopping early cannot narrow it.
-    family_size = len(manifest["cases"]) + len(MIXED_SHAPES) * len(MIXED_METRICS)
-    if adaptive:
-        family_size *= len(manifest["checkpoints"])
+    shapes = sum(
+        len(SHARED_LEAF_SHAPES) if case == SHARED_LEAF_CASE else 1
+        for case in manifest["cases"]
+    )
+    family_size = shapes * len(LATENCY_METRICS) * len(manifest["checkpoints"])
     for name in sorted(set(base) | set(candidate)):
         if (
             name not in base
@@ -500,14 +395,10 @@ def analyze_benchmark(root: Path, manifest: dict, name: str) -> BenchmarkResult:
 def render_report(root: Path, base_label: str, candidate_label: str) -> str:
     manifest = read_json(root / "manifest.json")
     validate_manifest(manifest)
-    warnings = list(manifest.get("warnings", []))
-    metrics = {}
-    for name in (*manifest["cases"], "mixed"):
-        result = analyze_benchmark(root, manifest, name)
-        metrics.update(result.metrics)
-        warnings.extend(result.warnings)
+    result = analyze(root, manifest)
+    warnings = [*manifest.get("warnings", []), *result.warnings]
     rows = []
-    for name, (a, b, comparison) in sorted(metrics.items()):
+    for name, (a, b, comparison) in sorted(result.metrics.items()):
         interval = (
             f"[{comparison.interval[0]:+.1%}, {comparison.interval[1]:+.1%}]"
             if comparison.interval is not None
@@ -528,6 +419,8 @@ def render_report(root: Path, base_label: str, candidate_label: str) -> str:
         if a.kind == "cost":
             direction = "changed"
         else:
+            # Only a cost can change from zero, which has no relative change.
+            assert comparison.relative is not None
             improved = (
                 comparison.relative > 0 if a.kind == "rate" else comparison.relative < 0
             )

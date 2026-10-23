@@ -55,11 +55,12 @@ jobs:
           --candidate "$HEAD_SHA" --output "$PERF_RESULTS" --build-only
 
     - name: Measure workloads
-      timeout-minutes: 10
-      # The processes run on virtual time. A comparison that resolves at 8 to 16
-      # pairs takes about a minute, and a full 32-pair comparison a few minutes.
-      # This guards the driver; individual benchmark processes have their own
-      # two-minute timeout.
+      timeout-minutes: 15
+      # The processes run on virtual time, and each one runs every case. Each
+      # pair takes about 5 seconds, so a comparison that resolves at 8 pairs takes
+      # under a minute, and the full 32 pairs take about 3 minutes. This guards
+      # the driver; individual benchmark processes have their own two-minute
+      # timeout.
       run: python3 hack/ci/perf_compare.py --output "$PERF_RESULTS" --run-only
 
     - name: Render job summary
