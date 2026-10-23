@@ -14,6 +14,10 @@ use glassdb_concurr::rt;
 
 const BAR_WIDTH: usize = 30;
 
+/// The wall time between two updates of the bar. More frequent updates make
+/// the remaining time hard to read.
+const REDRAW_INTERVAL: Duration = Duration::from_secs(1);
+
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
 struct State {
@@ -24,6 +28,9 @@ struct State {
     cell_fraction: f64,
     /// Whether the bar is on screen now.
     drawn: bool,
+    /// Whether the first stage of a cell started. The setup before it logs its
+    /// own lines, so the bar waits for that stage.
+    visible: bool,
 }
 
 /// The part of a cell that one stage of it takes.
@@ -85,6 +92,18 @@ pub(crate) fn enable(total_cells: usize) {
         done_cells: 0,
         cell_fraction: 0.0,
         drawn: false,
+        visible: false,
+    });
+    // The bar also moves while a cell sets up and no stage reports progress,
+    // so that the elapsed time continues. The thread ends with the bar.
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(REDRAW_INTERVAL);
+            match lock().as_mut() {
+                Some(state) => draw(state),
+                None => return,
+            }
+        }
     });
 }
 
@@ -101,9 +120,12 @@ pub(crate) fn finish_cell() {
     });
 }
 
-/// Moves the bar to the progress of `stage` now.
+/// Records the progress of `stage` now. The bar shows it at its next update.
 pub(crate) fn advance(stage: Stage) {
-    update(|state| state.cell_fraction = stage.fraction());
+    if let Some(state) = lock().as_mut() {
+        state.cell_fraction = stage.fraction();
+        state.visible = true;
+    }
 }
 
 /// Removes the bar from the screen.
@@ -157,6 +179,9 @@ fn clear(state: &mut State) {
 }
 
 fn draw(state: &mut State) {
+    if !state.visible {
+        return;
+    }
     let fraction = if state.total_cells == 0 {
         1.0
     } else {

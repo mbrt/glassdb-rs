@@ -371,7 +371,7 @@ async fn run_cell(
         warmup.splits,
         warmup.merges,
         change_rate
-            .map(|rate| format!(", {rate:.2} changes per model second at the end"))
+            .map(|rate| format!(", {rate:.2} changes/s at the end"))
             .unwrap_or_default(),
         if quiet { "" } else { " (not quiet)" }
     );

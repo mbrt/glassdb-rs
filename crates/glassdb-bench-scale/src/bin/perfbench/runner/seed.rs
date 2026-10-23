@@ -198,6 +198,13 @@ async fn seed(
     drain_timeout: Duration,
 ) -> Result<SeedReport, Box<dyn Error>> {
     let spec = &cell.seed;
+    let keys: usize = cell
+        .pools
+        .values()
+        .filter(|pool| pool.seeded)
+        .map(|pool| pool.keys.unwrap_or(0) * cell.seed_collections)
+        .sum();
+    crate::progress::log!("  seeding {keys} keys");
     let db = spec
         .database
         .apply(Database::builder(database, backend.clone()))?
