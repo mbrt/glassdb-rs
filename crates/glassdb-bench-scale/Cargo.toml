@@ -22,8 +22,9 @@ glassdb = { path = "../glassdb", features = ["s3", "gcs", "s3-fake-server"] }
 glassdb-backend = { workspace = true }
 glassdb-concurr = { workspace = true }
 glassdb-data = { workspace = true }
-# A real tokio runtime drives the binaries.
-tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+# A real tokio runtime drives the binaries. perfbench pauses its clock for
+# `--time=virtual`, which needs `test-util`.
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3.32"
 async-trait = "0.1.92"

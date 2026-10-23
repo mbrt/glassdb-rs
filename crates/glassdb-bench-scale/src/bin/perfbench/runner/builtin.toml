@@ -88,21 +88,6 @@ values = ["low-conflict", "high-conflict"]
 path = "cell.affinity"
 values = [0, 25, 50, 75, 100]
 
-# The cell of the CI comparison: short and of fixed length. It runs only on the
-# accelerated memory backend, and its values keep about 10 s of wall time there,
-# because fewer samples make the comparison noisier.
-[experiments.ci.set]
-pools.wide.keys = 128
-seed.quiet-period = "1250ms"
-seed.timeout = "25s"
-cell.databases = 1
-cell.workers = 1
-cell.warm-up.quiet = "1250ms"
-cell.warm-up.timeout = "25s"
-cell.measure.until = "duration"
-cell.measure.duration = "50s"
-cell.measure.max-duration = "50s"
-
 # The worker grid of the canonical plots. Each worker count continues from the
 # tree after the warm-up of the count before it.
 [experiments.workers.set]
@@ -451,7 +436,12 @@ shapes = { diag-read-large = 1 }
 instances = 1
 shapes = { diag-rmw-shared = 3 }
 
-[experiments.diagnostics.set]
+# Every case of the CI comparison and of `make bench`, with the same settings:
+# single transactions of one worker with warm caches, and four shapes at the
+# same time on one leaf. The window of 10 s ends before the first background
+# pass of the garbage collector, so the counters of a run do not depend on the
+# random cadence of that pass; a measurement of latency can use a longer window.
+[experiments.suite.set]
 seed.quiet-period = "6s"
 seed.timeout = "75s"
 cell.gc = false
@@ -461,7 +451,7 @@ cell.warm-up.timeout = "1250ms"
 cell.measure.until = "duration"
 cell.measure.duration = "10s"
 cell.measure.max-duration = "10s"
-[[experiments.diagnostics.axes]]
+[[experiments.suite.axes]]
 name = "case"
 values = [
   { label = "warm_read", set = { "cell.workload" = "diag-read" } },
@@ -472,4 +462,5 @@ values = [
   { label = "rmw_five_leaves", set = { "cell.workload" = "diag-rmw-five", "cell.collections" = 5 } },
   { label = "read_long_keys_large_collection", set = { "cell.workload" = "diag-read-large" } },
   { label = "rmw_shared_leaf_three_transactions", set = { "cell.workload" = "diag-rmw-shared" } },
+  { label = "shapes_shared_leaf", set = { "cell.workload" = "low-conflict", "pools.wide.keys" = 128, "cell.databases" = 1, "cell.workers" = 1 } },
 ]

@@ -7,6 +7,7 @@ mod backend;
 mod progress;
 mod runner;
 mod scenarios;
+mod time;
 
 #[cfg(target_env = "musl")]
 #[global_allocator]
@@ -20,8 +21,8 @@ use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use glassdb::ProtocolTiming;
-use glassdb_concurr::rt;
 use serde::Serialize;
+use time::TimeMode;
 
 const SCHEMA_VERSION: u32 = 2;
 
@@ -57,6 +58,11 @@ struct Cli {
     /// List the experiments of the configuration and exit.
     #[arg(long)]
     list: bool,
+    /// How model time advances. `virtual` needs `--backend=memory` and no
+    /// `--delay-scale`, and the watchdogs `--drain-timeout` and the limit of
+    /// the full GCs then use virtual time too.
+    #[arg(long, value_enum, default_value = "real")]
+    time: TimeMode,
     /// Repeat the complete experiment.
     #[arg(long, default_value_t = 1)]
     runs: usize,
@@ -107,6 +113,7 @@ struct Report<T> {
     /// The experiment.
     scenario: String,
     backend: String,
+    time_mode: &'static str,
     model_time_speedup: f64,
     latency_jitter: bool,
     /// The command-line options of the backend and of the run.
@@ -140,14 +147,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let resolved = selection.resolve()?;
-    let configured_speedup = cli.backend.model_time_speedup()?;
-    if let Some(speedup) = configured_speedup {
-        rt::set_model_time_speedup(speedup)?;
-    }
-    let model_time_speedup = configured_speedup.unwrap_or(1.0);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
+    let model_time_speedup = cli.time.install(&cli.backend)?;
+    let runtime = cli.time.runtime()?;
     let factory = runtime.block_on(cli.backend.initialize())?;
     let execution = Execution {
         runs: cli.runs,
@@ -164,9 +165,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         schema_version: SCHEMA_VERSION,
         scenario: resolved.name.clone(),
         backend: cli.backend.label().to_string(),
+        time_mode: cli.time.label(),
         model_time_speedup,
         latency_jitter: cli.backend.latency_jitter,
-        options: cli.backend.describe(),
+        options: cli.backend.describe(cli.time),
         experiment: resolved.describe(),
         runs,
     };
