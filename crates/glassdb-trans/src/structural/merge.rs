@@ -114,15 +114,16 @@ impl Merger {
         }
     }
 
-    /// Reports whether cached state shows node `source` as an actionable merge
-    /// source for `reason`. Busy nodes defer the merge, so that it does not
-    /// write an intent that the polite gate acquisition would then cancel.
-    pub(super) async fn is_actionable(
+    /// Returns the merge target of node `source` if cached state shows it as
+    /// an actionable merge source for `reason`. Busy nodes defer the merge, so
+    /// that it does not write an intent that the polite gate acquisition would
+    /// then cancel.
+    pub(super) async fn actionable_target(
         &self,
         collection: &CollectionAddress,
         source: &NodeId,
         reason: MergeReason,
-    ) -> Result<bool, TransError> {
+    ) -> Result<Option<NodeId>, TransError> {
         let left = match self
             .nodes
             .load_node(collection, source, Requirement::ANY)
@@ -131,21 +132,21 @@ impl Merger {
             Ok((left, _)) => left,
             Err(StorageError::NotFound) => {
                 self.count_demand(reason, |stats| &stats.demand_merge_other);
-                return Ok(false);
+                return Ok(None);
             }
             Err(error) => return Err(error.into()),
         };
         let Some(boundary) = left.high_key().filter(|_| !left.is_drained()) else {
             self.count_demand(reason, |stats| &stats.demand_merge_other);
-            return Ok(false);
+            return Ok(None);
         };
         let Some(target) = self.target(collection, &left, Requirement::ANY).await? else {
             self.count_demand(reason, |stats| &stats.demand_merge_other);
-            return Ok(false);
+            return Ok(None);
         };
         if let Err(veto) = self.need(&left, &target.node, reason) {
             self.count_veto(reason, veto);
-            return Ok(false);
+            return Ok(None);
         }
         // Merging the children of two parents would leave the left parent
         // routing through the drained node (ADR-073).
@@ -159,7 +160,7 @@ impl Merger {
             .is_some_and(|parent| parent.covers(boundary))
         {
             self.count_demand(reason, |stats| &stats.demand_merge_other);
-            return Ok(false);
+            return Ok(None);
         }
         if left.locks().merge_reservation().is_some()
             || target.node.locks().merge_reservation().is_some()
@@ -169,7 +170,7 @@ impl Merger {
             self.count_demand(reason, |stats| &stats.demand_merge_busy);
             return Err(TransError::Retry);
         }
-        Ok(true)
+        Ok(Some(target.id))
     }
 
     /// Checks the merge of the gated source `left` again in current state, and

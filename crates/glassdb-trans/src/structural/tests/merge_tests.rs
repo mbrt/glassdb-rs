@@ -103,16 +103,28 @@ async fn assert_merged(s: &TestStore) {
 }
 
 async fn merge_l0(sp: &Restructurer) -> Result<(), TransError> {
-    sp.merge(
-        &MaintenanceCandidate {
-            path: node_path("L0"),
-            priority: TxId::new_at(rt::system_now()),
-            requested: rt::Instant::now(),
-            cause: CandidateCause::Merge(MergeReason::Underfull),
-        },
-        MergeReason::Underfull,
-    )
-    .await
+    merge_now(sp, "L0", MergeReason::Underfull).await
+}
+
+// Merges the leaf `name` into its right sibling at once, if `reason` still
+// calls for it, and returns the result that a sweep settles.
+async fn merge_now(sp: &Restructurer, name: &str, reason: MergeReason) -> Result<(), TransError> {
+    let path = node_path(name);
+    let Some(nodes) = sp.locate_merge(&path, reason).await? else {
+        return Ok(());
+    };
+    let change = PlannedChange::Merge {
+        collection: &nodes.collection,
+        source: &nodes.source,
+        reason,
+    };
+    sp.changes
+        .run(
+            change,
+            TxId::new_at(rt::system_now()),
+            StructuralTopology::Owned,
+        )
+        .await
 }
 
 // Splits a leaf with `entries` at "m" for a topology rule, with a paid rate of
@@ -149,16 +161,7 @@ fn rule_restructurer(s: &TestStore, bg: &Arc<Background>) -> Restructurer {
 }
 
 async fn demand_merge_l0(sp: &Restructurer, rate: Duration) -> Result<(), TransError> {
-    sp.merge(
-        &MaintenanceCandidate {
-            path: node_path("L0"),
-            priority: TxId::new_at(rt::system_now()),
-            requested: rt::Instant::now(),
-            cause: CandidateCause::Merge(MergeReason::Demand { rate }),
-        },
-        MergeReason::Demand { rate },
-    )
-    .await
+    merge_now(sp, "L0", MergeReason::Demand { rate }).await
 }
 
 // ADR-076: the leaves of a split that a topology rule asked for keep its paid
@@ -1057,4 +1060,155 @@ async fn recovery_fences_a_late_absorb() {
     hook.clear_before();
     hook.clear_after();
     assert_not_merged(&local, &[b"a", b"b"], &[b"m", b"n"]).await;
+}
+
+// A root over the leaves L0..L{count-1}, each with one key: "a", "b", and so
+// on. Every leaf is underfull.
+async fn seed_leaf_chain(s: &TestStore, count: u8) {
+    let mut children = Vec::new();
+    for leaf in 0..count {
+        let name = format!("L{leaf}");
+        let key = [b'a' + leaf];
+        let low = if leaf == 0 { Vec::new() } else { key.to_vec() };
+        let right = (leaf + 1 < count).then(|| format!("L{}", leaf + 1));
+        let high = [b'a' + leaf + 1];
+        let node = leaf_node(
+            &[&key],
+            right.as_ref().map(|_| high.as_slice()),
+            right.as_deref(),
+        )
+        .with_low_key(low.clone());
+        assert!(s.store_node(COLL, &name, &node, None).await.unwrap());
+        children.push((low, test_node_id(&name)));
+    }
+    s.create_root(COLL, &Node::index(IndexNode::from_children(children)))
+        .await
+        .unwrap();
+}
+
+fn push_underfull_merges(sp: &Restructurer, names: &[&str]) {
+    for name in names {
+        sp.candidates.push(MaintenanceCandidate {
+            path: node_path(name),
+            priority: sp.candidates.new_id(),
+            requested: rt::Instant::now(),
+            cause: CandidateCause::Merge(MergeReason::Underfull),
+        });
+    }
+}
+
+// Counts the writes of the collection record while `sweep` runs.
+async fn record_writes_of(backend: &HookBackend, sweep: impl Future<Output = ()>) -> usize {
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    backend.set_before({
+        let record = ObjectPath::CollectionRecord {
+            collection: collection(),
+        }
+        .to_string();
+        let writes = writes.clone();
+        move |op| {
+            if matches!(op, BackendOp::WriteIf { .. }) && op.path() == record {
+                writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let future: HookFuture = Box::pin(async { Ok(()) });
+            future
+        }
+    });
+    sweep.await;
+    backend.clear_before();
+    writes.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+async fn root_children(s: &TestStore) -> IndexNode {
+    let (root, _) = s
+        .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    root.as_index().unwrap().clone()
+}
+
+// Under a load that crosses many leaf boundaries, a topology rule asks for
+// many more merges than one merge at a time can make. The merges of different
+// nodes in one sweep run together, and join and leave the topology with one
+// CAS of the collection record.
+#[tokio::test]
+async fn one_sweep_merges_different_pairs_together() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let s = store_with_backend(backend.clone() as Arc<dyn Backend>);
+    seed_leaf_chain(&s, 6).await;
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, mergeable());
+    push_underfull_merges(&sp, &["L0", "L2", "L4"]);
+
+    let record_writes = record_writes_of(&backend, sp.run_once()).await;
+
+    assert_eq!(sp.stats_and_reset().merges, 3);
+    assert_eq!(record_writes, 2, "one CAS to join and one to leave");
+    for (left, right, merged_keys) in [
+        ("L0", "L1", [b"a", b"b"]),
+        ("L2", "L3", [b"c", b"d"]),
+        ("L4", "L5", [b"e", b"f"]),
+    ] {
+        assert!(current_node(&s, left).await.is_drained());
+        let right = current_node(&s, right).await;
+        assert_eq!(keys(&right), merged_keys);
+        assert!(right.locks().merge_reservation().is_none());
+    }
+    assert_eq!(
+        root_children(&s).await,
+        test_index(&[(b"", "L1"), (b"c", "L3"), (b"e", "L5")])
+    );
+    assert_no_intents(&s).await;
+}
+
+// The target of one merge is the source of the next. If both ran at the same
+// time, the reservation of one would stop the other, so they run one after
+// the other in the same sweep.
+#[tokio::test]
+async fn merges_that_share_a_node_run_one_after_the_other_in_one_sweep() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let s = store_with_backend(backend.clone() as Arc<dyn Backend>);
+    seed_leaf_chain(&s, 3).await;
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, mergeable());
+    push_underfull_merges(&sp, &["L0", "L1"]);
+
+    let record_writes = record_writes_of(&backend, sp.run_once()).await;
+
+    let stats = sp.stats_and_reset();
+    assert_eq!((stats.merges, stats.deferred), (2, 0));
+    assert_eq!(record_writes, 4, "one join and one leave for each round");
+    assert!(current_node(&s, "L0").await.is_drained());
+    assert!(current_node(&s, "L1").await.is_drained());
+    let merged = current_node(&s, "L2").await;
+    assert_eq!(merged.low_key(), b"");
+    assert_eq!(keys(&merged), [b"a", b"b", b"c"]);
+    assert_eq!(root_children(&s).await, test_index(&[(b"", "L2")]));
+    assert_no_intents(&s).await;
+}
+
+// A leaf can need a merge for two reasons at the same time. After the first
+// merge drains it, the second one must stop before it writes an intent, and
+// not defer.
+#[tokio::test(start_paused = true)]
+async fn a_second_reason_to_merge_a_drained_leaf_stops_in_the_same_sweep() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let s = store_with_backend(backend.clone() as Arc<dyn Backend>);
+    seed_leaf_chain(&s, 2).await;
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, mergeable());
+    push_underfull_merges(&sp, &["L0"]);
+    sp.candidates.push_request(RuleRequest {
+        change: ChangeRequest::Merge(LeafId::new(node_path("L0"))),
+        rate: Duration::from_secs(1),
+    });
+
+    let record_writes = record_writes_of(&backend, sp.run_once()).await;
+
+    let stats = sp.stats_and_reset();
+    assert_eq!((stats.merges, stats.deferred), (1, 0));
+    assert_eq!(record_writes, 2, "only the first merge joins the topology");
+    assert!(current_node(&s, "L0").await.is_drained());
+    assert_eq!(keys(&current_node(&s, "L1").await), [b"a", b"b"]);
+    assert_no_intents(&s).await;
 }

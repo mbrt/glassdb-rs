@@ -631,14 +631,17 @@ sweep does not start a change that a rule asked for more than three windows
 before ([ADR-083](adr/083-drop-stale-topology-requests.md)). A
 merge defers while a live transaction holds a lock on its source or target.
 
-Under load, a rule asks for many more leaf splits than one split at a time can
-make, and the tree does not settle. So a sweep splits different nodes at the
-same time, in batches of a fixed size. Each split keeps its own topology
-participant, but the participants of one collection share one CAS. Merges happen
-one at a time, after splits.
+Under load, a rule asks for many more leaf changes than one change at a time
+can make, and the tree does not settle. So a sweep splits different nodes at
+the same time, in batches of a fixed size, and then merges in the same way.
+Each change keeps its own topology participant, but the participants of one
+collection share one CAS. Two changes of the same node go in different
+batches, because the gate or the reservation of one stops the other. The
+batches come from cached state, so a change of a batch can still meet another
+one, and defer.
 
-The splits of one batch often have the same parent. A batch makes the node
-writes of its splits first, and then reconciles the parent of each collection
+The changes of one batch often have the same parent. A batch makes the node
+writes of its changes first, and then reconciles the parent of each collection
 once for all of them, with one gate and one CAS. The sweep, the deferred
 reconciliations, and structural recovery of one database instance take turns
 for each collection. Without the turns, they lose the gates of the parents to
