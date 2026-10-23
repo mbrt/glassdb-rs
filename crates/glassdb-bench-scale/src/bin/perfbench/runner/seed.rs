@@ -1,5 +1,6 @@
 //! The storage of a cell, and the seed that writes its pools.
 
+use std::collections::VecDeque;
 use std::error::Error;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -217,13 +218,16 @@ async fn seed(
     let mut settled = true;
     if !spec.quiet_period.is_zero() {
         let databases = std::slice::from_ref(&db);
+        // Each cell gets a copy of the seed, so its tree must not change.
         settled = wait_for_quiet(
             || structural_changes(databases),
             &AtomicBool::new(false),
             spec.quiet_period,
+            0.0,
             spec.timeout,
         )
-        .await;
+        .await
+        .quiet;
         // Garbage collection also changes the stored state, so every copy would
         // otherwise carry work that its cell does while it measures.
         {
@@ -329,33 +333,57 @@ pub(crate) fn gc_stats(databases: &[Database]) -> GcStats {
         })
 }
 
-/// Waits until `changes` stops moving for a full quiet period, or until
-/// `timeout` or `stop`, and reports whether the quiet period was reached.
+/// The result of [`wait_for_quiet`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QuietWait {
+    /// Whether the rate of the changes went down to the quiet rate.
+    pub(crate) quiet: bool,
+    /// The changes in each second of model time of the last full quiet
+    /// window, or none if the wait ended before one full window.
+    pub(crate) rate: Option<f64>,
+}
+
+/// Waits until `changes` moves at most `rate` times in each second of model
+/// time for a full quiet window of model time, or until `timeout` of model
+/// time or `stop`. A rate of zero waits for a window with no change.
 pub(crate) async fn wait_for_quiet(
     changes: impl Fn() -> u64,
     stop: &AtomicBool,
-    quiet: Duration,
+    window: Duration,
+    rate: f64,
     timeout: Duration,
-) -> bool {
-    let started = Instant::now();
-    let mut last = changes();
-    let mut unchanged_since = started;
-    let poll = (quiet / 4).clamp(Duration::from_millis(20), Duration::from_millis(250));
+) -> QuietWait {
+    let started = rt::Instant::now();
+    // The samples go back to the last one at or before the start of the
+    // window, so the first one is the count at the start of the window.
+    let mut samples = VecDeque::from([(started, changes())]);
+    let poll = (window / 4).clamp(Duration::from_millis(20), Duration::from_millis(250));
     loop {
-        let now = Instant::now();
+        let now = rt::Instant::now();
         let current = changes();
-        if current != last {
-            last = current;
-            unchanged_since = now;
-        }
-        let is_quiet = now.duration_since(unchanged_since) >= quiet;
-        if is_quiet
-            || now.duration_since(started) >= timeout
-            || stop.load(std::sync::atomic::Ordering::Relaxed)
+        samples.push_back((now, current));
+        while samples
+            .get(1)
+            .is_some_and(|(at, _)| now.duration_since(*at) >= window)
         {
-            return is_quiet;
+            samples.pop_front();
         }
-        tokio::time::sleep(poll).await;
+        let (since, before) = samples[0];
+        let elapsed = now.duration_since(since);
+        let observed = (elapsed >= window && !elapsed.is_zero())
+            .then(|| (current - before) as f64 / elapsed.as_secs_f64());
+        let quiet = window.is_zero() || observed.is_some_and(|observed| observed <= rate);
+        let result = QuietWait {
+            quiet,
+            rate: observed,
+        };
+        // A timeout around the loop would drop the last rate, and a warm-up
+        // that times out reports it.
+        let remaining = timeout.saturating_sub(now.duration_since(started));
+        if quiet || remaining.is_zero() || stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return result;
+        }
+        rt::sleep(poll.min(remaining)).await;
     }
 }
 
@@ -395,4 +423,110 @@ pub(crate) async fn collect_garbage(database: &Database) -> Result<Collected, GE
 
 pub(crate) fn millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use glassdb_concurr::rt;
+
+    use super::wait_for_quiet;
+
+    // Adds `per_second` changes in each second of model time, until `stop`.
+    async fn change_at(changes: &AtomicU64, per_second: u64, stop: &AtomicBool) {
+        while !stop.load(Ordering::Relaxed) {
+            rt::sleep(Duration::from_secs(1)).await;
+            changes.fetch_add(per_second, Ordering::Relaxed);
+        }
+    }
+
+    // A topology under a constant load can keep changing slowly near its
+    // stable boundaries. The wait must end when the rate is low, not only when
+    // the changes stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_low_rate_of_changes_is_quiet() {
+        let changes = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        let wait = async {
+            let wait = wait_for_quiet(
+                || changes.load(Ordering::Relaxed),
+                &AtomicBool::new(false),
+                Duration::from_secs(10),
+                0.2,
+                Duration::from_secs(60),
+            )
+            .await;
+            stop.store(true, Ordering::Relaxed);
+            wait
+        };
+        let started = rt::Instant::now();
+
+        let (wait, ()) = tokio::join!(wait, async {
+            // One change every 10 s is a rate of 0.1 in each second.
+            while !stop.load(Ordering::Relaxed) {
+                rt::sleep(Duration::from_secs(10)).await;
+                changes.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        assert!(wait.quiet);
+        assert!(wait.rate.unwrap() <= 0.2, "{wait:?}");
+        assert!(started.elapsed() < Duration::from_secs(12));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_high_rate_of_changes_is_not_quiet_and_reports_its_rate() {
+        let changes = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        let wait = async {
+            let wait = wait_for_quiet(
+                || changes.load(Ordering::Relaxed),
+                &AtomicBool::new(false),
+                Duration::from_secs(10),
+                0.2,
+                Duration::from_secs(30),
+            )
+            .await;
+            stop.store(true, Ordering::Relaxed);
+            wait
+        };
+
+        let (wait, ()) = tokio::join!(wait, change_at(&changes, 5, &stop));
+
+        assert!(!wait.quiet);
+        let rate = wait.rate.unwrap();
+        assert!((4.0..=6.0).contains(&rate), "{rate}");
+    }
+
+    // The seed waits for no change at all, because each cell gets a copy of
+    // its tree.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_rate_waits_for_a_window_without_changes() {
+        let changes = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        let wait = async {
+            let wait = wait_for_quiet(
+                || changes.load(Ordering::Relaxed),
+                &AtomicBool::new(false),
+                Duration::from_secs(10),
+                0.0,
+                Duration::from_secs(30),
+            )
+            .await;
+            stop.store(true, Ordering::Relaxed);
+            wait
+        };
+
+        let (wait, ()) = tokio::join!(wait, async {
+            while !stop.load(Ordering::Relaxed) {
+                // A rate of 0.2 in each second.
+                rt::sleep(Duration::from_secs(5)).await;
+                changes.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        assert!(!wait.quiet, "{wait:?}");
+    }
 }

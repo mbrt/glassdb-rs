@@ -80,7 +80,8 @@ pub(crate) struct ShapeSpec {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub(crate) struct SeedSpec {
-    /// The time without splits, merges, and GC progress that ends the seed.
+    /// The model time without splits, merges, and GC progress that ends the
+    /// seed.
     /// Zero ends the seed after its writes, with no wait and no full GC.
     #[serde(deserialize_with = "duration")]
     pub(crate) quiet_period: Duration,
@@ -148,11 +149,14 @@ pub(crate) struct WarmUpParams {
     /// Minimum model time of the warm-up.
     #[serde(deserialize_with = "duration")]
     pub(crate) minimum: Duration,
-    /// Wall time without splits and merges that ends the warm-up, or none to
-    /// run until the timeout.
+    /// The model time window of the quiet check, or none to run until the
+    /// timeout.
     #[serde(deserialize_with = "quiet")]
     pub(crate) quiet: Option<Duration>,
-    /// Maximum wall time. It wins over `minimum`.
+    /// The splits and merges of all database instances in each second of
+    /// model time, at or below which a full `quiet` window ends the warm-up.
+    pub(crate) quiet_rate: f64,
+    /// Maximum model time. It wins over `minimum`.
     #[serde(deserialize_with = "duration")]
     pub(crate) timeout: Duration,
 }
@@ -347,6 +351,12 @@ impl CellSpec {
     }
 
     fn check(&self) -> Result<(), Box<dyn Error>> {
+        let quiet_rate = self.params.warm_up.quiet_rate;
+        if !(quiet_rate.is_finite() && quiet_rate >= 0.0) {
+            return Err(
+                format!("cell.warm-up.quiet-rate must be 0 or more, got {quiet_rate}").into(),
+            );
+        }
         if self.params.affinity > 100 {
             return Err("cell.affinity must be a percentage from 0 through 100".into());
         }

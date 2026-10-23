@@ -1,7 +1,7 @@
 //! An optional progress bar on stderr.
 //!
 //! The bar shows how many cells of the experiment are done. A cell counts as
-//! partly done while it runs, by the elapsed part of its expected wall time.
+//! partly done while it runs, by the elapsed part of its expected model time.
 //! The expected time is an estimate, so the bar can move faster or slower than
 //! the clock, and the remaining time is only a guide.
 
@@ -9,6 +9,8 @@ use std::fmt::{self, Write as _};
 use std::io::Write as _;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use glassdb_concurr::rt;
 
 const BAR_WIDTH: usize = 30;
 
@@ -27,8 +29,8 @@ struct State {
 /// The part of a cell that one stage of it takes.
 #[derive(Clone, Copy)]
 pub(crate) struct Stage {
-    pub(crate) started: Instant,
-    /// The estimated wall time of the stage.
+    pub(crate) started: rt::Instant,
+    /// The estimated model time of the stage.
     pub(crate) expected: Duration,
     /// The fraction of the cell at the start and at the end of the stage.
     pub(crate) from: f64,
@@ -37,8 +39,12 @@ pub(crate) struct Stage {
 
 impl Stage {
     /// Splits a cell in a warm-up stage and a measurement stage, by their
-    /// expected wall times. `warm_start` is when the warm-up starts.
-    pub(crate) fn split(warm_start: Instant, warm: Duration, measure: Duration) -> (Self, Self) {
+    /// expected model times. `warm_start` is when the warm-up starts.
+    pub(crate) fn split(
+        warm_start: rt::Instant,
+        warm: Duration,
+        measure: Duration,
+    ) -> (Self, Self) {
         let total = (warm + measure).as_secs_f64();
         let share = if total > 0.0 {
             warm.as_secs_f64() / total
@@ -206,7 +212,7 @@ mod tests {
 
     #[test]
     fn stages_cover_the_cell() {
-        let now = Instant::now();
+        let now = rt::Instant::now();
         let (warm, measure) = Stage::split(now, Duration::from_secs(10), Duration::from_secs(30));
         assert_eq!(warm.from, 0.0);
         assert_eq!(warm.to, 0.25);

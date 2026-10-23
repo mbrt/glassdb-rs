@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use glassdb::{Collection, Database, Error as GError, Stats};
 use glassdb_bench_scale::backend_breakdown::BackendBreakdownHandle;
 use glassdb_bench_scale::bench::Bench;
+use glassdb_concurr::rt;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use tokio::task::JoinHandle;
@@ -51,7 +52,7 @@ pub(crate) struct Boundary {
     pub(crate) samples: usize,
     pub(crate) window: Window,
     pub(crate) wall: Instant,
-    pub(crate) model: glassdb_concurr::rt::Instant,
+    pub(crate) model: rt::Instant,
 }
 
 /// One shape of one group, as its workers run it.
@@ -263,7 +264,7 @@ impl Worker {
                         breakdown: shared.breakdown.snapshot(),
                     },
                     wall: Instant::now(),
-                    model: glassdb_concurr::rt::Instant::now(),
+                    model: rt::Instant::now(),
                 };
                 pass_start = Some((stats, boundary));
             }
@@ -366,7 +367,8 @@ impl Worker {
     }
 }
 
-/// Runs the measurement until its end condition, or until `max`.
+/// Runs the measurement until its end condition, or until `max` of model
+/// time.
 pub(crate) async fn drive(
     shared: &Shared,
     benches: &[Arc<Bench>],
@@ -374,11 +376,11 @@ pub(crate) async fn drive(
     min: Duration,
     max: Duration,
 ) -> Outcome {
-    let started = Instant::now();
+    let started = rt::Instant::now();
     // Poll often enough to react promptly, coarsely enough to stay negligible.
     let step = (max / 40).clamp(Duration::from_millis(20), Duration::from_millis(250));
     loop {
-        tokio::time::sleep(step).await;
+        glassdb_concurr::rt::sleep(step).await;
         if shared.failed.load(Ordering::Relaxed) {
             return Outcome::WorkerStopped;
         }

@@ -4,6 +4,10 @@
 
 Accepted — implemented.
 
+The section "Keep experiment control on unscaled wall time" is obsolete. The
+benchmark harness is not a database decision. Its README says which of its
+times are model time.
+
 This extends the simulation-aware runtime seam from
 [ADR-011](011-guided-interleaving-executor.md) and its enforcement in
 [ADR-013](013-deterministic-scheduling-test-coverage.md). It replaces the

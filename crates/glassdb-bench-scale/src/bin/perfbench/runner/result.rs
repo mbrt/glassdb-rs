@@ -78,8 +78,12 @@ pub(crate) struct WarmupResult {
     pub(crate) splits: u64,
     pub(crate) merges: u64,
     pub(crate) wall_ms: u64,
-    /// Whether the splits and merges stopped before the warm-up timeout.
+    /// Whether the rate of splits and merges went down to the quiet rate
+    /// before the warm-up timeout.
     pub(crate) quiet: bool,
+    /// The splits and merges in each second of model time of the last quiet
+    /// window, or none if the warm-up had no full window.
+    pub(crate) change_rate: Option<f64>,
     pub(crate) gc: GcResult,
 }
 
@@ -229,7 +233,7 @@ pub(crate) struct ShapeResult {
     pub(crate) converged: bool,
 }
 
-/// The structural changes of each instance in one wall second.
+/// The structural changes of each instance in one second of model time.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TimelineEntry {
