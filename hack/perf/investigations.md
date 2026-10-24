@@ -9,6 +9,177 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-10-24: a write price and symmetric merge terms under sustained load
+
+Status: under a high load, a write price for each divided round stops most
+splits, and halves the backend writes for each transaction. But the
+throughput depends mostly on the splits under the first, low load. In the
+reduced `workers` grid, each run either split at 20 workers or did not, and
+the runs that did not had about a third less throughput at 200 workers. A
+price of 75 ms skipped these splits in one run of two, and in the `mixed`
+low-conflict cell at 100% affinity, it stopped all of the useful splits (19%
+less throughput). Corrections of the queue wait for transactions over several
+leaves did not separate the useful splits from the others. Merge terms that
+are symmetric to the split terms did not change the `workers` grid, and made
+the `crossing` cell of `load-shift` change more. The temporary code is not in
+the repository.
+
+All runs used `--backend=memory --delays=s3 --delay-scale=0.2
+--prefix-depth=3` at `0ff05aae1`, plus temporary changes, on mains power.
+Virtual time (`--time=virtual`) does not show the problem: the identical
+workers share rounds, and the first `load-shift` warm-up was quiet after 12
+splits.
+
+### Variants
+
+The temporary changes measured these terms, and environment variables
+selected the variant:
+
+- **Split side:** the landed leaf CASes of divided rounds of each leaf, times
+  a write price. Also the direct commits that landed with keys on both sides
+  of the median (times the typical locked commit penalty), and the reads and
+  checks of a leaf by scans over its median (times the typical scan crossing
+  time).
+- **Merge side:** each database instance kept the last round of each leaf, with
+  its sibling links, for up to 1,024 leaves. When a round ended, it was
+  compared with the last round of each adjacent leaf. Two rounds where one
+  started before the other read its members were one round in a merged leaf,
+  and saved one write at the write price. A round that started while the
+  other ran after its read waited in a merged leaf, and added that wait for
+  each of its members.
+- **Symmetric conflicts:** one factor `w` = 5. A split adds `(w − 1)` times the
+  divided conflict time, as before. A merge removes `(1 − 1/w)` times the
+  crossing conflict time, instead of all of it.
+- **Merge threshold:** without the split-side time of both leaves (symmetric),
+  or as in ADR-074 (`OLD_MERGE`).
+- **Queue wait over several leaves:** a transaction acquires its locks in
+  several leaves in parallel, but waits only for the slowest one. Weight 1
+  divided the queue wait of each lock acquisition by the leaves of its phase.
+  Weight 3 also counted no queue wait of write-backs. Write-backs run in the
+  background after the commit point, and other transactions do not wait for
+  them: they check the transaction record when they do not know its state. Of
+  the other rounds, direct commits have one leaf, releases and structural gates
+  have no keys, and point reads and read validation do not go through the leaf
+  coordinator.
+
+### The `workers` experiment
+
+The reduced grid had 20, 80, 140, and 200 workers for each shape, with the
+other settings of `workers`. Each cell starts after the warm-up of the cell
+before it. The throughput is the geometric mean of the four shapes. Two runs
+of each variant, in the order A, B, C, D, then again:
+
+| Variant | Run | Splits at 20 | Splits | Quiet at 20/80/140/200 | Throughput 20/80/140/200 | Writes/tx at 140, 200 |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| A: `main` | 1 | 883 | 8,077 | yes/no/no/no | 273/1015/1535/1745 | 1.34, 1.49 |
+| A: `main` | 2 | 967 | 7,789 | no/no/no/no | 274/1016/1562/1788 | 1.32, 1.44 |
+| B: price 75 ms | 1 | 757 | 1,068 | no/yes/yes/yes | 269/975/1527/1801 | 0.71, 0.48 |
+| B: price 75 ms | 2 | 0 | 244 | yes in all | 231/699/1084/1207 | 0.55, 0.46 |
+| C: weight 1 | 1 | 834 | 5,327 | no/yes/no/no | 273/987/1419/1582 | 1.10, 1.20 |
+| C: weight 1 | 2 | 0 | 2,471 | yes/yes/no/no | 235/770/1149/1332 | 0.77, 0.89 |
+| D: weight 3 | 1 | 0 | 682 | yes/yes/yes/no | 235/721/1177/1091 | 0.67, 0.55 |
+| D: weight 3 | 2 | 0 | 633 | yes in all | 234/701/1154/1219 | 0.71, 0.51 |
+
+- The runs fall in two groups. With 757 to 967 splits at 20 workers, the
+  throughput was about 270/990/1,520/1,750. With none, it was about
+  234/700/1,150/1,190 in all later cells, also when the later cells split.
+- In B and C, the warm-up at 20 workers sometimes ended as quiet before the
+  moving averages of the rule paid for a split. The splits then started in
+  the measurement: 40 in B and 26 in C. D made no splits at 20 workers.
+- B in run 1 had the throughput of `main` with 1,068 splits against about
+  8,000, and 0.48 writes for each transaction at 200 workers against 1.47.
+  So the splits at 20 workers gave the throughput, and most of the later
+  splits gave none.
+- No variant merged. The queue wait that a merge adds was 76 to 213 s in the
+  measurement of each cell, and the saved writes were 1,000 to 3,300.
+- At 200 workers in D, run 1, the split-side time of the measurement was 2.4 s
+  of queue wait, 0.6 s of slow leaf CAS, and no lost CAS.
+
+Other variants ran in an earlier session, and the tree split at 20 workers
+in all of their runs. Without a price, the symmetric merge terms had the
+splits and the throughput of `main` (7,800 splits, one run). With a price of
+100 ms, 2 runs had 686 to 706 splits and 0.90 to 0.95 of the throughput of
+`main` at 80 to 140 workers. With a price of 75 ms and the merge threshold of
+ADR-074, one run had about the result of B in run 1.
+
+The full grid of `workers` (21 cells), one run of each. Both split at 20
+workers:
+
+| Variant | Splits | Not quiet | Change rate at the end | Writes/tx at 140, 200 | Throughput at 200 |
+| --- | ---: | --- | ---: | --- | ---: |
+| `main` | 41,800 | 20 workers, and 70 and more | 1.9 to 8.5/s | 1.64, 1.84 | 1,825 tx/s |
+| Price 75 ms | 14,591 | 20 workers, and 70 and more | 1.4 to 3.5/s | 0.96, 0.90 | 1,898 tx/s |
+
+- The cells at 20 to 60 workers split as much with the price as without it.
+  Their rounds had 1.03 to 1.25 members, so few rounds were divided, and a
+  split added almost no write.
+- After these cells, the tree had small leaves, and each cell of 70 workers or
+  more still made 700 to 1,100 splits in 180 s of model time.
+
+### The `load-shift` experiment
+
+Five database instances share one collection. In the measurements, lost CAS
+on other keys was most of the split-side time: about 3,800 s against about
+2,500 divided rounds in the first cell. So a price of 75 to 100 ms changed
+few splits there. The first and the third cells were quiet in all variants.
+The `crossing` cell:
+
+| Variant | Runs | Quiet | Splits | Merges | Throughput |
+| --- | ---: | --- | ---: | ---: | ---: |
+| `main` | 3 | 3 | 1,165 to 1,550 | 98 to 237 | 1,356 to 1,400 tx/s |
+| Symmetric, no price | 3 | 3 | 1,236 to 1,274 | 91 to 148 | 1,348 to 1,372 tx/s |
+| Price 75 ms | 3 | 0 | 1,439 to 1,543 | 477 to 540 | 1,477 to 1,538 tx/s |
+| Price 75 ms, `OLD_MERGE` | 2 | 1 | 1,237 to 1,655 | 280 to 423 | 1,518 to 1,567 tx/s |
+
+- With a split-side price, the cell made about 350 more splits and 350 more
+  merges, and ended with about the same number of leaves. Its throughput was
+  about 10% more, but it did not become quiet.
+- A merge-side price with no split-side price was quiet (928 splits, 126
+  merges, one run). So the split-side price causes the extra changes.
+- Paid rates of the time that a change removes, instead of its net time, did
+  not change this (2 runs, 548 and 583 merges).
+- A probe counted the requests of the rule. In one run at 75 ms, 11 to 16% of
+  the merge requests of each instance were of a leaf that this instance had
+  split in the 30 windows before. A run of the probe without a price was also
+  not quiet in `crossing` (2,005 splits and 367 merges), so the cell varies
+  more than the table shows. The rule asked for about 13,000 splits in each
+  instance, and ADR-083 dropped most of them.
+
+### The `mixed` experiment
+
+Four database instances, 8 workers for each shape. In one full run each of
+`main`, a price of 75 ms, and a price of 75 ms with `OLD_MERGE`, the
+high-conflict cells made no splits, and the low-conflict cells at 0 to 75%
+affinity made about the same splits and throughput. The
+low-conflict cell at 100% affinity, two runs of each variant:
+
+| Variant | Warm-up splits | Throughput | `ro-single` | Writes/tx |
+| --- | ---: | ---: | ---: | ---: |
+| A: `main` | 279 to 303 | 109 tx/s | 236 to 237 tx/s | 2.15 to 2.18 |
+| B: price 75 ms | 0 | 88 tx/s | 176 to 177 tx/s | 1.95 to 1.98 |
+| C: weight 1 | 205 to 206 | 105 tx/s | 225 to 228 tx/s | 2.14 to 2.15 |
+| D: weight 3 | 0 | 88 tx/s | 176 to 177 tx/s | 1.95 to 1.96 |
+
+The splits that B and D stopped gave 24% more throughput, and cost about 10%
+more writes.
+
+### Conclusions
+
+- A write price is a cost, not a predictor. Without a price, the rule splits
+  until the queue wait goes away, also when the splits give no throughput. A
+  price that stops these splits at high load also stops useful splits at low
+  load.
+- The useful splits came first, under the low load. The rule cannot tell them
+  from the later ones: weight 1 kept most of them but did not stop the later
+  splits, and weight 3 stopped both.
+- The warm-up of a cell can end as quiet before the rule pays for a split, so
+  the start of the next cell depends on chance.
+- The symmetric merge terms did not help the goal. The merge side never paid
+  in `workers`, and it caused more changes in `crossing`.
+- The split-side direct commit and scan terms were zero in `workers` and
+  `mixed`. In `crossing`, about 1,000 to 1,350 direct commits in each
+  measurement were divided.
+
 ## 2026-10-20: a split saves queue wait, and costs divided rounds
 
 Status: the queue wait that the avoidable time rule (ADR-074) counts is the
