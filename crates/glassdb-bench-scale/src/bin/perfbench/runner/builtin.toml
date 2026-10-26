@@ -80,7 +80,11 @@ max-duration = "60s"
 window-commits = 50
 
 # The default experiment: both conflict levels at five collection affinities.
-[experiments.mixed]
+[experiments.mixed.set]
+# The topology rule needs some half-lives of its averages (10 s) before it
+# splits, so a shorter warm-up can end quiet on the topology that it starts
+# with.
+cell.warm-up.minimum = "30s"
 [[experiments.mixed.axes]]
 path = "cell.workload"
 values = ["low-conflict", "high-conflict"]
@@ -94,6 +98,10 @@ values = [0, 25, 50, 75, 100]
 pools.wide.keys = 20000
 seed.quiet-period = "5s"
 cell.databases = 5
+# The topology rule needs some half-lives of its averages (10 s) before it
+# splits, so a shorter warm-up can end quiet on the topology that it starts
+# with.
+cell.warm-up.minimum = "30s"
 cell.warm-up.quiet = "5s"
 cell.warm-up.timeout = "180s"
 [[experiments.workers.axes]]
@@ -105,6 +113,10 @@ start = "previous-warm-up"
 # The affinity grid of the canonical plots.
 [experiments.affinity.set]
 cell.workers = 20
+# The topology rule needs some half-lives of its averages (10 s) before it
+# splits, so a shorter warm-up can end quiet on the topology that it starts
+# with.
+cell.warm-up.minimum = "30s"
 [[experiments.affinity.axes]]
 path = "cell.affinity"
 values = [0, 25, 50, 75, 100]
