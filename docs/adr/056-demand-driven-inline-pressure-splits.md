@@ -5,6 +5,8 @@
 Accepted — implemented. With [ADR-074](074-avoidable-time-drives-splits-and-merges.md)
 and [ADR-075](075-avoidable-time-is-the-default-topology-policy.md), it applies
 only with the size causes topology policy.
+[ADR-084](084-size-causes-are-the-default-topology-policy.md) makes the size
+causes the default topology policy again.
 
 This extends [ADR-031](031-dynamic-range-sharding.md)'s background split policy
 and resolves the capacity follow-up left by

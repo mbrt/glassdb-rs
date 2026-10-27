@@ -5,6 +5,8 @@
 Accepted — implemented. With [ADR-074](074-avoidable-time-drives-splits-and-merges.md)
 and [ADR-075](075-avoidable-time-is-the-default-topology-policy.md), the
 underfull threshold of leaves applies only with the size causes topology policy.
+[ADR-084](084-size-causes-are-the-default-topology-policy.md) makes the size
+causes the default topology policy again.
 
 Refines [ADR-031](031-dynamic-range-sharding.md) by adding merges to the B-link
 topology, and extends its background split policy into one maintenance policy

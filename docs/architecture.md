@@ -619,11 +619,11 @@ Splits and merges share one lifecycle and one parent reconciliation step. The
 `Restructurer` gives each candidate to the split module or the merge module.
 
 Committed leaf writes, parent reconciliation, and capacity rejections queue
-candidates. With the default avoidable time topology policy, a rule decides the
-other leaf splits and merges once per window
-([ADR-074](adr/074-avoidable-time-drives-splits-and-merges.md),
-[ADR-075](adr/075-avoidable-time-is-the-default-topology-policy.md)). With the
-size causes policy, the underfull threshold and inline pressure decide. A new
+candidates. With the default size causes topology policy, the soft caps, the
+underfull threshold, and inline pressure decide
+([ADR-084](adr/084-size-causes-are-the-default-topology-policy.md)). With the
+avoidable time policy, a rule decides the other leaf splits and merges once per
+window ([ADR-074](adr/074-avoidable-time-drives-splits-and-merges.md)). A new
 candidate wakes the restructurer after a short delay, so that one sweep takes a
 burst of writes. A deferred candidate waits for the next sweep, which comes at
 most a fixed interval later, so a busy node cannot cause a tight retry loop. A

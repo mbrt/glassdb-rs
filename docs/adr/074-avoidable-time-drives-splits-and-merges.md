@@ -6,6 +6,8 @@ Accepted — implemented.
 
 [ADR-075](075-avoidable-time-is-the-default-topology-policy.md)
 makes the avoidable time policy the default.
+[ADR-084](084-size-causes-are-the-default-topology-policy.md) makes the size
+causes the default again.
 
 [ADR-083](083-drop-stale-topology-requests.md) drops the changes that the
 rule asked for more than three windows before.

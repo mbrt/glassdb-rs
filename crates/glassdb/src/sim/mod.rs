@@ -89,7 +89,7 @@ pub(super) fn key_name(key: usize) -> Vec<u8> {
 
 /// Splits a leaf above two entries, so that a few keys grow the tree. With the
 /// size causes, a leaf with at most one live entry is underfull, so that
-/// deletes can merge nearly empty leaves (ADR-073). With the default topology
+/// deletes can merge nearly empty leaves (ADR-073). With the avoidable time
 /// policy, only leaves with no live entries are underfull (ADR-074).
 pub(super) fn tiny_node_size_policy() -> NodeSizePolicy {
     NodeSizePolicy::builder()
@@ -105,7 +105,7 @@ pub(super) fn tiny_node_size_policy() -> NodeSizePolicy {
 /// Splits a leaf above four entries, so that the merge vetoes admit merged
 /// leaves with two entries (ADR-073). With the size causes, every leaf below
 /// the split limit is underfull, so a few deletes drive merges. With the
-/// default topology policy, only leaves with no live entries are underfull
+/// avoidable time policy, only leaves with no live entries are underfull
 /// (ADR-074).
 pub(super) fn merging_node_size_policy() -> NodeSizePolicy {
     NodeSizePolicy::builder()

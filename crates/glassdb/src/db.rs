@@ -121,8 +121,8 @@ impl DatabaseBuilder {
 
     /// Sets the policy that decides when leaves split and merge. The policy is
     /// local to each database instance, and database instances with different
-    /// policies can share one database. Defaults to the avoidable time policy
-    /// (ADR-075).
+    /// policies can share one database. Defaults to the size causes policy
+    /// (ADR-084). The soft caps of [`NodeSizePolicy`] apply to both policies.
     pub fn topology_policy(mut self, policy: TopologyPolicy) -> Self {
         self.engine_config.set_topology_policy(policy);
         self

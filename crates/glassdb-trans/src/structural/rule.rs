@@ -47,10 +47,10 @@ pub enum TopologyPolicy {
     /// The avoidable time of the transactions of each database instance
     /// decides (ADR-074). Leaves over a soft cap still split, and leaves with
     /// no live entries still merge.
-    #[default]
     AvoidableTime,
     /// Soft caps, underfull thresholds, and inline pressure decide (ADR-031,
-    /// ADR-056, ADR-073).
+    /// ADR-056, ADR-073). The default (ADR-084).
+    #[default]
     SizeCauses,
 }
 
