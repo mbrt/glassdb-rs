@@ -9,6 +9,121 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-10-28: keys that transactions commit together
+
+Status: with the size causes and a soft cap of 48 entries, a leaf boundary
+can divide a range of keys that transactions write together, and nothing
+moves it. Temporary code merged two adjacent leaves when the same span of
+written keys crossed their boundary again and again, and moved soft cap
+splits to a key that divides no recent span. Transactions on fixed ranges of
+16 keys then had 1.20 to 1.24 times the throughput of the band alone, with
+0.85 to 0.92 of the writes. Random ranges, `load-shift`, `mixed`, and
+`workers` did not change, and were quiet. Each condition of the merge was
+needed to stop changes that do not pay. The temporary code is not in the
+repository.
+
+All runs used `--backend=memory --delays=s3 --delay-scale=0.2
+--prefix-depth=3` at `8c6a1149f`, plus temporary changes, on mains power.
+Ratios are to the size causes with the default soft cap of 48 entries and
+underfull threshold of 12 (`S48`) of the same set of runs, which ran
+alternated.
+
+### Loads
+
+Temporary `perfbench` configurations, on one collection of 20,000 keys, with
+8 workers of `rw-single` and of `ro-single`, and two cells: one database
+instance, and five that share the collection.
+
+- **Random ranges:** 8 workers of read-modify-write transactions of 16
+  adjacent keys, and 8 of 64, from a random start in the block of keys of the
+  worker (about 250 keys with five instances).
+- **Fixed ranges:** 16 shapes with one worker that write a fixed range of 16
+  keys each, at the keys `1000·i + 337`, and 8 with a fixed range of 64 keys
+  each, at `2500·i + 611`.
+
+The loads update keys of the seed, so leaves do not grow after the seed, and
+a split of the seed that divides a range stays.
+
+### What a divided range costs
+
+A soft cap of 256 entries (`S256`) against `S48`, two runs of each:
+
+| Load | Cell | Ranges | `rw-single` | `ro-single` | Writes/tx |
+| --- | --- | --- | ---: | ---: | ---: |
+| Random ranges | one | 1.15 (16 keys), 1.23 (64 keys) | 0.91 | 0.86 | 0.68 |
+| Random ranges | five | 0.87 (16 keys), 1.17 (64 keys) | 0.66 | 1.04 | 0.64 |
+| Fixed ranges | one | 1.45 (16 keys), 1.15 (64 keys) | 0.89 | 0.81 | 0.69 |
+| Fixed ranges | five | 1.47 (16 keys), 1.23 (64 keys) | 0.64 | 0.89 | 0.52 |
+
+Larger leaves divide fewer ranges, and cost the transactions on single keys.
+
+### Variants
+
+Behind an environment variable, on the size causes:
+
+- **Spans:** the first and the last written key of each committed transaction
+  whose written keys are in one leaf or in two adjacent leaves, for the last
+  32 such transactions of each leaf. A key `k` divides a span when
+  `first < k <= last`.
+- **Split:** a soft cap split uses the median unless it divides a recent
+  span. Then it uses the nearest key in the middle half of the leaf that
+  divides no recent span, or waits. Above 2 times the soft cap, or above the
+  byte soft cap, it splits at the key of the middle half that divides the
+  fewest recent spans. Root, capacity, and inline pressure splits do not
+  change.
+- **Merge (`R72`, `R96`):** a commit over the boundary of two adjacent leaves
+  queues a merge of the two, at most once in 30 s for each pair. The merge
+  can make a leaf of up to 72 or 96 live entries, and of up to half the byte
+  soft cap. The other merge rules of ADR-073 stay. The merged leaf keeps the
+  spans of both.
+- **Recurrence (`C96`):** as `R96`, and the same span crossed the boundary at
+  least 3 times in 60 s.
+- **Share (`X96`):** as `C96`, and the commits over the boundary are at least
+  half of the commits with more than one key of the two leaves, in 60 s.
+- **Free key (`Y96`):** as `X96`, and a merged leaf above the soft cap has a
+  key in its middle half that divides no recent span.
+
+### Results
+
+Ratios to `S48`, one database instance and five:
+
+| Variant | Runs | Fixed ranges of 16 keys | Random ranges: splits and merges in the warm-up | `crossing`: throughput, splits and merges in the warm-up |
+| --- | ---: | --- | --- | --- |
+| `R72` | 2 | 1.13, 1.15 | | |
+| `R96` | 2 | 1.18, 1.26 | 644, 1,548 (1 run) | 0.83, 2,239 (1 run) |
+| `C96` | 2 | 1.26, 1.24 | 339, 486 (1 run) | 0.98, 1,999 (1 run) |
+| `X96` | 2 | 1.11, 1.24 | 56, 218 | 1.00, 0 (2 runs of 3) |
+| `Y96` | 2 | 1.20, 1.24 | 3, 2 | 0.99, 0 |
+
+- With 72 entries, most pairs did not fit: the leaves of the seed had about
+  38 entries each.
+- Random adjacent pairs and random ranges in small blocks of keys repeat, so
+  the recurrence alone did not stop their merges. The share stopped them in
+  `crossing`. A merge of ranges wider than a leaf with no key free of them
+  was split again at 96 entries. The free key stopped these merges.
+- Ranges of 64 keys are wider than the soft cap, and stayed at 0.97 to 1.00
+  with `Y96`.
+- `Y96` against `S48`: `rw-single` and `ro-single` 0.96 to 1.03 on the fixed
+  ranges, with 0.92 and 0.85 of the writes; random ranges 0.98 to 1.02;
+  `load-shift` 0.98, 0.99, 1.02, with no splits and merges; `mixed` 1.01;
+  `workers` 0.99 to 1.00. All warm-ups were quiet. On the fixed ranges, the
+  measurement had 3 to 6 changes, because a merge waits while the writer of
+  the range holds its locks.
+- One run of `X96` in `load-shift` ended with an internal error at shutdown
+  ("coordinator shut down while locking leaf"). Two runs again, and 16 runs
+  of `Y96`, ended without it.
+
+### Conclusions
+
+- A boundary that divides a range of keys that transactions write together
+  costs them, and the band does not repair it.
+- A merge for these keys pays only when the same span crosses the boundary
+  often, when it is most of the multi-key commits of the two leaves, and when
+  the merged leaf can split again outside the spans. Without one of these,
+  random multi-key commits merge and split leaves again and again.
+- Ranges wider than the soft cap need larger leaves, which this design does
+  not give.
+
 ## 2026-10-27: a size band with lost CAS splits below it
 
 Status: a size band of 48 to 12 entries, with lost CAS as the only demand
@@ -122,6 +237,25 @@ The reduced grid at 20, 80, 140, and 200 workers, one run of each variant:
 `H48sg` were 0.92 to 0.93 at 200 workers. `H48sg` made no split below the
 band there, so this can be noise or the cost of the probe.
 
+### A higher factor
+
+`H48s` with a factor of 4 (`F4`) and 8 (`F8`) for each split below the band,
+against a new set of `S48` runs. Three runs of the false sharing load, two of
+`load-shift`, and one of the reduced `workers` grid:
+
+| Variant | Hot writer | All shapes | `load-shift` throughput | `load-shift` writes/tx | `crossing` quiet | `workers` |
+| --- | --- | ---: | --- | --- | --- | --- |
+| `S48` | 1.78 to 2.85 tx/s | 567 tx/s | 1, 1, 1 | 1, 1, 1 | yes | 1 |
+| `F4` | 7.70 to 8.04 tx/s | 630 tx/s | 1.02, 0.95, 0.96 | 1.23, 1.15, 1.21 | no | 1.00 to 1.06 |
+| `F8` | 7.67 to 7.97 tx/s | 631 tx/s | 0.98, 0.99, 0.93 | 1.24, 1.18, 1.31 | no | 1.00 to 1.05 |
+
+- In each run of `load-shift`, `F4` made about 3,400 splits below the band,
+  and `F8` about 2,500.
+- In the warm-up of `crossing`, `F8` made 917 splits and 330 merges, and
+  `F4` 1,332 splits and 724 merges. A split removed the lost CAS of its
+  leaves, the merge veto ended, the leaves merged, and the lost CAS came
+  back.
+
 ### Conclusions
 
 - A split for false sharing must use a split key between the keys that
@@ -133,6 +267,9 @@ band there, so this can be noise or the cost of the probe.
   also pays for splits below the band, and these splits cost throughput and
   writes. The share of the smaller side, the lost CAS of its keys, and of its
   most delayed key did not tell it from false sharing.
+- A factor of 4 or 8 kept most of the throughput of `crossing`, but the leaves
+  there split and merged again and again, with 1.15 to 1.31 times the writes
+  of `S48`.
 - In `crossing`, many transactions write two adjacent keys. A split below the
   band divides some of them, and no variant counted that cost.
 
