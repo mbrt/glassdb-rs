@@ -1,4 +1,4 @@
-"""Read `perfbench` result files (schema version 2) into pandas frames.
+"""Read `perfbench` result files (schema version 3) into pandas frames.
 
 This module is the only place that knows the on-disk layout of the `perfbench`
 JSON envelope. `compare.py` and `plot_results.py` both build on it, so a schema
@@ -18,7 +18,7 @@ from typing import Any, Sequence
 
 import pandas as pd
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SHAPES = ("rwSingle", "rwMany", "roSingle", "roMulti")
 # The shapes of the mixed workloads, by their names in the configuration.
 SHAPE_NAMES = {
@@ -53,25 +53,53 @@ def body_replays_per_tx(mapping: dict) -> float:
     return mapping.get("replaysPerTx", mapping.get("retriesPerTx", 0))
 
 
-def read_envelope(path: Path) -> dict[str, Any]:
-    """Load one result file and check that it is a supported envelope."""
-    return check_envelope(_load(path), str(path))
+def read_envelope(path: Path, name: str | None = None) -> dict[str, Any]:
+    """Load one experiment of a result file, as `check_envelope` returns it."""
+    return check_envelope(_load(path), str(path), name=name)
+
+
+def experiment_names(path: Path) -> list[str]:
+    """Return the names of the experiments in one result file."""
+    return [experiment["name"] for experiment in _experiments(_load(path), str(path))]
 
 
 def check_envelope(
-    report: Any, source: str, scenario: str | None = None
+    report: Any, source: str, scenario: str | None = None, name: str | None = None
 ) -> dict[str, Any]:
-    """Return `report` when it is a supported envelope, optionally of `scenario`."""
-    if not isinstance(report, dict) or report.get("schemaVersion") != SCHEMA_VERSION:
-        raise ReportError(f"{source}: expected a schema-version 2 perfbench report")
-    if not isinstance(report.get("scenario"), str):
-        raise ReportError(f"{source}: scenario must be a string")
+    """Return one experiment of `report` as an envelope.
+
+    The envelope has the fields of the report, and the `scenario` (the name),
+    the `experiment`, and the `runs` of one experiment. `name` selects the
+    experiment, and `scenario` checks its kind. With neither, the report must
+    have one experiment, or one of the kind of `scenario`.
+    """
+    experiments = _experiments(report, source)
     accepted = MIXED_EXPERIMENTS if scenario == "mixed" else (scenario,)
-    if scenario is not None and report["scenario"] not in accepted:
+    names = [experiment["name"] for experiment in experiments]
+    if name is not None:
+        matches = [e for e in experiments if e["name"] == name]
+    elif scenario is not None:
+        matches = [e for e in experiments if e["name"] == scenario] or [
+            e for e in experiments if e["name"] in accepted
+        ]
+    else:
+        matches = experiments
+    if len(matches) != 1:
+        wanted = name or scenario
+        what = f"one {wanted} experiment" if wanted else "one experiment"
+        raise ReportError(f"{source}: expected {what}, got {names}")
+    experiment = matches[0]
+    if scenario is not None and experiment["name"] not in accepted:
         raise ReportError(
-            f"{source}: expected a {scenario} report, got {report['scenario']}"
+            f"{source}: expected a {scenario} experiment, got {experiment['name']}"
         )
-    return report
+    header = {key: value for key, value in report.items() if key != "experiments"}
+    return {
+        **header,
+        "scenario": experiment["name"],
+        "experiment": experiment,
+        "runs": experiment.get("runs"),
+    }
 
 
 def metadata(report: dict[str, Any], source: str) -> ReportMetadata:
@@ -101,13 +129,16 @@ def runs(report: dict[str, Any], source: str) -> list[tuple[int, dict[str, Any]]
     return result
 
 
-def mixed_cells(report: dict[str, Any], source: str) -> list[dict[str, Any]]:
-    """Flatten a mixed report into cells that each carry their `run` id.
+def mixed_cells(
+    report: dict[str, Any], source: str, name: str | None = None
+) -> list[dict[str, Any]]:
+    """Flatten the mixed experiment of a report into cells that each carry
+    their `run` id.
 
     Each cell also carries the `mode` of its workload, and its shapes the
     names of the mixed shapes, as the plots and tables name them.
     """
-    check_envelope(report, source, "mixed")
+    report = check_envelope(report, source, "mixed", name)
     cells: list[dict[str, Any]] = []
     for run_id, run in runs(report, source):
         run_cells = _array(run.get("cells"), f"{source}: run {run_id}.cells")
@@ -142,9 +173,10 @@ def mixed_cells(report: dict[str, Any], source: str) -> list[dict[str, Any]]:
 
 
 def read_mixed(
-    path: Path, *, require_converged: bool
+    path: Path, *, require_converged: bool, name: str | None = None
 ) -> tuple[ReportMetadata, pd.DataFrame]:
-    """Load a mixed report into one row per run, cell, and shape.
+    """Load the mixed experiment `name` of a report into one row per run,
+    cell, and shape.
 
     With `require_converged`, a shape that hit its time cap before reaching the
     target commits per window is an error instead of a plotted point.
@@ -155,11 +187,11 @@ def read_mixed(
     their `throughput_p10` and `throughput_p90` are NaN.
     """
     source = str(path)
-    report = check_envelope(_load(path), source, "mixed")
-    meta = metadata(report, source)
+    raw = _load(path)
+    meta = metadata(check_envelope(raw, source, "mixed", name), source)
     rows: list[dict[str, Any]] = []
     seen_cells: set[tuple[int, str, int, int, int]] = set()
-    for cell_index, cell in enumerate(mixed_cells(report, source)):
+    for cell_index, cell in enumerate(mixed_cells(raw, source, name)):
         run_id = cell["run"]
         label = f"{source}: run {run_id} cell {cell_index}"
         mode = cell["mode"]
@@ -438,6 +470,20 @@ def _window_percentiles(
         float(rates.quantile(0.5)),
         float(rates.quantile(0.9)),
     )
+
+
+def _experiments(report: Any, source: str) -> list[dict[str, Any]]:
+    """Return the experiments of a supported report."""
+    if not isinstance(report, dict) or report.get("schemaVersion") != SCHEMA_VERSION:
+        raise ReportError(
+            f"{source}: expected a schema-version {SCHEMA_VERSION} perfbench report"
+        )
+    experiments = _array(report.get("experiments"), f"{source}: experiments")
+    for index, value in enumerate(experiments):
+        experiment = _object(value, f"{source}: experiments[{index}]")
+        if not isinstance(experiment.get("name"), str):
+            raise ReportError(f"{source}: experiments[{index}].name must be a string")
+    return experiments
 
 
 def _load(path: Path) -> Any:

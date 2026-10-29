@@ -1,0 +1,6 @@
+# A read-modify-write of one key in each of five collections.
+include = ["../../configs/default.toml"]
+
+[cell]
+workload = "diag-rmw-five"
+collections = 5

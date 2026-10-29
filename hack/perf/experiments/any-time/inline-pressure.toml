@@ -1,0 +1,62 @@
+# How the leaves adapt when their aggregate inline budget is full (ADR-056).
+# One worker fills the inline budget of the leaf, then updates the
+# next keys until one pass takes no locked commit. The pressure cell ends with
+# that pass, and the recovery cell repeats it.
+
+[pools.inline]
+keys = 192
+value-bytes = 1024
+
+[shapes.fill]
+kind = "read-modify-write"
+pool = "inline"
+source = { sequence = { start = 0, count = 64, order = "ascending" } }
+keys = 1
+
+[shapes.pressure]
+kind = "read-modify-write"
+pool = "inline"
+source = { sequence = { start = 64, count = 64, order = "alternate-halves" } }
+keys = 1
+
+[workloads.fill.groups.all]
+instances = 1
+shapes = { fill = 1 }
+
+[workloads.pressure.groups.all]
+instances = 1
+shapes = { pressure = 1 }
+
+[seed]
+quiet-period = "0s"
+
+[seed.database]
+inline-max-value-bytes = 1024
+inline-max-leaf-bytes = 65536
+# A leaf of 64 values of 1 KiB fills the inline budget only above the default
+# soft cap of leaf entries.
+leaf-max-entries = 256
+
+[cell]
+collections = 1
+gc = false
+
+[cell.database]
+inline-max-value-bytes = 1024
+inline-max-leaf-bytes = 65536
+leaf-max-entries = 256
+
+[cell.warm-up]
+timeout = "0s"
+
+[cell.measure]
+max-duration = "30s"
+
+[[axes]]
+name = "phase"
+start = "previous"
+values = [
+  { label = "saturation", set = { "cell.workload" = "fill", "cell.measure.until" = "passes" } },
+  { label = "pressure", set = { "cell.workload" = "pressure", "cell.measure.until" = "no-locked-pass" } },
+  { label = "recovery", set = { "cell.workload" = "pressure", "cell.measure.until" = "passes" } },
+]

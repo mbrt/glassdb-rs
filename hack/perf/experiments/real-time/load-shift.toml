@@ -1,0 +1,25 @@
+# A change of the load on one tree. Each cell continues on the database
+# instances of the cell before it, and its warm-up shows whether the topology
+# becomes quiet again.
+include = ["../../configs/common-workloads.toml"]
+
+[pools.wide]
+keys = 20000
+
+[cell]
+collections = 1
+databases = 5
+workers = 200
+gc = false
+
+[cell.warm-up]
+timeout = "300s"
+
+[cell.measure]
+duration = "10s"
+max-duration = "20s"
+
+[[axes]]
+path = "cell.workload"
+values = ["low-conflict", "crossing", "low-conflict"]
+start = "previous"

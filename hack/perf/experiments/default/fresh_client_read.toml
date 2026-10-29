@@ -1,0 +1,6 @@
+# A read on a new database instance, which has no cache (the scenario kind
+# `fresh-client-read`). The open is not in the time.
+include = ["../../configs/default.toml"]
+
+[cell]
+workload = "diag-fresh-read"

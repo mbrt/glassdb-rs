@@ -1,9 +1,7 @@
 # False sharing: four database instances each write one of the adjacent keys 0
 # to 3, which share a leaf, while one more instance reads and writes the keys
-# around them (ADR-084). Run with
-# --config=hack/perf/experiments/false-sharing.toml --experiment=false-sharing.
-# The axis `policy` selects the topology: the engine defaults, the avoidable
-# time policy, or one key in each leaf.
+# around them (ADR-084). The axis `policy` selects the topology: the engine
+# defaults, the avoidable time policy, or one key in each leaf.
 
 [pools.false-sharing]
 keys = 4096
@@ -72,37 +70,43 @@ shapes = { hot3 = 4 }
 instances = 1
 shapes = { bg-rmw-seq = 8, bg-read-seq = 8, bg-rmw-pool = 8, bg-read-pool = 8 }
 
-[experiments.false-sharing.set]
-cell.workload = "false-sharing"
-cell.collections = 1
-seed.quiet-period = "10s"
-cell.gc = false
-cell.warm-up.minimum = "30s"
-cell.warm-up.quiet = "10s"
-cell.warm-up.timeout = "120s"
-cell.measure.until = "duration"
-cell.measure.duration = "60s"
-cell.measure.max-duration = "120s"
+[seed]
+quiet-period = "10s"
 
-[[experiments.false-sharing.axes]]
+[cell]
+workload = "false-sharing"
+collections = 1
+gc = false
+
+[cell.warm-up]
+minimum = "30s"
+quiet = "10s"
+timeout = "120s"
+
+[cell.measure]
+until = "duration"
+duration = "60s"
+max-duration = "120s"
+
+[[axes]]
 name = "policy"
 
-[[experiments.false-sharing.axes.values]]
+[[axes.values]]
 label = "default"
-[experiments.false-sharing.axes.values.set]
+[axes.values.set]
 "seed.timeout" = "600s"
 
-[[experiments.false-sharing.axes.values]]
+[[axes.values]]
 label = "avoidable"
-[experiments.false-sharing.axes.values.set]
+[axes.values.set]
 "seed.timeout" = "600s"
 "seed.database.topology" = "avoidable"
 "cell.database.topology" = "avoidable"
 
 # The seed has one key in each leaf, which takes longer to settle.
-[[experiments.false-sharing.axes.values]]
+[[axes.values]]
 label = "fixed-1"
-[experiments.false-sharing.axes.values.set]
+[axes.values.set]
 "seed.timeout" = "1800s"
 "seed.database.topology" = "size"
 "seed.database.leaf-max-entries" = 1

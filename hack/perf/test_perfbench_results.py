@@ -41,6 +41,24 @@ class PerfbenchResultsTest(unittest.TestCase):
         self.assertEqual(cells[0]["run"], 2)
         self.assertEqual(cells[0]["mode"], "hi")
 
+    def test_one_experiment_of_a_result_is_selected_by_name_or_kind(self) -> None:
+        def experiment(name: str, workers: int) -> dict:
+            cell = mixed_cell(workers=workers)
+            return envelope(name, [{"run": 1, "cells": [cell]}])["experiments"][0]
+
+        report = envelope("contention", [])
+        report["experiments"] += [experiment("workers", 1), experiment("affinity", 2)]
+
+        cells = perfbench_results.mixed_cells(report, "report", "affinity")
+        self.assertEqual(cells[0]["workersPerShape"], 2)
+        with self.assertRaisesRegex(perfbench_results.ReportError, "one mixed"):
+            perfbench_results.mixed_cells(report, "report")
+        with self.assertRaisesRegex(perfbench_results.ReportError, "a mixed"):
+            perfbench_results.mixed_cells(report, "report", "contention")
+        report["experiments"].pop()
+        cells = perfbench_results.mixed_cells(report, "report")
+        self.assertEqual(cells[0]["workersPerShape"], 1)
+
     def test_cell_with_failures_is_rejected(self) -> None:
         report = envelope("mixed", [{"run": 1, "cells": [mixed_cell(failures=3)]}])
         with self.assertRaisesRegex(perfbench_results.ReportError, "3 failures"):
@@ -56,7 +74,9 @@ class PerfbenchResultsTest(unittest.TestCase):
     def test_report_of_another_scenario_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write(Path(directory_name), "mixed.json", inline_report(1, 1.0))
-            with self.assertRaisesRegex(perfbench_results.ReportError, "mixed report"):
+            with self.assertRaisesRegex(
+                perfbench_results.ReportError, "mixed experiment"
+            ):
                 perfbench_results.read_mixed(path, require_converged=False)
 
     def test_legacy_retry_names_count_as_replays(self) -> None:

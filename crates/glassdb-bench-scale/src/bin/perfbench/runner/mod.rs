@@ -98,12 +98,15 @@ pub(crate) fn run(
     let mut runs = Vec::with_capacity(execution.runs);
     for run in 1..=execution.runs {
         runtime.block_on(cooldown(execution, run));
+        // A database name has only letters and digits.
+        let name: String = resolved
+            .name
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
         let mut seeds = Seeds::new(
             factory,
-            format!(
-                "perfbench{}{invocation}r{run}",
-                resolved.name.replace('-', "")
-            ),
+            format!("perfbench{name}{invocation}r{run}"),
             execution.drain_timeout,
         );
         let mut carry: Option<Carry> = None;

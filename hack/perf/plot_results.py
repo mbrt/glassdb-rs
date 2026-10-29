@@ -8,16 +8,18 @@
 #     "seaborn>=0.13",
 # ]
 # ///
-"""Plot `perfbench` result files, one set of figures per file.
+"""Plot `perfbench` result files, one set of figures per experiment.
 
-The scenario recorded in each file selects the figures:
+The kind of each experiment selects the figures:
 
-* `mixed`: throughput and latency by shape, one panel per mode. The x-axis is
-  the one dimension that varies: affinity or workers per shape;
+* `mixed`, `workers`, and `affinity`: throughput and latency by shape, one panel
+  per mode. The x-axis is the one dimension that varies: affinity or workers per
+  shape;
 * `contention`: throughput and latency by number of contended keys.
 
-`--series LABEL=FILE` (at least twice) overlays files of one scenario instead.
-Each scenario gets its own figures, named `cmp-<scenario>-*.png`.
+A file with several experiments gets figures named `<file>-<experiment>-*.png`.
+`--series LABEL=FILE` (at least twice) overlays files of one experiment instead.
+Each experiment gets its own figures, named `cmp-<experiment>-*.png`.
 
 Lines show the p50. Bands show the p10 to p90 range of a shape's throughput
 windows for throughput, and the p50 to p90 range of its transaction latencies
@@ -403,12 +405,14 @@ def _plot_mode_panels(
 
 
 def plot_mixed_report(
-    series: Mapping[str, Path], out_dir: Path, stem: str
+    series: Mapping[str, Path], out_dir: Path, stem: str, name: str | None = None
 ) -> list[Path]:
     """Plot throughput and latency of mixed reports against their swept axis."""
     frames, axes = [], set()
     for label, path in series.items():
-        _, data = perfbench_results.read_mixed(path, require_converged=False)
+        _, data = perfbench_results.read_mixed(
+            path, require_converged=False, name=name
+        )
         unconverged = int((~data["converged"]).sum())
         if unconverged:
             print(f"warning: {path}: {unconverged} shape points did not converge")
@@ -444,7 +448,7 @@ def plot_mixed_report(
 
 
 def plot_contention_report(
-    series: Mapping[str, Path], out_dir: Path, stem: str
+    series: Mapping[str, Path], out_dir: Path, stem: str, name: str | None = None
 ) -> list[Path]:
     """Plot throughput and latency of contention reports by contended keys.
 
@@ -511,40 +515,62 @@ PLOTTERS = {
 
 
 def plot_file(path: Path, out_dir: Path | None) -> list[Path]:
-    """Plot one result file into `out_dir`, by default next to the file."""
-    return plot_series({path.stem: path}, out_dir or path.parent, path.stem)
+    """Plot each experiment of one result file into `out_dir`, by default next
+    to the file."""
+    out_dir = out_dir or path.parent
+    names = perfbench_results.experiment_names(path)
+    if len(names) == 1:
+        return plot_series({path.stem: path}, out_dir, path.stem)
+    outputs = []
+    for name in names:
+        if _kind(name) in PLOTTERS:
+            stem = f"{path.stem}-{name}"
+            outputs += plot_series({path.stem: path}, out_dir, stem, name)
+    if not outputs:
+        raise ReportError(f"{path}: no plots for experiments {names}")
+    return outputs
 
 
-def plot_overlay(series: Mapping[str, Path], out_dir: Path) -> list[Path]:
-    """Overlay result files of one scenario, one set of figures per scenario."""
-    scenario = _scenario(next(iter(series.values())))
-    return plot_series(series, out_dir, f"cmp-{scenario}")
+def plot_overlay(
+    series: Mapping[str, Path], out_dir: Path, name: str | None = None
+) -> list[Path]:
+    """Overlay the experiment `name` of result files, by default their one
+    experiment."""
+    scenario = _scenario(next(iter(series.values())), name)
+    return plot_series(series, out_dir, f"cmp-{scenario}", name)
 
 
-def plot_series(series: Mapping[str, Path], out_dir: Path, stem: str) -> list[Path]:
-    scenarios = {_scenario(path) for path in series.values()}
+def plot_series(
+    series: Mapping[str, Path], out_dir: Path, stem: str, name: str | None = None
+) -> list[Path]:
+    scenarios = {_scenario(path, name) for path in series.values()}
     if len(scenarios) != 1:
-        raise ReportError(f"cannot overlay different scenarios: {sorted(scenarios)}")
+        raise ReportError(f"cannot overlay different experiments: {sorted(scenarios)}")
     scenario = scenarios.pop()
-    plotter = PLOTTERS.get(scenario)
+    plotter = PLOTTERS.get(_kind(scenario))
     if plotter is None:
-        raise ReportError(f"no plots for scenario {scenario!r}")
-    return plotter(series, out_dir, stem)
+        raise ReportError(f"no plots for experiment {scenario!r}")
+    return plotter(series, out_dir, stem, scenario)
 
 
-def _scenario(path: Path) -> str:
-    return perfbench_results.read_envelope(path)["scenario"]
+def _kind(name: str) -> str:
+    """Return the kind of plots of the experiment `name`."""
+    return "mixed" if name in perfbench_results.MIXED_EXPERIMENTS else name
+
+
+def _scenario(path: Path, name: str | None) -> str:
+    return perfbench_results.read_envelope(path, name)["scenario"]
 
 
 def render(worker_path: Path, affinity_path: Path, out_dir: Path) -> list[Path]:
     """Validate both canonical reports and render their four figures."""
     worker_metadata, workers = perfbench_results.read_mixed(
-        worker_path, require_converged=True
+        worker_path, require_converged=True, name="workers"
     )
     affinity_metadata, affinities = perfbench_results.read_mixed(
-        affinity_path, require_converged=True
+        affinity_path, require_converged=True, name="affinity"
     )
-    if worker_metadata != affinity_metadata:
+    if _model(worker_metadata) != _model(affinity_metadata):
         raise ReportError(
             "worker and affinity reports must use the same backend and model-time speedup"
         )
@@ -564,6 +590,11 @@ def render(worker_path: Path, affinity_path: Path, out_dir: Path) -> list[Path]:
     ]
 
 
+def _model(meta: perfbench_results.ReportMetadata) -> tuple[str, float]:
+    """Return the backend and the model-time speedup of a report."""
+    return meta.backend, meta.model_time_speedup
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sweeps = Path(__file__).resolve().parent / "out-sweeps"
@@ -578,7 +609,7 @@ def main() -> int:
         action="append",
         default=[],
         metavar="LABEL=FILE",
-        help="overlay result files of one scenario (repeat; needs --out)",
+        help="overlay result files of one experiment (repeat; needs --out)",
     )
     parser.add_argument(
         "--canonical",

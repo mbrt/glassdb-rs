@@ -1,0 +1,17 @@
+# Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time
+# on one leaf, with `low-conflict` keys.
+include = ["../../configs/default.toml", "../../configs/common-workloads.toml"]
+
+[pools.wide]
+keys = 128
+
+[seed.database]
+leaf-max-entries = 256
+
+[cell]
+workload = "low-conflict"
+databases = 1
+workers = 1
+
+[cell.database]
+leaf-max-entries = 256

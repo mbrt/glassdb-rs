@@ -1,7 +1,6 @@
 # Transactions on fixed ranges of 16 and 64 keys, with transactions on single
 # keys, for the write spans of ADR-084. See the investigation of 2026-10-28 in
-# investigations.md. Run with --config=hack/perf/experiments/fixed-ranges.toml
-# --experiment=fixed-ranges.
+# investigations.md.
 
 [pools.wide]
 keys = 20000
@@ -163,17 +162,21 @@ keys = 1
 [workloads.fixed-ranges.groups.all]
 shapes = { fr16-0 = 1, fr16-1 = 1, fr16-2 = 1, fr16-3 = 1, fr16-4 = 1, fr16-5 = 1, fr16-6 = 1, fr16-7 = 1, fr16-8 = 1, fr16-9 = 1, fr16-10 = 1, fr16-11 = 1, fr16-12 = 1, fr16-13 = 1, fr16-14 = 1, fr16-15 = 1, fr64-0 = 1, fr64-1 = 1, fr64-2 = 1, fr64-3 = 1, fr64-4 = 1, fr64-5 = 1, fr64-6 = 1, fr64-7 = 1, rw-single = 8, ro-single = 8 }
 
-[experiments.fixed-ranges.set]
-cell.workload = "fixed-ranges"
-cell.collections = 1
-cell.gc = false
-cell.warm-up.minimum = "30s"
-cell.warm-up.quiet = "10s"
-cell.warm-up.timeout = "180s"
-cell.measure.until = "converged"
-cell.measure.duration = "60s"
-cell.measure.max-duration = "180s"
+[cell]
+workload = "fixed-ranges"
+collections = 1
+gc = false
 
-[[experiments.fixed-ranges.axes]]
+[cell.warm-up]
+minimum = "30s"
+quiet = "10s"
+timeout = "180s"
+
+[cell.measure]
+until = "converged"
+duration = "60s"
+max-duration = "180s"
+
+[[axes]]
 path = "cell.databases"
 values = [1, 5]

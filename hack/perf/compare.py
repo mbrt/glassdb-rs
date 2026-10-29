@@ -12,11 +12,13 @@
 """Compare two GlassDB performance result sets and report how they differ.
 
 Generic two-directory comparator. Each side is a directory of result files
-produced by `perfbench` or a historical workload benchmark binary:
+produced by `perfbench` or a historical workload benchmark binary. The
+`perfbench` experiments are read from their own file, or from any result file
+of the directory that has them:
 
-* `mixed.json`      -> current mixed-workload affinity grid;
-* `contention.json` -> current overlapping-RMW contention matrix;
-* `inline-pressure.json` -> current saturation, pressure, and recovery phases;
+* `mixed`           -> current mixed-workload affinity grid;
+* `contention`      -> current overlapping-RMW contention matrix;
+* `inline-pressure` -> current saturation, pressure, and recovery phases;
 
 Legacy `mixbench.json` plus `rtbench` throughput, sample, stats, deadlock,
 inline-pressure, and diagnostics CSVs remain readable for reference-to-reference
@@ -111,21 +113,37 @@ def read_json(input_dir: Path, name: str) -> Any | None:
     return None
 
 
-def read_first_json(input_dir: Path, *names: str) -> Any | None:
-    """Load the first present JSON name, preferring the current artifact."""
-    for name in names:
-        result = read_json(input_dir, name)
-        if result is not None:
-            return result
-    return None
+def read_mixed_json(input_dir: Path) -> Any | None:
+    """Load the mixed result of a directory, preferring the current artifact."""
+    paths = scenario_paths(input_dir, "mixed.json")
+    if paths:
+        return json.loads(paths[0].read_text())
+    return read_json(input_dir, "mixbench.json")
 
 
 def scenario_paths(input_dir: Path, name: str) -> list[Path]:
-    """Result files of one scenario: the directory's own, else per-run copies."""
+    """Result files of one experiment: its own file, else per-run copies, else
+    the result files of the directory that have it."""
     path = input_dir / name
     if path.exists():
         return [path]
-    return sorted(input_dir.glob(f"runs/*/{name}"))
+    copies = sorted(input_dir.glob(f"runs/*/{name}"))
+    if copies:
+        return copies
+    experiment = Path(name).stem
+    return [
+        path
+        for path in sorted(input_dir.glob("*.json"))
+        if experiment in _experiment_names(path)
+    ]
+
+
+def _experiment_names(path: Path) -> list[str]:
+    """Return the experiments of a perfbench result, or none for another file."""
+    try:
+        return perfbench_results.experiment_names(path)
+    except perfbench_results.ReportError:
+        return []
 
 
 def perfbench_contention_frames(input_dir: Path) -> pd.DataFrame | None:
@@ -993,11 +1011,14 @@ def plot_overlay_contention(data, out_dir: Path) -> None:
 
 def plot_mixed_overlay(a: Path, b: Path, la: str, lb: str, out_dir: Path) -> None:
     """Overlay current-format mixed reports; legacy `mixbench.json` has no plots."""
-    paths = {la: a / "mixed.json", lb: b / "mixed.json"}
-    if not all(path.exists() for path in paths.values()):
+    found = {
+        label: scenario_paths(side, "mixed.json") for label, side in ((la, a), (lb, b))
+    }
+    if not all(found.values()):
         return
+    paths = {label: side[0] for label, side in found.items()}
     try:
-        plot_results.plot_overlay(paths, out_dir)
+        plot_results.plot_overlay(paths, out_dir, "mixed")
     except perfbench_results.ReportError as error:
         print(f"skipping mixed-workload plots: {error}")
 
@@ -1382,8 +1403,8 @@ def main() -> int:
                 )
             )
 
-    a_mx = read_first_json(args.a, "mixed.json", "mixbench.json")
-    b_mx = read_first_json(args.b, "mixed.json", "mixbench.json")
+    a_mx = read_mixed_json(args.a)
+    b_mx = read_mixed_json(args.b)
     if a_mx is not None and b_mx is not None:
         tbl = mixed_shape_table(a_mx, b_mx)
         if not tbl.empty:

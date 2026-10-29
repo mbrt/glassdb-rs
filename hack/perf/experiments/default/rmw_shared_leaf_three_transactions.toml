@@ -1,0 +1,5 @@
+# Three workers that update their own key of one leaf.
+include = ["../../configs/default.toml"]
+
+[cell]
+workload = "diag-rmw-shared"

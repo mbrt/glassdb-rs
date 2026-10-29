@@ -1,7 +1,7 @@
 //! Database-level GlassDB performance experiments.
 //!
-//! One runner runs every experiment. An experiment is a named entry of a
-//! layered TOML configuration; the README of this crate explains it.
+//! One runner runs every experiment. An experiment is a TOML file over layers
+//! of shared configuration; the README of this crate explains it.
 
 mod backend;
 mod progress;
@@ -24,7 +24,7 @@ use glassdb::ProtocolTiming;
 use serde::Serialize;
 use time::TimeMode;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// The protocol timing of every database instance.
 ///
@@ -39,25 +39,24 @@ const TIMING: ProtocolTiming = ProtocolTiming::new(Duration::from_secs(15), Dura
 struct Cli {
     #[command(flatten)]
     backend: backend::Options,
-    /// A configuration file. It can be given more than once, and a later file
-    /// changes the values of an earlier one. The built-in configuration is
-    /// always the first.
+    /// A configuration file, or a directory of them, for every experiment. It
+    /// can be given more than once, and a later file changes the values of an
+    /// earlier one. The built-in defaults are always the first.
     #[arg(long = "config")]
     configs: Vec<PathBuf>,
-    /// The experiment to run.
-    #[arg(long, default_value = "mixed")]
-    experiment: String,
-    /// Give a parameter of the experiment a fixed value, as `PATH=VALUE` with a
-    /// TOML value. It removes the axis that sets `PATH`. It can be given more
+    /// An experiment file, or a directory of them. It can be given more than
+    /// once, and the experiments run one after the other.
+    #[arg(long = "experiment")]
+    experiments: Vec<PathBuf>,
+    /// Give a parameter of each experiment a fixed value, as `PATH=VALUE` with
+    /// a TOML value. It removes the axis that sets `PATH`. It can be given more
     /// than once, and the last one wins.
     #[arg(long = "set")]
     set: Vec<String>,
-    /// Keep only one value of an axis, as `AXIS=LABEL`.
+    /// Keep only one value of an axis, as `AXIS=LABEL`, in each experiment
+    /// that has the axis.
     #[arg(long = "only")]
     only: Vec<String>,
-    /// List the experiments of the configuration and exit.
-    #[arg(long)]
-    list: bool,
     /// How model time advances. `virtual` needs `--backend=memory` and no
     /// `--delay-scale`, and the watchdogs `--drain-timeout` and the limit of
     /// the full GCs then use virtual time too.
@@ -108,18 +107,16 @@ impl ProgressMode {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Report<T> {
+struct Report {
     schema_version: u32,
-    /// The experiment.
-    scenario: String,
     backend: String,
     time_mode: &'static str,
     model_time_speedup: f64,
     latency_jitter: bool,
     /// The command-line options of the backend and of the run.
     options: serde_json::Value,
-    experiment: serde_json::Value,
-    runs: Vec<T>,
+    /// Each experiment as it ran, with its runs.
+    experiments: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Copy)]
@@ -136,16 +133,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let selection = runner::config::Selection {
         configs: cli.configs.clone(),
-        experiment: cli.experiment.clone(),
+        experiments: cli.experiments.clone(),
         set: cli.set.clone(),
         only: cli.only.clone(),
     };
-    if cli.list {
-        for name in selection.experiment_names()? {
-            println!("{name}");
-        }
-        return Ok(());
-    }
     let resolved = selection.resolve()?;
     let model_time_speedup = cli.time.install(&cli.backend)?;
     let runtime = cli.time.runtime()?;
@@ -155,24 +146,57 @@ fn main() -> Result<(), Box<dyn Error>> {
         run_cooldown: cli.run_cooldown,
         drain_timeout: cli.drain_timeout,
     };
-    if cli.progress.enabled() {
-        progress::enable(runner::plan(&resolved)?.0.len() * cli.runs);
+    let mut cells = 0;
+    for experiment in &resolved {
+        cells += runner::plan(experiment)?.0.len() * cli.runs;
     }
-    let runs = runner::run(&runtime, &factory, &resolved, execution);
+    if cli.progress.enabled() {
+        progress::enable(cells);
+    }
+    let mut experiments = Vec::with_capacity(resolved.len());
+    let outcome = run_all(&runtime, &factory, &resolved, execution, &mut experiments);
     progress::finish();
-    let runs = runs?;
+    if outcome.is_err() {
+        if experiments.is_empty() {
+            return outcome;
+        }
+        // A run of all experiments can take hours, so the experiments that
+        // completed before the error are kept.
+        crate::progress::log!(
+            "the result has only the {} experiments that completed",
+            experiments.len()
+        );
+    }
     let report = Report {
         schema_version: SCHEMA_VERSION,
-        scenario: resolved.name.clone(),
         backend: cli.backend.label().to_string(),
         time_mode: cli.time.label(),
         model_time_speedup,
         latency_jitter: cli.backend.latency_jitter,
         options: cli.backend.describe(cli.time),
-        experiment: resolved.describe(),
-        runs,
+        experiments,
     };
-    write_json(cli.output, &serde_json::to_value(report)?)
+    write_json(cli.output, &serde_json::to_value(report)?)?;
+    outcome
+}
+
+/// Runs each experiment, and adds its description with its runs to
+/// `experiments`, until one fails.
+fn run_all(
+    runtime: &tokio::runtime::Runtime,
+    factory: &backend::Factory,
+    resolved: &[runner::config::Resolved],
+    execution: Execution,
+    experiments: &mut Vec<serde_json::Value>,
+) -> Result<(), Box<dyn Error>> {
+    for experiment in resolved {
+        let runs = runner::run(runtime, factory, experiment, execution)
+            .map_err(|e| format!("{}: {e}", experiment.name))?;
+        let mut described = experiment.describe();
+        described["runs"] = serde_json::to_value(runs)?;
+        experiments.push(described);
+    }
+    Ok(())
 }
 
 fn write_json(path: Option<PathBuf>, value: &serde_json::Value) -> Result<(), Box<dyn Error>> {

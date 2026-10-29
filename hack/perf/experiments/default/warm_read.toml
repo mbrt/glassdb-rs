@@ -1,0 +1,5 @@
+# A read of one key with a 256-byte value.
+include = ["../../configs/default.toml"]
+
+[cell]
+workload = "diag-read"

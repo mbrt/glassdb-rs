@@ -67,14 +67,18 @@ def cell(
     )
 
 
-def report(runs: list[dict]) -> dict:
+def report(runs: list[dict], name: str = "mixed") -> dict:
     return {
-        "schemaVersion": 2,
-        "scenario": "mixed",
+        "schemaVersion": 3,
         "backend": "memory",
         "modelTimeSpeedup": 5.0,
-        "runs": runs,
+        "experiments": [{"name": name, "runs": runs}],
     }
+
+
+def runs_of(value: dict) -> list[dict]:
+    """Return the runs of the one experiment of a report."""
+    return value["experiments"][0]["runs"]
 
 
 def worker_report() -> dict:
@@ -88,7 +92,8 @@ def worker_report() -> dict:
                 ],
             }
             for run in plotter.EXPECTED_RUNS
-        ]
+        ],
+        "workers",
     )
 
 
@@ -109,7 +114,8 @@ def affinity_report() -> dict:
                 ],
             }
             for run in plotter.EXPECTED_RUNS
-        ]
+        ],
+        "affinity",
     )
 
 
@@ -129,7 +135,9 @@ class MixedSweepPlotterTest(unittest.TestCase):
             worker_metadata, workers = read_canonical(workers_path)
             affinity_metadata, affinities = read_canonical(affinity_path)
 
-        self.assertEqual(worker_metadata, affinity_metadata)
+        self.assertEqual(
+            plotter._model(worker_metadata), plotter._model(affinity_metadata)
+        )
         plotter.validate_worker_sweep(workers)
         plotter.validate_affinity_sweep(affinities)
         medians = plotter.median_rows(workers, ["workers"])
@@ -147,7 +155,7 @@ class MixedSweepPlotterTest(unittest.TestCase):
 
     def test_database_count_must_match_limit_and_workers(self) -> None:
         invalid = worker_report()
-        invalid["runs"][0]["cells"][0]["databases"] = 2
+        runs_of(invalid)[0]["cells"][0]["databases"] = 2
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write_report(Path(directory_name), "invalid.json", invalid)
             with self.assertRaisesRegex(plotter.ReportError, "does not equal"):
@@ -155,7 +163,7 @@ class MixedSweepPlotterTest(unittest.TestCase):
 
     def test_unconverged_shape_is_rejected(self) -> None:
         invalid = affinity_report()
-        invalid["runs"][0]["cells"][0]["shapes"][0]["converged"] = False
+        runs_of(invalid)[0]["cells"][0]["shapes"][0]["converged"] = False
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write_report(Path(directory_name), "invalid.json", invalid)
             with self.assertRaisesRegex(plotter.ReportError, "did not converge"):
@@ -163,7 +171,7 @@ class MixedSweepPlotterTest(unittest.TestCase):
 
     def test_p90_latency_must_not_be_below_p50(self) -> None:
         invalid = worker_report()
-        shape = invalid["runs"][0]["cells"][0]["shapes"][0]
+        shape = runs_of(invalid)[0]["cells"][0]["shapes"][0]
         shape["p90Ms"] = shape["p50Ms"] - 1
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write_report(Path(directory_name), "invalid.json", invalid)
@@ -200,7 +208,7 @@ class MixedSweepPlotterTest(unittest.TestCase):
         self,
     ) -> None:
         legacy = worker_report()
-        for run in legacy["runs"]:
+        for run in runs_of(legacy):
             for value in run["cells"]:
                 for shape in value["shapes"]:
                     del shape["windowMs"], shape["windowCounts"]
@@ -324,17 +332,21 @@ class GenericPlotterTest(unittest.TestCase):
             )
 
         return {
-            "schemaVersion": 2,
-            "scenario": "contention",
+            "schemaVersion": 3,
             "backend": "s3",
             "modelTimeSpeedup": 1.0,
-            "runs": [
+            "experiments": [
                 {
-                    "run": 1,
-                    "cells": [
-                        one(num_keys, pct)
-                        for num_keys in (2, 4, 6)
-                        for pct in overlap_pct
+                    "name": "contention",
+                    "runs": [
+                        {
+                            "run": 1,
+                            "cells": [
+                                one(num_keys, pct)
+                                for num_keys in (2, 4, 6)
+                                for pct in overlap_pct
+                            ],
+                        }
                     ],
                 }
             ],
@@ -463,7 +475,7 @@ class GenericPlotterTest(unittest.TestCase):
             contention = self.write_report(
                 directory, "contention.json", self.contention_report([100])
             )
-            with self.assertRaisesRegex(plotter.ReportError, "different scenarios"):
+            with self.assertRaisesRegex(plotter.ReportError, "different experiments"):
                 plotter.plot_overlay({"a": mixed, "b": contention}, directory)
 
     def test_overlay_rejects_reports_sweeping_different_dimensions(self) -> None:
@@ -498,7 +510,10 @@ class GenericPlotterTest(unittest.TestCase):
             path = self.write_report(
                 directory,
                 "inline-pressure.json",
-                {"schemaVersion": 2, "scenario": "inline-pressure", "runs": []},
+                {
+                    "schemaVersion": 3,
+                    "experiments": [{"name": "inline-pressure", "runs": []}],
+                },
             )
             with self.assertRaisesRegex(plotter.ReportError, "no plots"):
                 plotter.plot_file(path, directory)

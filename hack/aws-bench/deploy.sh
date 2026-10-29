@@ -39,10 +39,12 @@
 #   DRAIN_TIMEOUT    worker/shutdown deadline         (default: 90s)
 #
 # Experiments:
-#   EXPERIMENTS      perfbench experiments to run, comma-separated; each one
-#                    writes out/<experiment>.json (default: mixed,contention)
-#   PERFBENCH_CONFIG path of a perfbench configuration file that changes the
-#                    built-in experiments, after aws.toml (default: none). See
+#   EXPERIMENTS      names of the experiments in hack/perf/experiments to run,
+#                    comma-separated; each one writes out/<experiment>.json
+#                    (default: mixed,contention)
+#   PERFBENCH_CONFIG path of a perfbench configuration file that changes all
+#                    experiments, after aws.toml (default: none). It cannot
+#                    include other files. See
 #                    crates/glassdb-bench-scale/README.md.
 #   CONTENTION_DURATION measured window of each contention cell (default: 20s)
 #
@@ -85,8 +87,22 @@ stack_output() {
     --output text
 }
 
+# Fails unless each name of EXPERIMENTS is one experiment file, so that a wrong
+# name fails before the stack starts to cost.
+check_experiments() {
+  local name names files
+  IFS=',' read -r -a names <<<"$EXPERIMENTS"
+  for name in "${names[@]}"; do
+    files=("$REPO_ROOT"/hack/perf/experiments/*/"$name".toml)
+    if [[ ${#files[@]} -ne 1 || ! -f "${files[0]}" ]]; then
+      echo "EXPERIMENTS: $name is not one file in hack/perf/experiments" >&2
+      return 1
+    fi
+  done
+}
+
 write_config() {
-  local path="$1" name config=""
+  local path="$1" name config="" files
   # aws.toml is always a layer, so it travels in the environment file too.
   printf 'AWS_CONFIG=%q\n' "$(<"$SCRIPT_DIR/aws.toml")" >"$path"
   for name in RUNS RUN_COOLDOWN DRAIN_TIMEOUT EXPERIMENTS CONTENTION_DURATION; do
@@ -96,6 +112,10 @@ write_config() {
     config="$(<"$PERFBENCH_CONFIG")"
   fi
   printf 'PERFBENCH_CONFIG=%q\n' "$config" >>"$path"
+  # The experiment files and the files that they include, with their layout,
+  # so that the relative paths of `include` stay valid.
+  files="$(tar -C "$REPO_ROOT/hack/perf" -cz configs experiments | base64 -w0)"
+  printf 'EXPERIMENT_FILES=%q\n' "$files" >>"$path"
 }
 
 deploy() {
@@ -104,6 +124,7 @@ deploy() {
   trap 'rm -rf "$temp_dir"' EXIT
   binary="$temp_dir/perfbench"
   config="$temp_dir/perfbench.env"
+  check_experiments
 
   echo ">> building static perfbench binary for $RUST_TARGET"
   cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" \

@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use indexmap::IndexMap;
@@ -12,11 +12,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 use toml::Value;
 use toml::value::Table;
 
-/// The configuration that is always the first layer.
+/// The defaults that are the first layer of every experiment.
 const BUILTIN: &str = include_str!("builtin.toml");
 
-/// The top level of the merged configuration. Each cell checks its own
-/// sections; this checks the top-level keys and the experiments.
+/// The top level of the configuration of one experiment, without its axes.
+/// Each cell checks its own sections; this checks the top-level keys.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 #[allow(dead_code)]
@@ -29,20 +29,6 @@ struct Config {
     workloads: Table,
     seed: Table,
     cell: Table,
-    #[serde(default)]
-    experiments: IndexMap<String, Experiment>,
-}
-
-/// A named entry that one invocation runs: values and axes.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Experiment {
-    /// Values that replace the defaults, by dotted path.
-    #[serde(default, deserialize_with = "flat_paths")]
-    pub(crate) set: IndexMap<String, Value>,
-    /// The axes, from the outer loop to the inner loop.
-    #[serde(default)]
-    pub(crate) axes: Vec<Axis>,
 }
 
 /// An ordered list of values for one or more parameters.
@@ -90,101 +76,78 @@ pub(crate) struct CellPoint {
     pub(crate) start: Start,
 }
 
-/// The selected experiment with all its values resolved.
+/// One selected experiment with all its values resolved.
 #[derive(Debug, Clone)]
 pub(crate) struct Resolved {
+    /// The stem of the experiment file.
     pub(crate) name: String,
-    /// The configuration after the values of the experiment and of
-    /// `--set`, as one TOML table without `experiments`.
+    /// The configuration after all layers and `--set`, as one TOML table
+    /// without `axes`.
     pub(crate) base: Table,
     pub(crate) axes: Vec<Axis>,
 }
 
-/// Options of the command line that select and change the experiment.
+/// Options of the command line that select and change the experiments.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Selection {
-    pub(crate) configs: Vec<std::path::PathBuf>,
-    pub(crate) experiment: String,
+    /// Files, or directories of files, that apply to every experiment.
+    pub(crate) configs: Vec<PathBuf>,
+    /// Experiment files, or directories of experiment files.
+    pub(crate) experiments: Vec<PathBuf>,
     pub(crate) set: Vec<String>,
     pub(crate) only: Vec<String>,
 }
 
 impl Selection {
-    /// Returns the names of the experiments of the merged configuration.
-    pub(crate) fn experiment_names(&self) -> Result<Vec<String>, Box<dyn Error>> {
-        let (_, config) = self.load()?;
-        Ok(config.experiments.keys().cloned().collect())
+    /// Resolves each selected experiment, in the order of the command line,
+    /// and applies `--set` and `--only` to each one.
+    pub(crate) fn resolve(&self) -> Result<Vec<Resolved>, Box<dyn Error>> {
+        let files = experiment_files(&self.experiments)?;
+        let mut common: Table = toml::from_str(BUILTIN).map_err(|e| format!("built-in: {e}"))?;
+        for path in toml_files(&self.configs)? {
+            merge(&mut common, read_layer(&path, &mut Vec::new())?);
+        }
+        let mut resolved = files
+            .into_iter()
+            .map(|(name, path)| self.resolve_one(name, &path, &common))
+            .collect::<Result<Vec<_>, _>>()?;
+        for only in &self.only {
+            keep_only(&mut resolved, only)?;
+        }
+        for experiment in &resolved {
+            check_axes(&experiment.axes).map_err(|e| format!("{}: {e}", experiment.name))?;
+        }
+        Ok(resolved)
     }
 
-    /// Loads the layers, selects the experiment, and applies `--set` and
-    /// `--only`.
-    pub(crate) fn resolve(&self) -> Result<Resolved, Box<dyn Error>> {
-        let (mut merged, config) = self.load()?;
-        let mut experiment = config
-            .experiments
-            .get(&self.experiment)
-            .cloned()
-            .ok_or_else(|| {
-                let names: Vec<_> = config.experiments.keys().cloned().collect();
-                format!(
-                    "unknown experiment {:?}; known: {}",
-                    self.experiment,
-                    names.join(", ")
-                )
-            })?;
-        for axis in &mut experiment.axes {
-            axis.expand()?;
+    /// Merges the experiment file at `path` over `common`, and applies `--set`.
+    fn resolve_one(
+        &self,
+        name: String,
+        path: &Path,
+        common: &Table,
+    ) -> Result<Resolved, Box<dyn Error>> {
+        let mut base = common.clone();
+        merge(&mut base, read_layer(path, &mut Vec::new())?);
+        let mut axes: Vec<Axis> = match base.remove("axes") {
+            Some(axes) => axes
+                .try_into()
+                .map_err(|e| format!("{}: axes: {e}", path.display()))?,
+            None => Vec::new(),
+        };
+        for axis in &mut axes {
+            axis.expand()
+                .map_err(|e| format!("{}: {e}", path.display()))?;
         }
         for assignment in &self.set {
-            let (path, value) = parse_assignment(assignment)?;
-            experiment.axes.retain(|axis| !axis.sets(&path));
-            experiment.set.insert(path, value);
+            let (parameter, value) = parse_assignment(assignment)?;
+            axes.retain(|axis| !axis.sets(&parameter));
+            set_path(&mut base, &parameter, value)?;
         }
-        for only in &self.only {
-            let (name, label) = only
-                .split_once('=')
-                .ok_or_else(|| format!("--only {only:?}: expected AXIS=LABEL"))?;
-            let axis = experiment
-                .axes
-                .iter_mut()
-                .find(|axis| axis.label() == name)
-                .ok_or_else(|| format!("--only {only:?}: no axis {name:?}"))?;
-            let kept: Vec<_> = axis
-                .values
-                .iter()
-                .filter(|value| value_label(value).as_deref() == Some(label))
-                .cloned()
-                .collect();
-            if kept.is_empty() {
-                return Err(
-                    format!("--only {only:?}: axis {name:?} has no value {label:?}").into(),
-                );
-            }
-            axis.values = kept;
-        }
-        merged.remove("experiments");
-        for (path, value) in &experiment.set {
-            set_path(&mut merged, path, value.clone())?;
-        }
-        check_axes(&experiment)?;
-        Ok(Resolved {
-            name: self.experiment.clone(),
-            base: merged,
-            axes: experiment.axes,
-        })
-    }
-
-    /// Merges the built-in configuration and the `--config` files in order.
-    fn load(&self) -> Result<(Table, Config), Box<dyn Error>> {
-        let mut merged: Table = toml::from_str(BUILTIN).map_err(|e| format!("built-in: {e}"))?;
-        for path in &self.configs {
-            let layer = read_layer(path)?;
-            merge(&mut merged, layer);
-        }
-        let config: Config = Value::Table(merged.clone())
+        let _: Config = Value::Table(base.clone())
             .try_into()
-            .map_err(|e| format!("configuration: {e}"))?;
-        Ok((merged, config))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Resolved { name, base, axes })
     }
 }
 
@@ -348,10 +311,10 @@ fn value_label(value: &Value) -> Option<String> {
 
 /// Checks the axes for paths that two axes set, and for start rules that
 /// cannot hold.
-fn check_axes(experiment: &Experiment) -> Result<(), Box<dyn Error>> {
+fn check_axes(axes: &[Axis]) -> Result<(), Box<dyn Error>> {
     let mut seen = BTreeSet::new();
     let mut seeds_done = false;
-    for axis in &experiment.axes {
+    for axis in axes {
         match (&axis.path, &axis.name) {
             (Some(_), None) | (None, Some(_)) => {}
             _ => {
@@ -374,9 +337,6 @@ fn check_axes(experiment: &Experiment) -> Result<(), Box<dyn Error>> {
             return Err(format!("axis {:?}: each value needs a `label`", axis.label()).into());
         }
         for path in axis.paths() {
-            if experiment.set.contains_key(&path) {
-                return Err(format!("{path} is in `set` and in axis {:?}", axis.label()).into());
-            }
             if !seen.insert(path.clone()) {
                 return Err(format!("{path} is in two axes").into());
             }
@@ -396,14 +356,121 @@ fn check_axes(experiment: &Experiment) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn read_layer(path: &Path) -> Result<Table, Box<dyn Error>> {
+/// Keeps one value of the axis that `only` names, as `AXIS=LABEL`, in each
+/// experiment that has that axis.
+fn keep_only(experiments: &mut [Resolved], only: &str) -> Result<(), Box<dyn Error>> {
+    let (name, label) = only
+        .split_once('=')
+        .ok_or_else(|| format!("--only {only:?}: expected AXIS=LABEL"))?;
+    let mut found = false;
+    for experiment in experiments {
+        let Some(axis) = experiment.axes.iter_mut().find(|axis| axis.label() == name) else {
+            continue;
+        };
+        found = true;
+        let kept: Vec<_> = axis
+            .values
+            .iter()
+            .filter(|value| value_label(value).as_deref() == Some(label))
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            return Err(format!(
+                "--only {only:?}: axis {name:?} of {} has no value {label:?}",
+                experiment.name
+            )
+            .into());
+        }
+        axis.values = kept;
+    }
+    if !found {
+        return Err(format!("--only {only:?}: no experiment has axis {name:?}").into());
+    }
+    Ok(())
+}
+
+/// Returns the name and the path of each experiment file, and rejects two
+/// experiments with one name, because the result identifies them by name.
+fn experiment_files(paths: &[PathBuf]) -> Result<Vec<(String, PathBuf)>, Box<dyn Error>> {
+    if paths.is_empty() {
+        return Err("give at least one --experiment".into());
+    }
+    let mut files: IndexMap<String, PathBuf> = IndexMap::new();
+    for path in toml_files(paths)? {
+        let name = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| format!("{}: no experiment name", path.display()))?
+            .to_string();
+        if let Some(other) = files.get(&name) {
+            return Err(format!(
+                "experiment {name:?} is in {} and in {}",
+                other.display(),
+                path.display()
+            )
+            .into());
+        }
+        files.insert(name, path);
+    }
+    Ok(files.into_iter().collect())
+}
+
+/// Replaces each directory in `paths` with its `*.toml` files, in sorted order.
+fn toml_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    let mut files = Vec::new();
+    for path in paths {
+        if !path.is_dir() {
+            files.push(path.clone());
+            continue;
+        }
+        let mut entries = std::fs::read_dir(path)
+            .and_then(|entries| {
+                entries
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        entries.retain(|entry| entry.is_file() && entry.extension().is_some_and(|e| e == "toml"));
+        if entries.is_empty() {
+            return Err(format!("{}: no *.toml file", path.display()).into());
+        }
+        entries.sort();
+        files.extend(entries);
+    }
+    Ok(files)
+}
+
+/// Reads one file, with the files of its `include` merged before its own
+/// values. `including` holds the files whose includes are being read.
+fn read_layer(path: &Path, including: &mut Vec<PathBuf>) -> Result<Table, Box<dyn Error>> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if including.contains(&canonical) {
+        return Err(format!("{}: includes itself", path.display()).into());
+    }
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?)
+    let mut own: Table = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let includes: Vec<PathBuf> = match own.remove("include") {
+        Some(value) => value
+            .try_into()
+            .map_err(|e| format!("{}: include: {e}", path.display()))?,
+        None => Vec::new(),
+    };
+    let directory = path.parent().unwrap_or(Path::new(""));
+    including.push(canonical);
+    let mut layer = Table::new();
+    for include in includes {
+        merge(&mut layer, read_layer(&directory.join(include), including)?);
+    }
+    including.pop();
+    merge(&mut layer, own);
+    Ok(layer)
 }
 
 /// Merges `layer` into `base`: tables merge key by key, other values replace
-/// the earlier value. An experiment and a part selector replace the earlier
-/// value as a whole, so no axis or part parameter stays from an earlier layer.
+/// the earlier value. A part selector replaces the earlier value as a whole,
+/// so no part parameter stays from an earlier layer.
 fn merge(base: &mut Table, layer: Table) {
     merge_at(base, layer, "");
 }
@@ -432,7 +499,7 @@ fn replaced_whole(path: &str) -> bool {
     let segments: Vec<_> = path.split('.').collect();
     matches!(
         segments.as_slice(),
-        ["experiments", _] | ["shapes", _, "source"] | ["cell", "measure", "until"]
+        ["shapes" | "workloads", _, "source"] | ["cell", "measure", "until"]
     )
 }
 
@@ -475,60 +542,67 @@ fn parse_assignment(text: &str) -> Result<(String, Value), Box<dyn Error>> {
     Ok((path, value))
 }
 
-/// Flattens the `set` table of an experiment into dotted paths, so that TOML
-/// dotted keys and quoted paths mean the same.
-fn flat_paths<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<IndexMap<String, Value>, D::Error> {
-    let table = Table::deserialize(deserializer)?;
-    let mut flat = IndexMap::new();
-    flatten("", table, &mut flat);
-    Ok(flat)
-}
+/// The experiments of the repository.
+#[cfg(test)]
+pub(crate) const REPOSITORY_EXPERIMENTS: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../hack/perf/experiments");
 
-fn flatten(prefix: &str, table: Table, out: &mut IndexMap<String, Value>) {
-    for (key, value) in table {
-        let path = if prefix.is_empty() {
-            key
-        } else {
-            format!("{prefix}.{key}")
-        };
-        match value {
-            // A part selector with parameters is one value, not a path prefix.
-            Value::Table(inner) if !replaced_whole(&path) => flatten(&path, inner, out),
-            value => {
-                out.insert(path, value);
-            }
-        }
-    }
+/// Returns the file of the repository experiment `name`.
+#[cfg(test)]
+pub(crate) fn repository_experiment(name: &str) -> PathBuf {
+    let file = format!("{name}.toml");
+    std::fs::read_dir(REPOSITORY_EXPERIMENTS)
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join(&file))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("no repository experiment {name:?}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn resolve(
-        layers: &[&str],
-        experiment: &str,
-        set: &[&str],
-    ) -> Result<Resolved, Box<dyn Error>> {
-        let dir = std::env::temp_dir().join(format!(
+    /// A temporary directory, removed when it is dropped.
+    struct Dir(PathBuf);
+
+    impl std::ops::Deref for Dir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Writes `files`, as `(PATH, TEXT)`, in a new directory, and returns it.
+    fn write(files: &[(&str, &str)]) -> Dir {
+        let dir = Dir(std::env::temp_dir().join(format!(
             "perfbench-config-{}-{}",
             std::process::id(),
             rand::random::<u64>()
-        ));
-        std::fs::create_dir_all(&dir)?;
-        let configs = layers
-            .iter()
-            .enumerate()
-            .map(|(index, text)| {
-                let path = dir.join(format!("{index}.toml"));
-                std::fs::write(&path, text).map(|()| path)
-            })
-            .collect::<Result<_, _>>()?;
+        )));
+        for (path, text) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        dir
+    }
+
+    fn resolve(
+        dir: &Path,
+        configs: &[&str],
+        experiments: &[&str],
+        set: &[&str],
+    ) -> Result<Vec<Resolved>, Box<dyn Error>> {
         Selection {
-            configs,
-            experiment: experiment.to_string(),
+            configs: configs.iter().map(|path| dir.join(path)).collect(),
+            experiments: experiments.iter().map(|path| dir.join(path)).collect(),
             set: set.iter().map(|s| s.to_string()).collect(),
             only: Vec::new(),
         }
@@ -544,69 +618,199 @@ mod tests {
         Some(value)
     }
 
+    const SHAPE: &str = "[shapes.rw]\nkind = \"read-modify-write\"\npool = \"p\"\nkeys = 10\n";
+
     #[test]
     fn a_later_layer_changes_one_field_and_keeps_the_others() -> Result<(), Box<dyn Error>> {
-        let resolved = resolve(&["[shapes.rw-many]\nkeys = 4\n"], "mixed", &[])?;
+        let dir = write(&[
+            ("shape.toml", SHAPE),
+            (
+                "x.toml",
+                "include = [\"shape.toml\"]\n[shapes.rw]\nkeys = 4\n",
+            ),
+        ]);
+        let resolved = resolve(&dir, &[], &["x.toml"], &[])?;
         assert_eq!(
-            get(&resolved.base, "shapes.rw-many.keys"),
+            get(&resolved[0].base, "shapes.rw.keys"),
             Some(&Value::Integer(4))
         );
         assert_eq!(
-            get(&resolved.base, "shapes.rw-many.kind"),
+            get(&resolved[0].base, "shapes.rw.kind"),
             Some(&Value::String("read-modify-write".into()))
         );
         Ok(())
     }
 
     #[test]
-    fn an_experiment_and_a_source_replace_the_earlier_value_as_a_whole()
-    -> Result<(), Box<dyn Error>> {
-        let first = "[experiments.probe]\n[[experiments.probe.axes]]\npath = \"cell.affinity\"\nvalues = [0, 100]\n";
-        let second =
-            "[experiments.probe.set]\ncell.workers = 2\n\n[shapes.rw-many]\nsource = \"pool\"\n";
-        let resolved = resolve(
-            &[
-                "[shapes.rw-many]\nsource = { stripe = { shared-pct = 5 } }\n",
-                first,
-                second,
-            ],
-            "probe",
-            &[],
-        )?;
-        assert!(resolved.axes.is_empty());
+    fn a_source_replaces_the_earlier_value_as_a_whole() -> Result<(), Box<dyn Error>> {
+        let dir = write(&[
+            (
+                "all.toml",
+                "[shapes.rw]\nsource = { stripe = { shared-pct = 5 } }\n",
+            ),
+            ("x.toml", "[shapes.rw]\nsource = \"pool\"\n"),
+        ]);
+        let resolved = resolve(&dir, &["all.toml"], &["x.toml"], &[])?;
         assert_eq!(
-            get(&resolved.base, "cell.workers"),
-            Some(&Value::Integer(2))
-        );
-        assert_eq!(
-            get(&resolved.base, "shapes.rw-many.source"),
+            get(&resolved[0].base, "shapes.rw.source"),
             Some(&Value::String("pool".into()))
         );
         Ok(())
     }
 
     #[test]
-    fn set_removes_the_axis_of_its_path_and_the_last_one_wins() -> Result<(), Box<dyn Error>> {
-        let resolved = resolve(&[], "mixed", &["cell.affinity=50", "cell.affinity=25"])?;
-        assert!(
-            resolved
-                .axes
-                .iter()
-                .all(|axis| axis.label() != "cell.affinity")
-        );
+    fn layers_apply_in_order_and_experiments_do_not_see_each_other() -> Result<(), Box<dyn Error>> {
+        let dir = write(&[
+            ("all.toml", "[cell]\nworkers = 2\ndatabases = 2\n"),
+            ("base.toml", "[cell]\nworkers = 3\naffinity = 0\n"),
+            (
+                "experiments/a.toml",
+                "include = [\"../base.toml\"]\n[pools.wide]\nkeys = 10\n[cell]\nworkers = 5\n",
+            ),
+            ("experiments/b.toml", "[cell]\ngc = false\n"),
+        ]);
+        let resolved = resolve(&dir, &["all.toml"], &["experiments"], &["cell.affinity=50"])?;
+        let names: Vec<_> = resolved.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        let (a, b) = (&resolved[0].base, &resolved[1].base);
+        // The built-in defaults, the configs, the includes, the experiment
+        // file, and `--set`, in this order.
+        assert_eq!(get(a, "cell.databases"), Some(&Value::Integer(2)));
+        assert_eq!(get(a, "cell.workers"), Some(&Value::Integer(5)));
+        assert_eq!(get(a, "cell.affinity"), Some(&Value::Integer(50)));
+        assert_eq!(get(a, "cell.gc"), Some(&Value::Boolean(true)));
+        assert_eq!(get(b, "cell.workers"), Some(&Value::Integer(2)));
+        assert_eq!(get(b, "cell.affinity"), Some(&Value::Integer(50)));
+        assert_eq!(get(b, "cell.gc"), Some(&Value::Boolean(false)));
+        assert_eq!(get(b, "pools.wide"), None);
+        Ok(())
+    }
+
+    /// The files of a test case, as `(PATH, TEXT)`.
+    type Files<'a> = &'a [(&'a str, &'a str)];
+
+    #[test]
+    fn a_config_directory_loads_its_files_in_name_order_with_their_includes()
+    -> Result<(), Box<dyn Error>> {
+        let dir = write(&[
+            (
+                "all/b.toml",
+                "include = [\"../shared/one.toml\"]\n[cell]\nworkers = 3\n",
+            ),
+            ("all/a.toml", "[cell]\nworkers = 2\ndatabases = 2\n"),
+            // The path of an include is relative to the file that has it.
+            (
+                "shared/one.toml",
+                "include = [\"two.toml\"]\n[cell]\ndatabases = 5\n",
+            ),
+            ("shared/two.toml", "[cell]\naffinity = 0\n"),
+            ("x.toml", ""),
+        ]);
+        let base = &resolve(&dir, &["all"], &["x.toml"], &[])?[0].base;
+        assert_eq!(get(base, "cell.workers"), Some(&Value::Integer(3)));
+        assert_eq!(get(base, "cell.databases"), Some(&Value::Integer(5)));
+        assert_eq!(get(base, "cell.affinity"), Some(&Value::Integer(0)));
+        Ok(())
+    }
+
+    #[test]
+    fn a_workload_source_replaces_the_earlier_value_as_a_whole() -> Result<(), Box<dyn Error>> {
+        let dir = write(&[
+            (
+                "all.toml",
+                "[workloads.w]\nsource = { stripe = { shared-pct = 5 } }\n",
+            ),
+            (
+                "x.toml",
+                "[workloads.w]\nsource = { index = { keys = [0] } }\n",
+            ),
+        ]);
+        let base = &resolve(&dir, &["all.toml"], &["x.toml"], &[])?[0].base;
+        let source = get(base, "workloads.w.source").and_then(Value::as_table);
         assert_eq!(
-            get(&resolved.base, "cell.affinity"),
+            source.map(|s| s.keys().map(String::as_str).collect::<Vec<_>>()),
+            Some(vec!["index"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_files_are_rejected() {
+        let cases: [(Files, &[&str], &str); 4] = [
+            (
+                &[("a/x.toml", ""), ("b/x.toml", "")],
+                &["a", "b"],
+                "experiment \"x\" is in",
+            ),
+            (
+                &[
+                    ("x.toml", "include = [\"y.toml\"]\n"),
+                    ("y.toml", "include = [\"x.toml\"]\n"),
+                ],
+                &["x.toml"],
+                "includes itself",
+            ),
+            (&[("x.toml", "[unknown]\n")], &["x.toml"], "unknown field"),
+            (&[("empty/x.txt", "")], &["empty"], "no *.toml file"),
+        ];
+        for (files, experiments, message) in cases {
+            let dir = write(files);
+            let error = resolve(&dir, &[], experiments, &[])
+                .expect_err(message)
+                .to_string();
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn set_removes_the_axis_of_its_path_and_the_last_one_wins() -> Result<(), Box<dyn Error>> {
+        let dir = write(&[(
+            "x.toml",
+            "[[axes]]\npath = \"cell.affinity\"\nvalues = [0, 100]\n",
+        )]);
+        let resolved = resolve(
+            &dir,
+            &[],
+            &["x.toml"],
+            &["cell.affinity=50", "cell.affinity=25"],
+        )?;
+        assert!(resolved[0].axes.is_empty());
+        assert_eq!(
+            get(&resolved[0].base, "cell.affinity"),
             Some(&Value::Integer(25))
         );
         Ok(())
     }
 
     #[test]
+    fn a_value_of_the_file_applies_to_the_axis_values_that_do_not_set_it()
+    -> Result<(), Box<dyn Error>> {
+        let dir = write(&[(
+            "x.toml",
+            "[cell]\nworkers = 3\n[[axes]]\nname = \"pair\"\nvalues = [\
+             { label = \"a\", set = { \"cell.workers\" = 1 } }, { label = \"b\", set = {} }]\n",
+        )]);
+        let resolved = &resolve(&dir, &[], &["x.toml"], &[])?[0];
+        let workers: Vec<_> = resolved
+            .points()
+            .iter()
+            .map(|point| {
+                let table = resolved.cell_table(point).unwrap();
+                get(&table, "cell.workers").cloned()
+            })
+            .collect();
+        assert_eq!(workers, [Some(Value::Integer(1)), Some(Value::Integer(3))]);
+        Ok(())
+    }
+
+    #[test]
     fn the_outermost_axis_that_changed_decides_the_start() -> Result<(), Box<dyn Error>> {
-        let layer = "[experiments.chain]\n\
-            [[experiments.chain.axes]]\npath = \"cell.affinity\"\nvalues = [0, 100]\n\
-            [[experiments.chain.axes]]\npath = \"cell.workers\"\nvalues = [1, 2, 3]\nstart = \"previous\"\n";
-        let points = resolve(&[layer], "chain", &[])?.points();
+        let dir = write(&[(
+            "x.toml",
+            "[[axes]]\npath = \"cell.affinity\"\nvalues = [0, 100]\n\
+             [[axes]]\npath = \"cell.workers\"\nvalues = [1, 2, 3]\nstart = \"previous\"\n",
+        )]);
+        let points = resolve(&dir, &[], &["x.toml"], &[])?[0].points();
         let starts: Vec<_> = points.iter().map(|point| point.start).collect();
         use Start::*;
         assert_eq!(starts, [Seed, Previous, Previous, Seed, Previous, Previous]);
@@ -617,51 +821,68 @@ mod tests {
     fn invalid_axes_are_rejected() {
         let cases = [
             (
-                "[experiments.x]\n[[experiments.x.axes]]\npath = \"cell.workers\"\nvalues = [1, 2]\nstart = \"previous\"\n\
-                 [[experiments.x.axes]]\npath = \"cell.affinity\"\nvalues = [0, 100]\n",
+                "[[axes]]\npath = \"cell.workers\"\nvalues = [1, 2]\nstart = \"previous\"\n\
+                 [[axes]]\npath = \"cell.affinity\"\nvalues = [0, 100]\n",
                 "inside an axis that continues",
             ),
             (
-                "[experiments.x.set]\ncell.workers = 3\n[[experiments.x.axes]]\npath = \"cell.workers\"\nvalues = [1, 2]\n",
-                "is in `set` and in axis",
+                "[[axes]]\npath = \"cell.workers\"\nvalues = [1]\n\
+                 [[axes]]\npath = \"cell.workers\"\nvalues = [2]\n",
+                "is in two axes",
             ),
             (
-                "[experiments.x]\n[[experiments.x.axes]]\nname = \"pair\"\nvalues = [{ set = { \"cell.workers\" = 1 } }]\n",
+                "[[axes]]\nname = \"pair\"\nvalues = [{ set = { \"cell.workers\" = 1 } }]\n",
                 "needs a `label`",
             ),
         ];
-        for (layer, message) in cases {
-            let error = resolve(&[layer], "x", &[]).expect_err(message).to_string();
+        for (text, message) in cases {
+            let dir = write(&[("x.toml", text)]);
+            let error = resolve(&dir, &[], &["x.toml"], &[])
+                .expect_err(message)
+                .to_string();
             assert!(error.contains(message), "{error}");
         }
     }
 
     #[test]
-    fn every_builtin_experiment_plans_its_cells_and_chains() -> Result<(), Box<dyn Error>> {
-        let names = Selection::default().experiment_names()?;
-        assert!(names.len() >= 9, "{names:?}");
-        for name in names {
-            let resolved = Selection {
-                experiment: name.clone(),
-                ..Selection::default()
-            }
-            .resolve()?;
-            crate::runner::plan(&resolved).map_err(|e| format!("{name}: {e}"))?;
+    fn every_repository_experiment_plans_its_cells_and_chains() -> Result<(), Box<dyn Error>> {
+        let experiments: Vec<_> = std::fs::read_dir(REPOSITORY_EXPERIMENTS)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<_, _>>()?;
+        let resolved = Selection {
+            experiments,
+            ..Selection::default()
+        }
+        .resolve()?;
+        assert!(resolved.len() >= 20, "{}", resolved.len());
+        for experiment in &resolved {
+            crate::runner::plan(experiment).map_err(|e| format!("{}: {e}", experiment.name))?;
         }
         Ok(())
     }
 
     #[test]
-    fn only_keeps_one_value_of_a_coupled_axis() -> Result<(), Box<dyn Error>> {
+    fn only_keeps_one_value_of_an_axis_in_each_experiment_that_has_it() -> Result<(), Box<dyn Error>>
+    {
         let mut selection = Selection {
-            experiment: "suite".into(),
-            only: vec!["case=warm_read".into()],
+            experiments: vec![
+                repository_experiment("inline-pressure"),
+                repository_experiment("warm_read"),
+            ],
+            only: vec!["phase=pressure".into()],
             ..Selection::default()
         };
         let resolved = selection.resolve()?;
-        assert_eq!(resolved.points().len(), 1);
-        selection.only = vec!["case=missing".into()];
-        assert!(selection.resolve().is_err());
+        assert_eq!(resolved[0].points().len(), 1);
+        assert_eq!(resolved[1].points().len(), 1);
+        for (only, message) in [
+            ("phase=missing", "has no value"),
+            ("case=warm_read", "no experiment has axis"),
+        ] {
+            selection.only = vec![only.into()];
+            let error = selection.resolve().expect_err(only).to_string();
+            assert!(error.contains(message), "{error}");
+        }
         Ok(())
     }
 }

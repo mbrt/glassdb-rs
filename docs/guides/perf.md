@@ -13,6 +13,13 @@ the Criterion suites that the experiments of
 replaced. Their results are of schema version 1, which the current tools do
 not read.
 
+The entries from 2026-10-21 to 2026-10-28 name the experiments of the built-in
+configuration, for example `mixed`, and their results are of schema version 2.
+The experiments are now files in
+[hack/perf/experiments](../../hack/perf/experiments): give the path of the file
+to `--experiment`, for example
+`--experiment=hack/perf/experiments/real-time/mixed.toml`.
+
 The s3 delay profile limits each prefix of 3 path segments since 2026-10-20:
 each collection and each first symbol of a transaction ID has its own request
 limit. Earlier entries that do not pass `--prefix-depth` used 2 segments, where
@@ -36,9 +43,9 @@ adjacent leaves merge for them.
 - `--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
   --drain-timeout=90s`, 2 runs of each, alternated, on mains power, except one
   run of each for `workers4`
-- fixed ranges: `--config=hack/perf/experiments/fixed-ranges.toml
-  --experiment=fixed-ranges`; random ranges:
-  `--config=hack/perf/experiments/random-ranges.toml --experiment=random-ranges`;
+- fixed ranges: `--experiment=hack/perf/experiments/real-time/fixed-ranges.toml`;
+  random ranges:
+  `--experiment=hack/perf/experiments/real-time/random-ranges.toml`;
   `workers4` and `mixed` as in the entry of the first change below
 - ratio = target / base
 

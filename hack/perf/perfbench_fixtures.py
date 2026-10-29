@@ -1,4 +1,4 @@
-"""Builders of schema-version 2 perfbench results for the tests."""
+"""Builders of schema-version 3 perfbench results for the tests."""
 
 from __future__ import annotations
 
@@ -75,5 +75,9 @@ def contention_cell(
 
 
 def report(scenario: str, runs: list[dict[str, Any]], **fields: Any) -> dict[str, Any]:
-    """Return a result envelope of `scenario`."""
-    return {"schemaVersion": 2, "scenario": scenario, "runs": runs, **fields}
+    """Return a result with the one experiment `scenario`."""
+    return {
+        "schemaVersion": 3,
+        "experiments": [{"name": scenario, "runs": runs}],
+        **fields,
+    }

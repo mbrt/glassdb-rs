@@ -4,14 +4,16 @@
 a configuration of built-in parts. A scenario that the built-in parts cannot
 express adds one part in Rust, and the configuration uses it by name.
 
-The built-in configuration is
+An experiment is a TOML file. The experiments of the repository are in
+[hack/perf/experiments](../../hack/perf/experiments), and the files that they
+share are in [hack/perf/configs](../../hack/perf/configs). The built-in
+defaults are in
 [src/bin/perfbench/runner/builtin.toml](src/bin/perfbench/runner/builtin.toml).
-`perfbench --list` prints its experiments. Raw backend latency is measured by
-`backendbench`, in the same crate.
+Raw backend latency is measured by `backendbench`, in the same crate.
 
 ## Layers
 
-1. **Runner** (`runner/`). It reads the configuration, runs the loop of cells,
+1. **Runner** (`runner/`). It reads the configurations, runs the loop of cells,
    the seeds, the warm-ups, and the measurements, and writes the result. It
    knows no scenario.
 2. **Parts.** Each part has a name and its own parameters, and the
@@ -37,7 +39,7 @@ A scenario never needs its own subcommand.
 
 | Term | Meaning |
 | --- | --- |
-| Configuration | The merged content of the `--config` files. |
+| Configuration | The merged layers of one experiment: the built-in defaults, the `--config` files, the files that the experiment file includes, the experiment file, and `--set`. |
 | Parameter | One value in the configuration, named by its path, for example `cell.workers` or `shapes.rw-many.keys`. |
 | Seed parameter | A parameter that changes what the seed writes or how the seed database opens. |
 | Cell parameter | A parameter that changes only the load, the databases, or the timing of a cell. |
@@ -47,10 +49,10 @@ A scenario never needs its own subcommand.
 | Shape | A named kind with its parameters, its pool, and its key source. |
 | Group | Database instances that run the same shapes. The result reports each group and each shape apart. |
 | Workload | A named set of groups that run at the same time. |
-| Experiment | A named entry in the configuration: parameter values and axes. One invocation runs one experiment. |
+| Experiment | A TOML file with parameter values and axes. Its name is the file name without `.toml`. One invocation runs one or more experiments, one after the other. |
 | Axis | An ordered list of values for one or more parameters, with a start rule. |
 | Cell | One warm-up and one measurement, with one value of each parameter. |
-| Run | One repetition of the whole experiment (`--runs`). |
+| Run | One repetition of a whole experiment (`--runs`). |
 
 "Experiment" and "run" are the design-of-experiments terms for a design and its
 replicates. An axis whose values set more than one parameter is a factor with
@@ -60,23 +62,34 @@ composite levels.
 
 ```bash
 cargo build --release -p glassdb-bench-scale --bin perfbench
-target/release/perfbench --list
-target/release/perfbench --experiment mixed           # the default experiment
-target/release/perfbench --experiment split-merge-fight --runs 3
-target/release/perfbench --config my.toml --experiment probe \
+e=hack/perf/experiments
+target/release/perfbench --experiment $e/real-time/mixed.toml
+target/release/perfbench --experiment $e/real-time/split-merge-fight.toml --runs 3
+target/release/perfbench --experiment $e/default                # a directory
+target/release/perfbench --experiment $e/real-time/*-ranges.toml
+target/release/perfbench --config my.toml --experiment probe.toml \
   --set cell.workers=50 --set shapes.rw-many.keys=4
 ```
 
-- `--config PATH` loads a file. It can be given more than once. The built-in
-  file is always the first one.
-- `--experiment NAME` selects the experiment. The default is `mixed`.
-- `--set PATH=VALUE` gives one parameter of the selected experiment a fixed
-  value. It can be given more than once, and the last one wins. If an axis sets
-  `PATH`, `--set` removes that axis. For a coupled axis, this removes all its
-  paths, and they keep the value of `set` or the default. `VALUE` is a TOML
-  value, for example `--set 'cell.affinity=50'`.
-- `--only AXIS=LABEL` keeps only one value of an axis. It can be given once
-  for each axis. For example, `--experiment=suite --only=case=warm_read` runs one case.
+- `--experiment PATH` selects an experiment file, or a directory: all its
+  `*.toml` files, in name order. It can be given more than once, and the
+  experiments run one after the other, into one result. Two experiments with
+  the same name are an error. There is no default.
+- `--config PATH` loads a file, or the `*.toml` files of a directory, for every
+  experiment. It can be given more than once.
+- `--set PATH=VALUE` gives one parameter of each experiment a fixed value. It
+  can be given more than once, and the last one wins. If an axis sets `PATH`,
+  `--set` removes that axis. For a coupled axis, this removes all its paths,
+  and they keep the value of the files. `VALUE` is a TOML value, for example
+  `--set 'cell.affinity=50'`.
+- `--only AXIS=LABEL` keeps only one value of an axis, in each experiment that
+  has the axis. It is an error if no experiment has the axis. It can be given
+  once for each axis. For example, `--only=phase=pressure` runs one phase of
+  `inline-pressure`.
+
+If an experiment fails, the result has the experiments that completed before
+it, and perfbench exits with the error. If the first experiment fails, there is
+no result.
 
 The options that are the same for all experiments are command-line options:
 `--backend`, `--delays`, `--delay-scale`, `--time`, `--prefix-depth`, `--latency-jitter`,
@@ -130,23 +143,44 @@ for the absolute value of a metric:
 The result records the mode as `timeMode`. Results of different modes are not
 comparable.
 
-## Merging files
+## Configuration layers
 
-The files merge in the order of the command line:
+Each experiment has its own configuration. perfbench merges these layers in
+this order:
+
+1. the built-in defaults (`[seed]` and `[cell]`);
+2. each `--config` file, in the order of the command line;
+3. the files that the experiment file includes, in their order;
+4. the experiment file;
+5. each `--set`.
+
+So an experiment file can change any value, and the change does not apply to
+other experiments. The values of an experiment win over the `--config` files.
+
+A file can include other files before its own values:
+
+```toml
+include = ["../../configs/default.toml"]
+```
+
+The paths are relative to the file. An included file can include other files.
+A file that includes itself, directly or through other files, is an error.
+`include` works the same in an experiment file and in a `--config` file.
+
+Two files merge in order, and a later value wins, with these rules:
 
 - Tables merge key by key. A later file can change one field of a shape and
   keep its other fields.
 - A scalar or a list replaces the earlier value.
-- The value of a part selector (`source`, `cell.measure.until`) replaces the
-  earlier value as a whole. A later file can then change the part, and the
-  parameters of the earlier part do not stay.
-- An experiment replaces the earlier experiment with the same name as a whole.
-  Its values and axes are always from one file, so an axis never stays from an
-  earlier file.
+- The value of a part selector (`source` of a shape or of a workload,
+  `cell.measure.until`) replaces the earlier value as a whole. A later file can
+  then change the part, and the parameters of the earlier part do not stay.
+- `axes` is a list, so the axes of a later file replace all earlier axes. A
+  `--config` file with `axes` gives them to each experiment that has none.
 - A key that the schema does not know is an error.
 
-The result records the experiment after `--set`, and the configuration that it
-uses, so that a result file is enough to repeat its run.
+The result records each experiment after `--set`, and the configuration that
+it uses, so that a result file is enough to repeat its run.
 
 ## Kinds
 
@@ -260,14 +294,14 @@ condition, are marked in the result.
 
 ## Parameters
 
-All other parameters, with their scope and the default of the built-in file:
+All other parameters, with their scope and the built-in default:
 
 | Path | Scope | Default | Meaning |
 | --- | --- | --- | --- |
 | `cell.collections` | seed | `"databases"` | Collections of each pool. `"databases"` gives one for each instance of the cell. |
 | `seed.quiet-period` | seed | `"10s"` | Model time without splits and merges that ends the seed. `"0s"` ends the seed after its writes, without a wait and without full GCs. |
 | `seed.timeout` | seed | `"180s"` | The run fails after this model time. |
-| `cell.workload` | cell | `"low-conflict"` | The workload. |
+| `cell.workload` | cell | none | The workload. Each cell must have one. |
 | `cell.databases` | cell | 4 | Instances of a group that does not give `instances`. |
 | `cell.workers` | cell | 8 | Workers of a shape whose value is `"cell"`. |
 | `cell.affinity` | cell | 100 | Percent of transactions on the home collection. The others select a collection at random. |
@@ -286,23 +320,32 @@ use. The loader checks only these shapes, workloads, and pools.
 
 ## Experiments
 
-An experiment has two parts:
+An experiment file has the values of the experiment, and `axes`: the axes, from
+the outer loop to the inner loop. With no axes, the experiment has one cell.
 
-- `set`: values that replace the defaults for this experiment. Dotted keys are
-  paths.
-- `axes`: the axes, from the outer loop to the inner loop.
+```toml
+# An experiment of the mixed workloads at five affinities.
+include = ["../../configs/common-workloads.toml"]
+
+[cell]
+workload = "low-conflict"
+
+[[axes]]
+path = "cell.affinity"
+values = [0, 25, 50, 75, 100]
+```
 
 An axis has one of two forms:
 
 ```toml
 # One parameter.
-[[experiments.<name>.axes]]
+[[axes]]
 path = "cell.affinity"
 values = [0, 50, 100]
 start = "seed"
 
 # Coupled parameters. Each value has a label and sets one or more paths.
-[[experiments.<name>.axes]]
+[[axes]]
 name = "policy"
 start = "seed"
 values = [
@@ -315,7 +358,7 @@ An axis can also take its values from an axis generator, a scenario part that
 gives the values of a coupled axis:
 
 ```toml
-[[experiments.contention.axes]]
+[[axes]]
 name = "overlap"
 generate = { contention-overlaps = { shape = "contention-rmw", max-keys = 6 } }
 ```
@@ -324,9 +367,9 @@ The loader replaces `generate` with the values before `--set` and `--only`, so
 the result and `--only` see the generated labels. Use a generator when the
 values follow a rule that a plain list repeats many times.
 
-- A path must not be in `set` and in an axis, or in two axes.
-- A value of the coupled form that does not set a path keeps the value of
-  `set` or the default.
+- A path must not be in two axes.
+- An axis value wins over the value of the files. A value of the coupled form
+  that does not set a path keeps the value of the files.
 - A value can repeat, for example `["low-conflict", "crossing", "low-conflict"]`.
 
 The values of `start`:
@@ -382,10 +425,11 @@ The checks before the first seed:
 
 ## Result
 
-The result has `schemaVersion` 2. Its envelope has `scenario` (the
-experiment), `backend`, `timeMode`, `modelTimeSpeedup`, `latencyJitter`, the command-line
-`options`, and the resolved `experiment`: the merged configuration and the
-axes. Each run has its cells. Each cell has:
+The result has `schemaVersion` 3. It has `backend`, `timeMode`,
+`modelTimeSpeedup`, `latencyJitter`, the command-line `options`, and
+`experiments`: one entry for each experiment, in the order that they ran. Each
+entry has the `name` of the experiment, its resolved `configuration`, its
+`axes`, and its `runs`. Each run has its cells. Each cell has:
 
 - `labels` (the label of each axis value), `parameters` (the paths that the
   axes set, and a summary of the sources: `keys` and `shared` of an `overlap`
@@ -422,27 +466,7 @@ stop after 600 s of wall time. Every cell runs on one multi-thread runtime.
 `hack/perf/perfbench_results.py` reads the result files for the
 comparison and plot tools.
 
-## Built-in experiments
-
-| Experiment | What it measures |
-| --- | --- |
-| `mixed` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
-| `suite` | Single transactions of one worker with warm caches, and their backend costs, and a `shapes_shared_leaf` case of four shapes at the same time on one leaf. Each case is one value of the axis `case`, with the same settings and a fixed length of 10 s. One run measures all of them. It is the experiment of the CI comparison and of `make bench`. |
-| `workers` | The worker grid of the canonical plots: 1 to 200 workers per shape, each count after the warm-up of the count before it. |
-| `affinity` | The affinity grid of the canonical plots: 5 affinities × 1, 3, 5, and 7 database instances. |
-| `load-shift` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
-| `contention` | Five writers whose transactions share some of their 1 to 6 keys. |
-| `inline-pressure` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
-| `split-merge-fight` | A stable load under which the topology policies of three instances disagree, with the `avoidable`, `fixed-1`, and `fixed-2` policies. |
-| `membership-churn` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
-
-### Mixed workloads
-
-In the `low-conflict` workload, each worker selects its keys from its own
-stripe of 5,000 keys, so transactions seldom conflict, but they share leaves.
-In `high-conflict`, all workers share 8 keys. The stripes of a pool must give
-each worker at least the keys of a transaction; the loader rejects a smaller
-pool.
+## Seeds, warm-ups, and measurements
 
 Before the cells run, the seed writes all keys and waits until splits, merges,
 and garbage collection stop for `seed.quiet-period`. If that takes longer than
@@ -452,9 +476,9 @@ cell writes its keys again.
 
 Each cell then runs its load without measuring it. The warm-up lasts at least
 `cell.warm-up.minimum`, and then until the rate of splits and merges in a
-`cell.warm-up.quiet` window of model time is at most `cell.warm-up.quiet-rate`, or until
-`cell.warm-up.timeout`. Under load, the tree
-often keeps splitting, so a loaded cell usually measures after the timeout.
+`cell.warm-up.quiet` window of model time is at most `cell.warm-up.quiet-rate`,
+or until `cell.warm-up.timeout`. Under load, the tree often keeps splitting, so
+a loaded cell usually measures after the timeout.
 `hack/perf/investigations.md` explains why the splits continue.
 
 The measurement runs for at least `cell.measure.duration`. perfbench splits it
@@ -465,44 +489,13 @@ unconverged. Its windows have fewer commits, so its throughput distribution is
 noisier. The commits of the transactions that finish after the measurement are
 not in a window.
 
-### Canonical plots
-
-The canonical plots use the local S3 model. `--prefix-depth=3` gives each
-collection its own simulated S3 request-rate limit:
-
-```bash
-cargo build --release -p glassdb-bench-scale --bin perfbench
-common=(--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
-  --runs=3 --drain-timeout=90s)
-target/release/perfbench "${common[@]}" --experiment=workers \
-  --output=hack/perf/out-sweeps/workers.json
-target/release/perfbench "${common[@]}" --experiment=affinity \
-  --output=hack/perf/out-sweeps/affinity.json
-uv run hack/perf/plot_results.py --canonical
-```
-
 A chain of cells that continue each other shares one seed. The seed writes the
 collections of the largest cell of the chain, and each cell uses the first of
-them. `hack/perf/README.md` explains the plots and the comparison tools, and
-`hack/aws-bench/README.md` the real-S3 runner.
+them.
 
-### Suite cases
+## Experiments of the repository
 
-The cases of the `suite` experiment replace the Criterion suite of `glassdb`.
-Except for the last one, each case runs one worker on one instance with warm
-caches. A case warms up for 1250 ms and measures for 10 s of model time. Most
-cases are built-in parts:
-
-| Case | Shape |
-| --- | --- |
-| `warm_read` | A read of one key with a 256-byte value. |
-| `warm_read_external` | A read of a 1,025-byte value, which a transaction record stores. |
-| `fresh_client_read` | A read on a new database instance, which has no cache (the scenario kind `fresh-client-read`). The open is not in the time. |
-| `rmw_inline_1024` | A read-modify-write of one key with a 1,024-byte value, at the default inline limit. |
-| `rmw_external_1025` | The same with a 1,025-byte value, above the limit. |
-| `rmw_five_leaves` | One key in each of five collections (`collections = 5`). |
-| `read_long_keys_large_collection` | A read in a collection of 1,024 keys of 256 bytes (`key-bytes = 256`), after its splits. |
-| `rmw_shared_leaf_three_transactions` | Three workers that update their own key of one leaf. |
-| `shapes_shared_leaf` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time on one leaf, with `low-conflict` keys. |
-
-The `costs` of each cell are the numbers that the CI comparison checks.
+[hack/perf/README.md](../../hack/perf/README.md) lists the experiments of the
+repository, the time mode that each one needs, and the commands of the
+canonical plots. [hack/aws-bench/README.md](../../hack/aws-bench/README.md)
+explains the real-S3 runner.

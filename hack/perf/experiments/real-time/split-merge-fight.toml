@@ -1,0 +1,80 @@
+# A stable load under which the topology policies of database instances
+# disagree. Two writers of one key each lose leaf CASes to each other, so their
+# policy splits the leaf. A scanner then crosses into the right leaf, so its
+# policy merges the leaves again. The fixed policies keep one or two leaves.
+
+[pools.fight]
+keys = 2
+
+[shapes.write-left]
+kind = "write"
+pool = "fight"
+source = { index = { keys = [0] } }
+
+[shapes.write-right]
+kind = "write"
+pool = "fight"
+source = { index = { keys = [1] } }
+
+[shapes.scan-all]
+kind = "scan"
+pool = "fight"
+source = { index = { keys = [0] } }
+
+[workloads.fight.groups.left-splitter]
+instances = 1
+shapes = { write-left = 4 }
+
+[workloads.fight.groups.right-splitter]
+instances = 1
+shapes = { write-right = 4 }
+
+[workloads.fight.groups.merger]
+instances = 1
+shapes = { scan-all = 8 }
+
+[seed]
+quiet-period = "1s"
+
+[cell]
+workload = "fight"
+collections = 1
+gc = false
+
+[cell.warm-up]
+quiet = "never"
+timeout = "10s"
+
+[cell.measure]
+until = "duration"
+duration = "60s"
+max-duration = "120s"
+
+[[axes]]
+name = "policy"
+
+[[axes.values]]
+label = "avoidable"
+[axes.values.set]
+"seed.database.topology" = "avoidable"
+"cell.database.topology" = "avoidable"
+
+# The size causes with no underfull threshold keep the one leaf of the seed.
+[[axes.values]]
+label = "fixed-1"
+[axes.values.set]
+"cell.database.topology" = "size"
+"cell.database.leaf-min-entries" = 0
+"cell.database.index-min-children" = 0
+
+# The seed splits the leaf between the two keys, and the cells keep both leaves.
+[[axes.values]]
+label = "fixed-2"
+[axes.values.set]
+"seed.database.topology" = "size"
+"seed.database.leaf-max-entries" = 1
+"seed.database.leaf-min-entries" = 0
+"seed.database.index-min-children" = 0
+"cell.database.topology" = "size"
+"cell.database.leaf-min-entries" = 0
+"cell.database.index-min-children" = 0

@@ -1,4 +1,4 @@
-.PHONY: test test-unit test-sim test-bench lint format build clean fuzz fuzz-min bench flamegraph
+.PHONY: test test-unit test-sim test-bench lint format build clean fuzz fuzz-min bench bench-all flamegraph
 
 # Flags for every build under the in-repo deterministic simulation executor:
 # `--cfg sim` routes spawn/time/randomness through it, and `--cfg tokio_unstable`
@@ -40,16 +40,40 @@ lint:
 format:
 	cargo fmt --all
 
-# Run the perfbench experiments on virtual time, with the latency jitter of the
-# provider. The default runs the suite: every case of the CI comparison in one
-# run. Select another experiment with EXPERIMENT, for example
-# `make bench EXPERIMENT=mixed`. Virtual time is fast, but it does not show CPU
-# saturation: use real time for the canonical plots
-# (crates/glassdb-bench-scale/README.md explains the experiments and the time
-# modes).
+EXPERIMENTS_DIR = hack/perf/experiments
+BENCH_ALL_OUT = $(or $(OUT),target/performance/bench-all-$(or $(TIME),real).json)
+
+# Run perfbench experiments on virtual time, with the latency jitter of the
+# provider. The default runs the experiments of the CI comparison. Select other
+# experiment files or directories with EXPERIMENT, for example
+# `make bench EXPERIMENT=hack/perf/experiments/any-time/contention.toml`.
+# Virtual time is fast, but it does not show CPU saturation: use real time for
+# the canonical plots (crates/glassdb-bench-scale/README.md explains the
+# experiments and the time modes).
 bench:
 	cargo run --release -p glassdb-bench-scale --bin perfbench -- \
-		--time=virtual --experiment=$(or $(EXPERIMENT),suite)
+		--time=virtual --experiment=$(or $(EXPERIMENT),$(EXPERIMENTS_DIR)/default)
+
+# Run all experiments one after the other, into one result in OUT. The default
+# is one run of each in real time, with the local S3 model of the canonical
+# plots (hack/perf/README.md). It takes hours and uses all CPUs: keep the host
+# idle and on mains power. TIME=virtual runs only the experiments that can run
+# on virtual time.
+bench-all:
+	mkdir -p $(dir $(BENCH_ALL_OUT))
+ifeq ($(TIME),virtual)
+	cargo run --release -p glassdb-bench-scale --bin perfbench -- \
+		--time=virtual --output=$(BENCH_ALL_OUT) \
+		--experiment=$(EXPERIMENTS_DIR)/default \
+		--experiment=$(EXPERIMENTS_DIR)/any-time
+else
+	cargo run --release -p glassdb-bench-scale --bin perfbench -- \
+		--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3 \
+		--drain-timeout=90s --output=$(BENCH_ALL_OUT) \
+		--experiment=$(EXPERIMENTS_DIR)/default \
+		--experiment=$(EXPERIMENTS_DIR)/any-time \
+		--experiment=$(EXPERIMENTS_DIR)/real-time
+endif
 
 # Record a CPU flamegraph to guide profiling work (a diagnostic aid only -
 # excluded from `test` and benchmarks; it changes no
