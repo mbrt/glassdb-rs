@@ -1,0 +1,27 @@
+# The worker grid of the canonical plots. Each worker count continues from the
+# tree after the warm-up of the count before it.
+include = ["../../configs/common-workloads.toml"]
+
+[pools.wide]
+keys = 20000
+
+[seed]
+quiet-period = "5s"
+
+[cell]
+workload = "low-conflict"
+databases = 5
+
+# With the avoidable time policy, the rule needs some half-lives of its
+# averages (10 s) before it splits, so a shorter warm-up can end quiet on the
+# topology that it starts with.
+[cell.warm-up]
+minimum = "30s"
+quiet = "5s"
+timeout = "180s"
+
+[[axes]]
+path = "cell.workers"
+values = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100,
+          110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
+start = "previous-warm-up"

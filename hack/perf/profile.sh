@@ -7,20 +7,26 @@
 # Usage:
 #   hack/perf/profile.sh
 #   CASE=rmw_inline_1024 hack/perf/profile.sh
-#   EXPERIMENT=mixed hack/perf/profile.sh
+#   EXPERIMENT=hack/perf/experiments/real-time/mixed.toml hack/perf/profile.sh
 #
 # Tunables (env):
-#   EXPERIMENT        perfbench experiment (default suite)
-#   CASE              one case of the suite experiment (default: all)
-#   SECONDS_PER_CASE  measured wall time of each case (default 10)
+#   EXPERIMENT        perfbench experiment file or directory
+#                     (default hack/perf/experiments/default)
+#   CASE              one experiment of hack/perf/experiments/default, in place
+#                     of EXPERIMENT (default: all)
+#   SECONDS_PER_CASE  measured wall time of each default experiment (default 10)
 #   OUT               output directory for artifacts (default hack/perf)
 
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-EXPERIMENT="${EXPERIMENT:-suite}"
+DEFAULT=hack/perf/experiments/default
+EXPERIMENT="${EXPERIMENT:-$DEFAULT}"
 CASE="${CASE:-}"
+if [[ -n "$CASE" ]]; then
+	EXPERIMENT="$DEFAULT/$CASE.toml"
+fi
 SECONDS_PER_CASE="${SECONDS_PER_CASE:-10}"
 OUT="${OUT:-hack/perf}"
 
@@ -34,7 +40,7 @@ run_args=(
 	--experiment="$EXPERIMENT"
 	--output="$OUT/profile.json"
 )
-if [[ "$EXPERIMENT" == "suite" ]]; then
+if [[ "$(realpath -m "$EXPERIMENT")" == "$(realpath -m "$DEFAULT")"* ]]; then
 	# perfbench durations are model time, and the default model clock runs five
 	# times as fast as wall time.
 	model_seconds=$((SECONDS_PER_CASE * 5))
@@ -42,9 +48,6 @@ if [[ "$EXPERIMENT" == "suite" ]]; then
 		--set="cell.measure.duration=\"${model_seconds}s\""
 		--set="cell.measure.max-duration=\"${model_seconds}s\""
 	)
-	if [[ -n "$CASE" ]]; then
-		run_args+=(--only="case=$CASE")
-	fi
 fi
 
 if ! cargo flamegraph --version >/dev/null 2>&1; then

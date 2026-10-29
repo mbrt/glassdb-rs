@@ -277,6 +277,18 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(stats.loc[0, "direct-landed"], 1)
         self.assertEqual(stats.loc[0, "num-replays"], 1)
 
+    def test_an_experiment_is_found_in_a_result_of_several(self) -> None:
+        cell = contention_cell(1, 1, committed=2, tx_per_sec=2)
+        report = envelope("contention", [{"run": 1, "cells": [cell]}])
+        report["experiments"].append({"name": "mixed", "runs": []})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "all.json").write_text(json.dumps(report))
+            (path / "notes.json").write_text("[]")
+            stats = compare.perfbench_contention_frames(path)
+
+        self.assertEqual(list(stats["count"]), [2])
+
     def test_mixed_aggregate_table_accepts_legacy_replays_per_tx(self) -> None:
         def cells(replays_per_tx: float):
             return [

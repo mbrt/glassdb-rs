@@ -1,0 +1,5 @@
+# A read of a 1,025-byte value, which a transaction record stores.
+include = ["../../configs/default.toml"]
+
+[cell]
+workload = "diag-read-external"

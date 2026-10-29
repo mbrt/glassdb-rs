@@ -78,13 +78,15 @@ def shared_leaf_cell():
 
 def result(latency_jitter):
     return {
-        "schemaVersion": 2,
-        "scenario": perf_report.SUITE,
+        "schemaVersion": 3,
         "backend": "memory",
         "timeMode": "virtual",
         "modelTimeSpeedup": 1,
         "latencyJitter": latency_jitter,
-        "runs": [{"run": 1, "cells": [example_cell(), shared_leaf_cell()]}],
+        "experiments": [
+            {"name": cell["labels"]["case"], "runs": [{"run": 1, "cells": [cell]}]}
+            for cell in (example_cell(), shared_leaf_cell())
+        ],
     }
 
 
@@ -139,17 +141,15 @@ class PerfReportTest(unittest.TestCase):
 
     def update_cell(self, kind, case, change, **options):
         def apply(value):
-            (cell,) = [
-                c for c in value["runs"][0]["cells"] if c["labels"]["case"] == case
-            ]
-            change(cell)
+            (experiment,) = [e for e in value["experiments"] if e["name"] == case]
+            change(experiment["runs"][0]["cells"][0])
 
         self.update(kind, apply, **options)
 
     def remove_cell(self, kind, case, **options):
         def apply(value):
-            cells = value["runs"][0]["cells"]
-            value["runs"][0]["cells"] = [c for c in cells if c["labels"]["case"] != case]
+            experiments = value["experiments"]
+            value["experiments"] = [e for e in experiments if e["name"] != case]
 
         self.update(kind, apply, **options)
 
@@ -471,10 +471,11 @@ class PerfReportTest(unittest.TestCase):
         self.assertIn("incomplete paired measurements", report)
 
     def test_another_case_is_not_compared(self):
-        self.update_cell(
-            "timing", "example", lambda cell: cell.update(labels={"case": "other"})
-        )
-        self.assertIn("expected one example cell", self.report())
+        def rename(value):
+            value["experiments"][0]["name"] = "other"
+
+        self.update("timing", rename)
+        self.assertIn("expected one example experiment", self.report())
 
     def test_invalid_numbers_and_low_sample_counts_are_warnings(self):
         self.update_cell(
@@ -511,7 +512,7 @@ class PerfReportTest(unittest.TestCase):
             ("timeMode", "real"),
             ("timeMode", None),
             ("schemaVersion", 1),
-            ("scenario", "mixed"),
+            ("schemaVersion", 2),
         ):
             with self.subTest(key=key):
                 self.update("timing", lambda v: v.update({key: value}), repetitions=[1])
@@ -542,7 +543,7 @@ class PerfReportTest(unittest.TestCase):
 
     def test_model_mismatch_is_not_compared(self):
         self.update("timing", lambda value: value.update(modelTimeSpeedup=5))
-        self.assertIn("unsupported suite schema or backend model", self.report())
+        self.assertIn("unsupported perfbench schema or backend model", self.report())
 
 
 if __name__ == "__main__":

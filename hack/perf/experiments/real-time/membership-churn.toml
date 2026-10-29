@@ -1,0 +1,55 @@
+# Creates and deletes that change the key membership of one leaf while other
+# transactions scan it. A direct churner commits direct. A locked churner scans
+# first, so it takes key locks and the membership lock of the leaf.
+
+[pools.churn]
+# 6 churn workers with 4 own keys each.
+keys = 24
+seeded = false
+
+# Each worker owns a block of keys, so that the keys of the direct churners
+# sort before the keys of the locked churner, and a split can separate them.
+[shapes.direct-churn]
+kind = "create-delete"
+pool = "churn"
+source = "adjacent"
+
+[shapes.locked-churn]
+kind = "create-delete"
+pool = "churn"
+source = "adjacent"
+locked = true
+
+[shapes.scan-churn]
+kind = "scan"
+pool = "churn"
+source = { index = { keys = [0] } }
+
+[workloads.churn.groups.direct-churner]
+instances = 1
+shapes = { direct-churn = 4 }
+
+[workloads.churn.groups.locked-churner]
+instances = 1
+shapes = { locked-churn = 2 }
+
+[workloads.churn.groups.scanner]
+instances = 1
+shapes = { scan-churn = 8 }
+
+[seed]
+quiet-period = "0s"
+
+[cell]
+workload = "churn"
+collections = 1
+gc = false
+
+[cell.warm-up]
+quiet = "never"
+timeout = "5s"
+
+[cell.measure]
+until = "duration"
+duration = "60s"
+max-duration = "120s"

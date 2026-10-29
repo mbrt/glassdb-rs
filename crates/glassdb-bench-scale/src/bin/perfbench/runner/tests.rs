@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use glassdb::middleware::{DelayOptions, ProviderLatencyProfile, RateLimit, WriteRateLimits};
 
-use super::config::Selection;
+use super::config::{Resolved, Selection, repository_experiment};
 use super::result::RunResult;
 use crate::Execution;
 use crate::backend::Factory;
@@ -23,14 +23,20 @@ fn factory() -> Factory {
     })
 }
 
-/// Runs `experiment` with the values of `set`, and returns its cells as JSON.
-fn run(experiment: &str, set: &[&str]) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
-    let resolved = Selection {
-        experiment: experiment.to_string(),
+/// Resolves the repository experiment `experiment` with the values of `set`.
+fn resolve(experiment: &str, set: &[&str]) -> Result<Resolved, Box<dyn Error>> {
+    let mut resolved = Selection {
+        experiments: vec![repository_experiment(experiment)],
         set: set.iter().map(|s| s.to_string()).collect(),
         ..Selection::default()
     }
     .resolve()?;
+    Ok(resolved.remove(0))
+}
+
+/// Runs `experiment` with the values of `set`, and returns its cells as JSON.
+fn run(experiment: &str, set: &[&str]) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
+    let resolved = resolve(experiment, set)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -116,12 +122,7 @@ fn a_pass_condition_ends_the_measurement_of_a_sequence() -> Result<(), Box<dyn E
 fn a_chain_of_cells_shares_the_seed_of_its_largest_cell() -> Result<(), Box<dyn Error>> {
     let mut set = SHORT.to_vec();
     set.extend(["pools.wide.keys=20000", "cell.databases=3"]);
-    let resolved = Selection {
-        experiment: "workers".to_string(),
-        set: set.iter().map(|s| s.to_string()).collect(),
-        ..Selection::default()
-    }
-    .resolve()?;
+    let resolved = resolve("workers", &set)?;
     let (points, specs) = super::plan(&resolved)?;
     assert_eq!(specs[0].collections, 1);
     assert!(specs.iter().all(|spec| spec.seed_collections == 3));

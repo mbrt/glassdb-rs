@@ -1,0 +1,37 @@
+# Five writers of `keys` keys each, of which `shared` are the same for all
+# writers.
+
+[pools.contention]
+value-bytes = 1024
+
+[shapes.contention-rmw]
+kind = "read-modify-write"
+pool = "contention"
+source = { overlap = { shared = 1 } }
+keys = 1
+
+[workloads.contention.groups.all]
+instances = 1
+shapes = { contention-rmw = 5 }
+
+[seed]
+quiet-period = "0s"
+
+[cell]
+workload = "contention"
+collections = 1
+gc = false
+
+[cell.warm-up]
+timeout = "0s"
+
+[cell.measure]
+until = "duration"
+duration = "60s"
+max-duration = "120s"
+
+# One cell for each key count from 1 to 6, and each count of shared keys up
+# to it, labeled `keys<K>-shared<S>`.
+[[axes]]
+name = "overlap"
+generate = { contention-overlaps = { shape = "contention-rmw", max-keys = 6 } }

@@ -1,0 +1,6 @@
+# A read-modify-write of one key with a 1,024-byte value, at the default inline
+# limit.
+include = ["../../configs/default.toml"]
+
+[cell]
+workload = "diag-rmw-inline"

@@ -1,0 +1,16 @@
+# Both conflict levels at five collection affinities.
+include = ["../../configs/common-workloads.toml"]
+
+# With the avoidable time policy, the rule needs some half-lives of its
+# averages (10 s) before it splits, so a shorter warm-up can end quiet on the
+# topology that it starts with.
+[cell.warm-up]
+minimum = "30s"
+
+[[axes]]
+path = "cell.workload"
+values = ["low-conflict", "high-conflict"]
+
+[[axes]]
+path = "cell.affinity"
+values = [0, 25, 50, 75, 100]

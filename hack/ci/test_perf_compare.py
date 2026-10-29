@@ -31,18 +31,25 @@ class HarnessTest(unittest.TestCase):
             self.assertEqual((root / "base/crates/glassdb/lib.rs").read_text(), "base")
             self.assertEqual((root / "base/Cargo.lock").read_text(), "base")
 
-    def test_both_sides_use_the_base_harness_when_the_candidate_one_fails(self):
+    def prepare_with(self, fail_candidate_harness, base_has_experiments=True):
+        """Prepare a comparison of fake snapshots, and return what the sides
+        built, the manifest, and the experiment file that both sides read."""
         built = []
 
         def fake_snapshot(repo, destination, revision):
             harness = destination / "crates/glassdb-bench-scale"
             harness.mkdir(parents=True)
             (harness / "main.rs").write_text(destination.name)
+            if destination.name == "main" and not base_has_experiments:
+                return
+            experiments = destination / perf_compare.EXPERIMENTS
+            experiments.mkdir(parents=True)
+            (experiments / "warm_read.toml").write_text(destination.name)
 
         def fake_build(source, target, output, side, log=None):
             harness = (source / "crates/glassdb-bench-scale/main.rs").read_text()
             built.append((side, harness))
-            if side == "main" and harness == "pr":
+            if fail_candidate_harness and side == "main" and harness == "pr":
                 raise RuntimeError("unsupported comparison")
             return {"perfbench": f"{side}-perfbench"}
 
@@ -51,15 +58,34 @@ class HarnessTest(unittest.TestCase):
         ), mock.patch.object(
             perf_compare, "snapshot", fake_snapshot
         ), mock.patch.object(perf_compare, "build", fake_build):
-            manifest = perf_compare.prepare(
-                Path(directory), Path(directory) / "out", "main", None
-            )
+            output = Path(directory).resolve() / "out"
+            manifest = perf_compare.prepare(Path(directory), output, "main", None)
+            experiments = output / "harness" / perf_compare.EXPERIMENTS
+            for arguments in (manifest["timingArgs"], manifest["counterArgs"]):
+                self.assertEqual(arguments[-1], f"--experiment={experiments}")
+            experiment = (experiments / "warm_read.toml").read_text()
+        return built, manifest, experiment
+
+    def test_both_sides_use_the_experiments_of_the_candidate_harness(self):
+        built, manifest, experiment = self.prepare_with(False)
+
+        self.assertEqual(built, [("main", "pr"), ("pr", "pr")])
+        self.assertNotIn("harness", manifest)
+        self.assertEqual(experiment, "pr")
+
+    def test_both_sides_use_the_base_harness_when_the_candidate_one_fails(self):
+        built, manifest, experiment = self.prepare_with(True)
 
         self.assertEqual(
             built, [("main", "pr"), ("main", "main"), ("pr", "main")]
         )
         self.assertEqual(manifest["harness"], "base")
         self.assertEqual(len(manifest["warnings"]), 1)
+        self.assertEqual(experiment, "main")
+
+    def test_a_base_harness_without_experiment_files_is_unsupported(self):
+        with self.assertRaisesRegex(RuntimeError, "harness has no"):
+            self.prepare_with(True, base_has_experiments=False)
 
     def test_current_snapshot_includes_edits_but_not_deleted_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -106,8 +132,8 @@ class MeasurementTest(unittest.TestCase):
             "latencyJitter": True,
             "processTimeoutSeconds": 30,
             "warnings": [],
-            "timingArgs": ["--experiment=suite"],
-            "counterArgs": ["--latency-jitter=false", "--experiment=suite"],
+            "timingArgs": ["--experiment=default"],
+            "counterArgs": ["--latency-jitter=false", "--experiment=default"],
             **{side: {"perfbench": str(self.fixture)} for side in ("main", "pr")},
         }
 
@@ -152,7 +178,7 @@ class MeasurementTest(unittest.TestCase):
     def test_fixed_latency_measurements_use_the_requested_profile(self):
         manifest = self.manifest(cases=("a",))
         manifest.update(
-            timingArgs=["--latency-jitter=false", "--experiment=suite"],
+            timingArgs=["--latency-jitter=false", "--experiment=default"],
             latencyJitter=False,
         )
         perf_compare.measure(self.root, manifest)
@@ -170,15 +196,14 @@ class MeasurementTest(unittest.TestCase):
             self.assertIs(counters["latencyJitter"], False)
             # One process measures every case, including the shapes_shared_leaf workload.
             for result in (timing, counters):
-                labels = [cell["labels"]["case"] for cell in result["runs"][0]["cells"]]
-                self.assertEqual(labels, ["a", "shapes_shared_leaf"])
+                names = [experiment["name"] for experiment in result["experiments"]]
+                self.assertEqual(names, ["a", "shapes_shared_leaf"])
         kinds = [row[1] for row in self.order(kind=None)[:4]]
         self.assertEqual(kinds, ["timing", "counters"] * 2)
 
-    def test_the_default_plan_measures_the_suite_on_virtual_time(self):
+    def test_the_default_plan_measures_on_virtual_time(self):
         for arguments in (perf_compare.TIMING_ARGS, perf_compare.COUNTER_ARGS):
             self.assertIn("--time=virtual", arguments)
-            self.assertIn(f"--experiment={perf_compare.perf_report.SUITE}", arguments)
             self.assertFalse(
                 [arg for arg in arguments if arg.startswith("--delay-scale")]
             )
@@ -192,7 +217,7 @@ class MeasurementTest(unittest.TestCase):
         self.configure(latencyJitter=True)
         manifest = self.manifest(cases=("a",))
         manifest.update(
-            timingArgs=["--latency-jitter=false", "--experiment=suite"],
+            timingArgs=["--latency-jitter=false", "--experiment=default"],
             latencyJitter=False,
         )
         with self.assertRaisesRegex(
@@ -357,10 +382,11 @@ for case in [*cases, 'shapes_shared_leaf']:
         latency = 100 * factor
         cell = {'shapes': [{'shape': case, 'committed': 200, 'converged': True,
             'p50Ms': latency, 'p90Ms': 2 * latency, 'txPerSec': 1000 / latency}]}
-    cells.append({**cell, 'labels': {'case': case}, 'failures': 0, 'costs': costs})
-result = {'schemaVersion': 2, 'scenario': 'suite', 'backend': 'memory',
+    cells.append({'name': case, 'runs': [{'run': 1,
+        'cells': [{**cell, 'failures': 0, 'costs': costs}]}]})
+result = {'schemaVersion': 3, 'backend': 'memory',
     'latencyJitter': jitter, 'timeMode': 'virtual', 'modelTimeSpeedup': 1,
-    'runs': [{'run': 1, 'cells': cells}]}
+    'experiments': cells}
 output.write_text(json.dumps(result))
 """
 

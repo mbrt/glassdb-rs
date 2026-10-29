@@ -42,8 +42,15 @@ CASES = (
 # the jitter of the provider latency out of the percentile samples, so that
 # changes of a few percent remain visible.
 MEASURE_WINDOW = "300s"
-# The options of every compared process. The experiment comes from the built-in
-# configuration of the candidate harness, and runs all cases in one process.
+# The experiments that all comparisons measure, one for each case, and the
+# shared files that they include. They are part of the harness.
+EXPERIMENTS = Path("hack/perf/experiments/default")
+CONFIGS = Path("hack/perf/configs")
+# The sources that the base revision takes from the harness. The crate must be
+# in the base revision; the experiment files can be new.
+HARNESS = (Path("crates/glassdb-bench-scale"), CONFIGS, EXPERIMENTS)
+# The options of every compared process. One process runs all cases. The
+# driver adds the experiments, from the copy of the harness in the output.
 COMMON_ARGS = [
     "--backend=memory",
     "--delays=s3",
@@ -54,7 +61,6 @@ COMMON_ARGS = [
     "--prefix-depth=3",
     "--runs=1",
     "--drain-timeout=10s",
-    f"--experiment={perf_report.SUITE}",
 ]
 # The latency comes from a process that keeps the jitter of the provider, so
 # that percentiles are realistic.
@@ -101,15 +107,17 @@ def snapshot(repo: Path, destination: Path, revision: str | None) -> None:
 
 def use_harness(candidate: Path, base: Path) -> str:
     """Copy the benchmark sources, retaining engine dependencies and locks."""
-    paths = [Path("crates/glassdb-bench-scale")]
     digest = hashlib.sha256()
-    for relative in paths:
+    for relative in HARNESS:
         source = candidate / relative
         target = base / relative
-        if not target.is_dir():
+        if relative == HARNESS[0] and not target.is_dir():
             raise RuntimeError(f"unsupported comparison: baseline has no {relative}")
         # These directories are disposable snapshots owned by this invocation.
-        shutil.rmtree(target)
+        if target.is_dir():
+            shutil.rmtree(target)
+        if not source.is_dir():
+            continue
         shutil.copytree(source, target)
         for path in sorted(source.rglob("*")):
             if path.is_file():
@@ -173,8 +181,8 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         "completedPairs": 0,
         "cases": list(CASES),
         "latencyJitter": LATENCY_JITTER,
-        "timingArgs": TIMING_ARGS,
-        "counterArgs": COUNTER_ARGS,
+        "timingArgs": list(TIMING_ARGS),
+        "counterArgs": list(COUNTER_ARGS),
         "processTimeoutSeconds": PROCESS_TIMEOUT,
         "base": base,
         "candidate": candidate or "working tree",
@@ -217,6 +225,19 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
                 snapshots / "main-own", targets / "main", output, "main"
             )
         manifest["pr"] = build(snapshots / "pr", targets / "pr", output, "pr")
+        # The candidate snapshot has the harness that both sides use, and the
+        # measurement reads its experiment files after the snapshots are gone.
+        harness = output.resolve() / "harness"
+        if not (snapshots / "pr" / EXPERIMENTS).is_dir():
+            raise RuntimeError(
+                f"unsupported comparison: the harness has no {EXPERIMENTS}"
+            )
+        for relative in (CONFIGS, EXPERIMENTS):
+            if (snapshots / "pr" / relative).is_dir():
+                shutil.copytree(snapshots / "pr" / relative, harness / relative)
+        experiments = f"--experiment={harness / EXPERIMENTS}"
+        manifest["timingArgs"].append(experiments)
+        manifest["counterArgs"].append(experiments)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return manifest
 
@@ -247,8 +268,8 @@ def measure(output: Path, manifest: dict) -> None:
             manifest["cpuModel"],
         )
 
-    def run_suite(side, repetition):
-        """Run the suite twice, for the latency and for the counters."""
+    def run_experiments(side, repetition):
+        """Run the experiments for the latency, and then for the counters."""
         directory = output / side / f"{repetition:02d}"
         directory.mkdir(parents=True, exist_ok=True)
         for stem, arguments in (
@@ -278,7 +299,7 @@ def measure(output: Path, manifest: dict) -> None:
                 # Adjacent pairs limit host drift.
                 sides = ("main", "pr") if repetition % 2 else ("pr", "main")
                 for side in sides:
-                    directory = run_suite(side, repetition)
+                    directory = run_experiments(side, repetition)
                     _, warnings = perf_report.read_measurement(
                         directory,
                         manifest["cases"],

@@ -1,0 +1,57 @@
+# The pools, shapes, and workloads of the experiments on mixed loads: the
+# low-conflict and high-conflict workloads, and transactions over adjacent keys.
+# An experiment includes this file and selects one of them with `cell.workload`.
+
+# Key pools. The seed writes each pool that a cell uses, once in each
+# collection of the cell.
+
+[pools.wide]
+keys = 5000
+
+[pools.hot]
+keys = 8
+
+# Transaction shapes.
+
+[shapes.rw-single]
+kind = "read-modify-write"
+pool = "wide"
+keys = 1
+
+[shapes.rw-many]
+kind = "read-modify-write"
+pool = "wide"
+keys = 10
+
+[shapes.ro-single]
+kind = "read"
+pool = "wide"
+keys = 1
+
+[shapes.ro-multi]
+kind = "read"
+pool = "wide"
+keys = 10
+
+[shapes.rw-adjacent]
+kind = "read-modify-write"
+pool = "wide"
+source = "adjacent"
+keys = 2
+
+# Workloads: the groups of database instances, and the workers of each shape.
+
+[workloads.low-conflict.groups.all]
+shapes = { rw-single = "cell", rw-many = "cell", ro-single = "cell", ro-multi = "cell" }
+
+# The same shapes on 8 keys that all workers share. A shape with more keys
+# than the pool uses all keys of the pool.
+[workloads.high-conflict]
+pool = "hot"
+source = "pool"
+[workloads.high-conflict.groups.all]
+shapes = { rw-single = "cell", rw-many = "cell", ro-single = "cell", ro-multi = "cell" }
+
+# Transactions over adjacent keys, which cross leaf boundaries.
+[workloads.crossing.groups.all]
+shapes = { rw-single = "cell", rw-adjacent = "cell" }

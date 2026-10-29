@@ -1,0 +1,129 @@
+# The settings of the default experiments, which CI compares between two
+# revisions: single transactions of one worker with warm caches, and four
+# shapes at the same time on one leaf. Each experiment of
+# `experiments/default/` includes this file and selects one workload. The
+# experiments are the cases of the former Criterion suite, with their names.
+#
+# The window of 10 s ends before the first background pass of the garbage
+# collector, so the counters of a run do not depend on the random cadence of
+# that pass; a measurement of latency can use a longer window.
+
+[seed]
+quiet-period = "6s"
+timeout = "75s"
+
+[cell]
+gc = false
+
+[cell.warm-up]
+minimum = "0s"
+quiet = "never"
+timeout = "1250ms"
+
+[cell.measure]
+until = "duration"
+duration = "10s"
+max-duration = "10s"
+
+[pools.diag-256]
+keys = 1
+value-bytes = 256
+
+[pools.diag-external]
+keys = 1
+value-bytes = 1025
+
+[pools.diag-1024]
+keys = 1
+value-bytes = 1024
+
+[pools.diag-large]
+keys = 1024
+value-bytes = 256
+key-bytes = 256
+
+[pools.diag-shared]
+keys = 3
+value-bytes = 256
+
+[shapes.diag-read]
+kind = "read"
+pool = "diag-256"
+source = { index = { keys = [0] } }
+keys = 1
+
+[shapes.diag-read-external]
+kind = "read"
+pool = "diag-external"
+source = { index = { keys = [0] } }
+keys = 1
+
+[shapes.diag-fresh-read]
+kind = "fresh-client-read"
+pool = "diag-256"
+source = { index = { keys = [0] } }
+keys = 1
+
+[shapes.diag-rmw-inline]
+kind = "read-modify-write"
+pool = "diag-1024"
+source = { index = { keys = [0] } }
+keys = 1
+
+[shapes.diag-rmw-external]
+kind = "read-modify-write"
+pool = "diag-external"
+source = { index = { keys = [0] } }
+keys = 1
+
+[shapes.diag-rmw-five]
+kind = "read-modify-write"
+pool = "diag-256"
+source = { index = { keys = [0] } }
+keys = 1
+collections = 5
+
+[shapes.diag-read-large]
+kind = "read"
+pool = "diag-large"
+source = { index = { keys = [512] } }
+keys = 1
+
+[shapes.diag-rmw-shared]
+kind = "read-modify-write"
+pool = "diag-shared"
+source = { stripe = { shared-pct = 0 } }
+keys = 1
+
+[workloads.diag-read.groups.all]
+instances = 1
+shapes = { diag-read = 1 }
+
+[workloads.diag-read-external.groups.all]
+instances = 1
+shapes = { diag-read-external = 1 }
+
+[workloads.diag-fresh-read.groups.all]
+instances = 1
+shapes = { diag-fresh-read = 1 }
+
+[workloads.diag-rmw-inline.groups.all]
+instances = 1
+shapes = { diag-rmw-inline = 1 }
+
+[workloads.diag-rmw-external.groups.all]
+instances = 1
+shapes = { diag-rmw-external = 1 }
+
+[workloads.diag-rmw-five.groups.all]
+instances = 1
+shapes = { diag-rmw-five = 1 }
+
+[workloads.diag-read-large.groups.all]
+instances = 1
+shapes = { diag-read-large = 1 }
+
+[workloads.diag-rmw-shared.groups.all]
+instances = 1
+shapes = { diag-rmw-shared = 3 }
+

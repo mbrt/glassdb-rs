@@ -19,11 +19,11 @@ MODEL = {
     "modelTimeSpeedup": 1,
 }
 
-# The experiment that all comparisons measure, and the files of its results.
-SUITE = "suite"
+# The version of the perfbench results that the comparison reads.
+SCHEMA_VERSION = 3
 # The version of the manifest that the driver writes.
 MANIFEST_VERSION = 3
-# The case of the suite with four shapes at the same time on one leaf.
+# The case with four shapes at the same time on one leaf.
 SHARED_LEAF_CASE = "shapes_shared_leaf"
 TIMING_FILE = "timing.json"
 COUNTERS_FILE = "counters.json"
@@ -81,38 +81,36 @@ def read_json(path: Path):
 
 
 def read_report(path: Path) -> dict:
-    """Read one perfbench result of the suite on the compared backend model."""
+    """Read one perfbench result on the compared backend model."""
     report = read_json(path)
     # A result of an older harness has no time mode and ran on real time, which
     # measures different latencies.
-    if report.get("schemaVersion") != 2 or report.get("scenario") != SUITE or any(
+    if report.get("schemaVersion") != SCHEMA_VERSION or any(
         report.get(key) != value for key, value in MODEL.items()
     ):
-        raise ReportError(f"unsupported {SUITE} schema or backend model")
-    if len(report["runs"]) != 1:
-        raise ReportError(f"expected one run of {SUITE}")
+        raise ReportError("unsupported perfbench schema or backend model")
     return report
 
 
 def read_case(path: Path, case: str, latency_jitter: bool) -> dict:
-    """Read the cell of `case` from a result of the suite.
+    """Read the cell of the experiment `case` from a perfbench result.
 
-    The result must have the latency profile of the comparison, and its cell
-    must not have failed.
+    The result must have the latency profile of the comparison, and the
+    experiment must have one run of one cell that did not fail.
     """
     report = read_report(path)
     if report.get("latencyJitter", True) is not latency_jitter:
         raise ReportError(f"{case} latency profile differs from comparison settings")
-    cells = [
-        cell
-        for cell in report["runs"][0]["cells"]
-        if cell["labels"].get("case") == case
-    ]
-    if len(cells) != 1:
-        raise ReportError(f"expected one {case} cell, found {len(cells)}")
-    if cells[0]["failures"]:
+    experiments = [e for e in report["experiments"] if e["name"] == case]
+    if len(experiments) != 1:
+        raise ReportError(f"expected one {case} experiment, found {len(experiments)}")
+    runs = experiments[0]["runs"]
+    if len(runs) != 1 or len(runs[0]["cells"]) != 1:
+        raise ReportError(f"expected one run of one cell of {case}")
+    cell = runs[0]["cells"][0]
+    if cell["failures"]:
         raise ReportError(f"{case} cell failed")
-    return cells[0]
+    return cell
 
 
 def add(metrics: dict, name: str, unit: str, kind: str, value) -> None:

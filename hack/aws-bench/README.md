@@ -42,10 +42,12 @@ hack/aws-bench/deploy.sh teardown
 The default real-S3 run executes the `mixed` and `contention` experiments once,
 with the longer real-S3 timeouts of `aws.toml` and 20 s for each contention
 cell (`CONTENTION_DURATION`).
-Set `EXPERIMENTS` to a comma-separated list of other experiments, `RUNS` and
-`RUN_COOLDOWN` for the repetitions, and `PERFBENCH_CONFIG` to the path of a
-configuration file that changes the built-in experiments. `AUTO_STOP=false`
-keeps the instance running for interactive inspection.
+Set `EXPERIMENTS` to a comma-separated list of the names of other experiments
+in `hack/perf/experiments`, `RUNS` and `RUN_COOLDOWN` for the repetitions, and
+`PERFBENCH_CONFIG` to the path of a configuration file that changes all
+experiments. That file cannot include other files. `deploy.sh` sends the experiment files and the files that they
+include with the configuration. `AUTO_STOP=false` keeps the instance running
+for interactive inspection.
 
 The stack creates billable EC2, S3, and interface-endpoint resources. Auto-stop
 halts compute after the run, but endpoints and stored objects continue billing
