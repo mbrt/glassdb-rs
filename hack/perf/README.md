@@ -14,6 +14,7 @@ Manual experiments that use these tools are recorded in
 | `compare_refs.sh` | Compares two revisions with the CI comparison driver. |
 | `perfbench_results.py` | Reads the result files; the other tools use it. |
 | `profile.sh` | Records a CPU flamegraph of one experiment. |
+| `experiments/` | Configuration files of experiments, each for `--config`. Their loads are in the entries of `investigations.md` and in `docs/guides/perf.md`. |
 
 ## Plotting results
 

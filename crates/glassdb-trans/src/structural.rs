@@ -25,6 +25,7 @@ mod rule;
 mod split;
 mod stats;
 mod topology;
+mod write_spans;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;

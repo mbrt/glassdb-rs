@@ -620,7 +620,8 @@ Splits and merges share one lifecycle and one parent reconciliation step. The
 
 Committed leaf writes, parent reconciliation, and capacity rejections queue
 candidates. With the default size causes topology policy, the soft caps, the
-underfull threshold, and inline pressure decide
+underfull threshold, and inline pressure decide, and the write spans that the
+writers of the leaf entries show move soft cap splits and cause merges
 ([ADR-084](adr/084-size-causes-are-the-default-topology-policy.md)). With the
 avoidable time policy, a rule decides the other leaf splits and merges once per
 window ([ADR-074](adr/074-avoidable-time-drives-splits-and-merges.md)). A new

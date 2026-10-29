@@ -30,8 +30,9 @@ alternated.
 
 ### Loads
 
-Temporary `perfbench` configurations, on one collection of 20,000 keys, with
-8 workers of `rw-single` and of `ro-single`, and two cells: one database
+The `perfbench` configurations `hack/perf/experiments/random-ranges.toml` and
+`hack/perf/experiments/fixed-ranges.toml` have one collection of 20,000 keys,
+with 8 workers of `rw-single` and of `ro-single`, and two cells: one database
 instance, and five that share the collection.
 
 - **Random ranges:** 8 workers of read-modify-write transactions of 16
@@ -113,6 +114,35 @@ Ratios to `S48`, one database instance and five:
   ("coordinator shut down while locking leaf"). Two runs again, and 16 runs
   of `Y96`, ended without it.
 
+### Write spans from the leaves
+
+Each committed entry of a leaf names its writer. A second temporary version
+read the write spans from the leaves instead of keeping them in each database
+instance: the entries of one writer that started less than 60 s before, of two
+or more entries. It had no recurrence. A commit over the boundary of two
+adjacent leaves asked for their merge, and the share and the free key decided
+it, from the write spans of both leaves. It had no limit of merges for each
+pair. Two runs of each, and one of `workers`, alternated with `S48` and with
+`Y96` as it was implemented, with the limit of one merge of a pair in 30 s:
+
+| Cell | Leaves | Recorded |
+| --- | --- | --- |
+| Fixed ranges of 16 keys, one and five instances | 1.26, 1.22 | 1.27, 1.32 |
+| Fixed ranges of 64 keys | 1.23, 1.18 | 1.02, 1.00 |
+| Writes/tx on the fixed ranges | 0.75, 0.75 | 0.83, 0.75 |
+| Random ranges of 16 keys | 0.95, 0.95 | 0.99, 1.01 |
+| `load-shift` | 0.98, 1.01, 1.11 | 1.04, 1.00, 1.00 |
+| `mixed` | 1.03 | 1.02 |
+| `workers` at 20/80/140/200 | 1.01, 0.99, 1.00, 1.03 | 1.00, 1.00, 1.00, 0.96 |
+
+- The seed writes 64 keys in each transaction, and its writers were recent, so
+  its soft cap splits waited. The seed made about half of the splits of `S48`,
+  and about 310 splits came in the first warm-up (1,564 in `workers`), when
+  the writers were 60 s old. In `load-shift`, 67 of them came in the
+  measurement of the first cell. The larger leaves of the seed can explain the
+  gain on the ranges of 64 keys.
+- All warm-ups were quiet.
+
 ### Conclusions
 
 - A boundary that divides a range of keys that transactions write together
@@ -123,6 +153,9 @@ Ratios to `S48`, one database instance and five:
   random multi-key commits merge and split leaves again and again.
 - Ranges wider than the soft cap need larger leaves, which this design does
   not give.
+- The writers of the leaf entries show the same write spans to all database
+  instances, with about the same results, and with no state. After a bulk
+  write, the splits of its leaves wait until its writer is old.
 
 ## 2026-10-27: a size band with lost CAS splits below it
 
@@ -404,12 +437,13 @@ quiet. Throughput and writes for each transaction, as ratios to A:
 
 ### False sharing
 
-A temporary `perfbench` configuration had one collection of 4,096 keys. Four
-database instances, each with 4 workers, wrote one key each: the keys 0 to 3.
-One more database instance, with 32 workers, ran read-modify-write and read
-transactions on the keys 4 to 63 one after another, and on random keys of the
-collection. A tree with one key in each leaf (`fixed-1`) separated the four
-keys. Two runs of each variant:
+The `perfbench` configuration `hack/perf/experiments/false-sharing.toml` has
+one collection of 4,096 keys. The runs of this entry used a version of it with
+other variants of the topology. Four database instances, each with 4 workers,
+wrote one key each: the keys 0 to 3. One more database instance, with 32
+workers, ran read-modify-write and read transactions on the keys 4 to 63 one
+after another, and on random keys of the collection. A tree with one key in
+each leaf (`fixed-1`) separated the four keys. Two runs of each variant:
 
 | Variant | Each hot writer | Hot p50 | Lost CAS for each hot commit | Read-modify-write on keys 4 to 63 | Read of keys 4 to 63 | Writes/tx |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |

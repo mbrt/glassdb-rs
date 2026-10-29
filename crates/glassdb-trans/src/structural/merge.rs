@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use glassdb_concurr::rt;
 use glassdb_data::{CollectionAddress, NodeId, StructuralIntentId, TxId};
 use glassdb_storage::{
     LeafBody, LeafObservation, MergeTarget, Node, NodeBody, NodeStore, PaidChange, Requirement,
@@ -27,6 +28,7 @@ use super::nodes::StructuralNodeAccess;
 use super::reclamation::{ReclamationReporter, reclaim_holder_free_tombstones};
 use super::recovery::ReadyChange;
 use super::stats::Stats;
+use super::write_spans;
 
 /// Safety bound on the right-link hops that the search for a merge target
 /// walks past drained nodes, so a malformed chain can never spin the
@@ -65,6 +67,9 @@ pub(super) struct Merger {
 pub(super) enum MergeReason {
     /// The node is below an underfull threshold.
     Underfull,
+    /// Transactions write keys of the leaf and of its right sibling together
+    /// (ADR-084).
+    WriteSpan,
     /// A topology rule decided that the leaf merges.
     Demand {
         /// The avoidable time in each second that pays for the merge.
@@ -340,6 +345,11 @@ impl Merger {
     /// split cause, so that the merged node does not split again soon
     /// (ADR-073). The merge compacts both nodes, so their holder-free
     /// tombstones do not count. Only an underfull merge applies to index nodes.
+    ///
+    /// A merge for write spans can make a leaf of up to twice the soft cap of
+    /// entries, because its soft cap split then keeps the write spans
+    /// (ADR-084). It keeps a quarter of the inline budget free, so that the
+    /// next writes of the merged leaf do not cause inline pressure at once.
     fn need(&self, left: &Node, right: &Node, reason: MergeReason) -> Result<(), MergeVeto> {
         let (mut left, mut right) = (left.clone(), right.clone());
         reclaim_holder_free_tombstones(&mut left);
@@ -351,23 +361,37 @@ impl Merger {
         // rates of a split of the two leaves (ADR-076).
         let pays = match reason {
             MergeReason::Demand { rate } => self.pays_more(rate, &left, &right),
+            MergeReason::WriteSpan => {
+                self.candidates.keeps_write_spans()
+                    && write_spans::pays_for_merge(&left, &right, policy, rt::system_now())
+            }
             MergeReason::Underfull => false,
+        };
+        let (max_entries, max_inline) = match reason {
+            MergeReason::WriteSpan => (
+                policy.leaf_max_entries().saturating_mul(2),
+                self.candidates.inline().max_leaf_bytes / 4 * 3,
+            ),
+            _ => (
+                policy.leaf_max_entries() / 2,
+                self.candidates.inline().max_leaf_bytes / 2,
+            ),
         };
         match (left.body(), right.body()) {
             (NodeBody::Leaf(left), NodeBody::Leaf(right)) => {
                 let inline_len = |leaf: &LeafBody| -> usize {
                     leaf.entries().map(|e| e.current.inline_len()).sum()
                 };
-                let underfull = left.entries().filter(|entry| entry.exists()).count()
-                    < self.candidates.leaf_min_live_entries();
-                let fits = left.len() + right.len() <= policy.leaf_max_entries() / 2
-                    && inline_len(left) + inline_len(right)
-                        <= self.candidates.inline().max_leaf_bytes / 2
+                let underfull = reason != MergeReason::WriteSpan
+                    && left.entries().filter(|entry| entry.exists()).count()
+                        < self.candidates.leaf_min_live_entries();
+                let fits = left.len() + right.len() <= max_entries
+                    && inline_len(left) + inline_len(right) <= max_inline
                     && fits_bytes;
                 if !(pays || underfull) {
                     Err(match reason {
                         MergeReason::Demand { .. } => MergeVeto::Unpaid,
-                        MergeReason::Underfull => MergeVeto::NotNeeded,
+                        MergeReason::Underfull | MergeReason::WriteSpan => MergeVeto::NotNeeded,
                     })
                 } else if !fits {
                     Err(MergeVeto::TooLarge)
@@ -504,6 +528,7 @@ impl MergeReason {
         match self {
             MergeReason::Underfull => 4,
             MergeReason::Demand { .. } => 5,
+            MergeReason::WriteSpan => 6,
         }
     }
 }

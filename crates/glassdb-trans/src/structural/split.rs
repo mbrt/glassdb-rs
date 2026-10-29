@@ -63,6 +63,7 @@ use super::measurements::ChangeKind;
 use super::reclamation::{ReclamationReporter, reclaim_holder_free_tombstones};
 use super::recovery::{PreparedIntent, ReadyChange};
 use super::stats::Stats;
+use super::write_spans::{self, SoftCapSplit};
 
 /// Decides which splits are necessary, and writes their nodes.
 #[derive(Clone)]
@@ -162,12 +163,15 @@ impl Splitter {
         path: &ObjectPath,
         reason: &SplitReason,
     ) -> Result<Option<ObjectPath>, TransError> {
-        let SplitReason::InlinePressure { key, .. } = reason else {
-            return Ok(Some(path.clone()));
-        };
         let (ObjectPath::TreeRoot { collection } | ObjectPath::Node { collection, .. }) = path
         else {
             return Err(TransError::other("split candidate is not a tree node"));
+        };
+        let SplitReason::InlinePressure { key, .. } = reason else {
+            return self
+                .soft_cap_split_waits(collection, path, reason)
+                .await
+                .map(|waits| (!waits).then(|| path.clone()));
         };
         let located = match self
             .router
@@ -291,11 +295,26 @@ impl Splitter {
             }
             need => return self.cancel(reason, need),
         }
+        let at = match reason {
+            SplitReason::SoftCap => match self.soft_cap_split(target, &node) {
+                SoftCapSplit::At(key) => Some(key),
+                SoftCapSplit::Median => None,
+                SoftCapSplit::Wait if reclaimed.is_empty() => {
+                    return self.cancel(reason, SplitNeed::NotActionable);
+                }
+                SoftCapSplit::Wait => return Prepared::ReclaimOnly { node, reclaimed },
+            },
+            _ => None,
+        };
+        let split = Split {
+            reason,
+            at: at.as_deref(),
+        };
         match target {
             SplitTarget::NonRoot(id) => {
-                self.plan_nonroot_split(id, reason, prepared, node, worker, reclaimed)
+                self.plan_nonroot_split(id, split, prepared, node, worker, reclaimed)
             }
-            SplitTarget::Root => self.plan_root_split(reason, prepared, &node, worker, reclaimed),
+            SplitTarget::Root => self.plan_root_split(split, prepared, &node, worker, reclaimed),
         }
     }
 
@@ -364,6 +383,45 @@ impl Splitter {
         }
     }
 
+    /// Reports whether the soft cap split of the non-root leaf at `path` waits
+    /// for its write spans in cached state, so that it takes no structural gate
+    /// (ADR-084). Each write of the leaf asks for the split again. A leaf with
+    /// holder-free tombstones does not wait, so that the split reclaims them.
+    async fn soft_cap_split_waits(
+        &self,
+        collection: &CollectionAddress,
+        path: &ObjectPath,
+        reason: &SplitReason,
+    ) -> Result<bool, TransError> {
+        let (SplitReason::SoftCap, true, ObjectPath::Node { id, .. }) =
+            (reason, self.candidates.keeps_write_spans(), path)
+        else {
+            return Ok(false);
+        };
+        let mut node = match self.nodes.load_node(collection, id, Requirement::ANY).await {
+            Ok((node, _)) => node,
+            Err(StorageError::NotFound) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let reclaimable = !reclaim_holder_free_tombstones(&mut node).is_empty();
+        Ok(!reclaimable
+            && node.over_soft_cap(self.candidates.policy())
+            && self.soft_cap_split(SplitTarget::NonRoot(id), &node) == SoftCapSplit::Wait)
+    }
+
+    /// Returns where the soft cap split of the leaf `node` divides it, so that
+    /// it keeps the write spans of the leaf (ADR-084). A root leaf splits at
+    /// its median: it is the whole collection, and its split cannot defer in
+    /// cached state.
+    fn soft_cap_split(&self, target: SplitTarget<'_>, node: &Node) -> SoftCapSplit {
+        match target {
+            SplitTarget::NonRoot(_) if self.candidates.keeps_write_spans() => {
+                write_spans::soft_cap_split(node, self.candidates.policy(), rt::system_now())
+            }
+            _ => SoftCapSplit::Median,
+        }
+    }
+
     /// Cancels a split that the check of the gated source no longer calls
     /// for.
     fn cancel(&self, reason: &SplitReason, need: SplitNeed) -> Prepared<SplitPlan> {
@@ -386,7 +444,7 @@ impl Splitter {
     fn plan_nonroot_split(
         &self,
         source_id: &NodeId,
-        reason: &SplitReason,
+        split: Split<'_>,
         prepared: &PreparedIntent,
         mut source: Node,
         worker: &TxId,
@@ -395,7 +453,7 @@ impl Splitter {
         let right_id = prepared
             .nonroot_sibling()
             .expect("a prepared non-root intent always reserves one sibling");
-        let Some((right, split_key)) = reason.divide(&mut source, right_id, prepared.id()) else {
+        let Some((right, split_key)) = split.divide(&mut source, right_id, prepared.id()) else {
             return Prepared::Cancel(Ok(()));
         };
         source.remove_structural_gate(worker);
@@ -417,7 +475,7 @@ impl Splitter {
     /// Builds both root children and the replacement root index.
     fn plan_root_split(
         &self,
-        reason: &SplitReason,
+        split: Split<'_>,
         prepared: &PreparedIntent,
         node: &Node,
         worker: &TxId,
@@ -427,7 +485,7 @@ impl Splitter {
             .root_children()
             .expect("a prepared root intent always reserves two children");
         let (left, right, split_key) =
-            split_into_children(reason, node, right_id, prepared.id(), worker);
+            split_into_children(split, node, right_id, prepared.id(), worker);
         let index = Node::index(IndexNode::from_children([
             (Vec::new(), left_id),
             (split_key.clone(), right_id),
@@ -526,8 +584,18 @@ impl SplitReason {
     pub(super) fn is_inline_pressure(&self) -> bool {
         matches!(self, SplitReason::InlinePressure { .. })
     }
+}
 
-    /// Divides `node` like [`Node::split`], at the key that the reason asks
+/// A split of one node: why, and the key of a soft cap split that keeps the
+/// write spans of the leaf (ADR-084).
+#[derive(Clone, Copy)]
+struct Split<'a> {
+    reason: &'a SplitReason,
+    at: Option<&'a [u8]>,
+}
+
+impl Split<'_> {
+    /// Divides `node` like [`Node::split`], at the key that the split asks
     /// for, if any. A split that a topology rule asked for keeps its rate as
     /// the paid rate of its leaves (ADR-076).
     fn divide(
@@ -536,8 +604,8 @@ impl SplitReason {
         right_id: NodeId,
         intent: &StructuralIntentId,
     ) -> Option<(Node, Vec<u8>)> {
-        match self {
-            SplitReason::Demand { at, rate } => {
+        match (self.reason, self.at) {
+            (SplitReason::Demand { at, rate }, _) => {
                 let paid = Some(Payment {
                     per_second: *rate,
                     intent: *intent,
@@ -547,6 +615,7 @@ impl SplitReason {
                     None => node.split(right_id, paid),
                 }
             }
+            (SplitReason::SoftCap, Some(key)) => node.split_leaf_at(right_id, key, None),
             _ => node.split(right_id, None),
         }
     }
@@ -565,14 +634,14 @@ impl<'a> SplitTarget<'a> {
 /// an in-place root split, returning `(left, right, split_key)`. `left` links to
 /// `right_id`; `right` inherits `node`'s former bounds.
 fn split_into_children(
-    reason: &SplitReason,
+    split: Split<'_>,
     node: &Node,
     right_id: NodeId,
     intent: &StructuralIntentId,
     structure_holder: &TxId,
 ) -> (Node, Node, Vec<u8>) {
     let mut source = node.clone();
-    let (right, split_key) = reason
+    let (right, split_key) = split
         .divide(&mut source, right_id, intent)
         .expect("a split source has entries or children in both halves");
     source.remove_structural_gate(structure_holder);

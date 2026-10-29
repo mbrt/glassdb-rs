@@ -689,14 +689,18 @@ impl Algo {
         outcome
     }
 
-    /// Reports to the topology rule a commit or validation pass that ended with
-    /// `outcome` after `took`, when a conflict ended it without a result.
+    /// Reports a commit or validation pass that ended with `outcome` after
+    /// `took`: to the leaf changes when it committed, and to the topology rule
+    /// when a conflict ended it without a result.
     fn observe_pass(
         &self,
         tx: &mut Handle,
         outcome: &Result<PassOutcome, TransError>,
         took: Duration,
     ) {
+        if matches!(outcome, Ok(PassOutcome::Complete)) {
+            self.structural_hints.observe_commit(&tx.accesses);
+        }
         if !self.structural_hints.measurements_enabled() {
             return;
         }

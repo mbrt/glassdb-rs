@@ -2290,3 +2290,152 @@ fn a_sweep_orders_changes_by_cause_and_rate() {
         ["cap", "fast", "demand-merge", "medium", "slow", "merge"].map(node_path)
     );
 }
+
+// A leaf L0 with the keys "a" to "d" under the root index, over the soft cap
+// of `tiny`. A recent transaction wrote the keys from `first` to `last`.
+async fn seed_child_leaf(s: &TestStore, first: &[u8], last: &[u8]) {
+    let writer = recent_writer();
+    let leaf = Node::leaf(LeafBody::from_entries(
+        [b"a".as_slice(), b"b", b"c", b"d"].iter().map(|k| {
+            if (first..=last).contains(k) {
+                written_by(k, &writer)
+            } else {
+                live(k)
+            }
+        }),
+    ));
+    assert!(s.store_node(COLL, "L0", &leaf, None).await.unwrap());
+    s.create_root(COLL, &Node::index(test_index(&[(b"", "L0")])))
+        .await
+        .unwrap();
+}
+
+// ADR-084: the median "c" divides the keys "b" and "c" that a transaction
+// committed together, so the split moves to "b".
+#[tokio::test]
+async fn a_soft_cap_split_keeps_the_keys_that_transactions_commit_together() {
+    let s = store();
+    seed_child_leaf(&s, b"b", b"c").await;
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, tiny());
+
+    split_path(&sp, &node_path("L0"), &SplitReason::SoftCap)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        leaf_keys(&s).await,
+        [
+            vec![b"a".to_vec()],
+            vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+        ]
+    );
+}
+
+// ADR-084: below twice the soft cap, a split waits while each key of the middle
+// half of the leaf divides keys that a transaction committed together. It takes
+// no structural gate in cached state.
+#[tokio::test]
+async fn a_soft_cap_split_waits_while_it_would_divide_keys_committed_together() {
+    let s = store();
+    seed_child_leaf(&s, b"a", b"d").await;
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, tiny());
+
+    assert_eq!(
+        sp.splitter
+            .locate(&node_path("L0"), &SplitReason::SoftCap)
+            .await
+            .unwrap(),
+        None
+    );
+    split_path(&sp, &node_path("L0"), &SplitReason::SoftCap)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        leaf_keys(&s).await,
+        [vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"d".to_vec()
+        ]]
+    );
+}
+
+// ADR-084: a root leaf is the whole collection, so its soft cap split stays at
+// the median.
+#[tokio::test]
+async fn a_root_leaf_splits_at_its_median_whatever_keys_are_committed_together() {
+    let s = store();
+    let writer = recent_writer();
+    let root = Node::leaf(LeafBody::from_entries([
+        live(b"a"),
+        written_by(b"b", &writer),
+        written_by(b"c", &writer),
+        live(b"d"),
+    ]));
+    s.create_root(COLL, &root).await.unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, tiny());
+
+    split_path(&sp, &root_path(), &SplitReason::SoftCap)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        leaf_keys(&s).await,
+        [
+            vec![b"a".to_vec(), b"b".to_vec()],
+            vec![b"c".to_vec(), b"d".to_vec()]
+        ]
+    );
+}
+
+// ADR-084 and ADR-062: a split that would wait for its write spans still
+// reclaims the holder-free tombstones of the leaf.
+#[tokio::test]
+async fn a_waiting_soft_cap_split_still_reclaims_holder_free_tombstones() {
+    let s = store();
+    let writer = recent_writer();
+    let leaf = Node::leaf(LeafBody::from_entries([
+        written_by(b"a", &writer),
+        written_by(b"b", &writer),
+        written_by(b"c", &writer),
+        written_by(b"d", &writer),
+        tombstone(b"e", tx_id(b"deleter")),
+    ]));
+    assert!(s.store_node(COLL, "L0", &leaf, None).await.unwrap());
+    s.create_root(COLL, &Node::index(test_index(&[(b"", "L0")])))
+        .await
+        .unwrap();
+    let bg = Arc::new(Background::new());
+    let four = NodeSizePolicy::builder()
+        .leaf_max_entries(4)
+        .node_soft_max_bytes(1 << 20)
+        .build()
+        .unwrap();
+    let sp = restructurer(&s, &bg, four);
+
+    assert!(
+        sp.splitter
+            .locate(&node_path("L0"), &SplitReason::SoftCap)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    split_path(&sp, &node_path("L0"), &SplitReason::SoftCap)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        leaf_keys(&s).await,
+        [vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"d".to_vec()
+        ]]
+    );
+}

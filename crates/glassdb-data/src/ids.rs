@@ -256,6 +256,13 @@ impl TxId {
         Self::with_random_prefix(unix_nanos)
     }
 
+    /// Returns the instant of the wound-wait priority of the identity: the
+    /// start of the transaction, which a renewed identity keeps. For an
+    /// identity from [`TxId::new_random`], the instant is random.
+    pub fn started_at(&self) -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_nanos(self.priority())
+    }
+
     /// Builds a transaction identity from an explicit timestamp and random prefix.
     /// Meant for tests that need deterministic priorities. At most the first 8
     /// bytes of `prefix` are used, and shorter prefixes are padded with zeros.

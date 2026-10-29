@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 use crate::access::AccessSet;
 use crate::leaf_coord::{LeafDelayKind, StructuralHinter};
 
-use super::measurements::{ChangeKind, TopologyMeasurements};
+use super::measurements::{ChangeKind, TopologyMeasurements, written_pair};
 use super::merge::MergeReason;
 use super::paid_rate::PaidRates;
 use super::rule::{ChangeRequest, RuleRequest, TOPOLOGY_WINDOW};
@@ -86,6 +86,28 @@ pub(super) enum CandidateCause {
 }
 
 impl StructuralHintSink {
+    /// Notes that a transaction with `accesses` committed. When it wrote keys
+    /// in two adjacent leaves, their merge may keep its write span in one leaf
+    /// (ADR-084). Two leaves that were too large to merge when the transaction
+    /// read them ask for no merge, so that their commits do not fill the
+    /// queue.
+    pub(crate) fn observe_commit(&self, accesses: &AccessSet) {
+        if !self.candidates.keeps_write_spans() {
+            return;
+        }
+        let max_entries = self.candidates.policy.leaf_max_entries().saturating_mul(2);
+        if let Some((left, _)) =
+            written_pair(accesses).filter(|(_, entries)| *entries <= max_entries)
+        {
+            self.candidates.push(MaintenanceCandidate {
+                path: left,
+                priority: self.candidates.new_id(),
+                requested: rt::Instant::now(),
+                cause: CandidateCause::Merge(MergeReason::WriteSpan),
+            });
+        }
+    }
+
     /// Records recoverable aggregate inline pressure for authoritative
     /// revalidation by the restructurer. A topology rule decides with the
     /// time of the pressure instead.
@@ -213,6 +235,12 @@ impl MaintenanceCandidates {
         self.measurements.as_deref()
     }
 
+    /// Whether the leaves keep their write spans, when the sizes decide the
+    /// leaf changes (ADR-084).
+    pub(super) fn keeps_write_spans(&self) -> bool {
+        self.measurements.is_none()
+    }
+
     /// The paid rates that the changes of this database instance saw.
     pub(super) fn paid_rates(&self) -> &PaidRates {
         &self.paid_rates
@@ -269,7 +297,9 @@ impl MaintenanceCandidates {
             CandidateCause::Split(SplitReason::Demand { rate, .. })
             | CandidateCause::Merge(MergeReason::Demand { rate }) => (1, Reverse(*rate)),
             CandidateCause::Split(_) => (0, Reverse(Duration::MAX)),
-            CandidateCause::Merge(MergeReason::Underfull) => (2, Reverse(Duration::ZERO)),
+            CandidateCause::Merge(MergeReason::Underfull | MergeReason::WriteSpan) => {
+                (2, Reverse(Duration::ZERO))
+            }
         });
         (candidates, stale)
     }

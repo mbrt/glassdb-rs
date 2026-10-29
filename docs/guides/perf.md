@@ -19,6 +19,49 @@ limit. Earlier entries that do not pass `--prefix-depth` used 2 segments, where
 all collections of a database share one limit. Pass `--prefix-depth=2` to
 measure them again.
 
+## ADR-084: keys that transactions commit together
+
+The second change of
+[ADR-084](../adr/084-size-causes-are-the-default-topology-policy.md) keeps the
+write spans of the leaves in one leaf: soft cap splits avoid them, and two
+adjacent leaves merge for them.
+
+### Setup
+
+- base: `8c6a1149f` (the size causes with 48 and 12 entries); target: the
+  write spans, both with the engine defaults. The target ran before the last
+  review changes: a writer whose clock is ahead counts as recent, and commits
+  over two leaves too large to merge ask for no merge. These change no
+  decision of one database instance.
+- `--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
+  --drain-timeout=90s`, 2 runs of each, alternated, on mains power, except one
+  run of each for `workers4`
+- fixed ranges: `--config=hack/perf/experiments/fixed-ranges.toml
+  --experiment=fixed-ranges`; random ranges:
+  `--config=hack/perf/experiments/random-ranges.toml --experiment=random-ranges`;
+  `workers4` and `mixed` as in the entry of the first change below
+- ratio = target / base
+
+### Results
+
+| Cell | Ratio | Writes/tx, base → target |
+| --- | --- | --- |
+| Fixed ranges, one instance | 16 keys 1.26, 64 keys 1.23, `rw-single` 1.02, `ro-single` 0.98 | 1.2 → 0.9 |
+| Fixed ranges, five instances | 16 keys 1.22, 64 keys 1.18, `rw-single` 1.01, `ro-single` 0.98 | 2.4 → 1.8 |
+| Random ranges, one instance | 16 keys 0.95, 64 keys 0.98, `rw-single` 1.00, `ro-single` 1.01 | 1.4 → 1.5 |
+| Random ranges, five instances | 16 keys 0.95, 64 keys 0.99, `rw-single` 0.99, `ro-single` 1.00 | 2.9 → 2.9 |
+| `load-shift` | 0.98, 1.01, 1.11 | 1.08 → 1.17, 1.36 → 1.43, 1.19 → 1.29 |
+| `mixed` | 1.03 | 2.19 → 2.17 |
+| `workers4`, 20/80/140/200 workers | 1.01, 0.99, 1.00, 1.03 | 0.62 → 0.59 at 200 |
+
+- All warm-ups were quiet.
+- The seed writes 64 keys in each transaction, so its soft cap splits waited:
+  the target made about half of the splits of the base in the seed, and about
+  310 splits in the first warm-up (1,564 in `workers4`). In `load-shift`, 67 of
+  them came in the measurement of the first cell.
+- On the fixed and the random ranges, the target made 4 to 11 splits and 2 to
+  9 merges in each measurement, and the base none.
+
 ## ADR-084: the size causes are the default topology policy
 
 [ADR-084](../adr/084-size-causes-are-the-default-topology-policy.md) makes the
