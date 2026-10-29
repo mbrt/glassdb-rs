@@ -8,7 +8,7 @@
 //! a structural intent written ahead of the change, a one-node structural
 //! gate, and parent reconciliation after the change. An independent loop
 //! completes the changes that a crash or an error interrupted. When the
-//! [`TopologyPolicy`] has a rule, as the default policy does, a third loop
+//! [`TopologyPolicy`] has a rule, as the avoidable time policy does, a third loop
 //! gives the measurements of each window to the rule, and queues the leaf
 //! changes that the rule asks for (ADR-074).
 
@@ -25,6 +25,7 @@ mod rule;
 mod split;
 mod stats;
 mod topology;
+mod write_spans;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;

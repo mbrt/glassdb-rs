@@ -109,7 +109,7 @@ pub struct TopologyTimeStats {
 }
 
 /// Split activity attributable to aggregate inline pressure. Only the size
-/// causes topology policy requests these splits (ADR-075).
+/// causes topology policy requests these splits (ADR-056, ADR-084).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InlinePressureStats {
     /// Processed candidates.

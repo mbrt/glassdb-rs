@@ -396,3 +396,14 @@ fn test_index(children: &[(&[u8], &str)]) -> IndexNode {
             .map(|(separator, child)| (separator.to_vec(), test_node_id(child))),
     )
 }
+
+// A committed key that a recent transaction `writer` wrote, so that it is part
+// of a write span with the other keys of `writer` (ADR-084).
+fn written_by(key: &[u8], writer: &TxId) -> LeafEntry {
+    LeafEntry::new(key).with_current(CurrentState::External { writer: *writer })
+}
+
+// A recent transaction identity.
+fn recent_writer() -> TxId {
+    TxId::new_at(rt::system_now())
+}

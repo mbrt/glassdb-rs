@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use glassdb_data::{NodeId, ObjectPath};
-use glassdb_storage::LeafBody;
+use glassdb_storage::{LeafBody, Node};
 
 use crate::access::AccessSet;
 use crate::leaf_coord::{LeafDelayKind, upper_half};
@@ -75,6 +75,8 @@ struct LeafReads<'a> {
     median: Option<&'a [u8]>,
     /// The right sibling of the leaf, as the same read observed it.
     right_sibling: Option<NodeId>,
+    /// The entries of the leaf, as the same read observed them.
+    entries: usize,
     keys: Vec<&'a [u8]>,
 }
 
@@ -258,6 +260,20 @@ impl TopologyMeasurements {
     }
 }
 
+/// Returns the left one of two adjacent leaves, when the written keys of
+/// `accesses` are in both, as their reads observed them, with the entries of
+/// the two leaves as observed. A written key that was not read has no leaf.
+pub(super) fn written_pair(accesses: &AccessSet) -> Option<(ObjectPath, usize)> {
+    let reads = LeafReads::of_writes(accesses)?;
+    let (left, _) = LeafReads::adjacent_pair(&reads)?;
+    let entries = reads.values().map(|read| read.entries).sum();
+    Some((left, entries))
+}
+
+fn observed_entries(node: Option<&Node>) -> usize {
+    node.and_then(Node::as_leaf).map_or(0, LeafBody::len)
+}
+
 impl State {
     fn leaf(&mut self, path: &ObjectPath) -> &mut LeafWindow {
         self.leaves.entry(path.clone()).or_default()
@@ -276,11 +292,29 @@ impl<'a> LeafReads<'a> {
                     .and_then(|node| node.as_leaf())
                     .and_then(LeafBody::median_key),
                 right_sibling: observation.value().and_then(|node| node.right_sibling()),
+                entries: observed_entries(observation.value().map(|node| &**node)),
                 keys: Vec::new(),
             });
             leaf.keys.push(read.key().key());
         }
         leaves
+    }
+
+    /// Groups the written keys of `accesses` by the leaf that their reads
+    /// observed, or returns none if a written key has no read.
+    fn of_writes(accesses: &'a AccessSet) -> Option<BTreeMap<&'a ObjectPath, Self>> {
+        let mut leaves: BTreeMap<&ObjectPath, Self> = BTreeMap::new();
+        for point in accesses.points().filter(|point| point.write.is_some()) {
+            let observation = point.read?.observation();
+            let leaf = leaves.entry(observation.path()).or_insert_with(|| Self {
+                median: None,
+                right_sibling: observation.value().and_then(|node| node.right_sibling()),
+                entries: observed_entries(observation.value().map(|node| &**node)),
+                keys: Vec::new(),
+            });
+            leaf.keys.push(point.key.key());
+        }
+        Some(leaves)
     }
 
     /// Returns the two leaves of `reads`, the left one first, if there are

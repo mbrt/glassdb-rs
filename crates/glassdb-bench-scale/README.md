@@ -223,7 +223,7 @@ make a topology that the cells then keep:
 
 | Path | Default | Meaning |
 | --- | --- | --- |
-| `<db>.topology` | `"avoidable"` | `"avoidable"` (ADR-074), or `"size"` (ADR-031, ADR-056, ADR-073). |
+| `<db>.topology` | `"size"` | `"size"` (ADR-031, ADR-056, ADR-073, ADR-084), or `"avoidable"` (ADR-074). |
 | `<db>.leaf-max-entries` | engine default | Soft cap on leaf entries. |
 | `<db>.leaf-min-entries` | engine default | Underfull threshold of leaves. |
 | `<db>.index-min-children` | engine default | Underfull threshold of index nodes. |
@@ -306,8 +306,8 @@ start = "seed"
 name = "policy"
 start = "seed"
 values = [
-  { label = "avoidable" },
-  { label = "fixed-2", set = { "cell.database.topology" = "size", "seed.database.leaf-max-entries" = 1 } },
+  { label = "band" },
+  { label = "avoidable", set = { "cell.database.topology" = "avoidable" } },
 ]
 ```
 
@@ -432,7 +432,7 @@ comparison and plot tools.
 | `affinity` | The affinity grid of the canonical plots: 5 affinities × 1, 3, 5, and 7 database instances. |
 | `load-shift` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
 | `contention` | Five writers whose transactions share some of their 1 to 6 keys. |
-| `inline-pressure` | How leaves adapt when their aggregate inline budget is full (ADR-056, ADR-074): passes over the next keys until one pass commits without locks. |
+| `inline-pressure` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
 | `split-merge-fight` | A stable load under which the topology policies of three instances disagree, with the `avoidable`, `fixed-1`, and `fixed-2` policies. |
 | `membership-churn` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
 

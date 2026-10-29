@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — implemented.
+Superseded by [ADR-084](084-size-causes-are-the-default-topology-policy.md).
 
 Refines [ADR-074](074-avoidable-time-drives-splits-and-merges.md). It replaces
 the decision of ADR-074 that the size causes stay the default. The rules of the

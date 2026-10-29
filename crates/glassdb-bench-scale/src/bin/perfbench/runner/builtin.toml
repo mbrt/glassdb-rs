@@ -80,7 +80,11 @@ max-duration = "60s"
 window-commits = 50
 
 # The default experiment: both conflict levels at five collection affinities.
-[experiments.mixed]
+[experiments.mixed.set]
+# With the avoidable time policy, the rule needs some half-lives of its
+# averages (10 s) before it splits, so a shorter warm-up can end quiet on the
+# topology that it starts with.
+cell.warm-up.minimum = "30s"
 [[experiments.mixed.axes]]
 path = "cell.workload"
 values = ["low-conflict", "high-conflict"]
@@ -94,6 +98,10 @@ values = [0, 25, 50, 75, 100]
 pools.wide.keys = 20000
 seed.quiet-period = "5s"
 cell.databases = 5
+# With the avoidable time policy, the rule needs some half-lives of its
+# averages (10 s) before it splits, so a shorter warm-up can end quiet on the
+# topology that it starts with.
+cell.warm-up.minimum = "30s"
 cell.warm-up.quiet = "5s"
 cell.warm-up.timeout = "180s"
 [[experiments.workers.axes]]
@@ -105,6 +113,10 @@ start = "previous-warm-up"
 # The affinity grid of the canonical plots.
 [experiments.affinity.set]
 cell.workers = 20
+# With the avoidable time policy, the rule needs some half-lives of its
+# averages (10 s) before it splits, so a shorter warm-up can end quiet on the
+# topology that it starts with.
+cell.warm-up.minimum = "30s"
 [[experiments.affinity.axes]]
 path = "cell.affinity"
 values = [0, 25, 50, 75, 100]
@@ -160,8 +172,8 @@ cell.measure.max-duration = "120s"
 name = "overlap"
 generate = { contention-overlaps = { shape = "contention-rmw", max-keys = 6 } }
 
-# How the leaves adapt when their aggregate inline budget is full (ADR-056,
-# ADR-074). One worker fills the inline budget of the leaf, then updates the
+# How the leaves adapt when their aggregate inline budget is full (ADR-056).
+# One worker fills the inline budget of the leaf, then updates the
 # next keys until one pass takes no locked commit. The pressure cell ends with
 # that pass, and the recovery cell repeats it.
 
@@ -196,6 +208,10 @@ seed.database.inline-max-value-bytes = 1024
 seed.database.inline-max-leaf-bytes = 65536
 cell.database.inline-max-value-bytes = 1024
 cell.database.inline-max-leaf-bytes = 65536
+# A leaf of 64 values of 1 KiB fills the inline budget only above the default
+# soft cap of leaf entries.
+seed.database.leaf-max-entries = 256
+cell.database.leaf-max-entries = 256
 cell.gc = false
 cell.warm-up.timeout = "0s"
 cell.measure.max-duration = "30s"
@@ -258,6 +274,9 @@ name = "policy"
 
 [[experiments.split-merge-fight.axes.values]]
 label = "avoidable"
+[experiments.split-merge-fight.axes.values.set]
+"seed.database.topology" = "avoidable"
+"cell.database.topology" = "avoidable"
 
 # The size causes with no underfull threshold keep the one leaf of the seed.
 [[experiments.split-merge-fight.axes.values]]
@@ -462,5 +481,5 @@ values = [
   { label = "rmw_five_leaves", set = { "cell.workload" = "diag-rmw-five", "cell.collections" = 5 } },
   { label = "read_long_keys_large_collection", set = { "cell.workload" = "diag-read-large" } },
   { label = "rmw_shared_leaf_three_transactions", set = { "cell.workload" = "diag-rmw-shared" } },
-  { label = "shapes_shared_leaf", set = { "cell.workload" = "low-conflict", "pools.wide.keys" = 128, "cell.databases" = 1, "cell.workers" = 1 } },
+  { label = "shapes_shared_leaf", set = { "cell.workload" = "low-conflict", "pools.wide.keys" = 128, "cell.databases" = 1, "cell.workers" = 1, "seed.database.leaf-max-entries" = 256, "cell.database.leaf-max-entries" = 256 } },
 ]

@@ -465,6 +465,10 @@ _Avoid_: Write cost, throttle cost
 The rate of avoidable time that paid for the last split or merge that a topology rule asked for, kept in the leaves of that change with its kind. The opposite change of these leaves must pay more.
 _Avoid_: Change record, change justification, change cost
 
+**Write span**:
+The first and the last key of the entries of one recent writer of two or more entries in one leaf or in two adjacent leaves. A split between these two keys divides the keys that the writer committed together.
+_Avoid_: Commit range, key group
+
 **Topology participant**:
 A transaction identity that a collection record lists while it can make structural changes to the collection tree.
 _Avoid_: Topology lock

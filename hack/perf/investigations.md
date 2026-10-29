@@ -9,26 +9,513 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-10-28: keys that transactions commit together
+
+Status: with the size causes and a soft cap of 48 entries, a leaf boundary
+can divide a range of keys that transactions write together, and nothing
+moves it. Temporary code merged two adjacent leaves when the same span of
+written keys crossed their boundary again and again, and moved soft cap
+splits to a key that divides no recent span. Transactions on fixed ranges of
+16 keys then had 1.20 to 1.24 times the throughput of the band alone, with
+0.85 to 0.92 of the writes. Random ranges, `load-shift`, `mixed`, and
+`workers` did not change, and were quiet. Each condition of the merge was
+needed to stop changes that do not pay. The temporary code is not in the
+repository.
+
+All runs used `--backend=memory --delays=s3 --delay-scale=0.2
+--prefix-depth=3` at `8c6a1149f`, plus temporary changes, on mains power.
+Ratios are to the size causes with the default soft cap of 48 entries and
+underfull threshold of 12 (`S48`) of the same set of runs, which ran
+alternated.
+
+### Loads
+
+The `perfbench` configurations `hack/perf/experiments/random-ranges.toml` and
+`hack/perf/experiments/fixed-ranges.toml` have one collection of 20,000 keys,
+with 8 workers of `rw-single` and of `ro-single`, and two cells: one database
+instance, and five that share the collection.
+
+- **Random ranges:** 8 workers of read-modify-write transactions of 16
+  adjacent keys, and 8 of 64, from a random start in the block of keys of the
+  worker (about 250 keys with five instances).
+- **Fixed ranges:** 16 shapes with one worker that write a fixed range of 16
+  keys each, at the keys `1000·i + 337`, and 8 with a fixed range of 64 keys
+  each, at `2500·i + 611`.
+
+The loads update keys of the seed, so leaves do not grow after the seed, and
+a split of the seed that divides a range stays.
+
+### What a divided range costs
+
+A soft cap of 256 entries (`S256`) against `S48`, two runs of each:
+
+| Load | Cell | Ranges | `rw-single` | `ro-single` | Writes/tx |
+| --- | --- | --- | ---: | ---: | ---: |
+| Random ranges | one | 1.15 (16 keys), 1.23 (64 keys) | 0.91 | 0.86 | 0.68 |
+| Random ranges | five | 0.87 (16 keys), 1.17 (64 keys) | 0.66 | 1.04 | 0.64 |
+| Fixed ranges | one | 1.45 (16 keys), 1.15 (64 keys) | 0.89 | 0.81 | 0.69 |
+| Fixed ranges | five | 1.47 (16 keys), 1.23 (64 keys) | 0.64 | 0.89 | 0.52 |
+
+Larger leaves divide fewer ranges, and cost the transactions on single keys.
+
+### Variants
+
+Behind an environment variable, on the size causes:
+
+- **Spans:** the first and the last written key of each committed transaction
+  whose written keys are in one leaf or in two adjacent leaves, for the last
+  32 such transactions of each leaf. A key `k` divides a span when
+  `first < k <= last`.
+- **Split:** a soft cap split uses the median unless it divides a recent
+  span. Then it uses the nearest key in the middle half of the leaf that
+  divides no recent span, or waits. Above 2 times the soft cap, or above the
+  byte soft cap, it splits at the key of the middle half that divides the
+  fewest recent spans. Root, capacity, and inline pressure splits do not
+  change.
+- **Merge (`R72`, `R96`):** a commit over the boundary of two adjacent leaves
+  queues a merge of the two, at most once in 30 s for each pair. The merge
+  can make a leaf of up to 72 or 96 live entries, and of up to half the byte
+  soft cap. The other merge rules of ADR-073 stay. The merged leaf keeps the
+  spans of both.
+- **Recurrence (`C96`):** as `R96`, and the same span crossed the boundary at
+  least 3 times in 60 s.
+- **Share (`X96`):** as `C96`, and the commits over the boundary are at least
+  half of the commits with more than one key of the two leaves, in 60 s.
+- **Free key (`Y96`):** as `X96`, and a merged leaf above the soft cap has a
+  key in its middle half that divides no recent span.
+
+### Results
+
+Ratios to `S48`, one database instance and five:
+
+| Variant | Runs | Fixed ranges of 16 keys | Random ranges: splits and merges in the warm-up | `crossing`: throughput, splits and merges in the warm-up |
+| --- | ---: | --- | --- | --- |
+| `R72` | 2 | 1.13, 1.15 | | |
+| `R96` | 2 | 1.18, 1.26 | 644, 1,548 (1 run) | 0.83, 2,239 (1 run) |
+| `C96` | 2 | 1.26, 1.24 | 339, 486 (1 run) | 0.98, 1,999 (1 run) |
+| `X96` | 2 | 1.11, 1.24 | 56, 218 | 1.00, 0 (2 runs of 3) |
+| `Y96` | 2 | 1.20, 1.24 | 3, 2 | 0.99, 0 |
+
+- With 72 entries, most pairs did not fit: the leaves of the seed had about
+  38 entries each.
+- Random adjacent pairs and random ranges in small blocks of keys repeat, so
+  the recurrence alone did not stop their merges. The share stopped them in
+  `crossing`. A merge of ranges wider than a leaf with no key free of them
+  was split again at 96 entries. The free key stopped these merges.
+- Ranges of 64 keys are wider than the soft cap, and stayed at 0.97 to 1.00
+  with `Y96`.
+- `Y96` against `S48`: `rw-single` and `ro-single` 0.96 to 1.03 on the fixed
+  ranges, with 0.92 and 0.85 of the writes; random ranges 0.98 to 1.02;
+  `load-shift` 0.98, 0.99, 1.02, with no splits and merges; `mixed` 1.01;
+  `workers` 0.99 to 1.00. All warm-ups were quiet. On the fixed ranges, the
+  measurement had 3 to 6 changes, because a merge waits while the writer of
+  the range holds its locks.
+- One run of `X96` in `load-shift` ended with an internal error at shutdown
+  ("coordinator shut down while locking leaf"). Two runs again, and 16 runs
+  of `Y96`, ended without it.
+
+### Write spans from the leaves
+
+Each committed entry of a leaf names its writer. A second temporary version
+read the write spans from the leaves instead of keeping them in each database
+instance: the entries of one writer that started less than 60 s before, of two
+or more entries. It had no recurrence. A commit over the boundary of two
+adjacent leaves asked for their merge, and the share and the free key decided
+it, from the write spans of both leaves. It had no limit of merges for each
+pair. Two runs of each, and one of `workers`, alternated with `S48` and with
+`Y96` as it was implemented, with the limit of one merge of a pair in 30 s:
+
+| Cell | Leaves | Recorded |
+| --- | --- | --- |
+| Fixed ranges of 16 keys, one and five instances | 1.26, 1.22 | 1.27, 1.32 |
+| Fixed ranges of 64 keys | 1.23, 1.18 | 1.02, 1.00 |
+| Writes/tx on the fixed ranges | 0.75, 0.75 | 0.83, 0.75 |
+| Random ranges of 16 keys | 0.95, 0.95 | 0.99, 1.01 |
+| `load-shift` | 0.98, 1.01, 1.11 | 1.04, 1.00, 1.00 |
+| `mixed` | 1.03 | 1.02 |
+| `workers` at 20/80/140/200 | 1.01, 0.99, 1.00, 1.03 | 1.00, 1.00, 1.00, 0.96 |
+
+- The seed writes 64 keys in each transaction, and its writers were recent, so
+  its soft cap splits waited. The seed made about half of the splits of `S48`,
+  and about 310 splits came in the first warm-up (1,564 in `workers`), when
+  the writers were 60 s old. In `load-shift`, 67 of them came in the
+  measurement of the first cell. The larger leaves of the seed can explain the
+  gain on the ranges of 64 keys.
+- All warm-ups were quiet.
+
+### Conclusions
+
+- A boundary that divides a range of keys that transactions write together
+  costs them, and the band does not repair it.
+- A merge for these keys pays only when the same span crosses the boundary
+  often, when it is most of the multi-key commits of the two leaves, and when
+  the merged leaf can split again outside the spans. Without one of these,
+  random multi-key commits merge and split leaves again and again.
+- Ranges wider than the soft cap need larger leaves, which this design does
+  not give.
+- The writers of the leaf entries show the same write spans to all database
+  instances, with about the same results, and with no state. After a bulk
+  write, the splits of its leaves wait until its writer is old.
+
+## 2026-10-27: a size band with lost CAS splits below it
+
+Status: a size band of 48 to 12 entries, with lost CAS as the only demand
+split cause, separated the four hot keys of the false sharing load in all
+runs, when the split key came from the contention and not from the median.
+The hot writers then had the throughput of a tree with one key in each leaf,
+and the leaves next to them stayed in the band. But in the `crossing` cell of
+`load-shift`, where five database instances write random keys of one
+collection, the same rule made about 1,600 splits below the band and lost 17%
+of the throughput of the band alone. No measured rate of lost CAS separated
+the two loads well. The temporary code is not in the repository.
+
+All runs used `--backend=memory --delays=s3 --delay-scale=0.2
+--prefix-depth=3` at `01e70a268`, plus temporary changes, on mains power. The
+false sharing load is the one of the entry of 2026-10-26: four database
+instances write the adjacent keys 0 to 3, and one database instance runs
+transactions on the keys 4 to 63 and on random keys. Ratios are to the size
+policy with the band of 48 to 12 entries (`S48`) of the same set of runs.
+
+### Variants
+
+All variants used the avoidable time policy with `leaf-max-entries = 48` and
+`leaf-min-entries = 12`, and these changes:
+
+- **Band:** a leaf with fewer than 12 live entries is a merge candidate, as
+  with the size policy.
+- **Split causes:** lost CAS, slow leaf CAS, and inline pressure. No queue
+  wait, and no merge causes of the rule.
+- **Merge veto:** no merge of a leaf whose split-side average is above half of
+  the split threshold, or whose paid rate (ADR-076) is at or above it.
+- **A split below the band** (`H48`): the split threshold is multiplied by
+  12 divided by half of the live entries.
+- **A fixed factor** (`H48c`): the factor is 2 for each split below the band.
+- **A hot key gate** (`H48k`): as `H48c`, and the lost CAS time of the most
+  delayed key of the leaf must pass the split threshold alone.
+- **A contention split key** (`H48s`): as `H48c`, but a lost CAS is a split
+  cause only when the keys of the round and the keys that the landed CAS
+  changed do not interleave. The split key is the key between the two sets
+  that is nearest to the median. A split is below the band when its smaller
+  side has fewer than 12 entries.
+- **A side gate** (`H48sg`): as `H48s`, and the keys of the smaller side must
+  have at least half of the lost CAS time of the leaf.
+
+### False sharing
+
+One key in each leaf (`F1`) gave 7.85 tx/s for each hot writer.
+
+| Variant | Hot writer in each run | Read-modify-write on keys 4 to 63 | Read of keys 4 to 63 | All shapes | Writes/tx |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `S48` | 1.85 to 2.13 tx/s | 13 to 30 tx/s | 186 to 210 tx/s | 578 tx/s | 0.31 |
+| `H48` | 6.91, 2.22 tx/s | 91, 19 tx/s | 166, 228 tx/s | | 0.32 to 0.53 |
+| `H48c` | 2.38, 2.23, 7.90 tx/s | 3, 7, 80 tx/s | 113, 244, 174 tx/s | | 0.32 to 0.55 |
+| `H48k` | 3.60, 2.11, 6.42 tx/s | 29, 7, 84 tx/s | 204, 222, 174 tx/s | | 0.29 to 0.51 |
+| `H48s` | 7.87 to 7.90 tx/s | 70 to 76 tx/s | 158 to 161 tx/s | 625 tx/s | 0.57 |
+| `H48sg` | 7.73 to 7.91 tx/s | 70 to 78 tx/s | 156 to 164 tx/s | 630 tx/s | 0.56 |
+| `F1` | 7.85 tx/s | 128 tx/s | 131 tx/s | 690 tx/s | 0.88 |
+
+- With a split at the median, the leaf of the hot keys split 48, 24, 12, 6,
+  3, and the measurements of the rule started again after each split. Some
+  runs stopped at a leaf of 4 to 16 entries with all hot keys, and some did
+  not split.
+- With the contention split key, the first split was at the index 2 to 4 of
+  the leaf of 48 entries, and the next split separated single keys. The hot
+  keys were in leaves of one key, next to leaves of 29 to 46 entries. There
+  were 4 to 8 splits, all before the measurement.
+- When the read-modify-write transactions on the keys 4 to 63 had more
+  throughput, the reads of the same keys had less. `F1` shows the same.
+
+### `load-shift`
+
+Throughput and writes for each transaction of the three cells (low conflict,
+`crossing`, low conflict), as ratios to `S48`:
+
+| Variant | Runs | Throughput | Writes/tx | Quiet |
+| --- | ---: | --- | --- | --- |
+| `H48` | 2 | 0.97, 0.95, 1.01 | 1.19, 1.12, 1.00 | yes |
+| `H48c` | 2 | 0.96, 0.85, 1.00 | 1.23, 1.06, 0.88 | yes |
+| `H48k` | 2 | 0.97, 0.85, 0.96 | 1.19, 1.09, 1.03 | not in one cell |
+| `H48s` | 2 | 0.96, 0.82, 0.97 | 1.18, 1.14, 1.01 | yes |
+| `H48sg` | 2 | 1.00, 0.83, 1.03 | 1.13, 1.09, 0.84 | yes |
+
+- With a fixed factor, the variants made 1,860 to 2,850 splits below the band
+  in each run, most of them in the warm-up of `crossing`. `H48` made about
+  140 in the first cell, and `S48` made none.
+- The hot key gate passed about 5,000 and 18,000 times, and blocked about
+  2,500 and 3,600 times. The side gate blocked 58% of its checks.
+
+### The lost CAS rate of a split below the band
+
+A probe printed the decayed lost CAS rate of each split request below the
+band: of the keys of the smaller side, and of the whole leaf. One run of
+`H48s` for each load:
+
+| Rate | False sharing (26 requests): p10, p50, p90 | `load-shift` (11,553 requests): p10, p50, p90, max |
+| --- | --- | --- |
+| Lost CASes per second, smaller side | 0, 0, 0.34 | 0, 0.13, 0.27, 1.6 |
+| Lost time per second, smaller side | 0, 0, 0.16 s | 0, 0.017, 0.043, 0.87 s |
+| Lost time per second, whole leaf | 0.068, 0.134 s, (max 0.28) | 0.024, 0.031, 0.055, 1.63 s |
+
+- On the smaller side, the false sharing values are in the range of
+  `load-shift`. A split between two hot keys often had the keys that lost
+  the CAS on its larger side.
+- The lost time of the whole leaf was higher in the false sharing load, but
+  the gap was small (p10 0.068 s against p90 0.055 s), and the tail of
+  `load-shift` went far above it.
+
+### `workers`
+
+The reduced grid at 20, 80, 140, and 200 workers, one run of each variant:
+`H48`, `H48c`, and `H48k` were within 0.03 of `S48` in all cells. `H48s` and
+`H48sg` were 0.92 to 0.93 at 200 workers. `H48sg` made no split below the
+band there, so this can be noise or the cost of the probe.
+
+### A higher factor
+
+`H48s` with a factor of 4 (`F4`) and 8 (`F8`) for each split below the band,
+against a new set of `S48` runs. Three runs of the false sharing load, two of
+`load-shift`, and one of the reduced `workers` grid:
+
+| Variant | Hot writer | All shapes | `load-shift` throughput | `load-shift` writes/tx | `crossing` quiet | `workers` |
+| --- | --- | ---: | --- | --- | --- | --- |
+| `S48` | 1.78 to 2.85 tx/s | 567 tx/s | 1, 1, 1 | 1, 1, 1 | yes | 1 |
+| `F4` | 7.70 to 8.04 tx/s | 630 tx/s | 1.02, 0.95, 0.96 | 1.23, 1.15, 1.21 | no | 1.00 to 1.06 |
+| `F8` | 7.67 to 7.97 tx/s | 631 tx/s | 0.98, 0.99, 0.93 | 1.24, 1.18, 1.31 | no | 1.00 to 1.05 |
+
+- In each run of `load-shift`, `F4` made about 3,400 splits below the band,
+  and `F8` about 2,500.
+- In the warm-up of `crossing`, `F8` made 917 splits and 330 merges, and
+  `F4` 1,332 splits and 724 merges. A split removed the lost CAS of its
+  leaves, the merge veto ended, the leaves merged, and the lost CAS came
+  back.
+
+### Conclusions
+
+- A split for false sharing must use a split key between the keys that
+  conflict. A split at the median needs many steps, and also divides the keys
+  next to the hot keys.
+- With that split key, lost CAS separates hot keys in a few splits, and the
+  other leaves stay in the band.
+- Lost CAS that is spread over the keys of a collection, as in `crossing`,
+  also pays for splits below the band, and these splits cost throughput and
+  writes. The share of the smaller side, the lost CAS of its keys, and of its
+  most delayed key did not tell it from false sharing.
+- A factor of 4 or 8 kept most of the throughput of `crossing`, but the leaves
+  there split and merged again and again, with 1.15 to 1.31 times the writes
+  of `S48`.
+- In `crossing`, many transactions write two adjacent keys. A split below the
+  band divides some of them, and no variant counted that cost.
+
+## 2026-10-26: a size band, and the lost CAS of false sharing
+
+Status: the size policy (ADR-031, ADR-073) with a band of 48 to 12 entries
+had the same or more throughput than the avoidable time rule in all cells of
+`workers`, `mixed`, and `load-shift`. It was quiet in all of them, and at 200
+workers in `workers` it used 0.42 of the writes. Smaller bands had more
+throughput in `workers` and `mixed`, and less in `load-shift`. Under sustained
+load, the rule splits leaves for queue wait in one database instance, and
+these splits remove real queue wait, but each split removes little of it. An
+estimate of the rounds that a split adds did not tell the useful splits from
+the others. A load where four database instances write four adjacent keys
+showed false sharing: with the keys in four leaves, the writers had 3.6 times
+the throughput of a band of 32 entries. The rule separated the keys in one
+run of two. The temporary code is not in the repository.
+
+All runs used `--backend=memory --delays=s3 --delay-scale=0.2
+--prefix-depth=3` at `01e70a268`, on mains power, with the warm-up minimum of
+30 s of model time in `workers` and `mixed`. The reduced `workers` grid had
+20, 80, 140, and 200 workers. The throughput is the geometric mean of the
+shapes. Ratios are to the avoidable time rule (A) of the same set of runs,
+and the variants of a set ran alternated.
+
+### What pays for the splits of the rule
+
+A probe split the net split-side time of each split request of the rule into
+its parts:
+
+| Cell | Requests | Keys of the leaf at the split (median) | Queue wait | Lost CAS | Delayed keys (median) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `workers`, 20 workers | 2,946 | 131 | 99% | 0% | 4 |
+| `workers`, 80 workers | 2,929 | 9 | 99% | 0% | 3 |
+| `workers`, 140 workers | 13,451 | 4 | 99% | 0% | 3 |
+| `workers`, 200 workers | 41,906 | 4 | 99% | 0% | 2 |
+| `mixed`, low conflict, 100% affinity | 741 | 105 | 99% | 0% | 4 |
+| `split-merge-fight` | 94 | 2 | 0% | 100% | 1 |
+
+- The queue wait was about 42% from lock acquisitions, 41% from write-backs,
+  and 17% from direct commits, in all cells. So the kind of round does not
+  tell the useful splits from the others.
+- At 140 and 200 workers, the rule asked for 1.8 and 4.3 times the splits that
+  landed.
+
+### Queue wait and a split
+
+A coordinator round takes all members that are queued when its leaf load
+returns, also after a lost CAS. Members with different keys, and with the same
+keys, share one round. So the queue wait of a member depends on the time when
+it arrives, and not on the keys of the other members. The rule counts a queue
+wait as a split cause when the round before it had all its keys in the other
+half of the leaf.
+
+A probe logged the rounds and the members of one leaf in four. An offline
+replay put the members of each half of the leaf in a queue of its own, with the
+measured times of the rounds of the leaf. A replay with one queue gave the
+measured queue wait within 3 to 8%.
+
+| Cell | Queue wait that the rule counts, of all queue wait | Queue wait that a split removes, of the counted queue wait |
+| --- | ---: | ---: |
+| `workers`, 20 workers | 24% | 0.95 |
+| `workers`, 80 workers | 1% | 0.02 to 1.06 |
+| `workers`, 140 workers | 4% | 0.55 to 0.95 |
+| `workers`, 200 workers | 14% | 0.75 to 0.78 |
+| `mixed` | 41% | 0.96 to 0.98 |
+
+The ranges are from two orders of the round times in the replay. At 140 and
+200 workers, 29 to 38% of the rounds were on leaves of one entry, which a
+split cannot divide.
+
+### An estimate of the rounds that a split adds
+
+The temporary code replayed the two halves of each leaf in the leaf
+coordinator of each database instance, with a third queue for the leaf as it
+is. Its rounds were 0.99 to 1.00 of the real rounds, and its queue wait 0.91
+to 0.94 of the real queue wait. The queue wait that a split removes replaced
+the queue wait split cause of the rule, and each extra round of the halves
+cost a price.
+
+| Cell | Extra rounds of a split | Queue wait removed for each extra round |
+| --- | ---: | ---: |
+| `workers`, 20 workers | +3% | 37 ms |
+| `workers`, 80 workers | +1% | 28 ms |
+| `workers`, 140 workers | +3% | 24 ms |
+| `workers`, 200 workers | +6% | 25 ms |
+| `mixed` | +11% | 16 ms |
+
+These are the numbers with no price. So one split adds few rounds at all
+loads, and the useful and the other splits remove about the same queue wait
+for each round. Two runs of `workers` and of `mixed` for each price:
+
+| Price for each extra round | `mixed` | `workers` at 20/80/140/200 | Writes/tx at 200 | Quiet at 80 to 200 |
+| --- | ---: | --- | ---: | --- |
+| None (A: 1.48 writes/tx) | 1 | 1 | 1.48 | no |
+| 0 ms | 0.93 | 0.98/0.96/0.98/0.96 | 1.41 | no |
+| 10 ms | 0.86 | 0.97/0.93/0.89/0.93 | 1.17 | at 80 only |
+| 30 ms | 0.81 | 0.85/0.68/0.69/0.81 | 0.51 | yes |
+| 60 ms | 0.80 | 0.85/0.62/0.66/0.74 | 0.43 | yes |
+
+With a price of 30 ms or more, the first cell of `workers` did not split, and
+all later cells had less throughput.
+
+### A size band
+
+The size policy splits a leaf above `leaf-max-entries` (or 256 KiB) and
+merges it below `leaf-min-entries`. The seed and the cells used the same band.
+With all bands, the cells made no splits and no merges, and all warm-ups were
+quiet. Throughput and writes for each transaction, as ratios to A:
+
+| Cell | 256/64 | 128/32 | 64/16 | 48/12 | 32/8 | 16/4 | 8/2 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `workers`, 20 workers | 0.84, 0.90 | 0.95, 0.94 | 1.09, 0.90 | 1.12, 0.91 | 1.16, 0.90 | 1.18, 0.89 | 1.19, 0.86 |
+| `workers`, 80 workers | 0.64, 0.72 | 0.87, 0.83 | 1.04, 0.88 | 1.04, 0.91 | 1.06, 0.99 | 1.09, 1.09 | 1.12, 1.16 |
+| `workers`, 140 workers | 0.60, 0.44 | 0.93, 0.45 | 1.13, 0.59 | 1.05, 0.63 | 1.10, 0.71 | 1.13, 0.86 | 1.17, 1.04 |
+| `workers`, 200 workers | 0.59, 0.29 | 0.84, 0.31 | 1.16, 0.36 | 1.16, 0.42 | 1.18, 0.48 | 1.31, 0.64 | 1.32, 0.82 |
+| `mixed` | 0.81, 0.90 | 0.92, 0.99 | 1.05, 0.99 | 1.06, 0.99 | 1.12, 0.97 | 1.21, 0.89 | 1.24, 0.88 |
+| `load-shift`, first cell | 0.86, 0.68 | 1.17, 1.23 | 1.36, 1.82 | 1.37, 2.05 | 1.26, 2.42 | 1.06, 3.06 | 0.84, 3.62 |
+| `load-shift`, `crossing` | 0.56, 0.68 | 0.66, 0.50 | 0.98, 0.78 | 1.04, 0.87 | 1.03, 0.92 | 0.99, 0.98 | 0.91, 1.09 |
+| `load-shift`, last cell | 0.67, 0.36 | 0.88, 0.54 | 1.04, 0.97 | 1.04, 1.08 | 0.94, 1.27 | 0.76, 1.66 | 0.59, 2.05 |
+
+- The bands of 256 to 64 entries and the band of 32 entries in `workers` and
+  `mixed` are from one set of runs, and the others from a second set. The
+  ratios of 32 entries were 0.08 apart between the two sets at 200 workers,
+  and within 0.07 in the other cells. `load-shift`
+  had one run for 256/64 and 128/32, and two runs for the others.
+- At 200 workers in `workers`, A had about 12 entries in each leaf, and 1.6
+  members in each round. The band of 48 entries had 3.9 members in each
+  round, and the band of 8 entries had 1.7.
+- In `load-shift`, five database instances share one collection. Small leaves
+  there had more writes, and less throughput in the first and the last cells.
+
+### False sharing
+
+The `perfbench` configuration `hack/perf/experiments/false-sharing.toml` has
+one collection of 4,096 keys. The runs of this entry used a version of it with
+other variants of the topology. Four database instances, each with 4 workers,
+wrote one key each: the keys 0 to 3. One more database instance, with 32
+workers, ran read-modify-write and read transactions on the keys 4 to 63 one
+after another, and on random keys of the collection. A tree with one key in
+each leaf (`fixed-1`) separated the four keys. Two runs of each variant:
+
+| Variant | Each hot writer | Hot p50 | Lost CAS for each hot commit | Read-modify-write on keys 4 to 63 | Read of keys 4 to 63 | Writes/tx |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | 3.3 to 4.4 tx/s | 0.8 s | 0.2 to 1.9 | 49 tx/s | 190 tx/s | 0.28 to 0.69 |
+| Band 32/8 | 2.1 to 2.3 tx/s | 1.2 to 1.6 s | about 2 | 22 tx/s | 195 tx/s | 0.33 |
+| Band 16/4 | 2.2 to 2.4 tx/s | 1.3 to 1.5 s | about 2 | 31 tx/s | 206 tx/s | 0.36 |
+| `fixed-1` | 7.8 to 8.1 tx/s | 0.5 s | 0.015 | 128 tx/s | 130 tx/s | 0.94 |
+
+- In one run of A, each hot database instance split its key out, and the hot
+  writers had 5 to 6.5 tx/s. In the other run, they did not split.
+- One key in each leaf lowered the throughput of reads that cross leaves, and
+  raised the writes for each transaction.
+
+### What limits the throughput
+
+- The CPU use was 10 to 35% of 22 cores. A used 3 to 6 times the CPU of the
+  bands at 200 workers.
+- Without the throttle of the S3 model, throughput changed by less than 4%.
+- A shape alone had the same latency with all bands: the latency of its
+  backend calls. Under load, the added latency at 200 workers was 0.3 to 0.6
+  times that latency for the band of 32 entries, and 2 to 3 times for the
+  band of 256 entries. That band had the fewest backend calls for each
+  transaction. So the added time is in the process, for example the wait for a
+  coordinator round of the same leaf, or the encoding of large leaves. No
+  counter measures it.
+- A cell of 200 workers that continued from the cell of 140 workers had
+  different throughput from a cell that started from the seed: 0.73 times for
+  the band of 256 entries, and 1.15 times for A.
+
+### Conclusions
+
+- A band of moderate leaves gives the throughput of the splits of the rule
+  without the later splits. Under sustained load, most splits of the rule
+  remove a small queue wait in one database instance, and a band keeps more
+  members in each round.
+- The best band depends on the load. 48/12 was the only band that matched or
+  beat A in all cells.
+- The size policy does not separate keys that several database instances
+  write. The lost CAS of false sharing is a cause for leaves smaller than the
+  band, and the rule found it in one run of two.
+- The queue wait of one database instance is not a good split cause under
+  sustained load. A split removes most of the queue wait that the rule counts,
+  but this queue wait is a small part of all queue wait, and the splits that
+  it pays for cost more than they give.
+
 ## 2026-10-24: a write price and symmetric merge terms under sustained load
 
-Status: under a high load, a write price for each divided round stops most
-splits, and halves the backend writes for each transaction. But the
-throughput depends mostly on the splits under the first, low load. In the
-reduced `workers` grid, each run either split at 20 workers or did not, and
-the runs that did not had about a third less throughput at 200 workers. A
-price of 75 ms skipped these splits in one run of two, and in the `mixed`
-low-conflict cell at 100% affinity, it stopped all of the useful splits (19%
-less throughput). Corrections of the queue wait for transactions over several
-leaves did not separate the useful splits from the others. Merge terms that
-are symmetric to the split terms did not change the `workers` grid, and made
-the `crossing` cell of `load-shift` change more. The temporary code is not in
-the repository.
+Status: under a high load, a write price of 75 ms for each divided round stops
+most splits, and the warm-ups become quiet. In the reduced `workers` grid, it
+cut the writes for each transaction at 200 workers to about a third, with 0.92
+to 1.00 of the throughput. But in the `mixed` low-conflict cell at 100%
+affinity, it stopped all of the useful splits (19% less throughput). A
+correction of the queue wait for transactions over several leaves kept most of
+these useful splits. Merge terms that are symmetric to the split terms did not
+change the `workers` grid, and made the `crossing` cell of `load-shift` change
+more. The temporary code is not in the repository.
 
 All runs used `--backend=memory --delays=s3 --delay-scale=0.2
 --prefix-depth=3` at `0ff05aae1`, plus temporary changes, on mains power.
 Virtual time (`--time=virtual`) does not show the problem: the identical
 workers share rounds, and the first `load-shift` warm-up was quiet after 12
 splits.
+
+The reduced `workers` grid and the `mixed` cell ran with a warm-up of at least
+30 s of model time, as perfbench now sets for these experiments. With the
+earlier minimum of 5 s, a warm-up could end as quiet before the moving
+averages of the rule (half-life 10 s) paid for a split. In the reduced grid,
+the first cell then did not split, and all later cells had about a third less
+throughput. The other runs had the minimum of 5 s: the full `workers` grid,
+`load-shift`, the full `mixed` runs, weight 1, and the variants of an earlier
+session. Their first cells split, and the warm-ups of weight 1 in `mixed` ran
+to the timeout of 60 s.
 
 ### Variants
 
@@ -52,55 +539,42 @@ selected the variant:
   crossing conflict time, instead of all of it.
 - **Merge threshold:** without the split-side time of both leaves (symmetric),
   or as in ADR-074 (`OLD_MERGE`).
-- **Queue wait over several leaves:** a transaction acquires its locks in
-  several leaves in parallel, but waits only for the slowest one. Weight 1
-  divided the queue wait of each lock acquisition by the leaves of its phase.
-  Weight 3 also counted no queue wait of write-backs. Write-backs run in the
-  background after the commit point, and other transactions do not wait for
-  them: they check the transaction record when they do not know its state. Of
-  the other rounds, direct commits have one leaf, releases and structural gates
-  have no keys, and point reads and read validation do not go through the leaf
-  coordinator.
+- **Queue wait over several leaves (weight 1):** a transaction acquires its
+  locks in several leaves in parallel, but waits only for the slowest one.
+  Weight 1 divided the queue wait of each lock acquisition by the leaves of its
+  phase.
 
 ### The `workers` experiment
 
 The reduced grid had 20, 80, 140, and 200 workers for each shape, with the
 other settings of `workers`. Each cell starts after the warm-up of the cell
 before it. The throughput is the geometric mean of the four shapes. Two runs
-of each variant, in the order A, B, C, D, then again:
+of each variant, in the order A, B, then again:
 
 | Variant | Run | Splits at 20 | Splits | Quiet at 20/80/140/200 | Throughput 20/80/140/200 | Writes/tx at 140, 200 |
 | --- | ---: | ---: | ---: | --- | --- | --- |
-| A: `main` | 1 | 883 | 8,077 | yes/no/no/no | 273/1015/1535/1745 | 1.34, 1.49 |
-| A: `main` | 2 | 967 | 7,789 | no/no/no/no | 274/1016/1562/1788 | 1.32, 1.44 |
-| B: price 75 ms | 1 | 757 | 1,068 | no/yes/yes/yes | 269/975/1527/1801 | 0.71, 0.48 |
-| B: price 75 ms | 2 | 0 | 244 | yes in all | 231/699/1084/1207 | 0.55, 0.46 |
-| C: weight 1 | 1 | 834 | 5,327 | no/yes/no/no | 273/987/1419/1582 | 1.10, 1.20 |
-| C: weight 1 | 2 | 0 | 2,471 | yes/yes/no/no | 235/770/1149/1332 | 0.77, 0.89 |
-| D: weight 3 | 1 | 0 | 682 | yes/yes/yes/no | 235/721/1177/1091 | 0.67, 0.55 |
-| D: weight 3 | 2 | 0 | 633 | yes in all | 234/701/1154/1219 | 0.71, 0.51 |
+| A: `main` | 1 | 997 | 8,035 | no/no/no/no | 276/1016/1565/1803 | 1.35, 1.49 |
+| A: `main` | 2 | 916 | 7,850 | yes/no/no/no | 274/1005/1592/1689 | 1.38, 1.52 |
+| B: price 75 ms | 1 | 801 | 1,058 | no/yes/yes/yes | 269/958/1444/1773 | 0.65, 0.54 |
+| B: price 75 ms | 2 | 781 | 1,278 | no/yes/yes/yes | 269/971/1449/1732 | 0.73, 0.53 |
 
-- The runs fall in two groups. With 757 to 967 splits at 20 workers, the
-  throughput was about 270/990/1,520/1,750. With none, it was about
-  234/700/1,150/1,190 in all later cells, also when the later cells split.
-- In B and C, the warm-up at 20 workers sometimes ended as quiet before the
-  moving averages of the rule paid for a split. The splits then started in
-  the measurement: 40 in B and 26 in C. D made no splits at 20 workers.
-- B in run 1 had the throughput of `main` with 1,068 splits against about
-  8,000, and 0.48 writes for each transaction at 200 workers against 1.47.
-  So the splits at 20 workers gave the throughput, and most of the later
-  splits gave none.
-- No variant merged. The queue wait that a merge adds was 76 to 213 s in the
-  measurement of each cell, and the saved writes were 1,000 to 3,300.
-- At 200 workers in D, run 1, the split-side time of the measurement was 2.4 s
-  of queue wait, 0.6 s of slow leaf CAS, and no lost CAS.
+- All runs split at 20 workers. The price changed these splits little.
+- In the later cells, B made 1,058 to 1,278 splits against about 7,900, and
+  its warm-ups were quiet. Its throughput was 0.95 of `main` at 80 workers,
+  0.92 at 140, and 1.00 at 200. Its writes for each transaction at 200 workers
+  were 0.36 of `main`.
+- At 200 workers, the rounds of B had about 4 members, and those of `main`
+  about 1.5.
+- No variant merged. In earlier runs with the minimum of 5 s, the queue wait
+  that a merge adds was 76 to 213 s in the measurement of each cell, and the
+  saved writes were 1,000 to 3,300.
 
 Other variants ran in an earlier session, and the tree split at 20 workers
 in all of their runs. Without a price, the symmetric merge terms had the
 splits and the throughput of `main` (7,800 splits, one run). With a price of
 100 ms, 2 runs had 686 to 706 splits and 0.90 to 0.95 of the throughput of
 `main` at 80 to 140 workers. With a price of 75 ms and the merge threshold of
-ADR-074, one run had about the result of B in run 1.
+ADR-074, one run had about the result of B.
 
 The full grid of `workers` (21 cells), one run of each. Both split at 20
 workers:
@@ -155,13 +629,12 @@ low-conflict cell at 100% affinity, two runs of each variant:
 
 | Variant | Warm-up splits | Throughput | `ro-single` | Writes/tx |
 | --- | ---: | ---: | ---: | ---: |
-| A: `main` | 279 to 303 | 109 tx/s | 236 to 237 tx/s | 2.15 to 2.18 |
-| B: price 75 ms | 0 | 88 tx/s | 176 to 177 tx/s | 1.95 to 1.98 |
-| C: weight 1 | 205 to 206 | 105 tx/s | 225 to 228 tx/s | 2.14 to 2.15 |
-| D: weight 3 | 0 | 88 tx/s | 176 to 177 tx/s | 1.95 to 1.96 |
+| A: `main` | 306 to 317 | 109 tx/s | 236 tx/s | 2.13 to 2.14 |
+| B: price 75 ms | 0 | 88 to 89 tx/s | 176 to 179 tx/s | 1.99 to 2.02 |
+| Weight 1 | 205 to 206 | 105 tx/s | 225 to 228 tx/s | 2.14 to 2.15 |
 
-The splits that B and D stopped gave 24% more throughput, and cost about 10%
-more writes.
+The warm-ups of B were quiet after the minimum, with no split. The splits that
+B stopped gave 23% more throughput, and cost about 6% more writes.
 
 ### Conclusions
 
@@ -169,11 +642,11 @@ more writes.
   until the queue wait goes away, also when the splits give no throughput. A
   price that stops these splits at high load also stops useful splits at low
   load.
-- The useful splits came first, under the low load. The rule cannot tell them
-  from the later ones: weight 1 kept most of them but did not stop the later
-  splits, and weight 3 stopped both.
-- The warm-up of a cell can end as quiet before the rule pays for a split, so
-  the start of the next cell depends on chance.
+- The useful splits came first, under the low load. Weight 1 kept most of the
+  useful splits in `mixed`. It did not run in `workers` with the warm-up of
+  30 s.
+- A warm-up must be longer than the time that the rule needs to pay for a
+  split. Otherwise the start of the next cell depends on chance.
 - The symmetric merge terms did not help the goal. The merge side never paid
   in `workers`, and it caused more changes in `crossing`.
 - The split-side direct commit and scan terms were zero in `workers` and

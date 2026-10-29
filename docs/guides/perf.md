@@ -19,6 +19,86 @@ limit. Earlier entries that do not pass `--prefix-depth` used 2 segments, where
 all collections of a database share one limit. Pass `--prefix-depth=2` to
 measure them again.
 
+## ADR-084: keys that transactions commit together
+
+The second change of
+[ADR-084](../adr/084-size-causes-are-the-default-topology-policy.md) keeps the
+write spans of the leaves in one leaf: soft cap splits avoid them, and two
+adjacent leaves merge for them.
+
+### Setup
+
+- base: `8c6a1149f` (the size causes with 48 and 12 entries); target: the
+  write spans, both with the engine defaults. The target ran before the last
+  review changes: a writer whose clock is ahead counts as recent, and commits
+  over two leaves too large to merge ask for no merge. These change no
+  decision of one database instance.
+- `--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
+  --drain-timeout=90s`, 2 runs of each, alternated, on mains power, except one
+  run of each for `workers4`
+- fixed ranges: `--config=hack/perf/experiments/fixed-ranges.toml
+  --experiment=fixed-ranges`; random ranges:
+  `--config=hack/perf/experiments/random-ranges.toml --experiment=random-ranges`;
+  `workers4` and `mixed` as in the entry of the first change below
+- ratio = target / base
+
+### Results
+
+| Cell | Ratio | Writes/tx, base → target |
+| --- | --- | --- |
+| Fixed ranges, one instance | 16 keys 1.26, 64 keys 1.23, `rw-single` 1.02, `ro-single` 0.98 | 1.2 → 0.9 |
+| Fixed ranges, five instances | 16 keys 1.22, 64 keys 1.18, `rw-single` 1.01, `ro-single` 0.98 | 2.4 → 1.8 |
+| Random ranges, one instance | 16 keys 0.95, 64 keys 0.98, `rw-single` 1.00, `ro-single` 1.01 | 1.4 → 1.5 |
+| Random ranges, five instances | 16 keys 0.95, 64 keys 0.99, `rw-single` 0.99, `ro-single` 1.00 | 2.9 → 2.9 |
+| `load-shift` | 0.98, 1.01, 1.11 | 1.08 → 1.17, 1.36 → 1.43, 1.19 → 1.29 |
+| `mixed` | 1.03 | 2.19 → 2.17 |
+| `workers4`, 20/80/140/200 workers | 1.01, 0.99, 1.00, 1.03 | 0.62 → 0.59 at 200 |
+
+- All warm-ups were quiet.
+- The seed writes 64 keys in each transaction, so its soft cap splits waited:
+  the target made about half of the splits of the base in the seed, and about
+  310 splits in the first warm-up (1,564 in `workers4`). In `load-shift`, 67 of
+  them came in the measurement of the first cell.
+- On the fixed and the random ranges, the target made 4 to 11 splits and 2 to
+  9 merges in each measurement, and the base none.
+
+## ADR-084: the size causes are the default topology policy
+
+[ADR-084](../adr/084-size-causes-are-the-default-topology-policy.md) makes the
+size causes the default topology policy, with a soft cap of 48 leaf entries and
+an underfull threshold of 12.
+
+### Setup
+
+- base: `01e70a268` (the avoidable time policy, 256 and 64 entries); target:
+  the commit of ADR-084, both with the engine defaults
+- `--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
+  --drain-timeout=90s`, 2 runs of each, alternated, on mains power
+- `workers4` is the `workers` experiment with 20, 80, 140, and 200 workers only
+  ([`hack/perf/investigations.md`](../../hack/perf/investigations.md), entry
+  of 2026-10-26); `mixed` is its low-conflict cell at 100% affinity
+- throughput is the geometric mean of the shapes; ratio = target / base
+
+### Results
+
+| Cell | Base tx/s | Target tx/s | Ratio | Writes/tx, base → target | Quiet, base → target |
+| --- | ---: | ---: | ---: | --- | --- |
+| `workers4`, 20 workers | 274 | 309 | 1.13 | 2.18 → 1.93 | 1/2 → 2/2 |
+| `workers4`, 80 workers | 1,012 | 1,053 | 1.04 | 1.35 → 1.27 | 0/2 → 2/2 |
+| `workers4`, 140 workers | 1,561 | 1,696 | 1.09 | 1.25 → 0.79 | 0/2 → 2/2 |
+| `workers4`, 200 workers | 1,786 | 2,136 | 1.20 | 1.50 → 0.59 | 0/2 → 2/2 |
+| `mixed` | 109 | 116 | 1.06 | 2.18 → 2.15 | 0/2 → 2/2 |
+| `load-shift`, first cell | 685 | 904 | 1.32 | 0.56 → 1.09 | 2/2 → 2/2 |
+| `load-shift`, `crossing` | 1,336 | 1,441 | 1.08 | 1.45 → 1.37 | 2/2 → 2/2 |
+| `load-shift`, last cell | 875 | 884 | 1.01 | 1.18 → 1.22 | 2/2 → 2/2 |
+
+- The target made no splits or merges after the seed. The base made 7,500
+  splits in the warm-ups of `workers4`.
+- The CPU of the process was 0.19 of the base in `workers4`, and 0.28 in
+  `load-shift`.
+- In the first cell of `load-shift`, five database instances write one
+  collection, and the target writes 1.9 times more for each transaction.
+
 ## ADRs 064-065: bounded parallel leaf work and renewed fallback identity
 
 [ADR-064](../adr/064-bounded-parallel-point-leaf-work.md) runs independent

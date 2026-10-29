@@ -107,8 +107,8 @@ pub(crate) struct DatabaseOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Topology {
-    #[default]
     Avoidable,
+    #[default]
     Size,
 }
 

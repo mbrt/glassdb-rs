@@ -240,7 +240,9 @@ impl SimWorkload for RmwWorkload {
         // Two distinct direct increments fill the inline budget of a leaf, so
         // the existing contention/fault schedules also cover inline rejections
         // and the avoidable time that they add (ADR-074), without a second
-        // lifecycle oracle or workload.
+        // lifecycle oracle or workload. The other workloads use the default
+        // topology policy, so this one keeps the rule of the avoidable time
+        // policy under simulation.
         open_det_db(
             backend,
             NodeSizePolicy::default(),
@@ -248,7 +250,7 @@ impl SimWorkload for RmwWorkload {
                 max_value_bytes: 8,
                 max_leaf_bytes: 16,
             },
-            TopologyPolicy::default(),
+            TopologyPolicy::AvoidableTime,
             media,
         )
     }

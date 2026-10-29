@@ -370,10 +370,11 @@ impl NodeSizePolicyBuilder {
 impl Default for NodeSizePolicyBuilder {
     fn default() -> Self {
         Self {
-            leaf_max_entries: 256,
+            // Moderate leaves for random point access (ADR-084).
+            leaf_max_entries: 48,
             node_soft_max_bytes: 256 * 1024,
             index_max_children: 256,
-            leaf_min_entries: 64,
+            leaf_min_entries: 12,
             index_min_children: 64,
             node_max_bytes: 1024 * 1024,
             split_headroom_bytes: 64 * 1024,
@@ -383,8 +384,6 @@ impl Default for NodeSizePolicyBuilder {
 
 impl Default for NodeSizePolicy {
     fn default() -> Self {
-        // A ~256-entry leaf soft cap mirrors the old fixed keys-per-leaf target
-        // (ADR-017), and keeps each object small for the backend.
         NodeSizePolicyBuilder::default()
             .build()
             .expect("default node size policy is valid")

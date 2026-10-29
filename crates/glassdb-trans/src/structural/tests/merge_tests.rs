@@ -1288,3 +1288,67 @@ async fn a_merge_into_a_leaf_that_needs_a_split_waits_for_the_split() {
     assert!(keys(&merged).len() < 4, "the merge went into one half");
     assert_no_intents(&s).await;
 }
+
+// ADR-084: a recent transaction wrote "b" and "m" together, over the
+// boundary of L0 and L1, so the two leaves merge.
+#[tokio::test]
+async fn leaves_merge_for_keys_committed_together_over_their_boundary() {
+    let s = store();
+    let writer = recent_writer();
+    let left = Node::leaf(LeafBody::from_entries([
+        live(b"a"),
+        written_by(b"b", &writer),
+    ]));
+    let right = Node::leaf(LeafBody::from_entries([
+        written_by(b"m", &writer),
+        live(b"n"),
+    ]));
+    seed_leaves(&s, left, right).await;
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, mergeable());
+
+    merge_now(&sp, "L0", MergeReason::WriteSpan).await.unwrap();
+
+    assert_merged(&s).await;
+}
+
+// ADR-084: without keys committed together over the boundary, a merge for
+// write spans does not go ahead.
+#[tokio::test]
+async fn leaves_do_not_merge_without_keys_committed_together_over_their_boundary() {
+    let s = store();
+    seed_two_leaves(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, mergeable());
+
+    merge_now(&sp, "L0", MergeReason::WriteSpan).await.unwrap();
+
+    assert_not_merged(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
+}
+
+// ADR-084: a merge for write spans makes a leaf of at most twice the soft cap
+// of entries, here 16.
+#[tokio::test]
+async fn leaves_do_not_merge_for_write_spans_over_twice_the_soft_cap() {
+    let s = store();
+    let writer = recent_writer();
+    let keys = |range: std::ops::RangeInclusive<u8>, written: u8| {
+        LeafBody::from_entries(range.map(|key| {
+            if key == written {
+                written_by(&[key], &writer)
+            } else {
+                live(&[key])
+            }
+        }))
+    };
+    let left = Node::leaf(keys(b'a'..=b'i', b'i'));
+    let right = Node::leaf(keys(b'm'..=b'u', b'm'));
+    seed_leaves(&s, left, right).await;
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, mergeable());
+
+    merge_now(&sp, "L0", MergeReason::WriteSpan).await.unwrap();
+
+    assert!(!current_node(&s, "L0").await.is_drained());
+    assert_no_intents(&s).await;
+}
