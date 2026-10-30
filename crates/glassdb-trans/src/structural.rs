@@ -19,10 +19,12 @@ mod measurements;
 mod merge;
 mod nodes;
 mod paid_rate;
+mod policy;
 mod reclamation;
 mod reconcile;
 mod recovery;
 mod rule;
+mod sink;
 mod split;
 mod stats;
 mod topology;
@@ -55,16 +57,19 @@ use change::{ChangeLifecycle, PlannedChange, StructuralTopology, SweepChange};
 use merge::MergeReason;
 use merge::Merger;
 use nodes::StructuralNodeAccess;
+use policy::{
+    AvoidableTimePolicy, SizeCausesPolicy, TopologyDecisions, TopologySettings, TopologySignals,
+};
 use reclamation::ReclamationReporter;
 use reconcile::ParentReconciler;
 use recovery::{RecoveryAction, RecoveryStep, StructuralRecovery};
-use rule::{TOPOLOGY_WINDOW, TopologyRule};
 use split::{SplitReason, Splitter};
 use stats::Stats;
 
-pub use candidates::StructuralHintSink;
 pub(crate) use measurements::TypicalTime;
+pub(crate) use policy::SignalKind;
 pub use rule::TopologyPolicy;
+pub use sink::StructuralHintSink;
 pub use stats::{DemandMergeStats, InlinePressureStats, RestructurerStats, TopologyTimeStats};
 pub(crate) use topology::TopologyMembership;
 
@@ -91,10 +96,12 @@ pub struct Restructurer {
     // alive across shutdown; `Engine` is the single strong owner.
     bg: Weak<Background>,
     mon: Monitor,
-    // The candidate feed that the restructurer drains. The coordinator
-    // receives a clone for stored-leaf capacity; direct-commit policies receive
-    // lightweight hint sinks for inline-pressure observations.
+    // The candidate queue that the restructurer drains.
     candidates: MaintenanceCandidates,
+    // The intake of the topology signals, which the coordinator and the other
+    // producers receive.
+    hints: StructuralHintSink,
+    signals: Arc<dyn TopologySignals>,
     stats: Arc<Stats>,
     splitter: Splitter,
     merger: Merger,
@@ -102,7 +109,17 @@ pub struct Restructurer {
     reconciler: ParentReconciler,
     recovery: StructuralRecovery,
     recovery_wake: Arc<Notify>,
-    topology_policy: TopologyPolicy,
+}
+
+/// What one topology policy gives the restructurer: the queue that the policy
+/// and the engine rules fill, the intake of the topology signals, and the policy
+/// behind its two traits.
+pub(super) struct TopologyParts {
+    sizes: NodeSizePolicy,
+    queue: MaintenanceCandidates,
+    hints: StructuralHintSink,
+    signals: Arc<dyn TopologySignals>,
+    decisions: Arc<dyn TopologyDecisions>,
 }
 
 /// A split candidate and the node that its split divides.
@@ -143,6 +160,43 @@ struct MergeNodes {
     target: NodeId,
 }
 
+impl TopologyParts {
+    /// The parts of `policy`, over nodes of `sizes` and values of `inline`,
+    /// for the database instance of `mon`.
+    pub(super) fn new(
+        policy: TopologyPolicy,
+        sizes: NodeSizePolicy,
+        inline: InlinePolicy,
+        mon: Monitor,
+    ) -> Self {
+        let queue = MaintenanceCandidates::new();
+        let settings = TopologySettings { sizes, inline };
+        match policy {
+            TopologyPolicy::SizeCauses => {
+                let policy = SizeCausesPolicy::new(settings, mon, queue.clone());
+                Self::of(queue, sizes, Arc::new(policy))
+            }
+            TopologyPolicy::AvoidableTime => {
+                let policy = AvoidableTimePolicy::new(settings, queue.clone());
+                Self::of(queue, sizes, Arc::new(policy))
+            }
+        }
+    }
+
+    fn of<P>(queue: MaintenanceCandidates, sizes: NodeSizePolicy, policy: Arc<P>) -> Self
+    where
+        P: TopologySignals + TopologyDecisions + 'static,
+    {
+        Self {
+            sizes,
+            hints: StructuralHintSink::new(queue.clone(), sizes, policy.clone()),
+            queue,
+            signals: policy.clone(),
+            decisions: policy,
+        }
+    }
+}
+
 impl Restructurer {
     /// Builds a restructurer and coordinator that share one timeline and
     /// candidate feed.
@@ -162,21 +216,16 @@ impl Restructurer {
         topology: TopologyPolicy,
         gc_hints: GcHints,
     ) -> (LeafCoordinator, Self) {
-        let candidates = if topology.rule().is_some() {
-            MaintenanceCandidates::for_topology_rule(policy, inline)
-        } else {
-            MaintenanceCandidates::with_policies(policy, inline)
-                .separating_contended_keys(mon.clone())
-        };
+        let parts = TopologyParts::new(topology, policy, inline, mon.clone());
         let coord = LeafCoordinator::with_hinter(
             nodes.clone(),
             key_state.clone(),
             mon.clone(),
             retry,
             policy,
-            Arc::new(candidates.clone()),
+            Arc::new(parts.hints.clone()),
         );
-        let restructurer = Restructurer::with_candidates(
+        let restructurer = Restructurer::with_parts(
             bg,
             membership,
             nodes,
@@ -186,9 +235,8 @@ impl Restructurer {
             key_state,
             db_prefix,
             coord.clone(),
-            candidates,
+            parts,
             gc_hints,
-            topology,
         );
         (coord, restructurer)
     }
@@ -196,7 +244,7 @@ impl Restructurer {
     /// Returns a producer handle for structural hints decided outside the leaf
     /// coordinator.
     pub fn hint_sink(&self) -> StructuralHintSink {
-        self.candidates.hint_sink()
+        self.hints.clone()
     }
 
     /// Returns and resets the counters of background split and merge
@@ -204,9 +252,7 @@ impl Restructurer {
     /// rule.
     pub fn stats_and_reset(&self) -> RestructurerStats {
         let mut stats = self.stats.take();
-        if let Some(measurements) = self.candidates.measurements() {
-            stats.topology_time = measurements.take_totals();
-        }
+        stats.topology_time = self.signals.take_topology_time();
         stats
     }
 
@@ -223,12 +269,12 @@ impl Restructurer {
                 restructurer.run_once().await;
             }
         });
-        if let Some(mut rule) = self.topology_policy.rule() {
-            let restructurer = self.clone();
+        if let Some(window) = self.signals.window() {
+            let signals = self.signals.clone();
             bg.spawn(async move {
                 loop {
-                    rt::sleep(TOPOLOGY_WINDOW).await;
-                    restructurer.decide_leaf_changes(rule.as_mut());
+                    rt::sleep(window).await;
+                    signals.end_window();
                 }
             });
         }
@@ -256,9 +302,10 @@ impl Restructurer {
         });
     }
 
-    /// Creates a restructurer over an explicitly co-wired coordinator and feed.
+    /// Creates a restructurer over an explicitly co-wired coordinator and
+    /// topology policy.
     #[allow(clippy::too_many_arguments)]
-    fn with_candidates(
+    fn with_parts(
         bg: Weak<Background>,
         topology: TopologyMembership,
         nodes: NodeStore,
@@ -268,10 +315,16 @@ impl Restructurer {
         key_state: KeyStateResolver,
         db_prefix: DbPrefix,
         coord: LeafCoordinator,
-        candidates: MaintenanceCandidates,
+        parts: TopologyParts,
         gc_hints: GcHints,
-        topology_policy: TopologyPolicy,
     ) -> Self {
+        let TopologyParts {
+            sizes,
+            queue: candidates,
+            hints,
+            signals,
+            decisions,
+        } = parts;
         let stats = Arc::new(Stats::default());
         let router = TreeRouter::new(nodes.clone(), NonZeroUsize::MIN);
         let structural_nodes =
@@ -280,7 +333,8 @@ impl Restructurer {
             structural_nodes.clone(),
             router.clone(),
             timeline.clone(),
-            candidates.clone(),
+            sizes,
+            hints.clone(),
         );
         let recovery = StructuralRecovery::new(
             topology.clone(),
@@ -299,6 +353,9 @@ impl Restructurer {
             router.clone(),
             timeline.clone(),
             candidates.clone(),
+            sizes,
+            decisions.clone(),
+            hints.clone(),
             stats.clone(),
             reclamation.clone(),
         );
@@ -308,7 +365,9 @@ impl Restructurer {
             router,
             timeline,
             mon.clone(),
-            candidates.clone(),
+            sizes,
+            decisions,
+            hints.clone(),
             stats.clone(),
             reclamation.clone(),
         );
@@ -322,12 +381,14 @@ impl Restructurer {
             recovery_wake.clone(),
             splitter.clone(),
             merger.clone(),
-            candidates.clone(),
+            hints.clone(),
         );
         Restructurer {
             bg,
             mon,
             candidates,
+            hints,
+            signals,
             stats,
             splitter,
             merger,
@@ -335,18 +396,6 @@ impl Restructurer {
             reconciler,
             recovery,
             recovery_wake,
-            topology_policy,
-        }
-    }
-
-    /// Gives the measurements of the window that ends now to `rule`, and
-    /// queues the leaf changes that it asks for.
-    fn decide_leaf_changes(&self, rule: &mut dyn TopologyRule) {
-        let Some(measurements) = self.candidates.measurements() else {
-            return;
-        };
-        for request in rule.decide(&measurements.take_window()) {
-            self.candidates.push_request(request);
         }
     }
 

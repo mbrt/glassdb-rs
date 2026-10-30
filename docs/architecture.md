@@ -618,6 +618,30 @@ requested recursive parent split and returns the result.
 Splits and merges share one lifecycle and one parent reconciliation step. The
 `Restructurer` gives each candidate to the split module or the merge module.
 
+### The topology policy decides, the restructurer changes
+
+Each topology policy is one struct with two traits. `SizeLimitsPolicy` has
+the soft caps, the underfull threshold, and inline pressure. The other
+policies contain one, and give it the reasons that they do not refine.
+`TopologySignals`
+receives the topology signals of the transactions, the scans, the leaf
+coordinator, and the changes that landed, and queues candidates.
+`TopologyDecisions` answers the split and merge modules, which check each
+candidate again on the current node: whether and where a leaf splits, whether
+two leaves merge, and the paid rate of the change. Each policy keeps the
+measurements that its decisions need. The split and merge modules keep the
+checks that do not depend on the policy, with their own node size limits:
+capacity splits, index nodes, tombstone reclamation, and the limits that a
+node must fit.
+
+`StructuralHintSink` is the single intake of the topology signals. It queues
+the capacity splits and the merges of underfull index nodes itself, with every
+policy. It gives the other signals to the policy, which ignores the ones that
+it does not use. A producer asks it first only for a signal that costs real
+work to measure, today the leaf delays that the coordinator tracks for every
+round, so that a policy does not cost what it does not use.
+`MaintenanceCandidates` is only the queue.
+
 Committed leaf writes, parent reconciliation, and capacity rejections queue
 candidates. With the default size causes topology policy, the soft caps, the
 underfull threshold, and inline pressure decide, and the write spans that the

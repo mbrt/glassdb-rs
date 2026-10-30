@@ -459,6 +459,10 @@ _Avoid_: Topology cost, contention cost, structural pressure
 What decides when the leaves of one database instance split and merge: the node sizes, or the avoidable time.
 _Avoid_: Leaf changes, split policy
 
+**Topology signal**:
+A measurement or an event of one database instance that a topology policy decides from, such as a lost leaf CAS, the time that a coordinator round lost, or a split that landed.
+_Avoid_: Observation (the state of a stored object), topology hint
+
 **Divided round**:
 A coordinator round with members on both sides of the median of its leaf. After a split at the median, the round needs two leaf CASes instead of one.
 _Avoid_: Shared round, split round

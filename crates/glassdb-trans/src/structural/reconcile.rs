@@ -6,15 +6,15 @@ use std::sync::{Arc, Mutex};
 use glassdb_concurr::shard;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::{
-    CurrentnessBarrier, IndexNode, LeafObservation, Node, Requirement, StorageError, Timeline,
-    TreeRouter,
+    CurrentnessBarrier, IndexNode, LeafObservation, Node, NodeSizePolicy, Requirement,
+    StorageError, Timeline, TreeRouter,
 };
 use tokio::sync::Semaphore;
 
 use crate::error::TransError;
 
-use super::candidates::MaintenanceCandidates;
 use super::nodes::StructuralNodeAccess;
+use super::sink::StructuralHintSink;
 use super::split::SplitReason;
 
 /// Upper bound on the deferred reconciliation queue. Dropping the oldest when
@@ -85,7 +85,9 @@ pub(super) struct ParentReconciler {
     structure: StructuralNodeAccess,
     router: TreeRouter,
     timeline: Timeline,
-    candidates: MaintenanceCandidates,
+    sizes: NodeSizePolicy,
+    // Receives the parents that a reconciliation left underfull.
+    hints: StructuralHintSink,
     pending: Arc<Mutex<VecDeque<PendingReconciliation>>>,
     // The sweep, the deferred reconciliations, and structural recovery
     // reconcile the same parents. Without turns, they lose the gates of the
@@ -98,13 +100,15 @@ impl ParentReconciler {
         structure: StructuralNodeAccess,
         router: TreeRouter,
         timeline: Timeline,
-        candidates: MaintenanceCandidates,
+        sizes: NodeSizePolicy,
+        hints: StructuralHintSink,
     ) -> Self {
         Self {
             structure,
             router,
             timeline,
-            candidates,
+            sizes,
+            hints,
             pending: Arc::new(Mutex::new(VecDeque::new())),
             collection_turns: (0..COLLECTION_TURNS).map(|_| Semaphore::new(1)).collect(),
         }
@@ -323,7 +327,7 @@ impl ParentReconciler {
         }
         let mut updated = parent.clone();
         updated.set_index(new_index)?;
-        let policy = self.candidates.policy();
+        let policy = &self.sizes;
         if updated.content_encoded_len() > policy.content_limit()
             || updated.encoded_len() > policy.node_max_bytes()
         {
@@ -353,7 +357,7 @@ impl ParentReconciler {
                 reason: SplitReason::SoftCap,
             }))));
         }
-        self.candidates.observe_index(parent_path, &updated);
+        self.hints.observe_index(parent_path, &updated);
         Ok(Some(GatedOutcome::Landed(None)))
     }
 }

@@ -49,10 +49,14 @@ async fn root_reclamation_can_avoid_an_actionable_split() {
     root.set_locks(locks);
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let candidates = MaintenanceCandidates::with_policy(tiny());
-    candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
     let gc_hints = GcHints::default();
-    let sp = restructurer_with_candidates_and_hints(&s, &bg, candidates, gc_hints.clone());
+    let sp = restructurer_with_topology_and_hints(
+        &s,
+        &bg,
+        TestTopology::size_causes(tiny()),
+        gc_hints.clone(),
+    );
+    sp.hints.observe_leaf(&root_path(), root.as_leaf().unwrap());
 
     sp.run_once().await;
 
@@ -173,10 +177,14 @@ async fn failed_compaction_does_not_publish_reclamation_outcomes() {
         }
     });
     let bg = Arc::new(Background::new());
-    let candidates = MaintenanceCandidates::with_policy(tiny());
-    candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
     let gc_hints = GcHints::default();
-    let sp = restructurer_with_candidates_and_hints(&s, &bg, candidates, gc_hints.clone());
+    let sp = restructurer_with_topology_and_hints(
+        &s,
+        &bg,
+        TestTopology::size_causes(tiny()),
+        gc_hints.clone(),
+    );
+    sp.hints.observe_leaf(&root_path(), root.as_leaf().unwrap());
 
     sp.run_once().await;
 
@@ -219,10 +227,15 @@ async fn nonroot_split_partitions_the_compacted_leaf() {
     .await
     .unwrap();
     let bg = Arc::new(Background::new());
-    let candidates = MaintenanceCandidates::with_policy(tiny());
-    candidates.observe_leaf(&node_path("L"), source.as_leaf().unwrap());
     let gc_hints = GcHints::default();
-    let sp = restructurer_with_candidates_and_hints(&s, &bg, candidates, gc_hints.clone());
+    let sp = restructurer_with_topology_and_hints(
+        &s,
+        &bg,
+        TestTopology::size_causes(tiny()),
+        gc_hints.clone(),
+    );
+    sp.hints
+        .observe_leaf(&node_path("L"), source.as_leaf().unwrap());
 
     sp.run_once().await;
 
@@ -408,7 +421,11 @@ async fn a_demand_split_divides_the_leaf_at_its_measured_key() {
     let s = store();
     s.create_root(COLL, &abcd_leaf()).await.unwrap();
     let bg = Arc::new(Background::new());
-    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+    let sp = restructurer_with_topology(
+        &s,
+        &bg,
+        TestTopology::avoidable_time(NodeSizePolicy::default()),
+    );
 
     let above_every_key = SplitReason::Demand {
         at: Some(b"e".to_vec()),
@@ -435,19 +452,23 @@ async fn queued_demand_splits_of_a_leaf_divide_it_at_the_newest_key() {
     let s = store();
     s.create_root(COLL, &abcd_leaf()).await.unwrap();
     let bg = Arc::new(Background::new());
-    let candidates = MaintenanceCandidates::with_policy(NodeSizePolicy::default());
+    let sp = restructurer_with_topology(
+        &s,
+        &bg,
+        TestTopology::avoidable_time(NodeSizePolicy::default()),
+    );
     for at in [b"e", b"b"] {
-        candidates.push(MaintenanceCandidate {
+        sp.candidates.push(MaintenanceCandidate {
             path: root_path(),
-            priority: candidates.new_id(),
+            priority: sp.candidates.new_id(),
             requested: rt::Instant::now(),
             cause: CandidateCause::Split(SplitReason::Demand {
                 at: Some(at.to_vec()),
                 rate: Duration::from_secs(1),
             }),
+            max_age: Some(crate::structural::policy::DEMAND_MAX_AGE),
         });
     }
-    let sp = restructurer_with_candidates(&s, &bg, candidates);
 
     sp.run_once().await;
 
@@ -464,7 +485,7 @@ async fn a_sweep_drops_a_demand_split_older_than_three_windows() {
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, NodeSizePolicy::default());
 
-    sp.candidates.push_request(root_split_request());
+    push_request(&sp.candidates, root_split_request());
     tokio::time::advance(Duration::from_secs(4)).await;
     sp.run_once().await;
 
@@ -479,11 +500,15 @@ async fn a_new_request_keeps_a_queued_demand_split() {
     let s = store();
     s.create_root(COLL, &abcd_leaf()).await.unwrap();
     let bg = Arc::new(Background::new());
-    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+    let sp = restructurer_with_topology(
+        &s,
+        &bg,
+        TestTopology::avoidable_time(NodeSizePolicy::default()),
+    );
 
-    sp.candidates.push_request(root_split_request());
+    push_request(&sp.candidates, root_split_request());
     tokio::time::advance(Duration::from_secs(4)).await;
-    sp.candidates.push_request(root_split_request());
+    push_request(&sp.candidates, root_split_request());
     sp.run_once().await;
 
     let stats = sp.stats_and_reset();
@@ -499,7 +524,7 @@ async fn a_sweep_keeps_an_old_soft_cap_split() {
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, tiny());
 
-    sp.candidates
+    sp.hints
         .observe_leaf(&root_path(), abcd_leaf().as_leaf().unwrap());
     tokio::time::advance(Duration::from_secs(60)).await;
     sp.run_once().await;
@@ -593,7 +618,11 @@ async fn a_demand_split_must_pay_more_than_the_paid_rate_of_the_merge() {
     let s = store();
     s.create_root(COLL, &merged_abcd_leaf()).await.unwrap();
     let bg = Arc::new(Background::new());
-    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+    let sp = restructurer_with_topology(
+        &s,
+        &bg,
+        TestTopology::avoidable_time(NodeSizePolicy::default()),
+    );
 
     split_path(&sp, &root_path(), &demand_split(1500))
         .await
@@ -1126,22 +1155,21 @@ async fn feed_drives_run_once() {
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
 
-    let candidates = MaintenanceCandidates::with_policy(tiny());
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(tiny()));
     // Under the cap: not enqueued.
-    candidates.observe_leaf(
+    sp.hints.observe_leaf(
         &root_path(),
         &LeafBody::from_entries([live(b"a"), live(b"b")]),
     );
     assert!(
-        candidates.drain().0.is_empty(),
+        sp.candidates.drain().0.is_empty(),
         "at-cap leaf is not a candidate"
     );
     // Over the cap: enqueued and split by a sweep.
-    candidates.observe_leaf(
+    sp.hints.observe_leaf(
         &root_path(),
         &LeafBody::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
     );
-    let sp = restructurer_with_candidates(&s, &bg, candidates);
     sp.run_once().await;
 
     let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
@@ -1180,9 +1208,8 @@ async fn one_hint_cascades_until_every_leaf_is_under_cap() {
         .index_max_children(100)
         .build()
         .unwrap();
-    let candidates = MaintenanceCandidates::with_policy(policy);
-    candidates.observe_leaf(&root_path(), root.as_leaf().unwrap());
-    let sp = restructurer_with_candidates(&s, &bg, candidates);
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(policy));
+    sp.hints.observe_leaf(&root_path(), root.as_leaf().unwrap());
 
     // 9 -> 4+5 -> 2+2+2+3 -> 2+2+2+1+2.
     for _ in 0..3 {
@@ -1229,14 +1256,12 @@ async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
     ]));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let candidates =
-        MaintenanceCandidates::with_policies(NodeSizePolicy::default(), pressure_inline());
-    let sp = restructurer_with_candidates(&s, &bg, candidates.clone());
+    let topology =
+        TestTopology::size_causes(NodeSizePolicy::default()).with_inline(pressure_inline());
+    let sp = restructurer_with_topology(&s, &bg, topology);
     let root_path = root_path();
 
-    candidates
-        .hint_sink()
-        .observe_inline_pressure(&root_path, b"h", 8);
+    sp.hints.observe_inline_pressure(&root_path, b"h", 8);
     sp.run_once().await;
 
     let router = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN);
@@ -1280,7 +1305,9 @@ async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
     };
     assert!(
         matches!(
-            target.node().map(|node| sp.splitter.need(node, &reason)),
+            target
+                .node()
+                .map(|node| sp.splitter.need(split_target(&target.path), node, &reason)),
             Some(SplitNeed::Split)
         ),
         "the first median left real pressure for a future observation"
@@ -1288,9 +1315,7 @@ async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
 
     // The old root path is deliberately stale now. Key-directed
     // revalidation must find and split the currently routed child.
-    candidates
-        .hint_sink()
-        .observe_inline_pressure(&root_path, b"h", 8);
+    sp.hints.observe_inline_pressure(&root_path, b"h", 8);
     sp.run_once().await;
 
     assert_eq!(
@@ -1327,7 +1352,9 @@ async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
         .await
         .unwrap();
     assert!(matches!(
-        target.node().map(|node| sp.splitter.need(node, &reason)),
+        target
+            .node()
+            .map(|node| sp.splitter.need(split_target(&target.path), node, &reason)),
         Some(SplitNeed::NotActionable)
     ));
 }
@@ -1338,14 +1365,12 @@ async fn inline_pressure_is_discarded_after_authoritative_revalidation() {
     let root = Node::leaf(LeafBody::from_entries([live(b"a"), live(b"b")]));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let candidates =
-        MaintenanceCandidates::with_policies(NodeSizePolicy::default(), pressure_inline());
-    let sp = restructurer_with_candidates(&s, &bg, candidates.clone());
+    let topology =
+        TestTopology::size_causes(NodeSizePolicy::default()).with_inline(pressure_inline());
+    let sp = restructurer_with_topology(&s, &bg, topology);
     let root_path = root_path();
 
-    candidates
-        .hint_sink()
-        .observe_inline_pressure(&root_path, b"b", 8);
+    sp.hints.observe_inline_pressure(&root_path, b"b", 8);
     sp.run_once().await;
     assert_eq!(
         sp.stats_and_reset(),
@@ -1361,9 +1386,7 @@ async fn inline_pressure_is_discarded_after_authoritative_revalidation() {
         "a value that now fits does not reshape the tree"
     );
 
-    candidates
-        .hint_sink()
-        .observe_inline_pressure(&root_path, b"missing", 8);
+    sp.hints.observe_inline_pressure(&root_path, b"missing", 8);
     sp.run_once().await;
     assert_eq!(
         sp.stats_and_reset(),
@@ -1400,12 +1423,11 @@ async fn contended_candidate_is_requeued() {
     let root = node;
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let candidates = MaintenanceCandidates::with_policy(tiny());
-    candidates.observe_leaf(
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(tiny()));
+    sp.hints.observe_leaf(
         &root_path(),
         &LeafBody::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
     );
-    let sp = restructurer_with_candidates(&s, &bg, candidates);
 
     sp.run_once().await;
     assert_eq!(
@@ -1675,7 +1697,7 @@ async fn split_defers_to_an_older_membership_reader_then_lands() {
     let root = Node::index(IndexNode::from_children([(Vec::new(), test_node_id("L"))]));
     s.create_root(COLL, &root).await.unwrap();
 
-    sp.candidates.observe_leaf(
+    sp.hints.observe_leaf(
         &node_path("L"),
         &LeafBody::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
     );
@@ -1727,13 +1749,12 @@ async fn byte_cap_enqueues_and_splits_below_entry_cap() {
         .index_max_children(1000)
         .build()
         .unwrap();
-    let candidates = MaintenanceCandidates::with_policy(policy);
-    candidates.observe_leaf(
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(policy));
+    sp.hints.observe_leaf(
         &root_path(),
         &LeafBody::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
     );
 
-    let sp = restructurer_with_candidates(&s, &bg, candidates);
     sp.run_once().await;
 
     // The only cap crossed is the byte cap, so a split here proves the byte
@@ -2007,9 +2028,8 @@ async fn one_sweep_of_splits_writes_the_collection_record_twice() {
         .index_max_children(100)
         .build()
         .unwrap();
-    let candidates = MaintenanceCandidates::with_policy(policy);
-    push_soft_cap_splits(&candidates, LEAVES);
-    let sp = restructurer_with_candidates(&s, &bg, candidates);
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(policy));
+    push_soft_cap_splits(&sp.candidates, LEAVES);
 
     sp.run_once().await;
     backend.clear_before();
@@ -2076,9 +2096,8 @@ async fn sibling_splits_of_one_batch_reconcile_their_parent_together() {
         .index_max_children(100)
         .build()
         .unwrap();
-    let candidates = MaintenanceCandidates::with_policy(policy);
-    push_soft_cap_splits(&candidates, LEAVES);
-    let sp = restructurer_with_candidates(&s, &bg, candidates);
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(policy));
+    push_soft_cap_splits(&sp.candidates, LEAVES);
 
     sp.run_once().await;
     backend.clear_before();
@@ -2119,7 +2138,7 @@ async fn a_batch_that_cannot_join_the_topology_leaves_nothing_behind() {
     seed_sibling_leaves(&s, 3).await;
     // A live drop holds the topology freeze, so no participant can join.
     let bg = Arc::new(Background::new());
-    let sp = restructurer_with_candidates(&s, &bg, MaintenanceCandidates::with_policy(tiny()));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(tiny()));
     let holder = sp.candidates.new_id();
     sp.mon.begin_tx(&holder);
     let (mut record, observed) = s
@@ -2186,7 +2205,7 @@ async fn two_causes_split_one_node_one_after_the_other() {
         .index_max_children(100)
         .build()
         .unwrap();
-    let candidates = MaintenanceCandidates::with_policy(policy);
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::avoidable_time(policy));
     for cause in [
         CandidateCause::Split(SplitReason::SoftCap),
         CandidateCause::Split(SplitReason::Demand {
@@ -2194,14 +2213,14 @@ async fn two_causes_split_one_node_one_after_the_other() {
             rate: Duration::from_secs(1),
         }),
     ] {
-        candidates.push(MaintenanceCandidate {
+        sp.candidates.push(MaintenanceCandidate {
             path: node_path("L"),
-            priority: candidates.new_id(),
+            priority: sp.candidates.new_id(),
             requested: rt::Instant::now(),
             cause,
+            max_age: None,
         });
     }
-    let sp = restructurer_with_candidates(&s, &bg, candidates);
 
     sp.run_once().await;
 
@@ -2247,6 +2266,7 @@ fn push_soft_cap_splits(candidates: &MaintenanceCandidates, count: usize) {
             priority: candidates.new_id(),
             requested: rt::Instant::now(),
             cause: CandidateCause::Split(SplitReason::SoftCap),
+            max_age: None,
         });
     }
 }
@@ -2257,13 +2277,14 @@ fn push_soft_cap_splits(candidates: &MaintenanceCandidates, count: usize) {
 // the demand splits of the earlier load.
 #[test]
 fn a_sweep_orders_changes_by_cause_and_rate() {
-    let candidates = MaintenanceCandidates::with_policy(NodeSizePolicy::default());
+    let candidates = MaintenanceCandidates::new();
     let push = |name: &str, cause: CandidateCause| {
         candidates.push(MaintenanceCandidate {
             path: node_path(name),
             priority: candidates.new_id(),
             requested: rt::Instant::now(),
             cause,
+            max_age: None,
         })
     };
     push("merge", CandidateCause::Merge(MergeReason::Underfull));
@@ -2452,7 +2473,7 @@ async fn contended_key_splits_away_from_the_keys_of_other_database_instances() {
         .leaf_min_entries(0)
         .build()
         .unwrap();
-    let (sp, mon) = contended_restructurer(&s, &bg, policy);
+    let (sp, mon) = restructurer_and_monitor(&s, &bg, policy);
     let local = local_writer(&mon);
     let node = Node::leaf(LeafBody::from_entries([
         written_by(b"a", &recent_writer()),
@@ -2468,7 +2489,7 @@ async fn contended_key_splits_away_from_the_keys_of_other_database_instances() {
     // More than the threshold of 32 lost leaf CASes, which decay while the
     // test runs.
     for _ in 0..40 {
-        sp.candidates.lost_leaf_cas(&node_path("L"), &round);
+        sp.hints.lost_leaf_cas(&node_path("L"), &round);
     }
     sp.run_once().await;
 
@@ -2503,7 +2524,7 @@ async fn contended_key_of_a_root_leaf_splits_in_place() {
         .leaf_min_entries(0)
         .build()
         .unwrap();
-    let (sp, mon) = contended_restructurer(&s, &bg, policy);
+    let (sp, mon) = restructurer_and_monitor(&s, &bg, policy);
     let local = local_writer(&mon);
     let root = Node::leaf(LeafBody::from_entries([
         written_by(b"a", &recent_writer()),
@@ -2517,7 +2538,7 @@ async fn contended_key_of_a_root_leaf_splits_in_place() {
     // More than the threshold of 32 lost leaf CASes, which decay while the
     // test runs.
     for _ in 0..40 {
-        sp.candidates.lost_leaf_cas(&root_path(), &round);
+        sp.hints.lost_leaf_cas(&root_path(), &round);
     }
     sp.run_once().await;
 
@@ -2534,4 +2555,12 @@ async fn contended_key_of_a_root_leaf_splits_in_place() {
     assert_eq!(separators, [b"".as_slice(), b"c"]);
     let stats = sp.stats_and_reset();
     assert_eq!((stats.splits, stats.contention_splits), (1, 1));
+}
+
+// The split target of the node at `path`.
+fn split_target(path: &ObjectPath) -> SplitTarget<'_> {
+    match path {
+        ObjectPath::Node { id, .. } => SplitTarget::NonRoot(id),
+        _ => SplitTarget::Root,
+    }
 }

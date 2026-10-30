@@ -8,6 +8,7 @@ use super::reconcile::{
     DEFERRED_RECONCILIATION_CAP, ParentReconciler, PendingReconciliation, ReconciliationOutcome,
 };
 use super::recovery::ChangeKind;
+use super::rule::RuleRequest;
 use super::split::{SplitNeed, SplitReason, SplitTarget};
 use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::leaf_coord::StructuralHinter;
@@ -28,6 +29,7 @@ use glassdb_storage::{
 
 mod contention_tests;
 mod merge_tests;
+mod policy_tests;
 mod reconcile_tests;
 mod recovery_tests;
 mod split_tests;
@@ -264,22 +266,52 @@ fn leaf_node(keys: &[&[u8]], high: Option<&[u8]>, right: Option<&str>) -> Node {
         .with_right_sibling(right.map(test_node_id))
 }
 
+/// The topology policy, the node sizes, and the inline policy of a test
+/// restructurer.
+#[derive(Clone, Copy)]
+struct TestTopology {
+    policy: TopologyPolicy,
+    sizes: NodeSizePolicy,
+    inline: InlinePolicy,
+}
+
+impl TestTopology {
+    fn size_causes(sizes: NodeSizePolicy) -> Self {
+        Self {
+            policy: TopologyPolicy::SizeCauses,
+            sizes,
+            inline: InlinePolicy::default(),
+        }
+    }
+
+    fn avoidable_time(sizes: NodeSizePolicy) -> Self {
+        Self {
+            policy: TopologyPolicy::AvoidableTime,
+            ..Self::size_causes(sizes)
+        }
+    }
+
+    fn with_inline(self, inline: InlinePolicy) -> Self {
+        Self { inline, ..self }
+    }
+}
+
 fn restructurer(store: &TestStore, bg: &Arc<Background>, policy: NodeSizePolicy) -> Restructurer {
-    restructurer_with_candidates(store, bg, MaintenanceCandidates::with_policy(policy))
+    restructurer_with_topology(store, bg, TestTopology::size_causes(policy))
 }
 
-fn restructurer_with_candidates(
+fn restructurer_with_topology(
     store: &TestStore,
     bg: &Arc<Background>,
-    candidates: MaintenanceCandidates,
+    topology: TestTopology,
 ) -> Restructurer {
-    restructurer_with_candidates_and_hints(store, bg, candidates, GcHints::default())
+    restructurer_with_topology_and_hints(store, bg, topology, GcHints::default())
 }
 
-fn restructurer_with_candidates_and_hints(
+fn restructurer_with_topology_and_hints(
     store: &TestStore,
     bg: &Arc<Background>,
-    candidates: MaintenanceCandidates,
+    topology: TestTopology,
     gc_hints: GcHints,
 ) -> Restructurer {
     let mon = store.foundation.monitor_for(
@@ -287,23 +319,39 @@ fn restructurer_with_candidates_and_hints(
         RetrySchedule::default(),
         crate::monitor::ProtocolTiming::default(),
     );
-    restructurer_with_monitor_and_hints(store, bg, mon, candidates, gc_hints)
+    restructurer_with_monitor_and_hints(store, bg, mon, topology, gc_hints)
 }
 
 fn restructurer_with_monitor(
     store: &TestStore,
     bg: &Arc<Background>,
     mon: Monitor,
-    candidates: MaintenanceCandidates,
+    topology: TestTopology,
 ) -> Restructurer {
-    restructurer_with_monitor_and_hints(store, bg, mon, candidates, GcHints::default())
+    restructurer_with_monitor_and_hints(store, bg, mon, topology, GcHints::default())
 }
 
 fn restructurer_with_monitor_and_hints(
     store: &TestStore,
     bg: &Arc<Background>,
     mon: Monitor,
-    candidates: MaintenanceCandidates,
+    topology: TestTopology,
+    gc_hints: GcHints,
+) -> Restructurer {
+    let parts = TopologyParts::new(
+        topology.policy,
+        topology.sizes,
+        topology.inline,
+        mon.clone(),
+    );
+    restructurer_with_parts(store, bg, mon, parts, gc_hints)
+}
+
+fn restructurer_with_parts(
+    store: &TestStore,
+    bg: &Arc<Background>,
+    mon: Monitor,
+    parts: TopologyParts,
     gc_hints: GcHints,
 ) -> Restructurer {
     let key_state = KeyStateResolver::new(mon.clone());
@@ -312,10 +360,10 @@ fn restructurer_with_monitor_and_hints(
         key_state.clone(),
         mon.clone(),
         RetryTiming::default(),
-        *candidates.policy(),
-        Arc::new(candidates.clone()),
+        parts.sizes,
+        Arc::new(parts.hints.clone()),
     );
-    Restructurer::with_candidates(
+    Restructurer::with_parts(
         Arc::downgrade(bg),
         TopologyMembership::new(store.records.clone(), mon.clone(), RetrySchedule::default()),
         store.nodes.clone(),
@@ -325,10 +373,32 @@ fn restructurer_with_monitor_and_hints(
         key_state,
         db_prefix("db"),
         coord,
-        candidates,
+        parts,
         gc_hints,
-        TopologyPolicy::SizeCauses,
     )
+}
+
+// A restructurer with the avoidable time policy over leaves of `sizes`, and
+// the policy, whose measurements a test reads.
+fn avoidable_time_restructurer(
+    store: &TestStore,
+    bg: &Arc<Background>,
+    sizes: NodeSizePolicy,
+) -> (Restructurer, Arc<AvoidableTimePolicy>) {
+    let mon = store.foundation.monitor_for(
+        bg,
+        RetrySchedule::default(),
+        crate::monitor::ProtocolTiming::default(),
+    );
+    let queue = MaintenanceCandidates::new();
+    let settings = TopologySettings {
+        sizes,
+        inline: InlinePolicy::default(),
+    };
+    let policy = Arc::new(AvoidableTimePolicy::new(settings, queue.clone()));
+    let parts = TopologyParts::of(queue, sizes, policy.clone());
+    let restructurer = restructurer_with_parts(store, bg, mon, parts, GcHints::default());
+    (restructurer, policy)
 }
 
 fn restructurer_and_monitor(
@@ -341,8 +411,8 @@ fn restructurer_and_monitor(
         RetrySchedule::default(),
         crate::monitor::ProtocolTiming::default(),
     );
-    let candidates = MaintenanceCandidates::with_policy(policy);
-    let restructurer = restructurer_with_monitor(store, bg, mon.clone(), candidates);
+    let restructurer =
+        restructurer_with_monitor(store, bg, mon.clone(), TestTopology::size_causes(policy));
     (restructurer, mon)
 }
 
@@ -404,6 +474,13 @@ fn written_by(key: &[u8], writer: &TxId) -> LeafEntry {
     LeafEntry::new(key).with_current(CurrentState::External { writer: *writer })
 }
 
+// Queues one change that a topology rule asked for, as the avoidable time
+// policy does at the end of a window.
+fn push_request(queue: &MaintenanceCandidates, request: RuleRequest) {
+    let (path, cause) = crate::structural::policy::request_candidate(request);
+    queue.push_expiring(&path, cause, crate::structural::policy::DEMAND_MAX_AGE);
+}
+
 // A recent transaction identity.
 fn recent_writer() -> TxId {
     TxId::new_at(rt::system_now())
@@ -415,22 +492,4 @@ fn local_writer(mon: &Monitor) -> TxId {
     let writer = recent_writer();
     mon.begin_owner_operation(&writer).unwrap().complete();
     writer
-}
-
-// A restructurer that separates the contended keys of the database instance
-// of the returned monitor (ADR-085).
-fn contended_restructurer(
-    store: &TestStore,
-    bg: &Arc<Background>,
-    policy: NodeSizePolicy,
-) -> (Restructurer, Monitor) {
-    let mon = store.foundation.monitor_for(
-        bg,
-        RetrySchedule::default(),
-        crate::monitor::ProtocolTiming::default(),
-    );
-    let candidates =
-        MaintenanceCandidates::with_policy(policy).separating_contended_keys(mon.clone());
-    let restructurer = restructurer_with_monitor(store, bg, mon.clone(), candidates);
-    (restructurer, mon)
 }

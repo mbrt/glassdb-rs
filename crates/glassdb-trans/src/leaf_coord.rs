@@ -46,6 +46,7 @@ use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::Monitor;
 use crate::retry_timing::RetryTiming;
+use crate::structural::SignalKind;
 
 /// Maximum inner CAS retries on a single leaf/root before treating the
 /// operation as conflicted and restarting the transaction.
@@ -530,9 +531,10 @@ pub trait StructuralHinter: Send + Sync {
     /// (ADR-085).
     fn lost_leaf_cas(&self, _path: &ObjectPath, _round_keys: &BTreeSet<Vec<u8>>) {}
 
-    /// Tells if the hinter uses measurements, such as [`Self::leaf_delay`].
-    /// Only then does the coordinator measure the delays of its rounds.
-    fn measurements_enabled(&self) -> bool {
+    /// Tells if the hinter uses observations of `kind`. Only then does the
+    /// coordinator measure them, such as the delays of its rounds for
+    /// [`Self::leaf_delay`].
+    fn wants(&self, _kind: SignalKind) -> bool {
         false
     }
 }
@@ -1460,7 +1462,8 @@ impl CasWorker {
                 PersistResult::Unchanged(observed) => (observed, None),
                 // The CAS did not land, or the clean plan's loaded state
                 // changed. Neither resolves an earlier in-doubt mutation.
-                // Every topology policy uses lost leaf CASes (ADR-085). A
+                // Every topology policy receives the lost leaf CASes, and
+                // the leaf delays start from them too (ADR-074, ADR-085). A
                 // rejected CAS already cost a backend operation, so recording
                 // it costs little.
                 PersistResult::Rejected => {
@@ -1583,7 +1586,9 @@ impl LeafCoordinator {
         policy: NodeSizePolicy,
         hinter: Arc<dyn StructuralHinter>,
     ) -> Self {
-        let delays = hinter.measurements_enabled().then(DelayState::default);
+        let delays = hinter
+            .wants(SignalKind::LeafDelays)
+            .then(DelayState::default);
         let core = Arc::new(CoordCore {
             tmon,
             nodes,
@@ -3317,8 +3322,10 @@ mod tests {
             self.lost_rounds.lock().unwrap().push(round_keys.clone());
         }
 
-        fn measurements_enabled(&self) -> bool {
-            self.measurements
+        fn wants(&self, kind: SignalKind) -> bool {
+            match kind {
+                SignalKind::LeafDelays => self.measurements,
+            }
         }
     }
 
