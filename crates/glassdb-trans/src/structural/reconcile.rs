@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use glassdb_concurr::shard;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::{
-    CurrentnessBarrier, IndexNode, LeafObservation, Node, NodeSizePolicy, Requirement,
+    CurrentnessBarrier, IndexNode, LeafObservation, Node, NodeSizePolicy, Requirement, RoutedLeaf,
     StorageError, Timeline, TreeRouter,
 };
 use tokio::sync::Semaphore;
@@ -168,15 +168,28 @@ impl ParentReconciler {
             .map_err(|_| TransError::other("reconciliation turns are closed"))?;
         while !reconciliation.routes.is_empty() && reconciliation.retries_remaining > 0 {
             reconciliation.retries_remaining -= 1;
-            let Some((parent, keys)) = self.next_parent(reconciliation).await? else {
+            let Some((observed, keys)) = self.next_parent(reconciliation).await? else {
                 continue;
             };
+            let collection = &reconciliation.collection;
+            let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+            // The gate guards a write of the parent, and a parent that agrees
+            // gets none. The gate would only block the reconciliations of other
+            // database instances, which then end in recovery.
+            if self
+                .agrees(collection, &observed, &key_refs, reconciliation.start)
+                .await?
+            {
+                reconciliation.routes.retain(|(key, _)| !keys.contains(key));
+                reconciliation.retries_remaining = PARENT_RETRIES;
+                continue;
+            }
+            let parent = observed.path;
             let parent_id = match &parent {
                 ObjectPath::TreeRoot { .. } => None,
                 ObjectPath::Node { id, .. } => Some(*id),
                 _ => return Err(TransError::other("router returned a non-node parent path")),
             };
-            let collection = &reconciliation.collection;
             let Some((lock_id, locked_parent, observation)) = self
                 .structure
                 .begin_gated_worker(collection, parent_id.as_ref())
@@ -184,7 +197,6 @@ impl ParentReconciler {
             else {
                 continue;
             };
-            let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
             let reconciled = self
                 .reconcile_gated_parent(
                     collection,
@@ -265,13 +277,13 @@ impl ParentReconciler {
         ))
     }
 
-    /// Returns a parent of the routes, and the keys of the routes that it is
-    /// the parent of. Removes the routes that no parent routes to their node
-    /// any more. `None` reports that no route remains.
+    /// Returns a parent of the routes as observed, and the keys of the routes
+    /// that it is the parent of. Removes the routes that no parent routes to
+    /// their node any more. `None` reports that no route remains.
     async fn next_parent(
         &self,
         reconciliation: &mut ParentReconciliation,
-    ) -> Result<Option<(ObjectPath, Vec<Vec<u8>>)>, TransError> {
+    ) -> Result<Option<(RoutedLeaf, Vec<Vec<u8>>)>, TransError> {
         let requirement = Requirement::after(reconciliation.start);
         let mut parents = Vec::with_capacity(reconciliation.routes.len());
         for (key, target) in &reconciliation.routes {
@@ -279,22 +291,75 @@ impl ParentReconciler {
                 .router
                 .parent_of(&reconciliation.collection, key, target, requirement)
                 .await?;
-            parents.push(parent.map(|parent| parent.path));
+            parents.push(parent);
         }
         let mut parents = parents.into_iter();
-        let mut first = None;
+        let mut first: Option<RoutedLeaf> = None;
         let mut keys = Vec::new();
         reconciliation.routes.retain(|(key, _)| {
             let Some(parent) = parents.next().flatten() else {
                 return false;
             };
             let first = first.get_or_insert_with(|| parent.clone());
-            if *first == parent {
+            if first.path == parent.path {
                 keys.push(key.clone());
             }
             true
         });
         Ok(first.map(|first| (first, keys)))
+    }
+
+    /// Reports whether `parent`, as observed, already agrees with the chains
+    /// of its children through each of `keys`.
+    ///
+    /// The observation follows `barrier`, so it includes the structural
+    /// changes of the routes. A later split or merge of the parent only moves
+    /// the entries that make it agree to nodes that the routes reach through
+    /// right links, and it reconciles its own routes.
+    async fn agrees(
+        &self,
+        collection: &CollectionAddress,
+        parent: &RoutedLeaf,
+        keys: &[&[u8]],
+        barrier: CurrentnessBarrier,
+    ) -> Result<bool, TransError> {
+        let Some(node) = parent.node() else {
+            return Ok(false);
+        };
+        // The keys of a group share the observation of the first key. For
+        // another key, that observation can be older than a merge or a split
+        // of the parent, and only a fresh read in the gated path shows it.
+        if keys
+            .iter()
+            .any(|key| !node.covers(key) || node.is_below_range(key))
+        {
+            return Ok(false);
+        }
+        let Some(index) = node.as_index() else {
+            return Ok(true);
+        };
+        Ok(self
+            .reconciled_index(collection, index, keys, barrier)
+            .await?
+            == *index)
+    }
+
+    /// Returns `index` after it agrees with the chains of its children
+    /// through each of `keys`.
+    async fn reconciled_index(
+        &self,
+        collection: &CollectionAddress,
+        index: &IndexNode,
+        keys: &[&[u8]],
+        barrier: CurrentnessBarrier,
+    ) -> Result<IndexNode, TransError> {
+        let mut reconciled = index.clone();
+        for key in keys {
+            let chain = self.child_chain(collection, index, key, barrier).await?;
+            let path: Vec<(NodeId, &Node)> = chain.iter().map(|(id, node)| (*id, node)).collect();
+            reconciled.reconcile(&path);
+        }
+        Ok(reconciled)
     }
 
     /// Reconciles the gated parent with the chains of its children through
@@ -316,12 +381,9 @@ impl ParentReconciler {
         let Some(index) = parent.as_index() else {
             return Ok(Some(GatedOutcome::Landed(None)));
         };
-        let mut new_index = index.clone();
-        for key in keys {
-            let chain = self.child_chain(collection, index, key, barrier).await?;
-            let path: Vec<(NodeId, &Node)> = chain.iter().map(|(id, node)| (*id, node)).collect();
-            new_index.reconcile(&path);
-        }
+        let new_index = self
+            .reconciled_index(collection, index, keys, barrier)
+            .await?;
         if new_index == *index {
             return Ok(Some(GatedOutcome::Landed(None)));
         }
