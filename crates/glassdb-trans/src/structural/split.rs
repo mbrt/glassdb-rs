@@ -48,22 +48,22 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use glassdb_concurr::rt;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::{
-    IndexNode, LeafEntry, LeafObservation, Node, NodeStore, PaidChange, Payment, Requirement,
+    IndexNode, LeafObservation, Node, NodeSizePolicy, NodeStore, Payment, Requirement,
     StorageError, Timeline, TreeRouter,
 };
 
 use crate::error::TransError;
 
-use super::candidates::{CandidateCause, MaintenanceCandidate, MaintenanceCandidates};
+use super::candidates::{CandidateCause, MaintenanceCandidates};
 use super::change::{Applied, ParentRoute, Prepared};
 use super::measurements::ChangeKind;
+use super::policy::{SplitDecision, TopologyDecisions};
 use super::reclamation::{ReclamationReporter, reclaim_holder_free_tombstones};
 use super::recovery::{PreparedIntent, ReadyChange};
+use super::sink::StructuralHintSink;
 use super::stats::Stats;
-use super::write_spans::{self, SoftCapSplit};
 
 /// Decides which splits are necessary, and writes their nodes.
 #[derive(Clone)]
@@ -71,9 +71,13 @@ pub(super) struct Splitter {
     nodes: NodeStore,
     router: TreeRouter,
     timeline: Timeline,
-    // Supplies the size policies, and receives the split outputs that are
-    // still over their soft cap.
+    // Receives the split outputs that are still over their soft cap.
     candidates: MaintenanceCandidates,
+    // The limits of nodes, which every topology policy keeps.
+    sizes: NodeSizePolicy,
+    decisions: Arc<dyn TopologyDecisions>,
+    // Receives the leaves that a split wrote.
+    hints: StructuralHintSink,
     stats: Arc<Stats>,
     reclamation: ReclamationReporter,
 }
@@ -95,6 +99,12 @@ pub(super) enum SplitReason {
         at: Option<Vec<u8>>,
         /// The avoidable time in each second that pays for the split.
         rate: Duration,
+    },
+    /// This database instance loses leaf CASes on the contended key `key` to
+    /// other database instances, so the leaf of the key splits away from
+    /// their keys (ADR-085).
+    Contention {
+        key: Vec<u8>,
     },
 }
 
@@ -137,11 +147,15 @@ pub(super) enum SplitPlan {
 }
 
 impl Splitter {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         nodes: NodeStore,
         router: TreeRouter,
         timeline: Timeline,
         candidates: MaintenanceCandidates,
+        sizes: NodeSizePolicy,
+        decisions: Arc<dyn TopologyDecisions>,
+        hints: StructuralHintSink,
         stats: Arc<Stats>,
         reclamation: ReclamationReporter,
     ) -> Self {
@@ -150,13 +164,16 @@ impl Splitter {
             router,
             timeline,
             candidates,
+            sizes,
+            decisions,
+            hints,
             stats,
             reclamation,
         }
     }
 
     /// Finds the node that a split candidate asks to split: the node of the
-    /// candidate, or for inline pressure the leaf that covers the key now.
+    /// candidate, or for a split for a key the leaf that covers the key now.
     /// `None` tells that the candidate is no longer actionable.
     pub(super) async fn locate(
         &self,
@@ -167,7 +184,7 @@ impl Splitter {
         else {
             return Err(TransError::other("split candidate is not a tree node"));
         };
-        let SplitReason::InlinePressure { key, .. } = reason else {
+        let Some(key) = reason.key() else {
             return self
                 .soft_cap_split_waits(collection, path, reason)
                 .await
@@ -184,92 +201,38 @@ impl Splitter {
         {
             Ok(located) => located,
             Err(StorageError::NotFound) => {
-                self.stats
-                    .inline_pressure_discarded
-                    .fetch_add(1, Ordering::Relaxed);
+                self.record_discarded(reason);
                 return Ok(None);
             }
             Err(error) => return Err(error.into()),
         };
+        let target = match &located.path {
+            ObjectPath::Node { id, .. } => SplitTarget::NonRoot(id),
+            _ => SplitTarget::Root,
+        };
         match located
             .node()
-            .map(|node| self.need(node, reason))
+            .map(|node| self.need(target, node, reason))
             .unwrap_or(SplitNeed::NotActionable)
         {
             SplitNeed::Split => Ok(Some(located.path)),
             SplitNeed::NotActionable => {
-                self.stats
-                    .inline_pressure_discarded
-                    .fetch_add(1, Ordering::Relaxed);
+                self.record_discarded(reason);
                 Ok(None)
             }
             SplitNeed::Reroute => Err(TransError::Retry),
         }
     }
 
-    /// Classifies whether `node` still needs the split represented by `reason`.
-    pub(super) fn need(&self, node: &Node, reason: &SplitReason) -> SplitNeed {
-        match reason {
-            SplitReason::Capacity => {
-                // The rejected operation is retried by its owner. A hint only
-                // asks for one split of a divisible node, even below soft caps.
-                if node.as_leaf().is_some_and(|leaf| leaf.len() >= 2)
-                    || node.as_index().is_some_and(|index| index.len() >= 2)
-                {
-                    SplitNeed::Split
-                } else {
-                    SplitNeed::NotActionable
-                }
-            }
-            SplitReason::SoftCap => {
-                if node.over_soft_cap(self.candidates.policy()) {
-                    SplitNeed::Split
-                } else {
-                    SplitNeed::NotActionable
-                }
-            }
-            SplitReason::Demand { at, rate } => {
-                let divisible = node.as_leaf().is_some_and(|leaf| match at {
-                    Some(key) => leaf.divides_at(key),
-                    None => leaf.len() >= 2,
-                });
-                let pays = self.candidates.paid_rates().pays_more(
-                    PaidChange::Split,
-                    *rate,
-                    [node.paid_rate()],
-                );
-                if divisible && pays {
-                    SplitNeed::Split
-                } else {
-                    SplitNeed::NotActionable
-                }
-            }
-            SplitReason::InlinePressure { key, value_len } => {
-                let Some(leaf) = node.as_leaf() else {
-                    return SplitNeed::Reroute;
-                };
-                if !node.covers(key) {
-                    return SplitNeed::Reroute;
-                }
-                let inline = self.candidates.inline();
-                if !inline.admits_value(*value_len)
-                    || leaf.len() < 2
-                    || !leaf.lookup(key).is_some_and(LeafEntry::exists)
-                {
-                    return SplitNeed::NotActionable;
-                }
-                let other_inline_bytes = leaf
-                    .entries()
-                    .filter(|entry| entry.key.as_slice() != key.as_slice())
-                    .map(|entry| entry.current.inline_len())
-                    .sum();
-                if inline.admits(other_inline_bytes, *value_len) {
-                    SplitNeed::NotActionable
-                } else {
-                    SplitNeed::Split
-                }
-            }
-        }
+    /// Classifies whether `node`, the node of `target`, still needs the split
+    /// represented by `reason`.
+    pub(super) fn need(
+        &self,
+        target: SplitTarget<'_>,
+        node: &Node,
+        reason: &SplitReason,
+    ) -> SplitNeed {
+        need_of(&self.decide(target, node, reason))
     }
 
     /// Checks the split of the gated source `node` again, and plans its node
@@ -283,32 +246,32 @@ impl Splitter {
         mut node: Node,
         prepared: &PreparedIntent,
     ) -> Prepared<SplitPlan> {
-        match self.need(&node, reason) {
+        let decision = self.decide(target, &node, reason);
+        match need_of(&decision) {
             SplitNeed::Split => {}
             need => return self.cancel(reason, need),
         }
         let reclaimed = reclaim_holder_free_tombstones(&mut node);
-        match self.need(&node, reason) {
-            SplitNeed::Split => {}
-            SplitNeed::NotActionable if !reclaimed.is_empty() => {
+        // The reclamation can change the decision only when it removed
+        // entries.
+        let decision = if reclaimed.is_empty() {
+            decision
+        } else {
+            self.decide(target, &node, reason)
+        };
+        let (at, paid_rate) = match decision {
+            SplitDecision::Split { at, paid_rate } => (at, paid_rate),
+            SplitDecision::Reroute => return self.cancel(reason, SplitNeed::Reroute),
+            SplitDecision::Wait | SplitDecision::NotNeeded if !reclaimed.is_empty() => {
                 return Prepared::ReclaimOnly { node, reclaimed };
             }
-            need => return self.cancel(reason, need),
-        }
-        let at = match reason {
-            SplitReason::SoftCap => match self.soft_cap_split(target, &node) {
-                SoftCapSplit::At(key) => Some(key),
-                SoftCapSplit::Median => None,
-                SoftCapSplit::Wait if reclaimed.is_empty() => {
-                    return self.cancel(reason, SplitNeed::NotActionable);
-                }
-                SoftCapSplit::Wait => return Prepared::ReclaimOnly { node, reclaimed },
-            },
-            _ => None,
+            SplitDecision::Wait | SplitDecision::NotNeeded => {
+                return self.cancel(reason, SplitNeed::NotActionable);
+            }
         };
         let split = Split {
-            reason,
             at: at.as_deref(),
+            paid_rate,
         };
         match target {
             SplitTarget::NonRoot(id) => {
@@ -383,18 +346,18 @@ impl Splitter {
         }
     }
 
-    /// Reports whether the soft cap split of the non-root leaf at `path` waits
-    /// for its write spans in cached state, so that it takes no structural gate
-    /// (ADR-084). Each write of the leaf asks for the split again. A leaf with
-    /// holder-free tombstones does not wait, so that the split reclaims them.
+    /// Reports whether the soft cap split of the non-root node at `path` waits
+    /// in cached state, so that it takes no structural gate (ADR-084). Each
+    /// write of the leaf asks for the split again. A leaf with holder-free
+    /// tombstones does not wait, so that the split reclaims them.
     async fn soft_cap_split_waits(
         &self,
         collection: &CollectionAddress,
         path: &ObjectPath,
         reason: &SplitReason,
     ) -> Result<bool, TransError> {
-        let (SplitReason::SoftCap, true, ObjectPath::Node { id, .. }) =
-            (reason, self.candidates.keeps_write_spans(), path)
+        let (SplitReason::SoftCap, ObjectPath::Node { id, .. }, true) =
+            (reason, path, self.decisions.soft_cap_splits_wait())
         else {
             return Ok(false);
         };
@@ -405,20 +368,33 @@ impl Splitter {
         };
         let reclaimable = !reclaim_holder_free_tombstones(&mut node).is_empty();
         Ok(!reclaimable
-            && node.over_soft_cap(self.candidates.policy())
-            && self.soft_cap_split(SplitTarget::NonRoot(id), &node) == SoftCapSplit::Wait)
+            && self.decide(SplitTarget::NonRoot(id), &node, reason) == SplitDecision::Wait)
     }
 
-    /// Returns where the soft cap split of the leaf `node` divides it, so that
-    /// it keeps the write spans of the leaf (ADR-084). A root leaf splits at
-    /// its median: it is the whole collection, and its split cannot defer in
-    /// cached state.
-    fn soft_cap_split(&self, target: SplitTarget<'_>, node: &Node) -> SoftCapSplit {
-        match target {
-            SplitTarget::NonRoot(_) if self.candidates.keeps_write_spans() => {
-                write_spans::soft_cap_split(node, self.candidates.policy(), rt::system_now())
+    /// Decides the split of `node`, the node of `target`, for `reason`. The
+    /// capacity splits and the splits of index nodes do not depend on the
+    /// topology policy, and the policy decides the other splits of leaves.
+    fn decide(&self, target: SplitTarget<'_>, node: &Node, reason: &SplitReason) -> SplitDecision {
+        match reason {
+            // The rejected operation is retried by its owner. A hint only asks
+            // for one split of a divisible node, even below soft caps.
+            SplitReason::Capacity => {
+                if node.as_leaf().is_some_and(|leaf| leaf.len() >= 2)
+                    || node.as_index().is_some_and(|index| index.len() >= 2)
+                {
+                    SplitDecision::median()
+                } else {
+                    SplitDecision::NotNeeded
+                }
             }
-            _ => SoftCapSplit::Median,
+            SplitReason::SoftCap if node.as_leaf().is_none() => {
+                if node.over_soft_cap(&self.sizes) {
+                    SplitDecision::median()
+                } else {
+                    SplitDecision::NotNeeded
+                }
+            }
+            _ => self.decisions.split(target, node, reason),
         }
     }
 
@@ -427,11 +403,7 @@ impl Splitter {
     fn cancel(&self, reason: &SplitReason, need: SplitNeed) -> Prepared<SplitPlan> {
         let result = match need {
             SplitNeed::NotActionable => {
-                if reason.is_inline_pressure() {
-                    self.stats
-                        .inline_pressure_discarded
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+                self.record_discarded(reason);
                 Ok(())
             }
             SplitNeed::Reroute => Err(TransError::Retry),
@@ -490,7 +462,7 @@ impl Splitter {
             (Vec::new(), left_id),
             (split_key.clone(), right_id),
         ]));
-        let policy = self.candidates.policy();
+        let policy = &self.sizes;
         if index.content_encoded_len() > policy.content_limit()
             || index.encoded_len() > policy.node_max_bytes()
         {
@@ -536,19 +508,32 @@ impl Splitter {
     ) {
         self.reclamation.record(reclaimed, false);
         self.stats.record_split();
-        if let Some(paid) = outputs[0].1.paid_rate() {
-            self.candidates.paid_rates().landed(&paid.intent);
-        }
+        let leaves: Vec<NodeId> = outputs
+            .iter()
+            .filter(|(_, node)| node.as_leaf().is_some())
+            .map(|(id, _)| **id)
+            .collect();
+        let paid = outputs[0].1.paid_rate().map(|paid| &paid.intent);
+        self.hints
+            .leaves_changed(collection, &leaves, ChangeKind::Split, paid);
         for (id, node) in outputs {
             self.enqueue_if_over_soft_cap(collection, id, node);
-            if node.as_leaf().is_some() {
-                self.candidates
-                    .observe_leaf_change(collection, *id, ChangeKind::Split);
-            }
         }
         if reason.is_inline_pressure() {
             self.stats
                 .inline_pressure_completed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if matches!(reason, SplitReason::Contention { .. }) {
+            self.stats.contention_splits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Counts a split candidate that is no longer actionable.
+    fn record_discarded(&self, reason: &SplitReason) {
+        if reason.is_inline_pressure() {
+            self.stats
+                .inline_pressure_discarded
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -556,18 +541,24 @@ impl Splitter {
     /// Carries an oversized split output into a later sweep so one hint can
     /// drive the whole split cascade.
     fn enqueue_if_over_soft_cap(&self, collection: &CollectionAddress, id: &NodeId, node: &Node) {
-        if !node.over_soft_cap(self.candidates.policy()) {
+        if !node.over_soft_cap(&self.sizes) {
             return;
         }
-        self.candidates.push(MaintenanceCandidate {
-            path: ObjectPath::Node {
-                collection: collection.clone(),
-                id: *id,
-            },
-            priority: self.candidates.new_id(),
-            requested: rt::Instant::now(),
-            cause: CandidateCause::Split(SplitReason::SoftCap),
-        });
+        let path = ObjectPath::Node {
+            collection: collection.clone(),
+            id: *id,
+        };
+        self.candidates
+            .push_cause(&path, CandidateCause::Split(SplitReason::SoftCap));
+    }
+}
+
+/// Classifies whether a split with `decision` is still necessary.
+fn need_of(decision: &SplitDecision) -> SplitNeed {
+    match decision {
+        SplitDecision::Split { .. } | SplitDecision::Wait => SplitNeed::Split,
+        SplitDecision::NotNeeded => SplitNeed::NotActionable,
+        SplitDecision::Reroute => SplitNeed::Reroute,
     }
 }
 
@@ -578,6 +569,17 @@ impl SplitReason {
             SplitReason::InlinePressure { .. } => 1,
             SplitReason::Capacity => 2,
             SplitReason::Demand { .. } => 3,
+            // The merge reasons use 4 to 6.
+            SplitReason::Contention { .. } => 7,
+        }
+    }
+
+    /// The key whose leaf the split is for, when the reason names one. The
+    /// leaf of the key can change between the request and the split.
+    fn key(&self) -> Option<&[u8]> {
+        match self {
+            SplitReason::InlinePressure { key, .. } | SplitReason::Contention { key } => Some(key),
+            SplitReason::SoftCap | SplitReason::Capacity | SplitReason::Demand { .. } => None,
         }
     }
 
@@ -586,37 +588,30 @@ impl SplitReason {
     }
 }
 
-/// A split of one node: why, and the key of a soft cap split that keeps the
-/// write spans of the leaf (ADR-084).
+/// A split of one node, as the topology policy decided it: at a key, or at
+/// the median, and with the paid rate of its leaves.
 #[derive(Clone, Copy)]
 struct Split<'a> {
-    reason: &'a SplitReason,
     at: Option<&'a [u8]>,
+    paid_rate: Option<Duration>,
 }
 
 impl Split<'_> {
-    /// Divides `node` like [`Node::split`], at the key that the split asks
-    /// for, if any. A split that a topology rule asked for keeps its rate as
-    /// the paid rate of its leaves (ADR-076).
+    /// Divides `node` like [`Node::split`], at the key of the split, if any.
+    /// Both halves keep the paid rate of the split, if any (ADR-076).
     fn divide(
         &self,
         node: &mut Node,
         right_id: NodeId,
         intent: &StructuralIntentId,
     ) -> Option<(Node, Vec<u8>)> {
-        match (self.reason, self.at) {
-            (SplitReason::Demand { at, rate }, _) => {
-                let paid = Some(Payment {
-                    per_second: *rate,
-                    intent: *intent,
-                });
-                match at {
-                    Some(key) => node.split_leaf_at(right_id, key, paid),
-                    None => node.split(right_id, paid),
-                }
-            }
-            (SplitReason::SoftCap, Some(key)) => node.split_leaf_at(right_id, key, None),
-            _ => node.split(right_id, None),
+        let paid = self.paid_rate.map(|per_second| Payment {
+            per_second,
+            intent: *intent,
+        });
+        match self.at {
+            Some(key) => node.split_leaf_at(right_id, key, paid),
+            None => node.split(right_id, paid),
         }
     }
 }

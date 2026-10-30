@@ -204,16 +204,6 @@ struct NetSplitTime {
     split_key: Option<Vec<u8>>,
 }
 
-impl TopologyPolicy {
-    /// Returns the rule of this policy, or none when the size causes decide.
-    pub(super) fn rule(self) -> Option<Box<dyn TopologyRule>> {
-        match self {
-            TopologyPolicy::SizeCauses => None,
-            TopologyPolicy::AvoidableTime => Some(Box::new(AvoidableTimeRule::default())),
-        }
-    }
-}
-
 impl LeafWindow {
     /// Returns the time that one split of the leaf can remove.
     fn avoidable_time(&self) -> Duration {

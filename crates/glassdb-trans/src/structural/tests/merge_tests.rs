@@ -156,8 +156,8 @@ async fn seed_split_leaves_with_empty_left(s: &TestStore) {
 
 // A restructurer whose leaves merge only when a topology rule asks.
 fn rule_restructurer(s: &TestStore, bg: &Arc<Background>) -> Restructurer {
-    let candidates = MaintenanceCandidates::for_topology_rule(mergeable(), InlinePolicy::default());
-    restructurer_with_candidates(s, bg, candidates)
+    let candidates = TestTopology::avoidable_time(mergeable());
+    restructurer_with_topology(s, bg, candidates)
 }
 
 async fn demand_merge_l0(sp: &Restructurer, rate: Duration) -> Result<(), TransError> {
@@ -261,7 +261,7 @@ async fn underfull_leaf_merges_into_its_right_sibling() {
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, mergeable());
 
-    sp.candidates.observe_leaf(
+    sp.hints.observe_leaf(
         &node_path("L0"),
         &LeafBody::from_entries([live(b"a"), live(b"b")]),
     );
@@ -276,6 +276,64 @@ async fn underfull_leaf_merges_into_its_right_sibling() {
             ..RestructurerStats::default()
         }
     );
+}
+
+// ADR-085: this database instance writes L0, and only another database
+// instance writes L1 recently, so the underfull merge waits.
+#[tokio::test]
+async fn underfull_leaf_does_not_merge_into_a_leaf_of_another_database_instance() {
+    let s = store();
+    let bg = Arc::new(Background::new());
+    let (sp, mon) = restructurer_and_monitor(&s, &bg, mergeable());
+    let local = local_writer(&mon);
+    let left = Node::leaf(LeafBody::from_entries([
+        written_by(b"a", &local),
+        live(b"b"),
+    ]));
+    let right = Node::leaf(LeafBody::from_entries([
+        written_by(b"m", &recent_writer()),
+        written_by(b"n", &recent_writer()),
+    ]));
+    seed_leaves(&s, left, right).await;
+
+    sp.hints.observe_leaf(
+        &node_path("L0"),
+        &LeafBody::from_entries([live(b"a"), live(b"b")]),
+    );
+    sp.run_once().await;
+
+    assert_not_merged(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
+    let stats = sp.stats_and_reset();
+    assert_eq!(stats.merges, 0);
+    assert!(stats.kept_apart >= 1, "{stats:?}");
+}
+
+// ADR-085: this database instance writes both leaves, so the underfull merge
+// goes ahead, also when another database instance writes L1 too.
+#[tokio::test]
+async fn underfull_leaf_merges_into_a_leaf_that_its_database_instance_writes() {
+    let s = store();
+    let bg = Arc::new(Background::new());
+    let (sp, mon) = restructurer_and_monitor(&s, &bg, mergeable());
+    let local = local_writer(&mon);
+    let left = Node::leaf(LeafBody::from_entries([
+        written_by(b"a", &local),
+        live(b"b"),
+    ]));
+    let right = Node::leaf(LeafBody::from_entries([
+        written_by(b"m", &local_writer(&mon)),
+        written_by(b"n", &recent_writer()),
+    ]));
+    seed_leaves(&s, left, right).await;
+
+    sp.hints.observe_leaf(
+        &node_path("L0"),
+        &LeafBody::from_entries([live(b"a"), live(b"b")]),
+    );
+    sp.run_once().await;
+
+    assert_merged(&s).await;
+    assert_eq!(sp.stats_and_reset().kept_apart, 0);
 }
 
 #[tokio::test]
@@ -325,10 +383,13 @@ async fn a_sweep_drops_a_stale_demand_merge() {
     let bg = Arc::new(Background::new());
     let sp = rule_restructurer(&s, &bg);
 
-    sp.candidates.push_request(RuleRequest {
-        change: ChangeRequest::Merge(LeafId::new(node_path("L0"))),
-        rate: Duration::from_secs(1),
-    });
+    push_request(
+        &sp.candidates,
+        RuleRequest {
+            change: ChangeRequest::Merge(LeafId::new(node_path("L0"))),
+            rate: Duration::from_secs(1),
+        },
+    );
     tokio::time::advance(Duration::from_secs(4)).await;
     sp.run_once().await;
 
@@ -358,10 +419,10 @@ async fn merge_compacts_the_cold_tombstones_of_its_target() {
     seed_leaves(&s, leaf_node(&[b"a", b"b"], None, None), Node::leaf(right)).await;
     let bg = Arc::new(Background::new());
     let gc_hints = GcHints::default();
-    let sp = restructurer_with_candidates_and_hints(
+    let sp = restructurer_with_topology_and_hints(
         &s,
         &bg,
-        MaintenanceCandidates::with_policy(mergeable()),
+        TestTopology::size_causes(mergeable()),
         gc_hints.clone(),
     );
 
@@ -501,7 +562,7 @@ async fn merges_cascade_through_underfull_parents() {
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, policy);
 
-    sp.candidates
+    sp.hints
         .observe_leaf(&node_path("L0"), &LeafBody::from_entries([live(b"a")]));
     sp.run_once().await;
     sp.run_once().await;
@@ -515,7 +576,7 @@ async fn merges_cascade_through_underfull_parents() {
         .unwrap();
     assert_eq!(root.as_index().unwrap(), &test_index(&[(b"", "P1")]));
 
-    sp.candidates.observe_leaf(
+    sp.hints.observe_leaf(
         &node_path("L0b"),
         &LeafBody::from_entries([live(b"a"), live(b"f")]),
     );
@@ -552,7 +613,7 @@ async fn a_new_candidate_does_not_wait_for_the_sweep_interval() {
     let sp = restructurer(&s, &bg, mergeable());
     sp.start();
 
-    sp.candidates.observe_leaf(
+    sp.hints.observe_leaf(
         &node_path("L0"),
         &LeafBody::from_entries([live(b"a"), live(b"b")]),
     );
@@ -589,7 +650,7 @@ async fn a_deferred_candidate_waits_for_the_sweep_interval() {
         ..RestructurerStats::default()
     };
 
-    sp.candidates.observe_leaf(
+    sp.hints.observe_leaf(
         &node_path("L0"),
         &LeafBody::from_entries([live(b"a"), live(b"b")]),
     );
@@ -612,8 +673,7 @@ async fn the_time_before_a_merge_holds_its_gate_is_not_its_typical_time() {
     let s = store_with_backend(hook.clone());
     seed_two_leaves(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
     let bg = Arc::new(Background::new());
-    let candidates = MaintenanceCandidates::for_topology_rule(mergeable(), InlinePolicy::default());
-    let sp = restructurer_with_candidates(&s, &bg, candidates);
+    let (sp, policy) = avoidable_time_restructurer(&s, &bg, mergeable());
     let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
     // The intent is written before the merge gets its gate.
     hook.set_before(move |op| {
@@ -628,14 +688,17 @@ async fn the_time_before_a_merge_holds_its_gate_is_not_its_typical_time() {
         })
     });
 
-    sp.candidates.push_request(RuleRequest {
-        change: ChangeRequest::Merge(LeafId::new(node_path("L0"))),
-        rate: Duration::from_secs(1),
-    });
+    push_request(
+        &sp.candidates,
+        RuleRequest {
+            change: ChangeRequest::Merge(LeafId::new(node_path("L0"))),
+            rate: Duration::from_secs(1),
+        },
+    );
     sp.run_once().await;
 
     assert_merged(&s).await;
-    let window = sp.candidates.measurements().unwrap().take_window();
+    let window = policy.measurements().take_window();
     // Below the default of 500 ms, so the merge recorded its time.
     assert!(
         window.merge_time < Duration::from_millis(400),
@@ -659,7 +722,7 @@ async fn merge_defers_to_a_younger_entry_holder_then_lands() {
     )
     .await;
 
-    sp.candidates.observe_leaf(
+    sp.hints.observe_leaf(
         &node_path("L0"),
         &LeafBody::from_entries([live(b"a"), live(b"b")]),
     );
@@ -1093,6 +1156,7 @@ fn push_underfull_merges(sp: &Restructurer, names: &[&str]) {
             priority: sp.candidates.new_id(),
             requested: rt::Instant::now(),
             cause: CandidateCause::Merge(MergeReason::Underfull),
+            max_age: None,
         });
     }
 }
@@ -1198,10 +1262,13 @@ async fn a_second_reason_to_merge_a_drained_leaf_stops_in_the_same_sweep() {
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, mergeable());
     push_underfull_merges(&sp, &["L0"]);
-    sp.candidates.push_request(RuleRequest {
-        change: ChangeRequest::Merge(LeafId::new(node_path("L0"))),
-        rate: Duration::from_secs(1),
-    });
+    push_request(
+        &sp.candidates,
+        RuleRequest {
+            change: ChangeRequest::Merge(LeafId::new(node_path("L0"))),
+            rate: Duration::from_secs(1),
+        },
+    );
 
     let record_writes = record_writes_of(&backend, sp.run_once()).await;
 
@@ -1214,10 +1281,13 @@ async fn a_second_reason_to_merge_a_drained_leaf_stops_in_the_same_sweep() {
 }
 
 fn push_demand(sp: &Restructurer, change: ChangeRequest, millis: u64) {
-    sp.candidates.push_request(RuleRequest {
-        change,
-        rate: Duration::from_millis(millis),
-    });
+    push_request(
+        &sp.candidates,
+        RuleRequest {
+            change,
+            rate: Duration::from_millis(millis),
+        },
+    );
 }
 
 // A split adds a separator to the parent and a merge removes one. When they

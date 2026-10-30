@@ -618,19 +618,49 @@ requested recursive parent split and returns the result.
 Splits and merges share one lifecycle and one parent reconciliation step. The
 `Restructurer` gives each candidate to the split module or the merge module.
 
+### The topology policy decides, the restructurer changes
+
+Each topology policy is one struct with two traits. `SizeLimitsPolicy` has
+the soft caps, the underfull threshold, and inline pressure. The other
+policies contain one, and give it the reasons that they do not refine.
+`TopologySignals`
+receives the topology signals of the transactions, the scans, the leaf
+coordinator, and the changes that landed, and queues candidates.
+`TopologyDecisions` answers the split and merge modules, which check each
+candidate again on the current node: whether and where a leaf splits, whether
+two leaves merge, and the paid rate of the change. Each policy keeps the
+measurements that its decisions need. The split and merge modules keep the
+checks that do not depend on the policy, with their own node size limits:
+capacity splits, index nodes, tombstone reclamation, and the limits that a
+node must fit.
+
+`StructuralHintSink` is the single intake of the topology signals. It queues
+the capacity splits and the merges of underfull index nodes itself, with every
+policy. It gives the other signals to the policy, which ignores the ones that
+it does not use. A producer asks it first only for a signal that costs real
+work to measure, today the leaf delays that the coordinator tracks for every
+round, so that a policy does not cost what it does not use.
+`MaintenanceCandidates` is only the queue.
+
 Committed leaf writes, parent reconciliation, and capacity rejections queue
 candidates. With the default size causes topology policy, the soft caps, the
 underfull threshold, and inline pressure decide, and the write spans that the
 writers of the leaf entries show move soft cap splits and cause merges
-([ADR-084](adr/084-size-causes-are-the-default-topology-policy.md)). With the
-avoidable time policy, a rule decides the other leaf splits and merges once per
-window ([ADR-074](adr/074-avoidable-time-drives-splits-and-merges.md)). A new
-candidate wakes the restructurer after a short delay, so that one sweep takes a
-burst of writes. A deferred candidate waits for the next sweep, which comes at
-most a fixed interval later, so a busy node cannot cause a tight retry loop. A
-sweep does not start a change that a rule asked for more than three windows
-before ([ADR-083](adr/083-drop-stale-topology-requests.md)). A
-merge defers while a live transaction holds a lock on its source or target.
+([ADR-084](adr/084-size-causes-are-the-default-topology-policy.md)). A database
+instance that loses leaf CASes on a key to other database instances also splits
+the key away from their keys. It merges an underfull leaf only when it wrote
+recently live values of both leaves of the merge, or when one of them has no
+live value of a recent writer. It knows its own writers from the transaction
+identities of its recent owner operations
+([ADR-085](adr/085-lost-leaf-cas-separates-the-keys-of-database-instances.md)).
+With the avoidable time policy, a rule decides the other leaf splits and merges
+once per window ([ADR-074](adr/074-avoidable-time-drives-splits-and-merges.md)).
+A new candidate wakes the restructurer after a short delay, so that one sweep
+takes a burst of writes. A deferred candidate waits for the next sweep, which
+comes at most a fixed interval later, so a busy node cannot cause a tight retry
+loop. A sweep does not start a change that a rule asked for more than three
+windows before ([ADR-083](adr/083-drop-stale-topology-requests.md)). A merge
+defers while a live transaction holds a lock on its source or target.
 
 Under load, a rule asks for many more leaf changes than one change at a time
 can make, and the tree does not settle. So a sweep changes different nodes at

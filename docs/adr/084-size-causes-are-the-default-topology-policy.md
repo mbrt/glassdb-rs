@@ -4,6 +4,8 @@
 
 Accepted — implemented.
 
+Refined by [ADR-085](085-lost-leaf-cas-separates-the-keys-of-database-instances.md).
+
 Supersedes [ADR-075](075-avoidable-time-is-the-default-topology-policy.md).
 The rule of the avoidable time policy of
 [ADR-074](074-avoidable-time-drives-splits-and-merges.md) does not change, but

@@ -701,9 +701,6 @@ impl Algo {
         if matches!(outcome, Ok(PassOutcome::Complete)) {
             self.structural_hints.observe_commit(&tx.accesses);
         }
-        if !self.structural_hints.measurements_enabled() {
-            return;
-        }
         let body_time = std::mem::take(&mut tx.body_time);
         let conflict = match outcome {
             Ok(PassOutcome::Complete) => false,

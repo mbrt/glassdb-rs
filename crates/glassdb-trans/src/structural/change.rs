@@ -21,7 +21,6 @@ use tokio::sync::Notify;
 use crate::error::TransError;
 use crate::node_locking::GateAcquisition;
 
-use super::candidates::MaintenanceCandidates;
 use super::measurements;
 use super::merge::{MergeReason, Merger};
 use super::nodes::StructuralNodeAccess;
@@ -31,6 +30,7 @@ use super::recovery::{
     ChangeKind, PreparedIntent, PreparedIntentCancellation, ReadyChange, ReadyIntent,
     ReadyIntentCompletion, ReadyIntentTransition, StructuralRecovery,
 };
+use super::sink::StructuralHintSink;
 use super::split::{SplitReason, SplitTarget, Splitter};
 use super::topology::TopologyMembership;
 
@@ -48,7 +48,7 @@ pub(super) struct ChangeLifecycle {
     splitter: Splitter,
     merger: Merger,
     // Receives the time of each leaf change that lands.
-    candidates: MaintenanceCandidates,
+    hints: StructuralHintSink,
 }
 
 /// The structural change that one attempt makes.
@@ -200,7 +200,7 @@ impl ChangeLifecycle {
         recovery_wake: Arc<Notify>,
         splitter: Splitter,
         merger: Merger,
-        candidates: MaintenanceCandidates,
+        hints: StructuralHintSink,
     ) -> Self {
         Self {
             recovery,
@@ -211,7 +211,7 @@ impl ChangeLifecycle {
             recovery_wake,
             splitter,
             merger,
-            candidates,
+            hints,
         }
     }
 
@@ -757,8 +757,8 @@ impl StructuralChangeAttempt<'_> {
             && outcome.result.is_ok()
         {
             self.lifecycle
-                .candidates
-                .observe_change_time(self.change.measured_kind(), time);
+                .hints
+                .change_timed(self.change.measured_kind(), time);
         }
         outcome
     }

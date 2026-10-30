@@ -9,6 +9,166 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-10-30: lost leaf CASes separate the keys of database instances
+
+Status: with the size causes, a split for the keys on which a database instance
+loses leaf CASes, and an underfull merge only of leaves that the instance
+writes, separated the four hot keys of `false-sharing` in all runs. Each hot
+writer then committed about 8 transactions per second, against about 2 with
+the size causes alone and 4.3 with one key in each leaf. `load-shift` and
+`workers` stayed within 1.5% of the size causes alone. ADR-085 records the
+mechanism, and its implementation gave the same results. The temporary code
+is not in the repository.
+
+All runs used `--backend=memory --delays=s3 --delay-scale=0.2
+--prefix-depth=3 --drain-timeout=90s` in real time at `ce7f7b27b`, plus
+temporary changes. Each matrix alternated the size causes
+alone (`base`) and the variant (`exp`): three runs each of `false-sharing`
+(`policy=default`) and `load-shift`, and one run of `workers` at 20, 80, 140,
+and 200 workers. Ratios are the mean of the `exp` runs to the mean of the
+`base` runs of the same matrix.
+
+### Reproduction
+
+Three runs of each policy of `false-sharing`:
+
+| Policy | Each hot writer | Hot p50 | All shapes | Writes/tx |
+| --- | --- | --- | ---: | ---: |
+| `default` | 1.53 to 3.01 tx/s | 1.0 to 1.8 s | 559 to 582 tx/s | 0.30 to 0.34 |
+| `fixed-1` | 3.83 to 4.58 tx/s | 0.70 to 0.89 s | 672 to 677 tx/s | 0.71 to 0.73 |
+
+`fixed-1` gave about 4.3 tx/s for each hot writer, not the 7.85 tx/s of the
+entry of 2026-10-27.
+
+### The heat of a key
+
+A probe recorded each lost leaf CAS under the size causes, when the landed CAS
+changed only keys that the round does not access. It kept a decayed sum for each
+key, with a half-life of 10 s, in each database instance, and printed the top
+key of each instance every 10 s. Three measures:
+
+- `count`: each key of the round gets 1.
+- `share`: each key of the round gets 1 divided by the number of keys of the
+  round.
+- `clean`: as `share`, but only when the keys of the round and the changed keys
+  do not interleave.
+
+One run of each load, without splits. The values are of the top key of each
+instance in each print:
+
+| Load | `count` p50, max | `share` p50, max | `clean` p50, max |
+| --- | --- | --- | --- |
+| `false-sharing`, hot writers | 55, 67 | 55, 67 | 47, 67 |
+| `load-shift`, first low conflict cell | 15, 21 | 10.5, 21 | 9, 17 |
+| `load-shift`, `crossing` | 9.5, 17 | 7, 11 | 6, 9 |
+| `load-shift`, last low conflict cell | 14, 23 | 11, 17 | 10, 17 |
+
+- Each hot writer saw only its own key. The background instance of
+  `false-sharing` had a `share` of about 2, so only the hot writers asked for
+  splits.
+- With `count`, the keys of `load-shift` got within a factor of two of the hot
+  keys, because a round of 200 workers batches many keys.
+- `clean` told the loads apart no better than `share`.
+
+All variants below used `share` with a threshold of 32.
+
+### Variants
+
+All variants used the same split. For a key over the threshold, the instance
+that lost the CAS asked for a split of the leaf at the edge of the run of keys
+around the key whose recent writers (60 s) are of this instance, or that have
+no recent writer. The split key divided no write span, and the side with more
+keys outside the run went first. The variants differ in how they tell the
+writers of an instance, and in the merge veto:
+
+- **Tag.** Two bytes of the random prefix of each transaction identity named
+  the database instance. An underfull merge waited when the recent writers of
+  the two leaves had no instance in common.
+- **Local, target only.** Each instance kept the transaction identities of its
+  commit passes with writes, in an LRU of 131,072 entries. An underfull merge
+  waited when the target leaf had recent writers, and none of them was local.
+- **Local, both leaves.** As the variant before, but the merge waited when
+  either leaf had recent writers, and none of them was local.
+
+### `false-sharing`
+
+| Variant | Each hot writer, `exp` | Each hot writer, `base` | All shapes, `exp` | Writes/tx, `exp` | Changes in the measurement, `exp` |
+| --- | --- | --- | ---: | ---: | --- |
+| Tag | 7.73 to 8.08 tx/s | 1.78 to 2.58 tx/s | 639 to 648 tx/s | 0.56 | 0, 0, 0 |
+| Local, target only | 3.69 to 7.99 tx/s | 1.30 to 2.68 tx/s | 627 to 635 tx/s | 0.52 to 0.58 | 1, 6, 12 |
+| Local, both leaves | 7.76 to 8.13 tx/s | 1.57 to 2.51 tx/s | 633 to 640 tx/s | 0.56 to 0.57 | 0, 0, 0 |
+
+- With the local set on the target only, merges passed the veto in two runs,
+  and hot writers fell to 3.69 and 5.0 tx/s. A log of these merges showed that
+  most of them merged a leaf with a foreign writer only into a leaf with a
+  local writer. The merge request came from a write of the leaf while it still
+  held a key of the instance, and a split of another instance moved the key
+  before the merge ran.
+- With both leaves, the merges that passed the veto were of leaves that only
+  the background instance wrote.
+- With both leaves, the hot p50 was 0.48 to 0.53 s, against 1.2 to 2.0 s in
+  `base`.
+- The read-modify-writes on the keys 4 to 63 went from 14 to 19 tx/s to 73 to
+  76 tx/s, and their reads from 208 to 214 tx/s to 158 to 164 tx/s, with both
+  leaves. The entry of 2026-10-27 shows the same trade.
+- With both leaves, the veto stopped 1,646 of 1,648 and 2,929 of 2,932
+  underfull merge checks in two runs. The probe printed its counts only after a
+  lost leaf CAS, so these are the counts until the last lost leaf CAS of the
+  run, and the third run printed none. Each write of a leaf of one key asks for
+  its merge again.
+
+### `load-shift` and `workers`
+
+Throughput and writes for each transaction, as ratios to `base`:
+
+| Variant | `load-shift` throughput | `load-shift` writes/tx | `workers` throughput | `workers` writes/tx |
+| --- | --- | --- | --- | --- |
+| Tag | 0.966, 0.958, 1.009 | 1.01, 1.07, 1.01 | 0.995, 1.001, 1.013, 1.010 | 1.01, 1.04, 1.10, 1.00 |
+| Local, target only | 1.002, 1.042, 0.987 | 0.97, 0.97, 1.03 | 1.000, 1.002, 0.991, 1.028 | 0.99, 0.95, 0.97, 1.08 |
+| Local, both leaves | 1.010, 0.993, 0.997 | 0.97, 1.00, 0.99 | 0.991, 0.994, 0.985, 1.002 | 1.01, 1.03, 1.02, 1.03 |
+
+- No variant asked for a split in `load-shift` or `workers`, and no variant
+  merged. All cells were quiet.
+- The `crossing` cell of the tag variant was below each `base` run (2,983 to
+  3,032 tx/s against 3,049 to 3,224 tx/s). The variant asked for no change
+  there, and the variant with both leaves gave 0.993 in the same cell, so this
+  is noise.
+
+### Implementation
+
+The implementation of ADR-085, without the temporary changes, against the size
+causes alone at `ce7f7b27b`, in the same layout:
+
+| Measure | Implementation | `base` |
+| --- | --- | --- |
+| `false-sharing`, each hot writer | 7.78 to 8.01 tx/s | 1.58 to 2.43 tx/s |
+| `false-sharing`, all shapes | 637 to 643 tx/s | 578 to 596 tx/s |
+| `false-sharing`, hot p50 | 0.50 to 0.53 s | 1.1 to 1.8 s |
+| `false-sharing`, changes in the measurement | 0, 0, 0 | 0, 0, 12 |
+| `load-shift`, throughput as a ratio to `base` | 0.995, 1.000, 0.982 | 1 |
+| `load-shift`, writes/tx as a ratio to `base` | 1.04, 0.99, 1.04 | 1 |
+| `workers`, throughput as a ratio to `base` | 1.007, 0.999, 0.996, 1.010 | 1 |
+| `workers`, writes/tx as a ratio to `base` | 0.99, 1.04, 1.12, 1.00 | 1 |
+
+All cells were quiet. The cell of 140 workers had 1.12 times the writes for
+each transaction in its one run. The tag variant had 1.10 there, and the other
+cells were within 0.99 to 1.04.
+
+### Conclusions
+
+- A share of each lost leaf CAS for each key of the round tells false sharing
+  from the random loads of `load-shift`. The threshold of 32 had a margin of
+  about 1.5 over the top key of `load-shift`.
+- A split at the edge of the run of keys of one instance separated the hot keys
+  in a few splits, and left their neighbors in moderate leaves.
+- A veto of underfull merges that reads the writers of both leaves keeps the
+  boundaries, after the lost leaf CASes that paid for them stop. A database
+  instance that writes only one of the two leaves must not merge them.
+- A set of local transaction identities gave the same results as an instance
+  tag in the transaction identity.
+- `load-shift` never came near the threshold, so these runs do not show how
+  close a load must be to cause a wrong split.
+
 ## 2026-10-29: experiments that need real time
 
 Status: of the experiments that had no known time mode, `inline-pressure` and

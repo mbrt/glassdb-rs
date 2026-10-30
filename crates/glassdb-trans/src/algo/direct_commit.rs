@@ -160,9 +160,7 @@ impl DirectCommit {
             match outcome {
                 DirectMutationOutcome::Landed(predecessors) => {
                     self.counters.landed.fetch_add(1, Ordering::Relaxed);
-                    if self.structural_hints.measurements_enabled() {
-                        self.landed_time.record(started.elapsed());
-                    }
+                    self.landed_time.record(started.elapsed());
                     state.commit();
                     self.gc_hints.schedule_all(predecessors);
                     return Ok(DirectOutcome::Committed);
@@ -197,9 +195,6 @@ impl DirectCommit {
     /// landed after `took`. The time above a direct commit is avoidable when
     /// one structural change can remove the cause.
     pub(super) fn observe_locked_commit(&self, cause: LockedCause, took: Duration) {
-        if !self.structural_hints.measurements_enabled() {
-            return;
-        }
         let direct = self
             .landed_time
             .get()

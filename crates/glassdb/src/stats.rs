@@ -156,6 +156,8 @@ mod tests {
                 tombstones_reclaimed: 4,
                 splits_avoided: 1,
                 merges: 2,
+                contention_splits: 1,
+                kept_apart: 4,
                 inline_pressure: InlinePressureStats {
                     candidates: 2,
                     completed: 1,
@@ -207,6 +209,8 @@ mod tests {
                 tombstones_reclaimed: 9,
                 splits_avoided: 3,
                 merges: 5,
+                contention_splits: 3,
+                kept_apart: 10,
                 inline_pressure: InlinePressureStats {
                     candidates: 5,
                     completed: 2,
@@ -260,6 +264,8 @@ mod tests {
                     tombstones_reclaimed: 5,
                     splits_avoided: 2,
                     merges: 3,
+                    contention_splits: 2,
+                    kept_apart: 6,
                     inline_pressure: InlinePressureStats {
                         candidates: 3,
                         completed: 1,

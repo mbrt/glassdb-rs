@@ -14,7 +14,7 @@ use glassdb_storage::{LeafBody, Node, NodeSizePolicy};
 /// The age of a writer after which its entries no longer count as keys that
 /// transactions commit together. A transaction that wrote many keys once, for
 /// example a bulk load, does not hold the leaves apart for longer.
-const SPAN_AGE: Duration = Duration::from_secs(60);
+pub(super) const SPAN_AGE: Duration = Duration::from_secs(60);
 
 /// Where a split over the soft cap divides a leaf.
 #[derive(Debug, PartialEq, Eq)]
@@ -114,16 +114,28 @@ pub(super) fn pays_for_merge(
         || middle_half(&keys).any(|(_, key)| divided(&spans, key) == 0)
 }
 
-/// Returns the write spans of the entries of `left`, and of `right` after it,
-/// whose writers started less than [`SPAN_AGE`] before `now`.
+/// Reports whether a split of the leaf `node` at `key` divides no write span,
+/// at `now`.
+pub(super) fn divides_no_span(node: &Node, key: &[u8], now: SystemTime) -> bool {
+    node.as_leaf()
+        .is_none_or(|leaf| divided(&spans(leaf, None, now), key) == 0)
+}
+
+/// Reports whether `writer` started less than [`SPAN_AGE`] before `now`.
 ///
 /// The clock of another database instance can be ahead of this one, so a
 /// writer that started less than [`SPAN_AGE`] after `now` is recent too.
-fn spans<'a>(left: &'a LeafBody, right: Option<&'a LeafBody>, now: SystemTime) -> Vec<Span<'a>> {
-    let recent = |writer: &TxId| match now.duration_since(writer.started_at()) {
+pub(super) fn is_recent(writer: &TxId, now: SystemTime) -> bool {
+    match now.duration_since(writer.started_at()) {
         Ok(age) => age < SPAN_AGE,
         Err(ahead) => ahead.duration() < SPAN_AGE,
-    };
+    }
+}
+
+/// Returns the write spans of the entries of `left`, and of `right` after it,
+/// whose writers are recent.
+fn spans<'a>(left: &'a LeafBody, right: Option<&'a LeafBody>, now: SystemTime) -> Vec<Span<'a>> {
+    let recent = |writer: &TxId| is_recent(writer, now);
     let mut writers: HashMap<&TxId, (Span<'a>, usize)> = HashMap::new();
     let entries = left.entries().map(|entry| (entry, true)).chain(
         right

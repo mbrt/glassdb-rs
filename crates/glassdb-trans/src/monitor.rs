@@ -23,6 +23,17 @@ use crate::error::TransError;
 
 const FINAL_STATUS_CACHE_SIZE: usize = 16384;
 
+/// How long the identities of the owner operations of this database instance
+/// stay recent local identities (ADR-085). It covers the recency window of the
+/// writers of leaf entries.
+pub(crate) const LOCAL_RETENTION: Duration = Duration::from_secs(60);
+
+/// The recent local identities that one database instance keeps. At a rate of
+/// owner operations that fills it before [`LOCAL_RETENTION`], the oldest
+/// identities stop being local early. Read-only identities fill it too, but no
+/// leaf entry names them as its writer.
+const MAX_RECENT_LOCAL: usize = 65_536;
+
 /// Final-status cache activity for one snapshot or accumulated interval.
 ///
 /// Each final-status cache lookup counts once. Reads from local owner state
@@ -506,6 +517,25 @@ impl FinalStatusCache {
 #[derive(Default)]
 struct State {
     transactions: HashMap<TxId, TxRuntimeEntry>,
+    // The identities of the recent owner operations, oldest first, with the
+    // instant of their last operation (ADR-085).
+    recent_local: LinkedHashMap<TxId, rt::Instant>,
+}
+
+impl State {
+    /// Makes `tid` the newest recent local identity of the shard, which keeps
+    /// at most `capacity` of them.
+    fn note_recent_local(&mut self, tid: TxId, capacity: usize) {
+        let now = rt::Instant::now();
+        self.recent_local.remove(&tid);
+        self.recent_local.insert(tid, now);
+        while let Some((_, at)) = self.recent_local.front()
+            && (self.recent_local.len() > capacity
+                || now.saturating_duration_since(*at) >= LOCAL_RETENTION)
+        {
+            self.recent_local.pop_front();
+        }
+    }
 }
 
 struct Inner {
@@ -756,6 +786,8 @@ impl Monitor {
     /// operation and any later wound must remain pinned.
     pub(crate) fn begin_owner_operation(&self, tid: &TxId) -> Result<OwnerOperation, TransError> {
         let mut st = self.shard_for(tid).lock().unwrap();
+        let capacity = (MAX_RECENT_LOCAL / self.inner.shards.len()).max(1);
+        st.note_recent_local(*tid, capacity);
         let owned = match st.transactions.entry(*tid) {
             Entry::Vacant(entry) => {
                 let entry = entry.insert(TxRuntimeEntry::owned(None));
@@ -779,6 +811,17 @@ impl Monitor {
             tid: *tid,
             completed: false,
         })
+    }
+
+    /// Reports whether the identity `tid` opened an owner operation in this
+    /// database instance less than [`LOCAL_RETENTION`] ago (ADR-085).
+    pub(crate) fn is_recent_local(&self, tid: &TxId) -> bool {
+        self.shard_for(tid)
+            .lock()
+            .unwrap()
+            .recent_local
+            .get(tid)
+            .is_some_and(|at| rt::Instant::now().saturating_duration_since(*at) < LOCAL_RETENTION)
     }
 
     /// Whether this database instance still tracks `tid` as one of its locked-commit identities.
@@ -2396,6 +2439,21 @@ mod tests {
         // spawned for the duration of the test; the `Monitor` only stores a
         // `Weak`.
         _bg: Arc<Background>,
+    }
+
+    // ADR-085: an identity that opened an owner operation is a recent local
+    // identity for the retention, and then no longer.
+    #[tokio::test(start_paused = true)]
+    async fn local_identities_expire_after_their_retention() {
+        let (mon, _ctx) = new_test_monitor(Arc::new(MemoryBackend::new()));
+        let (local, other) = (tx_id(b"local"), tx_id(b"other"));
+
+        mon.begin_owner_operation(&local).unwrap().complete();
+        assert!(mon.is_recent_local(&local));
+        assert!(!mon.is_recent_local(&other));
+
+        tokio::time::advance(LOCAL_RETENTION).await;
+        assert!(!mon.is_recent_local(&local));
     }
 
     fn new_test_monitor(b: Arc<dyn Backend>) -> (Monitor, TestCtx) {
