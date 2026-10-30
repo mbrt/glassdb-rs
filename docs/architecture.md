@@ -684,7 +684,12 @@ writes of its changes first, and then reconciles the parent of each collection
 once for all of them, with one gate and one CAS. The sweep, the deferred
 reconciliations, and structural recovery of one database instance take turns
 for each collection. Without the turns, they lose the gates of the parents to
-each other, and each loss sends changes to recovery.
+each other, and each loss sends changes to recovery. The turns do not cover
+other database instances, and their recovery and deferred reconciliations
+mostly find parents that already agree. So a reconciliation takes the gate of a
+parent only if a read shows that the parent does not agree with its children
+yet. Without this read, these reconciliations hold the gates that the sweep
+needs.
 
 Each database instance decides on its own transactions, so instances can
 disagree on a leaf. A split or merge that a rule asks for keeps its paid rate

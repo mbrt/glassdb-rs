@@ -70,6 +70,77 @@ async fn reconciled_root(s: &TestStore, key: &[u8], target: &str) -> IndexNode {
     root.as_index().unwrap().clone()
 }
 
+// Seeds the leaf chain under a root with `children`, whose gate a live
+// reconciliation of another database instance holds. Returns the root.
+async fn seed_gated_root(s: &TestStore, sp: &Restructurer, children: &[(&[u8], &str)]) -> Node {
+    let mut root = seed_unpublished_leaf_chain(s, children).await;
+    let holder = TxId::with_priority(1, b"live-reconciliation");
+    sp.mon.begin_tx(&holder);
+    root.set_structural_gate(holder);
+    let (_, observation) = s
+        .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    assert!(s.store_root(COLL, &root, &observation).await.unwrap());
+    root
+}
+
+async fn current_root(s: &TestStore) -> Node {
+    let (root, _) = s
+        .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    root
+}
+
+/// A parent that already agrees needs no write, so its reconciliation does not
+/// wait for the gate. A worker of another database instance can hold that
+/// gate for each try, and the reconciliation would end in recovery.
+#[tokio::test]
+async fn reconciliation_of_an_agreeing_parent_does_not_wait_for_its_gate() {
+    let s = store();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+    let root = seed_gated_root(&s, &sp, &[(b"", "L0"), (b"m", "L1"), (b"t", "L4")]).await;
+
+    let mut reconciliation = sp
+        .reconciler
+        .begin(&collection(), [(b"m".to_vec(), test_node_id("L1"))]);
+    assert!(matches!(
+        sp.reconciler.reconcile(&mut reconciliation).await.unwrap(),
+        ReconciliationOutcome::Reconciled
+    ));
+    assert_eq!(
+        current_root(&s).await,
+        root,
+        "the gate of the root stays with its holder"
+    );
+}
+
+/// A parent that does not agree yet needs a write, so its reconciliation
+/// still waits for the gate.
+#[tokio::test]
+async fn reconciliation_of_a_parent_that_does_not_agree_waits_for_its_gate() {
+    let s = store();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+    let root = seed_gated_root(&s, &sp, &[(b"", "L0")]).await;
+
+    let mut reconciliation = sp
+        .reconciler
+        .begin(&collection(), [(b"m".to_vec(), test_node_id("L1"))]);
+    assert!(matches!(
+        sp.reconciler.reconcile(&mut reconciliation).await,
+        Err(TransError::Retry)
+    ));
+    assert_eq!(current_root(&s).await, root);
+    assert_eq!(
+        sp.reconciler.drain_pending().len(),
+        1,
+        "the route waits for a later sweep"
+    );
+}
+
 #[tokio::test]
 async fn reconciliation_rechecks_a_child_read_started_before_the_split() {
     let memory = Arc::new(MemoryBackend::new());
