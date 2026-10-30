@@ -1,7 +1,7 @@
 //! The feed of nodes that may need a structural change.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,7 +12,9 @@ use tokio::sync::Notify;
 
 use crate::access::AccessSet;
 use crate::leaf_coord::{LeafDelayKind, StructuralHinter};
+use crate::monitor::Monitor;
 
+use super::contention::Contention;
 use super::measurements::{ChangeKind, TopologyMeasurements, written_pair};
 use super::merge::MergeReason;
 use super::paid_rate::PaidRates;
@@ -56,6 +58,9 @@ pub(super) struct MaintenanceCandidates {
     // nothing else takes its windows.
     measurements: Option<Arc<TopologyMeasurements>>,
     paid_rates: Arc<PaidRates>,
+    // Present only with the size causes, which separate contended keys
+    // (ADR-085).
+    contention: Option<Arc<Contention>>,
 }
 
 /// Lightweight producer handle for structural hints decided outside the leaf
@@ -241,6 +246,22 @@ impl MaintenanceCandidates {
         self.measurements.is_none()
     }
 
+    /// Returns the feed with the contended keys of the database instance of
+    /// `mon`, which the size causes separate (ADR-085). A topology rule keeps
+    /// no contended keys.
+    pub(super) fn separating_contended_keys(mut self, mon: Monitor) -> Self {
+        if self.measurements.is_none() {
+            self.contention = Some(Arc::new(Contention::new(mon)));
+        }
+        self
+    }
+
+    /// The contended keys of this database instance, with the size causes
+    /// (ADR-085).
+    pub(super) fn contention(&self) -> Option<&Contention> {
+        self.contention.as_deref()
+    }
+
     /// The paid rates that the changes of this database instance saw.
     pub(super) fn paid_rates(&self) -> &PaidRates {
         &self.paid_rates
@@ -274,7 +295,7 @@ impl MaintenanceCandidates {
     /// Drains every queued candidate, de-duplicated by path and cause, for one
     /// sweep cycle, and the stale demand candidates that it dropped.
     /// The splits that a size cause asks for come first, because a full leaf
-    /// can stop writes. Then come the demand splits and demand merges with the
+    /// can stop writes. The splits for contended keys come with them. Then come the demand splits and demand merges with the
     /// highest rate, so that while the queue is long the changes that remove
     /// the most avoidable time land first, also after a change of the load.
     /// The underfull merges come last.
@@ -412,6 +433,7 @@ impl MaintenanceCandidates {
             inline,
             queue: Arc::new(Mutex::new(VecDeque::new())),
             queued: Arc::new(Notify::new()),
+            contention: None,
             measurements,
             paid_rates: Arc::new(PaidRates::default()),
         }
@@ -469,6 +491,10 @@ impl MaintenanceCandidate {
                 *rate = other_rate;
             }
             (
+                CandidateCause::Split(SplitReason::Contention { key }),
+                CandidateCause::Split(SplitReason::Contention { key: other_key }),
+            ) => *key = other_key,
+            (
                 CandidateCause::Merge(MergeReason::Demand { rate }),
                 CandidateCause::Merge(MergeReason::Demand { rate: other_rate }),
             ) => *rate = other_rate,
@@ -525,5 +551,23 @@ impl StructuralHinter for MaintenanceCandidates {
 
     fn measurements_enabled(&self) -> bool {
         self.measurements.is_some()
+    }
+
+    fn lost_leaf_cas(&self, path: &ObjectPath, round_keys: &BTreeSet<Vec<u8>>) {
+        let (
+            Some(contention),
+            ObjectPath::TreeRoot { collection } | ObjectPath::Node { collection, .. },
+        ) = (&self.contention, path)
+        else {
+            return;
+        };
+        if let Some(key) = contention.lost_leaf_cas(collection, round_keys) {
+            self.push(MaintenanceCandidate {
+                path: path.clone(),
+                priority: self.new_id(),
+                requested: rt::Instant::now(),
+                cause: CandidateCause::Split(SplitReason::Contention { key }),
+            });
+        }
     }
 }

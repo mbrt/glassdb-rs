@@ -96,6 +96,12 @@ pub(super) enum SplitReason {
         /// The avoidable time in each second that pays for the split.
         rate: Duration,
     },
+    /// This database instance loses leaf CASes on the contended key `key` to
+    /// other database instances, so the leaf of the key splits away from
+    /// their keys (ADR-085).
+    Contention {
+        key: Vec<u8>,
+    },
 }
 
 /// Whether a node still needs the split that its reason asked for.
@@ -156,7 +162,7 @@ impl Splitter {
     }
 
     /// Finds the node that a split candidate asks to split: the node of the
-    /// candidate, or for inline pressure the leaf that covers the key now.
+    /// candidate, or for a split for a key the leaf that covers the key now.
     /// `None` tells that the candidate is no longer actionable.
     pub(super) async fn locate(
         &self,
@@ -167,7 +173,7 @@ impl Splitter {
         else {
             return Err(TransError::other("split candidate is not a tree node"));
         };
-        let SplitReason::InlinePressure { key, .. } = reason else {
+        let Some(key) = reason.key() else {
             return self
                 .soft_cap_split_waits(collection, path, reason)
                 .await
@@ -184,9 +190,7 @@ impl Splitter {
         {
             Ok(located) => located,
             Err(StorageError::NotFound) => {
-                self.stats
-                    .inline_pressure_discarded
-                    .fetch_add(1, Ordering::Relaxed);
+                self.record_discarded(reason);
                 return Ok(None);
             }
             Err(error) => return Err(error.into()),
@@ -198,9 +202,7 @@ impl Splitter {
         {
             SplitNeed::Split => Ok(Some(located.path)),
             SplitNeed::NotActionable => {
-                self.stats
-                    .inline_pressure_discarded
-                    .fetch_add(1, Ordering::Relaxed);
+                self.record_discarded(reason);
                 Ok(None)
             }
             SplitNeed::Reroute => Err(TransError::Retry),
@@ -239,6 +241,16 @@ impl Splitter {
                     [node.paid_rate()],
                 );
                 if divisible && pays {
+                    SplitNeed::Split
+                } else {
+                    SplitNeed::NotActionable
+                }
+            }
+            SplitReason::Contention { key } => {
+                if node.as_leaf().is_none() || !node.covers(key) {
+                    return SplitNeed::Reroute;
+                }
+                if self.contention_split_key(node, key).is_some() {
                     SplitNeed::Split
                 } else {
                     SplitNeed::NotActionable
@@ -303,6 +315,15 @@ impl Splitter {
                     return self.cancel(reason, SplitNeed::NotActionable);
                 }
                 SoftCapSplit::Wait => return Prepared::ReclaimOnly { node, reclaimed },
+            },
+            // The writers of the leaf can stop being recent after the check
+            // above, and a contention split never falls back to the median.
+            SplitReason::Contention { key } => match self.contention_split_key(&node, key) {
+                Some(at) => Some(at),
+                None if reclaimed.is_empty() => {
+                    return self.cancel(reason, SplitNeed::NotActionable);
+                }
+                None => return Prepared::ReclaimOnly { node, reclaimed },
             },
             _ => None,
         };
@@ -427,11 +448,7 @@ impl Splitter {
     fn cancel(&self, reason: &SplitReason, need: SplitNeed) -> Prepared<SplitPlan> {
         let result = match need {
             SplitNeed::NotActionable => {
-                if reason.is_inline_pressure() {
-                    self.stats
-                        .inline_pressure_discarded
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+                self.record_discarded(reason);
                 Ok(())
             }
             SplitNeed::Reroute => Err(TransError::Retry),
@@ -551,6 +568,26 @@ impl Splitter {
                 .inline_pressure_completed
                 .fetch_add(1, Ordering::Relaxed);
         }
+        if matches!(reason, SplitReason::Contention { .. }) {
+            self.stats.contention_splits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Returns where a split of the leaf `node` separates the contended key
+    /// `key`, if anywhere.
+    fn contention_split_key(&self, node: &Node, key: &[u8]) -> Option<Vec<u8>> {
+        self.candidates
+            .contention()?
+            .split_key(node, key, rt::system_now())
+    }
+
+    /// Counts a split candidate that is no longer actionable.
+    fn record_discarded(&self, reason: &SplitReason) {
+        if reason.is_inline_pressure() {
+            self.stats
+                .inline_pressure_discarded
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Carries an oversized split output into a later sweep so one hint can
@@ -578,6 +615,17 @@ impl SplitReason {
             SplitReason::InlinePressure { .. } => 1,
             SplitReason::Capacity => 2,
             SplitReason::Demand { .. } => 3,
+            // The merge reasons use 4 to 6.
+            SplitReason::Contention { .. } => 7,
+        }
+    }
+
+    /// The key whose leaf the split is for, when the reason names one. The
+    /// leaf of the key can change between the request and the split.
+    fn key(&self) -> Option<&[u8]> {
+        match self {
+            SplitReason::InlinePressure { key, .. } | SplitReason::Contention { key } => Some(key),
+            SplitReason::SoftCap | SplitReason::Capacity | SplitReason::Demand { .. } => None,
         }
     }
 
@@ -587,7 +635,8 @@ impl SplitReason {
 }
 
 /// A split of one node: why, and the key of a soft cap split that keeps the
-/// write spans of the leaf (ADR-084).
+/// write spans of the leaf (ADR-084) or of a split that separates a contended
+/// key (ADR-085).
 #[derive(Clone, Copy)]
 struct Split<'a> {
     reason: &'a SplitReason,
@@ -615,7 +664,9 @@ impl Split<'_> {
                     None => node.split(right_id, paid),
                 }
             }
-            (SplitReason::SoftCap, Some(key)) => node.split_leaf_at(right_id, key, None),
+            (SplitReason::SoftCap | SplitReason::Contention { .. }, Some(key)) => {
+                node.split_leaf_at(right_id, key, None)
+            }
             _ => node.split(right_id, None),
         }
     }

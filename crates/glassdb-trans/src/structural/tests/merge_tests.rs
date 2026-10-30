@@ -278,6 +278,64 @@ async fn underfull_leaf_merges_into_its_right_sibling() {
     );
 }
 
+// ADR-085: this database instance writes L0, and only another database
+// instance writes L1 recently, so the underfull merge waits.
+#[tokio::test]
+async fn underfull_leaf_does_not_merge_into_a_leaf_of_another_database_instance() {
+    let s = store();
+    let bg = Arc::new(Background::new());
+    let (sp, mon) = contended_restructurer(&s, &bg, mergeable());
+    let local = local_writer(&mon);
+    let left = Node::leaf(LeafBody::from_entries([
+        written_by(b"a", &local),
+        live(b"b"),
+    ]));
+    let right = Node::leaf(LeafBody::from_entries([
+        written_by(b"m", &recent_writer()),
+        written_by(b"n", &recent_writer()),
+    ]));
+    seed_leaves(&s, left, right).await;
+
+    sp.candidates.observe_leaf(
+        &node_path("L0"),
+        &LeafBody::from_entries([live(b"a"), live(b"b")]),
+    );
+    sp.run_once().await;
+
+    assert_not_merged(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
+    let stats = sp.stats_and_reset();
+    assert_eq!(stats.merges, 0);
+    assert!(stats.kept_apart >= 1, "{stats:?}");
+}
+
+// ADR-085: this database instance writes both leaves, so the underfull merge
+// goes ahead, also when another database instance writes L1 too.
+#[tokio::test]
+async fn underfull_leaf_merges_into_a_leaf_that_its_database_instance_writes() {
+    let s = store();
+    let bg = Arc::new(Background::new());
+    let (sp, mon) = contended_restructurer(&s, &bg, mergeable());
+    let local = local_writer(&mon);
+    let left = Node::leaf(LeafBody::from_entries([
+        written_by(b"a", &local),
+        live(b"b"),
+    ]));
+    let right = Node::leaf(LeafBody::from_entries([
+        written_by(b"m", &local_writer(&mon)),
+        written_by(b"n", &recent_writer()),
+    ]));
+    seed_leaves(&s, left, right).await;
+
+    sp.candidates.observe_leaf(
+        &node_path("L0"),
+        &LeafBody::from_entries([live(b"a"), live(b"b")]),
+    );
+    sp.run_once().await;
+
+    assert_merged(&s).await;
+    assert_eq!(sp.stats_and_reset().kept_apart, 0);
+}
+
 #[tokio::test]
 async fn merge_is_vetoed_when_the_merged_leaf_would_split_soon() {
     let s = store();

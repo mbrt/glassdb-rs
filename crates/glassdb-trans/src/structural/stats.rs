@@ -14,6 +14,8 @@ pub(super) struct Stats {
     pub(super) tombstones_reclaimed: AtomicU64,
     pub(super) splits_avoided: AtomicU64,
     pub(super) merges: AtomicU64,
+    pub(super) contention_splits: AtomicU64,
+    pub(super) kept_apart: AtomicU64,
     pub(super) inline_pressure_candidates: AtomicU64,
     pub(super) inline_pressure_completed: AtomicU64,
     pub(super) inline_pressure_deferred: AtomicU64,
@@ -49,6 +51,14 @@ pub struct RestructurerStats {
     pub splits_avoided: u64,
     /// Locally observed merge linearizations (drains of the merged node).
     pub merges: u64,
+    /// Splits that separated a contended key from the keys of other database
+    /// instances (ADR-085). These also count in [`Self::splits`].
+    pub contention_splits: u64,
+    /// Checks of underfull merges that waited, because another database
+    /// instance writes one of the two leaves, and this one does not (ADR-085).
+    /// A merge is checked again at each write of its leaf, so one merge can
+    /// count many times.
+    pub kept_apart: u64,
     /// Activity attributable specifically to aggregate inline pressure.
     pub inline_pressure: InlinePressureStats,
     /// The time that the topology rule measured, by kind. Zero when the size
@@ -134,6 +144,8 @@ impl Stats {
             tombstones_reclaimed: take(&self.tombstones_reclaimed),
             splits_avoided: take(&self.splits_avoided),
             merges: take(&self.merges),
+            contention_splits: take(&self.contention_splits),
+            kept_apart: take(&self.kept_apart),
             inline_pressure: InlinePressureStats {
                 candidates: take(&self.inline_pressure_candidates),
                 completed: take(&self.inline_pressure_completed),
@@ -245,6 +257,8 @@ impl AddAssign for RestructurerStats {
         self.tombstones_reclaimed += rhs.tombstones_reclaimed;
         self.splits_avoided += rhs.splits_avoided;
         self.merges += rhs.merges;
+        self.contention_splits += rhs.contention_splits;
+        self.kept_apart += rhs.kept_apart;
         self.inline_pressure += rhs.inline_pressure;
         self.topology_time += rhs.topology_time;
         self.demand_merges += rhs.demand_merges;
@@ -265,6 +279,8 @@ impl Sub for RestructurerStats {
                 .saturating_sub(rhs.tombstones_reclaimed),
             splits_avoided: self.splits_avoided.saturating_sub(rhs.splits_avoided),
             merges: self.merges.saturating_sub(rhs.merges),
+            contention_splits: self.contention_splits.saturating_sub(rhs.contention_splits),
+            kept_apart: self.kept_apart.saturating_sub(rhs.kept_apart),
             inline_pressure: self.inline_pressure - rhs.inline_pressure,
             topology_time: self.topology_time - rhs.topology_time,
             demand_merges: self.demand_merges - rhs.demand_merges,

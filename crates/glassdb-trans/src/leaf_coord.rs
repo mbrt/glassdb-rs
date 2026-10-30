@@ -525,6 +525,11 @@ pub trait StructuralHinter: Send + Sync {
     ) {
     }
 
+    /// Notes a lost leaf CAS of a round of `path` on the keys `round_keys`: the
+    /// CAS that landed before it changed only other keys of the leaf
+    /// (ADR-085).
+    fn lost_leaf_cas(&self, _path: &ObjectPath, _round_keys: &BTreeSet<Vec<u8>>) {}
+
     /// Tells if the hinter uses measurements, such as [`Self::leaf_delay`].
     /// Only then does the coordinator measure the delays of its rounds.
     fn measurements_enabled(&self) -> bool {
@@ -1384,21 +1389,26 @@ impl CasWorker {
             };
             if let Some(lost) = lost_cas.take() {
                 let cause = lost.cause(edit.node());
-                let split_key = (cause == LostCasCause::OtherKeys)
-                    .then(|| lost.separating_key(edit.node()))
-                    .flatten();
-                match (split_key, lost_time.take()) {
-                    (Some(split_key), None) => {
-                        lost_time = Some(LostTime {
-                            since: lost.sent,
-                            members: lost.members,
-                            split_key,
-                        });
+                if cause == LostCasCause::OtherKeys {
+                    self.core.hinter.lost_leaf_cas(path, &lost.round_keys);
+                }
+                if self.core.delays.is_some() {
+                    let split_key = (cause == LostCasCause::OtherKeys)
+                        .then(|| lost.separating_key(edit.node()))
+                        .flatten();
+                    match (split_key, lost_time.take()) {
+                        (Some(split_key), None) => {
+                            lost_time = Some(LostTime {
+                                since: lost.sent,
+                                members: lost.members,
+                                split_key,
+                            });
+                        }
+                        // A split does not remove a loss on the same keys, so
+                        // the time after its CAS is not split time.
+                        (None, Some(_)) if cause == LostCasCause::SameKeys => {}
+                        (_, time) => lost_time = time,
                     }
-                    // A split does not remove a loss on the same keys, so the
-                    // time after its CAS is not split time.
-                    (None, Some(_)) if cause == LostCasCause::SameKeys => {}
-                    (_, time) => lost_time = time,
                 }
             }
             if self.core.delays.is_some() {
@@ -1450,12 +1460,13 @@ impl CasWorker {
                 PersistResult::Unchanged(observed) => (observed, None),
                 // The CAS did not land, or the clean plan's loaded state
                 // changed. Neither resolves an earlier in-doubt mutation.
+                // Every topology policy uses lost leaf CASes (ADR-085). A
+                // rejected CAS already cost a backend operation, so recording
+                // it costs little.
                 PersistResult::Rejected => {
-                    if self.core.delays.is_some() {
-                        lost_cas = loaded_observation
-                            .value()
-                            .map(|expected| LostCas::new(expected.clone(), &members, sent));
-                    }
+                    lost_cas = loaded_observation
+                        .value()
+                        .map(|expected| LostCas::new(expected.clone(), &members, sent));
                     reloaded = true;
                     continue;
                 }
@@ -3252,13 +3263,29 @@ mod tests {
         tokio::spawn(async move { coord.coordinate(operation).await })
     }
 
-    #[derive(Default)]
     struct DelayRecorder {
+        measurements: bool,
         delays: Mutex<Vec<Duration>>,
         split_keys: Mutex<Vec<Vec<u8>>>,
+        lost_rounds: Mutex<Vec<BTreeSet<Vec<u8>>>>,
+    }
+
+    impl Default for DelayRecorder {
+        fn default() -> Self {
+            Self {
+                measurements: true,
+                delays: Mutex::default(),
+                split_keys: Mutex::default(),
+                lost_rounds: Mutex::default(),
+            }
+        }
     }
 
     impl DelayRecorder {
+        fn lost_rounds(&self) -> Vec<BTreeSet<Vec<u8>>> {
+            self.lost_rounds.lock().unwrap().clone()
+        }
+
         fn take(&self) -> Vec<Duration> {
             std::mem::take(&mut self.delays.lock().unwrap())
         }
@@ -3285,8 +3312,13 @@ mod tests {
             self.split_keys.lock().unwrap().push(split_key.to_vec());
         }
 
+        fn lost_leaf_cas(&self, path: &ObjectPath, round_keys: &BTreeSet<Vec<u8>>) {
+            assert_eq!(path, &leaf_path());
+            self.lost_rounds.lock().unwrap().push(round_keys.clone());
+        }
+
         fn measurements_enabled(&self) -> bool {
-            true
+            self.measurements
         }
     }
 
@@ -3395,10 +3427,24 @@ mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<Background>,
     ) {
+        coord_losing_cas_to(Arc::new(DelayRecorder::default()), entries, change, wins).await
+    }
+
+    // Like [`coord_losing_cas_over`], with the hints `hints`.
+    async fn coord_losing_cas_to(
+        hints: Arc<DelayRecorder>,
+        entries: Vec<LeafEntry>,
+        change: PeerChange,
+        wins: usize,
+    ) -> (
+        LeafCoordinator,
+        Arc<DelayRecorder>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<Background>,
+    ) {
         let inner = slow_leaf_backend();
         store_leaf_entries(&cold_store(inner.clone()), &leaf(), entries).await;
         let (backend, peer_wins) = peer_wins_leaf_cas(inner, change);
-        let hints = Arc::new(DelayRecorder::default());
         let (coord, _nodes, _timeline, bg) = coord_over_retry(
             backend,
             NodeSizePolicy::default(),
@@ -3469,6 +3515,43 @@ mod tests {
             } else {
                 assert!(delays.is_empty(), "{name}: {delays:?}");
             }
+        }
+    }
+
+    // ADR-085: the size causes take no measurements, but a leaf CAS lost to
+    // other keys reaches the hinter with the keys of the round. A loss to the
+    // same keys does not, because a split cannot remove it.
+    #[tokio::test(start_paused = true)]
+    async fn lost_leaf_cas_on_other_keys_is_reported_without_measurements() {
+        let cases: [(&str, PeerChange, bool); 2] = [
+            ("other key", |node| with_peer_writer(node, b"b"), true),
+            ("same key", |node| with_peer_writer(node, b"a"), false),
+        ];
+        for (name, change, reported) in cases {
+            let hints = Arc::new(DelayRecorder {
+                measurements: false,
+                ..DelayRecorder::default()
+            });
+            let seed = TxId::with_priority(1, b"seed");
+            let entries = vec![
+                entry(b"a", LockType::None, None, Some(&seed)),
+                entry(b"b", LockType::None, None, Some(&seed)),
+            ];
+            let (coord, hints, _wins, _bg) = coord_losing_cas_to(hints, entries, change, 1).await;
+
+            assert!(
+                spawn_lock(&coord, b"a", 2).await.unwrap().unwrap(),
+                "{name}"
+            );
+            coord.close().await;
+
+            let expected = if reported {
+                vec![BTreeSet::from([b"a".to_vec()])]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(hints.lost_rounds(), expected, "{name}");
+            assert!(hints.take().is_empty(), "{name}");
         }
     }
 

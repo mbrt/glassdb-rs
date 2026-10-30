@@ -14,6 +14,7 @@
 
 mod candidates;
 mod change;
+mod contention;
 mod measurements;
 mod merge;
 mod nodes;
@@ -165,6 +166,7 @@ impl Restructurer {
             MaintenanceCandidates::for_topology_rule(policy, inline)
         } else {
             MaintenanceCandidates::with_policies(policy, inline)
+                .separating_contended_keys(mon.clone())
         };
         let coord = LeafCoordinator::with_hinter(
             nodes.clone(),

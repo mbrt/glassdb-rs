@@ -26,6 +26,7 @@ use glassdb_storage::{
     StructuralChange, StructuralIntent, StructuralIntentPhase, TreeRouter,
 };
 
+mod contention_tests;
 mod merge_tests;
 mod reconcile_tests;
 mod recovery_tests;
@@ -406,4 +407,30 @@ fn written_by(key: &[u8], writer: &TxId) -> LeafEntry {
 // A recent transaction identity.
 fn recent_writer() -> TxId {
     TxId::new_at(rt::system_now())
+}
+
+// A recent transaction identity that opened an owner operation in the
+// database instance of `mon`, so that it is a local writer there (ADR-085).
+fn local_writer(mon: &Monitor) -> TxId {
+    let writer = recent_writer();
+    mon.begin_owner_operation(&writer).unwrap().complete();
+    writer
+}
+
+// A restructurer that separates the contended keys of the database instance
+// of the returned monitor (ADR-085).
+fn contended_restructurer(
+    store: &TestStore,
+    bg: &Arc<Background>,
+    policy: NodeSizePolicy,
+) -> (Restructurer, Monitor) {
+    let mon = store.foundation.monitor_for(
+        bg,
+        RetrySchedule::default(),
+        crate::monitor::ProtocolTiming::default(),
+    );
+    let candidates =
+        MaintenanceCandidates::with_policy(policy).separating_contended_keys(mon.clone());
+    let restructurer = restructurer_with_monitor(store, bg, mon.clone(), candidates);
+    (restructurer, mon)
 }

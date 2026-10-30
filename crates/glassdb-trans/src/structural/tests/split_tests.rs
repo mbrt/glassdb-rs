@@ -2439,3 +2439,99 @@ async fn a_waiting_soft_cap_split_still_reclaims_holder_free_tombstones() {
         ]]
     );
 }
+
+// ADR-085: this database instance loses leaf CASes on "b", which it writes,
+// and other database instances write the other keys. The leaf splits at the
+// edge of "b" with more keys of the other database instances, which is "c".
+#[tokio::test]
+async fn contended_key_splits_away_from_the_keys_of_other_database_instances() {
+    let s = store();
+    let bg = Arc::new(Background::new());
+    let policy = NodeSizePolicy::builder()
+        .leaf_max_entries(8)
+        .leaf_min_entries(0)
+        .build()
+        .unwrap();
+    let (sp, mon) = contended_restructurer(&s, &bg, policy);
+    let local = local_writer(&mon);
+    let node = Node::leaf(LeafBody::from_entries([
+        written_by(b"a", &recent_writer()),
+        written_by(b"b", &local),
+        written_by(b"c", &recent_writer()),
+        written_by(b"d", &recent_writer()),
+    ]));
+    s.store_node(COLL, "L", &node, None).await.unwrap();
+    let root = Node::index(IndexNode::from_children([(Vec::new(), test_node_id("L"))]));
+    s.create_root(COLL, &root).await.unwrap();
+    let round = std::collections::BTreeSet::from([b"b".to_vec()]);
+
+    // More than the threshold of 32 lost leaf CASes, which decay while the
+    // test runs.
+    for _ in 0..40 {
+        sp.candidates.lost_leaf_cas(&node_path("L"), &round);
+    }
+    sp.run_once().await;
+
+    let (left, _) = s
+        .load_node(
+            COLL,
+            "L",
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    let keys: Vec<&[u8]> = left
+        .as_leaf()
+        .unwrap()
+        .entries()
+        .map(|entry| entry.key.as_slice())
+        .collect();
+    assert_eq!(keys, [b"a".as_slice(), b"b"]);
+    assert_eq!(left.high_key(), Some(b"c".as_slice()));
+    let stats = sp.stats_and_reset();
+    assert_eq!((stats.splits, stats.contention_splits), (1, 1));
+}
+
+// ADR-085: a root leaf splits in place for a contended key, at the edge of the
+// run of the key.
+#[tokio::test]
+async fn contended_key_of_a_root_leaf_splits_in_place() {
+    let s = store();
+    let bg = Arc::new(Background::new());
+    let policy = NodeSizePolicy::builder()
+        .leaf_max_entries(8)
+        .leaf_min_entries(0)
+        .build()
+        .unwrap();
+    let (sp, mon) = contended_restructurer(&s, &bg, policy);
+    let local = local_writer(&mon);
+    let root = Node::leaf(LeafBody::from_entries([
+        written_by(b"a", &recent_writer()),
+        written_by(b"b", &local),
+        written_by(b"c", &recent_writer()),
+        written_by(b"d", &recent_writer()),
+    ]));
+    s.create_root(COLL, &root).await.unwrap();
+    let round = std::collections::BTreeSet::from([b"b".to_vec()]);
+
+    // More than the threshold of 32 lost leaf CASes, which decay while the
+    // test runs.
+    for _ in 0..40 {
+        sp.candidates.lost_leaf_cas(&root_path(), &round);
+    }
+    sp.run_once().await;
+
+    let (root, _) = s
+        .load_root(COLL, Requirement::after(s.timeline.currentness_barrier()))
+        .await
+        .unwrap();
+    let separators: Vec<&[u8]> = root
+        .as_index()
+        .expect("the root leaf split in place")
+        .children()
+        .map(|(separator, _)| separator)
+        .collect();
+    assert_eq!(separators, [b"".as_slice(), b"c"]);
+    let stats = sp.stats_and_reset();
+    assert_eq!((stats.splits, stats.contention_splits), (1, 1));
+}

@@ -46,6 +46,9 @@ enum MergeVeto {
     TooLarge,
     /// The reason does not apply to the nodes.
     NotNeeded,
+    /// Another database instance writes one of the two leaves, and this one
+    /// does not, so an underfull merge waits for the writers (ADR-085).
+    KeptApart,
 }
 
 /// Decides which merges are necessary, and writes their nodes.
@@ -377,6 +380,11 @@ impl Merger {
                 self.candidates.inline().max_leaf_bytes / 2,
             ),
         };
+        let kept_apart = || {
+            self.candidates
+                .contention()
+                .is_some_and(|contention| contention.keeps_apart(&left, &right, rt::system_now()))
+        };
         match (left.body(), right.body()) {
             (NodeBody::Leaf(left), NodeBody::Leaf(right)) => {
                 let inline_len = |leaf: &LeafBody| -> usize {
@@ -393,6 +401,8 @@ impl Merger {
                         MergeReason::Demand { .. } => MergeVeto::Unpaid,
                         MergeReason::Underfull | MergeReason::WriteSpan => MergeVeto::NotNeeded,
                     })
+                } else if reason == MergeReason::Underfull && kept_apart() {
+                    Err(MergeVeto::KeptApart)
                 } else if !fits {
                     Err(MergeVeto::TooLarge)
                 } else {
@@ -423,14 +433,20 @@ impl Merger {
         )
     }
 
-    /// Counts the veto of one attempt of a merge that a topology rule asked
-    /// for.
+    /// Counts the veto of one attempt of a merge: each underfull merge that
+    /// waits for the writers of its leaves, and the other vetoes of the merges
+    /// that a topology rule asked for.
     fn count_veto(&self, reason: MergeReason, veto: MergeVeto) {
-        self.count_demand(reason, |stats| match veto {
-            MergeVeto::Unpaid => &stats.demand_merge_unpaid,
-            MergeVeto::TooLarge => &stats.demand_merge_too_large,
-            MergeVeto::NotNeeded => &stats.demand_merge_other,
-        });
+        let demand_counter: fn(&Stats) -> &AtomicU64 = match veto {
+            MergeVeto::KeptApart => {
+                self.stats.kept_apart.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            MergeVeto::Unpaid => |stats| &stats.demand_merge_unpaid,
+            MergeVeto::TooLarge => |stats| &stats.demand_merge_too_large,
+            MergeVeto::NotNeeded => |stats| &stats.demand_merge_other,
+        };
+        self.count_demand(reason, demand_counter);
     }
 
     /// Counts one outcome of a merge that a topology rule asked for.

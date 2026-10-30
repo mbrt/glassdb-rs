@@ -189,6 +189,12 @@ _Avoid_: Version, writer token, value version
 **Effective writer**:
 The writer that reads of one logical key observe: the committed holder of a write lock or create lock on the key, if one exists; otherwise the writer of the key's current state. The two are different only until the write-back of a committed transaction completes.
 
+**Local writer**:
+A writer whose commit pass ran in the database instance that reads its leaf entry.
+
+**Foreign writer**:
+A writer whose commit pass ran in another database instance.
+
 **Direct commit**:
 A commit that validates and publishes all point accesses of one transaction with one CAS of one leaf, without locks or a transaction record.
 _Avoid_: Logless commit, same-leaf commit
@@ -412,6 +418,10 @@ _Avoid_: Fold member
 The proposed state of one leaf and the round members' outcomes, which at most one CAS publishes. A plan does not prove that its CAS took effect.
 _Avoid_: Fold, fold plan
 
+**Lost leaf CAS**:
+A rejected leaf CAS of a coordinator round, because another CAS of the leaf landed first and changed only keys that the round does not access.
+_Avoid_: CAS conflict, lost CAS (alone)
+
 ## Structural changes
 
 **Topology**:
@@ -468,6 +478,10 @@ _Avoid_: Change record, change justification, change cost
 **Write span**:
 The first and the last key of the entries of one recent writer of two or more entries in one leaf or in two adjacent leaves. A split between these two keys divides the keys that the writer committed together.
 _Avoid_: Commit range, key group
+
+**Contended key**:
+A logical key on which one database instance often loses leaf CASes to other database instances.
+_Avoid_: Hot key, false-shared key
 
 **Topology participant**:
 A transaction identity that a collection record lists while it can make structural changes to the collection tree.
