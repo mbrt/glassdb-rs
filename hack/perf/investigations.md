@@ -18,10 +18,10 @@ need real time: in virtual time, the `avoidable` policy does not split, and the
 direct churner is 13 times as fast.
 
 Each experiment ran once in each mode, with `--backend=memory --delays=s3
---prefix-depth=3 --drain-timeout=90s`, and `--delay-scale=0.2` in real time, on
-mains power. Latencies in virtual time are 10 to 25% lower, because they have no
-timer rounding, so a throughput ratio of 0.8 to 0.9 (real / virtual) is
-expected. The other differences:
+--prefix-depth=3 --drain-timeout=90s`, and `--delay-scale=0.2` in real time.
+Latencies in virtual time are 10 to 25% lower, because they have no timer
+rounding, so a throughput ratio of 0.8 to 0.9 (real / virtual) is expected. The
+other differences:
 
 | Experiment | Throughput, real / virtual | Other differences |
 | --- | --- | --- |
@@ -43,11 +43,10 @@ splits to a key that divides no recent span. Transactions on fixed ranges of
 needed to stop changes that do not pay. The temporary code is not in the
 repository.
 
-All runs used `--backend=memory --delays=s3 --delay-scale=0.2
---prefix-depth=3` at `8c6a1149f`, plus temporary changes, on mains power.
-Ratios are to the size causes with the default soft cap of 48 entries and
-underfull threshold of 12 (`S48`) of the same set of runs, which ran
-alternated.
+All runs used `--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3`
+at `8c6a1149f`, plus temporary changes. Ratios are to the size causes with the
+default soft cap of 48 entries and underfull threshold of 12 (`S48`) of the same
+set of runs, which ran alternated.
 
 ### Loads
 
@@ -190,12 +189,12 @@ collection, the same rule made about 1,600 splits below the band and lost 17%
 of the throughput of the band alone. No measured rate of lost CAS separated
 the two loads well. The temporary code is not in the repository.
 
-All runs used `--backend=memory --delays=s3 --delay-scale=0.2
---prefix-depth=3` at `01e70a268`, plus temporary changes, on mains power. The
-false sharing load is the one of the entry of 2026-10-26: four database
-instances write the adjacent keys 0 to 3, and one database instance runs
-transactions on the keys 4 to 63 and on random keys. Ratios are to the size
-policy with the band of 48 to 12 entries (`S48`) of the same set of runs.
+All runs used `--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3`
+at `01e70a268`, plus temporary changes. The false sharing load is the one of the
+entry of 2026-10-26: four database instances write the adjacent keys 0 to 3, and
+one database instance runs transactions on the keys 4 to 63 and on random keys.
+Ratios are to the size policy with the band of 48 to 12 entries (`S48`) of the
+same set of runs.
 
 ### Variants
 
@@ -342,12 +341,11 @@ showed false sharing: with the keys in four leaves, the writers had 3.6 times
 the throughput of a band of 32 entries. The rule separated the keys in one
 run of two. The temporary code is not in the repository.
 
-All runs used `--backend=memory --delays=s3 --delay-scale=0.2
---prefix-depth=3` at `01e70a268`, on mains power, with the warm-up minimum of
-30 s of model time in `workers` and `mixed`. The reduced `workers` grid had
-20, 80, 140, and 200 workers. The throughput is the geometric mean of the
-shapes. Ratios are to the avoidable time rule (A) of the same set of runs,
-and the variants of a set ran alternated.
+All runs used `--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3`
+at `01e70a268`, with the warm-up minimum of 30 s of model time in `workers` and
+`mixed`. The reduced `workers` grid had 20, 80, 140, and 200 workers. The
+throughput is the geometric mean of the shapes. Ratios are to the avoidable time
+rule (A) of the same set of runs, and the variants of a set ran alternated.
 
 ### What pays for the splits of the rule
 
@@ -522,11 +520,10 @@ these useful splits. Merge terms that are symmetric to the split terms did not
 change the `workers` grid, and made the `crossing` cell of `load-shift` change
 more. The temporary code is not in the repository.
 
-All runs used `--backend=memory --delays=s3 --delay-scale=0.2
---prefix-depth=3` at `0ff05aae1`, plus temporary changes, on mains power.
-Virtual time (`--time=virtual`) does not show the problem: the identical
-workers share rounds, and the first `load-shift` warm-up was quiet after 12
-splits.
+All runs used `--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3`
+at `0ff05aae1`, plus temporary changes. Virtual time (`--time=virtual`) does not
+show the problem: the identical workers share rounds, and the first `load-shift`
+warm-up was quiet after 12 splits.
 
 The reduced `workers` grid and the `mixed` cell ran with a warm-up of at least
 30 s of model time, as perfbench now sets for these experiments. With the

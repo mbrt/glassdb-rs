@@ -41,8 +41,7 @@ adjacent leaves merge for them.
   over two leaves too large to merge ask for no merge. These change no
   decision of one database instance.
 - `--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
-  --drain-timeout=90s`, 2 runs of each, alternated, on mains power, except one
-  run of each for `workers4`
+  --drain-timeout=90s`, 2 runs of each, alternated.
 - fixed ranges: `--experiment=hack/perf/experiments/real-time/fixed-ranges.toml`;
   random ranges:
   `--experiment=hack/perf/experiments/real-time/random-ranges.toml`;
@@ -80,7 +79,7 @@ an underfull threshold of 12.
 - base: `01e70a268` (the avoidable time policy, 256 and 64 entries); target:
   the commit of ADR-084, both with the engine defaults
 - `--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
-  --drain-timeout=90s`, 2 runs of each, alternated, on mains power
+  --drain-timeout=90s`, 2 runs of each, alternated
 - `workers4` is the `workers` experiment with 20, 80, 140, and 200 workers only
   ([`hack/perf/investigations.md`](../../hack/perf/investigations.md), entry
   of 2026-10-26); `mixed` is its low-conflict cell at 100% affinity
