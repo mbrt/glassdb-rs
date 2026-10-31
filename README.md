@@ -220,13 +220,12 @@ workers:
 
 ![](docs/img/tx-throughput.png)
 
-As you can see, median throughput increases almost linearly for single-key
-reads. It reaches 2.5k transactions per second with 200 workers per shape (800
-workers in total).
+As you can see, median throughput increases almost linearly for all shapes,
+although more slowly for multi-key read-write transactions. It reaches 5k+
+transactions per second with 200 workers per shape (800 workers in total).
 
-The multi-key read-modify-write shape reaches the modeled S3 write limit for its
-collection prefixes. More independent collections can add more provider
-partitions.
+Increase in probability of conflicts between transactions, as concurrency goes
+up, causes slight dips in throughput for some workers.
 
 ### Latency
 
