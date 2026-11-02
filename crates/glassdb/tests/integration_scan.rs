@@ -51,7 +51,7 @@ async fn list_keys() {
     // Listing descends the B-link tree and scans its leaves via reads (ADR-031),
     // never a directory `list` of an object prefix.
     let stats = db.stats() - before_list;
-    assert_eq!(stats.backend.obj_lists, 0);
+    assert_eq!(stats.backend.lists, 0);
 }
 
 #[tokio::test]
@@ -705,12 +705,12 @@ async fn a_scan_omits_a_committed_delete_after_a_split_ends_its_membership() {
     let collection = open_top(&splitter, b"held-split").await;
     collection.write(b"a", b"w").await.unwrap();
     for _ in 0..100 {
-        if splitter.stats().restructurer.splits > 0 {
+        if splitter.stats().topology.splits.completed > 0 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert!(splitter.stats().restructurer.splits > 0);
+    assert!(splitter.stats().topology.splits.completed > 0);
 
     assert_eq!(
         scan_from_new_instance(&hold, b"held-split").await,

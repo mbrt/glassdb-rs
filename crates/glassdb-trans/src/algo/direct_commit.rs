@@ -27,23 +27,28 @@ pub struct DirectCommitStats {
     /// Mutation attempts shaped and routed for direct commit.
     pub candidates: u64,
     /// Candidates that committed directly.
-    pub landed: u64,
+    pub completed: u64,
 }
 
 impl AddAssign for DirectCommitStats {
     fn add_assign(&mut self, rhs: Self) {
-        self.candidates += rhs.candidates;
-        self.landed += rhs.landed;
+        // Destructuring fails to compile when a field is added and not summed.
+        let Self {
+            candidates,
+            completed,
+        } = rhs;
+        self.candidates += candidates;
+        self.completed += completed;
     }
 }
 
 impl Sub for DirectCommitStats {
     type Output = Self;
 
-    fn sub(self, rhs: Self) -> Self::Output {
+    fn sub(self, rhs: Self) -> Self {
         Self {
             candidates: self.candidates.saturating_sub(rhs.candidates),
-            landed: self.landed.saturating_sub(rhs.landed),
+            completed: self.completed.saturating_sub(rhs.completed),
         }
     }
 }
@@ -51,7 +56,7 @@ impl Sub for DirectCommitStats {
 #[derive(Default)]
 struct DirectCommitCounters {
     candidates: AtomicU64,
-    landed: AtomicU64,
+    completed: AtomicU64,
 }
 
 /// Owns the direct same-leaf commit subprotocol.
@@ -88,7 +93,7 @@ impl DirectCommit {
     pub(super) fn stats_and_reset(&self) -> DirectCommitStats {
         DirectCommitStats {
             candidates: self.counters.candidates.swap(0, Ordering::Relaxed),
-            landed: self.counters.landed.swap(0, Ordering::Relaxed),
+            completed: self.counters.completed.swap(0, Ordering::Relaxed),
         }
     }
 
@@ -140,7 +145,7 @@ impl DirectCommit {
             let outcome = self.coord.coordinate(operation).await?;
             match outcome {
                 DirectMutationOutcome::Landed(predecessors) => {
-                    self.counters.landed.fetch_add(1, Ordering::Relaxed);
+                    self.counters.completed.fetch_add(1, Ordering::Relaxed);
                     state.commit();
                     self.gc_hints.schedule_all(predecessors);
                     return Ok(DirectOutcome::Committed);

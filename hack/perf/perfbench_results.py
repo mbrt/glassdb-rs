@@ -330,6 +330,8 @@ def read_inline_pressure(paths: Sequence[Path]) -> pd.DataFrame:
         "directLanded": "direct-landed",
         "backendOps": "backend-ops",
         "writeBytes": "write-bytes",
+        # Before the split and merge counters separated, these two columns
+        # also counted merge candidates and deferrals.
         "splitCandidates": "split-candidates",
         "splitCompleted": "split-completed",
         "splitDeferred": "split-deferred",

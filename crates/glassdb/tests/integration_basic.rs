@@ -152,7 +152,10 @@ async fn boundary_inline_falls_back_before_it_can_strand_a_leaf() {
     .unwrap();
     let direct = (db.stats() - before).direct_commit;
     assert_eq!(direct.candidates, 1);
-    assert_eq!(direct.landed, 0, "the split-unsafe inline value fell back");
+    assert_eq!(
+        direct.completed, 0,
+        "the split-unsafe inline value fell back"
+    );
 
     tokio::time::timeout(Duration::from_secs(5), coll.write(&second, b"second"))
         .await
@@ -364,7 +367,7 @@ async fn a_superseded_read_modify_write_replays_without_locking() {
     // The interposed overwrite and the replayed commit both land directly, and
     // neither the loss nor the replay ever acquires a lock.
     let delta = db.stats() - before;
-    assert_eq!(delta.direct_commit.landed, 2);
+    assert_eq!(delta.direct_commit.completed, 2);
     assert_eq!(delta.locker.calls, 0, "a replayed loss publishes no holder");
     assert_eq!(delta.transactions.replays, 1);
 }

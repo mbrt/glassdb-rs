@@ -1,7 +1,6 @@
 //! Removal of holder-free tombstones during structural changes (ADR-062).
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use glassdb_data::TxId;
 use glassdb_storage::{LeafBody, Node};
@@ -31,12 +30,7 @@ impl ReclamationReporter {
             return;
         }
         let count = u64::try_from(writers.len()).unwrap_or(u64::MAX);
-        self.stats
-            .tombstones_reclaimed
-            .fetch_add(count, Ordering::Relaxed);
-        if split_avoided {
-            self.stats.splits_avoided.fetch_add(1, Ordering::Relaxed);
-        }
+        self.stats.record_reclaimed(count, split_avoided);
         self.gc_hints.schedule_all(writers.iter().cloned());
     }
 }

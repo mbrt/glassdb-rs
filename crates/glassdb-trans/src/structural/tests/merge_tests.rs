@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::Ordering;
 
 use glassdb_backend::middleware::HookOutcome;
 
@@ -140,10 +141,13 @@ async fn underfull_leaf_merges_into_its_right_sibling() {
     assert_merged(&s).await;
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            candidates: 1,
-            merges: 1,
-            ..RestructurerStats::default()
+        TopologyStats {
+            merges: MergeStats {
+                candidates: 1,
+                completed: 1,
+                ..MergeStats::default()
+            },
+            ..TopologyStats::default()
         }
     );
 }
@@ -174,8 +178,8 @@ async fn underfull_leaf_does_not_merge_into_a_leaf_of_another_database_instance(
 
     assert_not_merged(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
     let stats = sp.stats_and_reset();
-    assert_eq!(stats.merges, 0);
-    assert!(stats.kept_apart >= 1, "{stats:?}");
+    assert_eq!(stats.merges.completed, 0);
+    assert!(stats.merges.kept_apart >= 1, "{stats:?}");
 }
 
 // ADR-085: this database instance writes both leaves, so the underfull merge
@@ -203,7 +207,7 @@ async fn underfull_leaf_merges_into_a_leaf_that_its_database_instance_writes() {
     sp.run_once().await;
 
     assert_merged(&s).await;
-    assert_eq!(sp.stats_and_reset().kept_apart, 0);
+    assert_eq!(sp.stats_and_reset().merges.kept_apart, 0);
 }
 
 #[tokio::test]
@@ -251,10 +255,13 @@ async fn merge_compacts_the_cold_tombstones_of_its_target() {
     assert_merged(&s).await;
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            merges: 1,
+        TopologyStats {
+            merges: MergeStats {
+                completed: 1,
+                ..MergeStats::default()
+            },
             tombstones_reclaimed: 3,
-            ..RestructurerStats::default()
+            ..TopologyStats::default()
         }
     );
     assert_eq!(gc_hints.pending(), deleted);
@@ -422,7 +429,7 @@ async fn merges_cascade_through_underfull_parents() {
         assert!(leaf.node().unwrap().as_leaf().unwrap().exists(key));
     }
     assert_no_intents(&s).await;
-    assert_eq!(sp.stats_and_reset().merges, 3);
+    assert_eq!(sp.stats_and_reset().merges.completed, 3);
 }
 
 #[tokio::test(start_paused = true)]
@@ -464,10 +471,13 @@ async fn a_deferred_candidate_waits_for_the_sweep_interval() {
     )
     .await;
     sp.start();
-    let deferred_once = RestructurerStats {
-        candidates: 1,
-        deferred: 1,
-        ..RestructurerStats::default()
+    let deferred_once = TopologyStats {
+        merges: MergeStats {
+            candidates: 1,
+            deferred: 1,
+            ..MergeStats::default()
+        },
+        ..TopologyStats::default()
     };
 
     sp.hints.observe_leaf(
@@ -646,7 +656,7 @@ async fn a_merge_that_loses_its_drain_abandons_the_absorb() {
 
         hook.clear_after();
         assert_not_merged(&local, &[b"a", b"b"], &[b"m", b"n"]).await;
-        assert_eq!(sp.stats_and_reset().merges, 0, "{loss:?}");
+        assert_eq!(sp.stats_and_reset().merges.completed, 0, "{loss:?}");
     }
 }
 
@@ -977,7 +987,7 @@ async fn one_sweep_merges_different_pairs_together() {
 
     let record_writes = record_writes_of(&backend, sp.run_once()).await;
 
-    assert_eq!(sp.stats_and_reset().merges, 3);
+    assert_eq!(sp.stats_and_reset().merges.completed, 3);
     assert_eq!(record_writes, 2, "one CAS to join and one to leave");
     for (left, right, merged_keys) in [
         ("L0", "L1", [b"a", b"b"]),
@@ -1011,7 +1021,7 @@ async fn merges_that_share_a_node_run_one_after_the_other_in_one_sweep() {
     let record_writes = record_writes_of(&backend, sp.run_once()).await;
 
     let stats = sp.stats_and_reset();
-    assert_eq!((stats.merges, stats.deferred), (2, 0));
+    assert_eq!((stats.merges.completed, stats.merges.deferred), (2, 0));
     assert_eq!(record_writes, 4, "one join and one leave for each round");
     assert!(current_node(&s, "L0").await.is_drained());
     assert!(current_node(&s, "L1").await.is_drained());
@@ -1041,7 +1051,7 @@ async fn a_second_reason_to_merge_a_drained_leaf_stops_in_the_same_sweep() {
     let record_writes = record_writes_of(&backend, sp.run_once()).await;
 
     let stats = sp.stats_and_reset();
-    assert_eq!((stats.merges, stats.deferred), (1, 0));
+    assert_eq!((stats.merges.completed, stats.merges.deferred), (1, 0));
     assert_eq!(record_writes, 2, "only the first merge joins the topology");
     assert!(current_node(&s, "L0").await.is_drained());
     assert_eq!(keys(&current_node(&s, "L1").await), [b"a", b"b"]);
@@ -1087,7 +1097,14 @@ async fn one_batch_splits_and_merges_under_one_parent() {
     let record_writes = record_writes_of(&backend, sp.run_once()).await;
 
     let stats = sp.stats_and_reset();
-    assert_eq!((stats.splits, stats.merges, stats.deferred), (1, 1, 0));
+    assert_eq!(
+        (
+            stats.splits.completed,
+            stats.merges.completed,
+            stats.splits.deferred + stats.merges.deferred
+        ),
+        (1, 1, 0)
+    );
     assert_eq!(record_writes, 2, "one batch");
     let root = root_children(&s).await;
     let children: Vec<_> = root.children().collect();

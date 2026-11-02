@@ -11,32 +11,41 @@ use crate::{Backend, BackendError, ListCursor, ListLimit, ListPage, ReadReply, R
 
 /// Snapshot of backend operation counters.
 ///
-/// The conditional-only trait (ADR-042) has no metadata-only operations, so the
-/// counters track object reads, mutations, and lists only. Deletes remain part
-/// of `obj_writes` for metric compatibility.
+/// The conditional-only trait (ADR-042) has no metadata-only operations, so
+/// the counters track object reads, mutations, and lists only. Deletes remain
+/// part of `writes`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BackendStats {
-    pub obj_reads: u64,
-    pub obj_writes: u64,
-    pub obj_lists: u64,
+    /// Object reads, conditional or not.
+    pub reads: u64,
+    /// Object mutations, including conditional deletes.
+    pub writes: u64,
+    /// Object list requests.
+    pub lists: u64,
 }
 
 impl AddAssign for BackendStats {
     fn add_assign(&mut self, rhs: Self) {
-        self.obj_reads += rhs.obj_reads;
-        self.obj_writes += rhs.obj_writes;
-        self.obj_lists += rhs.obj_lists;
+        // Destructuring fails to compile when a field is added and not summed.
+        let Self {
+            reads,
+            writes,
+            lists,
+        } = rhs;
+        self.reads += reads;
+        self.writes += writes;
+        self.lists += lists;
     }
 }
 
 impl Sub for BackendStats {
     type Output = Self;
 
-    fn sub(self, rhs: Self) -> Self::Output {
+    fn sub(self, rhs: Self) -> Self {
         Self {
-            obj_reads: self.obj_reads.saturating_sub(rhs.obj_reads),
-            obj_writes: self.obj_writes.saturating_sub(rhs.obj_writes),
-            obj_lists: self.obj_lists.saturating_sub(rhs.obj_lists),
+            reads: self.reads.saturating_sub(rhs.reads),
+            writes: self.writes.saturating_sub(rhs.writes),
+            lists: self.lists.saturating_sub(rhs.lists),
         }
     }
 }
@@ -58,9 +67,9 @@ impl WriteMeter {
 /// Wraps a backend and counts the operations performed on it.
 pub struct StatsBackend {
     inner: Arc<dyn Backend>,
-    obj_reads: AtomicU64,
-    obj_writes: AtomicU64,
-    obj_lists: AtomicU64,
+    reads: AtomicU64,
+    writes: AtomicU64,
+    lists: AtomicU64,
     total_writes: Arc<AtomicU64>,
 }
 
@@ -69,9 +78,9 @@ impl StatsBackend {
     pub fn new(inner: Arc<dyn Backend>) -> Self {
         StatsBackend {
             inner,
-            obj_reads: AtomicU64::new(0),
-            obj_writes: AtomicU64::new(0),
-            obj_lists: AtomicU64::new(0),
+            reads: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            lists: AtomicU64::new(0),
             total_writes: Arc::default(),
         }
     }
@@ -82,16 +91,16 @@ impl StatsBackend {
     }
 
     fn count_write(&self) {
-        self.obj_writes.fetch_add(1, Ordering::Relaxed);
+        self.writes.fetch_add(1, Ordering::Relaxed);
         self.total_writes.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Returns the current counters and resets them to zero.
     pub fn stats_and_reset(&self) -> BackendStats {
         BackendStats {
-            obj_reads: self.obj_reads.swap(0, Ordering::Relaxed),
-            obj_writes: self.obj_writes.swap(0, Ordering::Relaxed),
-            obj_lists: self.obj_lists.swap(0, Ordering::Relaxed),
+            reads: self.reads.swap(0, Ordering::Relaxed),
+            writes: self.writes.swap(0, Ordering::Relaxed),
+            lists: self.lists.swap(0, Ordering::Relaxed),
         }
     }
 }
@@ -99,7 +108,7 @@ impl StatsBackend {
 #[async_trait]
 impl Backend for StatsBackend {
     async fn read(&self, path: &str) -> Result<ReadReply, BackendError> {
-        self.obj_reads.fetch_add(1, Ordering::Relaxed);
+        self.reads.fetch_add(1, Ordering::Relaxed);
         self.inner.read(path).await
     }
 
@@ -108,7 +117,7 @@ impl Backend for StatsBackend {
         path: &str,
         expected: &Revision,
     ) -> Result<ReadReply, BackendError> {
-        self.obj_reads.fetch_add(1, Ordering::Relaxed);
+        self.reads.fetch_add(1, Ordering::Relaxed);
         self.inner.read_if_modified(path, expected).await
     }
 
@@ -142,7 +151,7 @@ impl Backend for StatsBackend {
         cursor: Option<&ListCursor>,
         limit: ListLimit,
     ) -> Result<ListPage, BackendError> {
-        self.obj_lists.fetch_add(1, Ordering::Relaxed);
+        self.lists.fetch_add(1, Ordering::Relaxed);
         self.inner.list(prefix, cursor, limit).await
     }
 }

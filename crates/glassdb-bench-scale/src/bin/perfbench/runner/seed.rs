@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use glassdb::{Collection, CollectionPath, Database, Error as GError, GcStats, RestructurerStats};
+use glassdb::{Collection, CollectionPath, Database, Error as GError, GcStats, TopologyStats};
 use glassdb_backend::Backend;
 use glassdb_bench_scale::backend_breakdown::{BackendBreakdownHandle, wrap};
 use glassdb_bench_scale::run::shutdown_databases_until;
@@ -255,7 +255,7 @@ async fn seed(
             }
         }
     }
-    report.splits = db.stats().restructurer.splits;
+    report.splits = db.stats().topology.splits.completed;
     report.settle_wall_ms = millis(started.elapsed());
     shutdown(&db, drain_timeout).await?;
     if !settled {
@@ -316,16 +316,16 @@ pub(crate) async fn shutdown(db: &Database, drain_timeout: Duration) -> Result<(
 
 /// Returns the completed splits and merges of `databases`.
 pub(crate) fn structural_changes(databases: &[Database]) -> u64 {
-    let stats = restructurer_stats(databases);
-    stats.splits + stats.merges
+    let stats = topology_stats(databases);
+    stats.splits.completed + stats.merges.completed
 }
 
-/// Returns the sum of the restructurer counters of `databases`.
-pub(crate) fn restructurer_stats(databases: &[Database]) -> RestructurerStats {
+/// Returns the sum of the topology counters of `databases`.
+pub(crate) fn topology_stats(databases: &[Database]) -> TopologyStats {
     databases
         .iter()
-        .fold(RestructurerStats::default(), |mut total, database| {
-            total += database.stats().restructurer;
+        .fold(TopologyStats::default(), |mut total, database| {
+            total += database.stats().topology;
             total
         })
 }

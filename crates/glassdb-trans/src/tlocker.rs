@@ -72,14 +72,16 @@ pub struct LockerStats {
 
 impl AddAssign for LockerStats {
     fn add_assign(&mut self, rhs: Self) {
-        self.calls += rhs.calls;
+        // Destructuring fails to compile when a field is added and not summed.
+        let Self { calls } = rhs;
+        self.calls += calls;
     }
 }
 
 impl Sub for LockerStats {
     type Output = Self;
 
-    fn sub(self, rhs: Self) -> Self::Output {
+    fn sub(self, rhs: Self) -> Self {
         Self {
             calls: self.calls.saturating_sub(rhs.calls),
         }

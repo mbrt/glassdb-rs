@@ -26,11 +26,11 @@ use crate::error::TransError;
 use crate::gc::{DEFAULT_GC_PARALLELISM, Gc, GcDiagnostics, GcHints, GcLimits, GcReport, GcStats};
 use crate::key_resolver::{KeyResolver, ScanResult};
 use crate::key_state_resolver::KeyStateResolver;
-use crate::leaf_coord::{LeafCoordinator, LeafCoordinatorStats};
+use crate::leaf_coord::{CoordinatorStats, LeafCoordinator};
 use crate::monitor::{Monitor, MonitorStats, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
 use crate::retry_timing::RetryTiming;
-use crate::structural::{Restructurer, RestructurerStats, TopologyMembership, TopologyPolicy};
+use crate::structural::{Restructurer, TopologyMembership, TopologyPolicy, TopologyStats};
 use crate::tlocker::{Locker, LockerStats};
 
 /// Balances backend traffic and memory use for a default production database instance.
@@ -166,11 +166,11 @@ pub struct EngineStats {
     /// Distributed-locker activity.
     pub locker: LockerStats,
     /// Shared leaf-coordinator activity.
-    pub coordinator: LeafCoordinatorStats,
+    pub coordinator: CoordinatorStats,
     /// Direct-commit coverage.
     pub direct_commit: DirectCommitStats,
     /// Background split and merge activity.
-    pub restructurer: RestructurerStats,
+    pub topology: TopologyStats,
     /// Garbage collection activity.
     pub gc: GcStats,
 }
@@ -319,7 +319,7 @@ impl Engine {
             locker: self.locker.stats_and_reset(),
             coordinator: self.coord.stats_and_reset(),
             direct_commit: self.algo.direct_commit_stats_and_reset(),
-            restructurer: self.restructurer.stats_and_reset(),
+            topology: self.restructurer.stats_and_reset(),
             gc: self.gc.stats_and_reset(),
         }
     }

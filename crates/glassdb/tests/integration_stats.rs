@@ -88,7 +88,7 @@ async fn stats_report_direct_commit_coverage() {
 
     let delta = db.stats() - before;
     assert_eq!(delta.direct_commit.candidates, 1);
-    assert_eq!(delta.direct_commit.landed, 1);
+    assert_eq!(delta.direct_commit.completed, 1);
 }
 
 // With the default topology policy, one aggregate inline rejection requests a
@@ -115,13 +115,13 @@ async fn aggregate_inline_pressure_splits_for_a_later_direct_commit() {
     rmw(&db, &coll, b"a", 1).await.unwrap();
     let first = db.stats() - before_first;
     assert_eq!(first.direct_commit.candidates, 1);
-    assert_eq!(first.direct_commit.landed, 1);
+    assert_eq!(first.direct_commit.completed, 1);
 
     let before_miss = db.stats();
     rmw(&db, &coll, b"b", 1).await.unwrap();
     let miss = db.stats() - before_miss;
     assert_eq!(miss.direct_commit.candidates, 1);
-    assert_eq!(miss.direct_commit.landed, 0);
+    assert_eq!(miss.direct_commit.completed, 0);
     assert!(
         miss.locker.calls > 0,
         "the discovering mutation completes through the locked fallback"
@@ -132,22 +132,22 @@ async fn aggregate_inline_pressure_splits_for_a_later_direct_commit() {
     for _ in 0..5 {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         after_split = db.stats();
-        if after_split.restructurer.inline_pressure.completed
-            > before_split.restructurer.inline_pressure.completed
+        if after_split.topology.splits.inline_pressure.completed
+            > before_split.topology.splits.inline_pressure.completed
         {
             break;
         }
     }
     let split = after_split - before_split;
-    assert_eq!(split.restructurer.inline_pressure.candidates, 1);
-    assert_eq!(split.restructurer.inline_pressure.completed, 1);
-    assert_eq!(split.restructurer.inline_pressure.discarded, 0);
+    assert_eq!(split.topology.splits.inline_pressure.candidates, 1);
+    assert_eq!(split.topology.splits.inline_pressure.completed, 1);
+    assert_eq!(split.topology.splits.inline_pressure.discarded, 0);
 
     let before_retry = db.stats();
     rmw(&db, &coll, b"b", 1).await.unwrap();
     let retry = db.stats() - before_retry;
     assert_eq!(retry.direct_commit.candidates, 1);
-    assert_eq!(retry.direct_commit.landed, 1);
+    assert_eq!(retry.direct_commit.completed, 1);
     assert_eq!(
         retry.locker.calls, 0,
         "the split gives the later mutation enough inline headroom"
@@ -184,7 +184,7 @@ async fn stats_report_cache_owner_activity() {
     let cold = reader_db.stats() - before_cold;
     assert_eq!(cold.transactions.reads, 1);
     assert!(cold.cache.l1_misses > 0);
-    assert!(cold.monitor.final_status_misses > 0);
+    assert!(cold.monitor.misses > 0);
 
     let before_warm = reader_db.stats();
     let reader_ref = &reader;
@@ -207,8 +207,8 @@ async fn stats_report_cache_owner_activity() {
     let warm = reader_db.stats() - before_warm;
     assert_eq!(warm.transactions.reads, 1);
     assert!(warm.cache.l1_hits > 0);
-    assert!(warm.monitor.final_status_hits > 0);
-    assert_eq!(warm.monitor.final_status_misses, 0);
+    assert!(warm.monitor.hits > 0);
+    assert_eq!(warm.monitor.misses, 0);
 
     let before_stale = reader_db.stats();
     assert_eq!(
@@ -222,8 +222,8 @@ async fn stats_report_cache_owner_activity() {
     let stale = reader_db.stats() - before_stale;
     assert_eq!(stale.transactions.reads, 0);
     assert!(stale.cache.l1_hits > 0);
-    assert!(stale.monitor.final_status_hits > 0);
-    assert_eq!(stale.backend.obj_reads, 0);
+    assert!(stale.monitor.hits > 0);
+    assert_eq!(stale.backend.reads, 0);
 
     reader.delete(key).await.unwrap();
     let before_deleted = reader_db.stats();
@@ -368,7 +368,7 @@ async fn warm_inline_updates_read_no_transaction_record() {
         let workload = db.stats() - before;
         assert_eq!(workload.transactions.completed, ITERATIONS * keys);
         assert_eq!(
-            workload.backend.obj_reads, 0,
+            workload.backend.reads, 0,
             "warmed inline writes of {keys} keys must not read transaction records"
         );
         db.shutdown().await;
@@ -429,10 +429,7 @@ async fn repeated_reads_of_an_external_value_use_the_cached_record() {
     }
     let warm = reader.stats() - before;
     assert_eq!(warm.transactions.completed, READS);
-    assert!(
-        warm.backend.obj_reads > 0,
-        "reads must still validate leaves"
-    );
+    assert!(warm.backend.reads > 0, "reads must still validate leaves");
     // Count backend reads, including conditional requests that transfer no
     // body. Other transaction records can belong to background work.
     let repeated: Vec<_> = operations

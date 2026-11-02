@@ -57,24 +57,33 @@ struct Stats {
 
 /// Coordination work for one snapshot or accumulated interval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LeafCoordinatorStats {
+pub struct CoordinatorStats {
+    /// Operations submitted to a coordinator round.
     pub submissions: u64,
+    /// Coordinator rounds that ran.
     pub rounds: u64,
+    /// Leaf CASes that a round retried after it lost them.
     pub cas_retries: u64,
 }
 
-impl AddAssign for LeafCoordinatorStats {
+impl AddAssign for CoordinatorStats {
     fn add_assign(&mut self, rhs: Self) {
-        self.submissions += rhs.submissions;
-        self.rounds += rhs.rounds;
-        self.cas_retries += rhs.cas_retries;
+        // Destructuring fails to compile when a field is added and not summed.
+        let Self {
+            submissions,
+            rounds,
+            cas_retries,
+        } = rhs;
+        self.submissions += submissions;
+        self.rounds += rounds;
+        self.cas_retries += cas_retries;
     }
 }
 
-impl Sub for LeafCoordinatorStats {
+impl Sub for CoordinatorStats {
     type Output = Self;
 
-    fn sub(self, rhs: Self) -> Self::Output {
+    fn sub(self, rhs: Self) -> Self {
         Self {
             submissions: self.submissions.saturating_sub(rhs.submissions),
             rounds: self.rounds.saturating_sub(rhs.rounds),
@@ -1189,9 +1198,9 @@ impl LeafCoordinator {
     }
 
     /// Returns and resets submission, worker-round, and inner-CAS retry counts.
-    pub fn stats_and_reset(&self) -> LeafCoordinatorStats {
+    pub fn stats_and_reset(&self) -> CoordinatorStats {
         let dedup = self.inner.dedup.stats_and_reset();
-        LeafCoordinatorStats {
+        CoordinatorStats {
             submissions: dedup.submissions,
             rounds: dedup.rounds,
             cas_retries: self.inner.core.stats.n_retries.swap(0, Ordering::Relaxed),

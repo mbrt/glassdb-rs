@@ -8,7 +8,7 @@ use std::time::Duration;
 use glassdb_backend::BackendStats;
 use glassdb_storage::CacheStats;
 use glassdb_trans::{
-    DirectCommitStats, GcStats, LeafCoordinatorStats, LockerStats, MonitorStats, RestructurerStats,
+    CoordinatorStats, DirectCommitStats, GcStats, LockerStats, MonitorStats, TopologyStats,
 };
 
 /// Transaction activity for one snapshot or accumulated interval.
@@ -28,18 +28,26 @@ pub struct TransactionStats {
 
 impl AddAssign for TransactionStats {
     fn add_assign(&mut self, rhs: Self) {
-        self.completed += rhs.completed;
-        self.elapsed += rhs.elapsed;
-        self.reads += rhs.reads;
-        self.writes += rhs.writes;
-        self.replays += rhs.replays;
+        // Destructuring fails to compile when a field is added and not summed.
+        let Self {
+            completed,
+            elapsed,
+            reads,
+            writes,
+            replays,
+        } = rhs;
+        self.completed += completed;
+        self.elapsed += elapsed;
+        self.reads += reads;
+        self.writes += writes;
+        self.replays += replays;
     }
 }
 
 impl Sub for TransactionStats {
     type Output = Self;
 
-    fn sub(self, rhs: Self) -> Self::Output {
+    fn sub(self, rhs: Self) -> Self {
         Self {
             completed: self.completed.saturating_sub(rhs.completed),
             elapsed: self.elapsed.saturating_sub(rhs.elapsed),
@@ -54,6 +62,9 @@ impl Sub for TransactionStats {
 ///
 /// Counters only increase over time and are never reset. Subtract snapshots to
 /// measure a specific interval.
+///
+/// Each field is named after the component that counts. Inside a group, a
+/// counter is a plural noun of what happened.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
     /// Transaction execution activity.
@@ -67,43 +78,55 @@ pub struct Stats {
     /// Distributed-locker activity.
     pub locker: LockerStats,
     /// Shared leaf-coordinator activity.
-    pub coordinator: LeafCoordinatorStats,
+    pub coordinator: CoordinatorStats,
     /// Direct-commit coverage.
     pub direct_commit: DirectCommitStats,
     /// Background split and merge activity.
-    pub restructurer: RestructurerStats,
+    pub topology: TopologyStats,
     /// Garbage collection activity.
     pub gc: GcStats,
 }
 
 impl AddAssign for Stats {
     fn add_assign(&mut self, rhs: Self) {
-        self.transactions += rhs.transactions;
-        self.backend += rhs.backend;
-        self.cache += rhs.cache;
-        self.monitor += rhs.monitor;
-        self.locker += rhs.locker;
-        self.coordinator += rhs.coordinator;
-        self.direct_commit += rhs.direct_commit;
-        self.restructurer += rhs.restructurer;
-        self.gc += rhs.gc;
+        // Destructuring fails to compile when a field is added and not summed.
+        let Self {
+            transactions,
+            backend,
+            cache,
+            monitor,
+            locker,
+            coordinator,
+            direct_commit,
+            topology,
+            gc,
+        } = rhs;
+        self.transactions += transactions;
+        self.backend += backend;
+        self.cache += cache;
+        self.monitor += monitor;
+        self.locker += locker;
+        self.coordinator += coordinator;
+        self.direct_commit += direct_commit;
+        self.topology += topology;
+        self.gc += gc;
     }
 }
 
 impl Sub for Stats {
-    type Output = Stats;
+    type Output = Self;
 
-    fn sub(self, other: Stats) -> Stats {
-        Stats {
-            transactions: self.transactions - other.transactions,
-            backend: self.backend - other.backend,
-            cache: self.cache - other.cache,
-            monitor: self.monitor - other.monitor,
-            locker: self.locker - other.locker,
-            coordinator: self.coordinator - other.coordinator,
-            direct_commit: self.direct_commit - other.direct_commit,
-            restructurer: self.restructurer - other.restructurer,
-            gc: self.gc - other.gc,
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            transactions: self.transactions - rhs.transactions,
+            backend: self.backend - rhs.backend,
+            cache: self.cache - rhs.cache,
+            monitor: self.monitor - rhs.monitor,
+            locker: self.locker - rhs.locker,
+            coordinator: self.coordinator - rhs.coordinator,
+            direct_commit: self.direct_commit - rhs.direct_commit,
+            topology: self.topology - rhs.topology,
+            gc: self.gc - rhs.gc,
         }
     }
 }
@@ -111,162 +134,116 @@ impl Sub for Stats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glassdb_trans::InlinePressureStats;
+    use glassdb_trans::{MergeStats, SplitCauseStats, SplitStats};
 
     #[test]
-    fn subtraction_covers_component_snapshots() {
+    fn subtraction_and_addition_cover_nested_groups() {
         let before = Stats {
             transactions: TransactionStats {
                 completed: 2,
                 elapsed: Duration::from_secs(3),
-                reads: 7,
-                writes: 5,
-                replays: 1,
-            },
-            backend: BackendStats {
-                obj_reads: 12,
-                obj_writes: 8,
-                obj_lists: 3,
-            },
-            cache: CacheStats {
-                l1_hits: 4,
-                l2_hits: 2,
                 ..Default::default()
             },
-            locker: LockerStats { calls: 6 },
-            monitor: MonitorStats {
-                final_status_hits: 3,
-                final_status_misses: 2,
+            backend: BackendStats {
+                reads: 12,
+                writes: 8,
+                lists: 3,
             },
-            coordinator: LeafCoordinatorStats {
-                submissions: 10,
-                rounds: 8,
-                cas_retries: 2,
-            },
-            direct_commit: DirectCommitStats {
-                candidates: 7,
-                landed: 5,
-            },
-            gc: GcStats::default(),
-            restructurer: RestructurerStats {
-                candidates: 3,
-                splits: 2,
-                deferred: 1,
-                tombstones_reclaimed: 4,
-                splits_avoided: 1,
-                merges: 2,
-                contention_splits: 1,
-                kept_apart: 4,
-                inline_pressure: InlinePressureStats {
-                    candidates: 2,
-                    completed: 1,
-                    deferred: 1,
-                    discarded: 0,
+            topology: TopologyStats {
+                splits: SplitStats {
+                    completed: 2,
+                    inline_pressure: SplitCauseStats {
+                        candidates: 2,
+                        completed: 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
                 },
+                merges: MergeStats {
+                    kept_apart: 4,
+                    ..Default::default()
+                },
+                tombstones_reclaimed: 4,
             },
+            ..Default::default()
         };
         let after = Stats {
             transactions: TransactionStats {
                 completed: 5,
                 elapsed: Duration::from_secs(8),
-                reads: 18,
-                writes: 9,
-                replays: 3,
-            },
-            backend: BackendStats {
-                obj_reads: 19,
-                obj_writes: 11,
-                obj_lists: 5,
-            },
-            cache: CacheStats {
-                l1_hits: 9,
-                l2_hits: 3,
                 ..Default::default()
             },
-            locker: LockerStats { calls: 10 },
-            monitor: MonitorStats {
-                final_status_hits: 8,
-                final_status_misses: 5,
+            backend: BackendStats {
+                reads: 19,
+                writes: 11,
+                lists: 5,
             },
-            coordinator: LeafCoordinatorStats {
-                submissions: 14,
-                rounds: 10,
-                cas_retries: 3,
-            },
-            direct_commit: DirectCommitStats {
-                candidates: 11,
-                landed: 8,
-            },
-            gc: GcStats::default(),
-            restructurer: RestructurerStats {
-                candidates: 5,
-                splits: 3,
-                deferred: 1,
-                tombstones_reclaimed: 9,
-                splits_avoided: 3,
-                merges: 5,
-                contention_splits: 3,
-                kept_apart: 10,
-                inline_pressure: InlinePressureStats {
-                    candidates: 5,
-                    completed: 2,
-                    deferred: 1,
-                    discarded: 1,
-                },
-            },
-        };
-        assert_eq!(
-            after - before,
-            Stats {
-                transactions: TransactionStats {
+            topology: TopologyStats {
+                splits: SplitStats {
                     completed: 3,
-                    elapsed: Duration::from_secs(5),
-                    reads: 11,
-                    writes: 4,
-                    replays: 2,
-                },
-                backend: BackendStats {
-                    obj_reads: 7,
-                    obj_writes: 3,
-                    obj_lists: 2,
-                },
-                cache: CacheStats {
-                    l1_hits: 5,
-                    l2_hits: 1,
+                    inline_pressure: SplitCauseStats {
+                        candidates: 5,
+                        completed: 2,
+                        discarded: 1,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
-                locker: LockerStats { calls: 4 },
-                monitor: MonitorStats {
-                    final_status_hits: 5,
-                    final_status_misses: 3
+                merges: MergeStats {
+                    kept_apart: 10,
+                    ..Default::default()
                 },
-                coordinator: LeafCoordinatorStats {
-                    submissions: 4,
-                    rounds: 2,
-                    cas_retries: 1,
-                },
-                direct_commit: DirectCommitStats {
-                    candidates: 4,
-                    landed: 3,
-                },
-                gc: GcStats::default(),
-                restructurer: RestructurerStats {
-                    candidates: 2,
-                    splits: 1,
-                    deferred: 0,
-                    tombstones_reclaimed: 5,
-                    splits_avoided: 2,
-                    merges: 3,
-                    contention_splits: 2,
-                    kept_apart: 6,
-                    inline_pressure: InlinePressureStats {
+                tombstones_reclaimed: 9,
+            },
+            ..Default::default()
+        };
+        let delta = Stats {
+            transactions: TransactionStats {
+                completed: 3,
+                elapsed: Duration::from_secs(5),
+                ..Default::default()
+            },
+            backend: BackendStats {
+                reads: 7,
+                writes: 3,
+                lists: 2,
+            },
+            topology: TopologyStats {
+                splits: SplitStats {
+                    completed: 1,
+                    inline_pressure: SplitCauseStats {
                         candidates: 3,
                         completed: 1,
-                        deferred: 0,
                         discarded: 1,
+                        ..Default::default()
                     },
+                    ..Default::default()
                 },
-            }
-        );
+                merges: MergeStats {
+                    kept_apart: 6,
+                    ..Default::default()
+                },
+                tombstones_reclaimed: 5,
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(after - before, delta);
+        let mut sum = before;
+        sum += delta;
+        assert_eq!(sum, after);
+    }
+
+    #[test]
+    fn subtraction_saturates_at_zero() {
+        let high = Stats {
+            backend: BackendStats {
+                reads: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(Stats::default() - high, Stats::default());
     }
 }

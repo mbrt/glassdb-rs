@@ -53,7 +53,7 @@ async fn leaves_merge_for_the_keys_that_transactions_write_together() {
         coll.write(&[key], &write_int(0)).await.unwrap();
     }
     tokio::time::sleep(Duration::from_secs(5)).await;
-    let splits = db.stats().restructurer.splits;
+    let splits = db.stats().topology.splits.completed;
     assert!(splits >= 3, "{splits}");
 
     let pairs = async |rounds: usize| {
@@ -66,13 +66,16 @@ async fn leaves_merge_for_the_keys_that_transactions_write_together() {
         tokio::time::sleep(Duration::from_secs(5)).await;
     };
     pairs(20).await;
-    let merged = db.stats().restructurer;
-    assert!(merged.merges >= 1);
+    let merged = db.stats().topology;
+    assert!(merged.merges.completed >= 1);
 
     // The merged leaves keep the pairs, so they neither split nor merge again.
     pairs(20).await;
-    let later = db.stats().restructurer;
-    assert_eq!((later.splits, later.merges), (merged.splits, merged.merges));
+    let later = db.stats().topology;
+    assert_eq!(
+        (later.splits.completed, later.merges.completed),
+        (merged.splits.completed, merged.merges.completed)
+    );
     let keys = coll.scan_keys(KeyScan::all()).await.unwrap();
     assert_eq!(keys.keys().len(), 16);
     db.shutdown().await;

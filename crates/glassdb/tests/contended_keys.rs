@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures::future::join_all;
 use glassdb::middleware::HookBackend;
-use glassdb::{Backend, Collection, Database, KeyScan, RestructurerStats, TopologyPolicy};
+use glassdb::{Backend, Collection, Database, KeyScan, TopologyPolicy, TopologyStats};
 
 pub mod integration_support;
 
@@ -87,10 +87,10 @@ async fn write_one_key_each(colls: &[Collection]) {
     .await;
 }
 
-fn sum(dbs: &[Database]) -> RestructurerStats {
-    let mut stats = RestructurerStats::default();
+fn sum(dbs: &[Database]) -> TopologyStats {
+    let mut stats = TopologyStats::default();
     for db in dbs {
-        stats += db.stats().restructurer;
+        stats += db.stats().topology;
     }
     stats
 }
@@ -111,9 +111,9 @@ async fn the_keys_of_database_instances_split_apart() {
     write_one_key_each(&colls).await;
 
     let stats = sum(&dbs);
-    assert!(stats.contention_splits >= 1, "{stats:?}");
-    assert_eq!(stats.merges, 0, "{stats:?}");
-    assert!(stats.kept_apart >= 1, "{stats:?}");
+    assert!(stats.splits.contention.completed >= 1, "{stats:?}");
+    assert_eq!(stats.merges.completed, 0, "{stats:?}");
+    assert!(stats.merges.kept_apart >= 1, "{stats:?}");
     let keys = colls[0].scan_keys(KeyScan::all()).await.unwrap();
     assert_eq!(keys.keys().len(), 8);
     shutdown(dbs).await;
@@ -129,7 +129,11 @@ async fn the_size_causes_do_not_split_the_keys_of_database_instances_apart() {
     write_one_key_each(&colls).await;
 
     let stats = sum(&dbs);
-    assert_eq!((stats.splits, stats.contention_splits), (0, 0), "{stats:?}");
+    assert_eq!(
+        (stats.splits.completed, stats.splits.contention.completed),
+        (0, 0),
+        "{stats:?}"
+    );
     shutdown(dbs).await;
 }
 
@@ -142,7 +146,11 @@ async fn the_keys_that_one_database_instance_writes_stay_together() {
     write_concurrently(&colls[0], 0..8, 1000).await;
 
     let stats = sum(&dbs);
-    assert_eq!((stats.splits, stats.contention_splits), (0, 0), "{stats:?}");
+    assert_eq!(
+        (stats.splits.completed, stats.splits.contention.completed),
+        (0, 0),
+        "{stats:?}"
+    );
     shutdown(dbs).await;
 }
 
@@ -153,7 +161,7 @@ async fn the_leaves_merge_again_when_their_writers_stop() {
     let (dbs, colls) = four_instances().await;
     write_one_key_each(&colls).await;
     let split = sum(&dbs);
-    assert!(split.contention_splits >= 1, "{split:?}");
+    assert!(split.splits.contention.completed >= 1, "{split:?}");
 
     tokio::time::sleep(Duration::from_secs(61)).await;
     for _ in 0..3 {
@@ -162,6 +170,6 @@ async fn the_leaves_merge_again_when_their_writers_stop() {
     }
 
     let merged = sum(&dbs);
-    assert!(merged.merges >= 1, "{merged:?}");
+    assert!(merged.merges.completed >= 1, "{merged:?}");
     shutdown(dbs).await;
 }

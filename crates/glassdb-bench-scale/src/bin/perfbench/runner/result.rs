@@ -238,17 +238,17 @@ impl InstanceResult {
             replays: stats.transactions.replays,
             lock_calls: stats.locker.calls,
             direct_candidates: stats.direct_commit.candidates,
-            direct_landed: stats.direct_commit.landed,
-            obj_reads: stats.backend.obj_reads,
-            obj_writes: stats.backend.obj_writes,
-            obj_lists: stats.backend.obj_lists,
+            direct_landed: stats.direct_commit.completed,
+            obj_reads: stats.backend.reads,
+            obj_writes: stats.backend.writes,
+            obj_lists: stats.backend.lists,
             coordinator_submissions: stats.coordinator.submissions,
             coordinator_rounds: stats.coordinator.rounds,
             coordinator_cas_retries: stats.coordinator.cas_retries,
-            split_candidates: stats.restructurer.candidates,
-            splits: stats.restructurer.splits,
-            split_deferred: stats.restructurer.deferred,
-            merges: stats.restructurer.merges,
+            split_candidates: stats.topology.splits.candidates,
+            splits: stats.topology.splits.completed,
+            split_deferred: stats.topology.splits.deferred,
+            merges: stats.topology.merges.completed,
         }
     }
 }
@@ -257,9 +257,9 @@ impl OpsPerTx {
     pub(crate) fn of(total: &Stats, logical_txn: u64, backend: BackendBreakdown) -> Self {
         let denominator = logical_txn.max(1) as f64;
         let (reads, writes, lists) = (
-            total.backend.obj_reads,
-            total.backend.obj_writes,
-            total.backend.obj_lists,
+            total.backend.reads,
+            total.backend.writes,
+            total.backend.lists,
         );
         Self {
             txn: logical_txn,
@@ -291,11 +291,11 @@ impl ProtocolPerTx {
             },
             coordinator_cas_retries_per_tx: total.coordinator.cas_retries as f64 / denominator,
             direct_candidates_per_tx: candidates as f64 / denominator,
-            direct_landed_per_tx: total.direct_commit.landed as f64 / denominator,
+            direct_landed_per_tx: total.direct_commit.completed as f64 / denominator,
             direct_land_rate: if candidates == 0 {
                 0.0
             } else {
-                total.direct_commit.landed as f64 / candidates as f64
+                total.direct_commit.completed as f64 / candidates as f64
             },
             lock_calls: total.locker.calls,
             replays: total.transactions.replays,
@@ -353,9 +353,9 @@ pub(crate) fn costs(workload: Window, shutdown: Window, transactions: u64) -> se
     let n = transactions.max(1) as f64;
     let window = |window: &Window| {
         serde_json::json!({
-            "reads": window.stats.backend.obj_reads as f64 / n,
-            "writes": window.stats.backend.obj_writes as f64 / n,
-            "lists": window.stats.backend.obj_lists as f64 / n,
+            "reads": window.stats.backend.reads as f64 / n,
+            "writes": window.stats.backend.writes as f64 / n,
+            "lists": window.stats.backend.lists as f64 / n,
             "readBodyBytes": window.breakdown.read_bytes() as f64 / n,
             "writeBodyBytes": window.breakdown.write_bytes() as f64 / n,
             "coordinatorSubmissions": window.stats.coordinator.submissions as f64 / n,

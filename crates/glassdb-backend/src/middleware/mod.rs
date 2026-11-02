@@ -141,8 +141,8 @@ mod tests {
             *seen.lock().unwrap(),
             vec![("a/".to_string(), Some(cursor.clone()), 1)]
         );
-        assert_eq!(stack.backend.stats_and_reset().obj_lists, 1);
-        assert_eq!(stack.provider_stats.stats_and_reset().obj_lists, 1);
+        assert_eq!(stack.backend.stats_and_reset().lists, 1);
+        assert_eq!(stack.provider_stats.stats_and_reset().lists, 1);
         let recorded = stack.log.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].op, "list");
