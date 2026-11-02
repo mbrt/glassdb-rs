@@ -953,11 +953,15 @@ impl Monitor {
             }
             OwnerClosePlan::AlreadyFinished => return Ok(OwnerAbortOutcome::AlreadyFinished),
         };
-        let mut status = self
-            .inner
-            .tx_records
-            .commit_status_at(tid, self.current_requirement())
-            .await?;
+        let mut status = match self.owned_wound_observation(tid) {
+            Some(observation) => TxStatus::from_observation(observation),
+            None => {
+                self.inner
+                    .tx_records
+                    .commit_status_at(tid, self.current_requirement())
+                    .await?
+            }
+        };
         let mut backoff = self.inner.retry.backoff();
         loop {
             if transition == AbortTransition::WoundIfPresent && status.observation.is_absent() {
@@ -1425,6 +1429,29 @@ impl Monitor {
             return OwnerClosePlan::AlreadyFinished;
         };
         owned.close(OwnerCloseReason::OwnerAbort)
+    }
+
+    /// Returns the durable observation of a wound on an owned transaction, when
+    /// this Database already saw it.
+    fn owned_wound_observation(&self, tid: &TxId) -> Option<Observation<TxRecord>> {
+        let st = self.shard_for(tid).lock().unwrap();
+        let TxRuntimeRole::Owned(owned) = &st.transactions.get(tid)?.role else {
+            return None;
+        };
+        // Only the owner changes a `Wounded` record: other aborters settle on
+        // it, a refresh or commit cannot replace it, and GC skips it
+        // (ADR-071). So an old observation is still a correct CAS expectation,
+        // and a stale one only fails the CAS and causes a read.
+        owned
+            .record
+            .as_ref()?
+            .last_observation
+            .clone()
+            .filter(|observation| {
+                observation
+                    .value()
+                    .is_some_and(|record| record.status == TxCommitStatus::Wounded)
+            })
     }
 
     fn begin_commit_write(&self, tid: &TxId) -> Result<(), TransError> {
@@ -2636,6 +2663,75 @@ mod tests {
         // A durable read of the acknowledged record replaces the cached wound.
         assert!(peer.has_durable_wound(&tid).await.unwrap());
         assert_eq!(peer.known_final_status(&tid), Some(TxCommitStatus::Aborted));
+    }
+
+    // The owner saw the wound when it checked its own status. The
+    // acknowledgement uses that observation instead of reading it again, so it
+    // costs one CAS.
+    #[tokio::test]
+    async fn owner_acknowledges_an_observed_wound_without_reading_it_again() {
+        let recorded = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
+        let operations = recorded.log();
+        let (owner, _owner_ctx) = new_test_monitor(recorded.clone());
+        let (peer, _peer_ctx) = new_test_monitor(recorded);
+        let tid = tx_id(b"wounded");
+        let operation = owner.begin_owner_operation(&tid).unwrap();
+        owner.begin_tx(&tid);
+        assert_eq!(peer.preempt_tx(&tid).await.unwrap(), TxFinalStatus::Aborted);
+        assert!(owner.has_durable_wound(&tid).await.unwrap());
+        operation.complete();
+        operations.lock().unwrap().clear();
+
+        assert_eq!(
+            owner.abort_owned_tx(&tid).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+        let ops = operations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|op| op.op)
+            .collect::<Vec<_>>();
+        assert_eq!(ops, vec!["write_if"]);
+        assert!(peer.has_durable_wound(&tid).await.unwrap());
+        assert_eq!(peer.known_final_status(&tid), Some(TxCommitStatus::Aborted));
+    }
+
+    // An observed wound can be stale when the record changed after the owner
+    // saw it. The failed CAS makes the owner read the record again, and the
+    // abort settles on the current status.
+    #[tokio::test]
+    async fn owner_abort_recovers_from_a_stale_wound_observation() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (owner, _owner_ctx) = new_test_monitor(backend.clone());
+        let (peer, peer_ctx) = new_test_monitor(backend);
+        let tid = tx_id(b"wounded");
+        let operation = owner.begin_owner_operation(&tid).unwrap();
+        owner.begin_tx(&tid);
+        assert_eq!(peer.preempt_tx(&tid).await.unwrap(), TxFinalStatus::Aborted);
+        assert!(owner.has_durable_wound(&tid).await.unwrap());
+        operation.complete();
+        let wounded = peer_ctx
+            .tx_records
+            .get_at(&tid, Requirement::ANY)
+            .await
+            .unwrap();
+        let mut aborted = TxRecord::clone(wounded.value().unwrap());
+        aborted.status = TxCommitStatus::Aborted;
+        peer_ctx
+            .tx_records
+            .set_if(&aborted, &wounded)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            owner.abort_owned_tx(&tid).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+        assert_eq!(
+            owner.tx_status(&tid).await.unwrap(),
+            TxCommitStatus::Aborted
+        );
     }
 
     #[tokio::test]

@@ -21,6 +21,14 @@ pub(crate) struct CollectionHandleState {
     drop_intent_targets: BTreeSet<CollectionAddress>,
 }
 
+/// Physical collection resources that one transaction identity owns, which an
+/// acknowledged abort rolls back.
+#[derive(Debug, Default)]
+pub(crate) struct IdentityCollectionResources {
+    prepared: BTreeSet<CollectionAddress>,
+    drop_intent_targets: BTreeSet<CollectionAddress>,
+}
+
 /// Issues reusable collection IDs within one transaction identity.
 #[derive(Clone)]
 pub struct CollectionReservations {
@@ -107,6 +115,14 @@ impl CollectionHandleState {
     /// transaction identity.
     pub(crate) fn replace_accesses(&mut self, accesses: CatalogAccesses) {
         self.accesses = accesses;
+    }
+
+    /// Moves the physical resources of the current identity out of the handle.
+    pub(crate) fn take_resources(&mut self) -> IdentityCollectionResources {
+        IdentityCollectionResources {
+            prepared: std::mem::take(&mut self.prepared),
+            drop_intent_targets: std::mem::take(&mut self.drop_intent_targets),
+        }
     }
 
     /// Drops physical resources that belonged to the retired identity.
@@ -323,9 +339,9 @@ impl CollectionCommit {
     pub(crate) async fn abort(
         &self,
         id: &TxId,
-        handle: &CollectionHandleState,
+        resources: &IdentityCollectionResources,
     ) -> Result<(), TransError> {
-        let drops = handle
+        let drops = resources
             .drop_intent_targets
             .iter()
             .cloned()
@@ -335,7 +351,7 @@ impl CollectionCommit {
         self.lifecycle
             .clear_aborted_drops(id, &drops, Requirement::ANY)
             .await?;
-        let prepared = handle.prepared.iter().cloned().collect::<Vec<_>>();
+        let prepared = resources.prepared.iter().cloned().collect::<Vec<_>>();
         self.lifecycle.reclaim(&prepared).await.map(|_| ())
     }
 }

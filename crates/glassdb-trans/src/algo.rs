@@ -36,7 +36,9 @@ use glassdb_storage::{
 };
 
 use crate::access::{AccessSet, LeafCoverage, ReadAccess, WriteOp};
-use crate::collection_commit::{CollectionCommit, CollectionHandleState, CollectionReservations};
+use crate::collection_commit::{
+    CollectionCommit, CollectionHandleState, CollectionReservations, IdentityCollectionResources,
+};
 use crate::collections::CatalogAccesses;
 use crate::error::TransError;
 use crate::gc::GcHints;
@@ -81,6 +83,7 @@ const MAX_LEAF_FULL_WAIT: Duration = Duration::from_secs(30);
 struct IdentityRetirement {
     mon: Monitor,
     gc_hints: GcHints,
+    collection_commit: CollectionCommit,
     background: Option<Weak<Background>>,
 }
 
@@ -93,7 +96,7 @@ impl IdentityRetirement {
         if !self.mon.is_tracked_local(tx_id) {
             return;
         }
-        let Some(bg) = self.background.as_ref().and_then(Weak::upgrade) else {
+        let Some(bg) = self.background() else {
             return;
         };
         let mon = self.mon.clone();
@@ -104,6 +107,63 @@ impl IdentityRetirement {
                 gc_hints.schedule(tx_id);
             }
         });
+    }
+
+    /// Acknowledges the wound of a retired identity and rolls back its
+    /// collection resources, or hands the identity to managed recovery.
+    async fn acknowledge_wound(
+        self: Arc<Self>,
+        tx_id: TxId,
+        resources: IdentityCollectionResources,
+    ) {
+        let result = match self.mon.abort_owned_tx(&tx_id).await {
+            Ok(outcome) => self.clean_up_abort(&tx_id, outcome, &resources).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            tracing::debug!(
+                transaction = %tx_id,
+                error = ?error,
+                "wounded transaction retirement deferred to managed recovery"
+            );
+            self.retire_unfinished(&tx_id);
+        }
+    }
+
+    /// Runs the cleanup that an owner abort with `outcome` leaves to the owner.
+    /// Only an acknowledged abort uses `resources`.
+    async fn clean_up_abort(
+        &self,
+        tx_id: &TxId,
+        outcome: OwnerAbortOutcome,
+        resources: &IdentityCollectionResources,
+    ) -> Result<(), TransError> {
+        match outcome {
+            OwnerAbortOutcome::Acknowledged => {
+                self.gc_hints.schedule(*tx_id);
+                self.collection_commit.abort(tx_id, resources).await
+            }
+            // A dropped or otherwise unresolved owner operation was pinned as
+            // `Wounded`. Its durable manifest and repeated GC passes own
+            // cleanup; local rollback must not race an effect that may land
+            // after this future returns.
+            OwnerAbortOutcome::Pinned => {
+                self.gc_hints.schedule(*tx_id);
+                Ok(())
+            }
+            // The collection objects and drop intents of a commit that won, or
+            // whose outcome is preserved, belong to the committed record and
+            // must be left for write-back and recovery. Without its owner
+            // record, an identity that another local path finished must not
+            // attempt collection rollback either.
+            OwnerAbortOutcome::Committed
+            | OwnerAbortOutcome::CommitOutcomePreserved
+            | OwnerAbortOutcome::AlreadyFinished => Ok(()),
+        }
+    }
+
+    fn background(&self) -> Option<Arc<Background>> {
+        self.background.as_ref().and_then(Weak::upgrade)
     }
 }
 
@@ -370,6 +430,7 @@ impl Algo {
         let retirement = Arc::new(IdentityRetirement {
             mon: mon.clone(),
             gc_hints: gc_hints.clone(),
+            collection_commit: collection_commit.clone(),
             background: background.clone(),
         });
         Algo {
@@ -569,40 +630,27 @@ impl Algo {
         if !tx.needs_abort() {
             return Ok(());
         }
-        match self.mon.abort_owned_tx(&tx.id).await? {
-            OwnerAbortOutcome::Acknowledged => {
-                self.gc_hints.schedule(tx.id);
-                self.collection_commit.abort(&tx.id, &tx.collections).await
-            }
-            // A dropped or otherwise unresolved owner operation was pinned as
-            // `Wounded`. Its durable manifest and repeated GC passes own
-            // cleanup; local rollback must not race an effect that may land
-            // after this future returns.
-            OwnerAbortOutcome::Pinned => {
-                self.gc_hints.schedule(tx.id);
-                Ok(())
-            }
-            // The commit point won before cleanup observed its result. Its
-            // collection objects and drop intents now belong to the committed
-            // record and must be left for write-back/recovery.
-            OwnerAbortOutcome::Committed => {
-                tx.commit();
-                Ok(())
-            }
-            // The commit write was dispatched but its result is no longer
-            // abortable. Preserve its resources exactly as for an observed
-            // committed winner.
-            OwnerAbortOutcome::CommitOutcomePreserved => {
-                tx.commit();
-                Ok(())
-            }
-            // Another local path already finished this identity. Without its
-            // owner record this handle must not attempt collection rollback.
-            OwnerAbortOutcome::AlreadyFinished => {
-                tx.commit();
-                Ok(())
-            }
+        let outcome = self.mon.abort_owned_tx(&tx.id).await?;
+        let resources = match outcome {
+            OwnerAbortOutcome::Acknowledged => tx.collections.take_resources(),
+            _ => IdentityCollectionResources::default(),
+        };
+        self.retirement
+            .clean_up_abort(&tx.id, outcome, &resources)
+            .await?;
+        // The commit point won before cleanup observed its result, or the
+        // commit write was dispatched and its result is no longer abortable.
+        // Either way the handle must act as committed. An identity that another
+        // local path already finished is also done.
+        if matches!(
+            outcome,
+            OwnerAbortOutcome::Committed
+                | OwnerAbortOutcome::CommitOutcomePreserved
+                | OwnerAbortOutcome::AlreadyFinished
+        ) {
+            tx.commit();
         }
+        Ok(())
     }
 
     async fn renew_for_serial(&self, tx: &mut Handle) -> Result<(), TransError> {
@@ -613,7 +661,24 @@ impl Algo {
 
     async fn renew_after_wound(&self, tx: &mut Handle) {
         let retired_id = tx.id;
-        if let Err(error) = self.end(tx).await {
+        if tx.needs_abort()
+            && let Some(bg) = self.retirement.background()
+        {
+            // The wound is decided: admission is closed and the record is, or
+            // will be, abort-side. The replay does not depend on the
+            // acknowledgement, and only GC waits for it (ADR-059), so it does
+            // not have to delay the replay.
+            //
+            // If shutdown discards the task, the record stays `Wounded`, as for
+            // any owner that does not acknowledge.
+            let resources = tx.collections.take_resources();
+            tx.retirement.disarm();
+            bg.spawn_waited(
+                self.retirement
+                    .clone()
+                    .acknowledge_wound(retired_id, resources),
+            );
+        } else if let Err(error) = self.end(tx).await {
             tracing::debug!(
                 transaction = %retired_id,
                 error = ?error,
@@ -1959,6 +2024,223 @@ mod tests {
         assert!(!old_id.older(h.id()));
 
         tm.end(&mut h).await.unwrap();
+    }
+
+    // A peer instance wounds the transaction. The replay must not wait for
+    // the owner's acknowledgement: the acknowledgement CAS stays blocked until
+    // the replay starts, and it lands later in the background.
+    #[tokio::test(start_paused = true)]
+    async fn a_wounded_transaction_replays_before_its_acknowledgement_lands() {
+        let backend = Arc::new(HookBackend::new(Arc::new(MemoryBackend::new())));
+        let (tm, tctx) = new_algo_from_backend_with_cache_policy_and_retirement(
+            backend.clone(),
+            1024,
+            NodeSizePolicy::default(),
+            true,
+        )
+        .await;
+        let keyp = logical_key(b"k");
+        let value = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
+        let mut h = begin_accesses(
+            &tm,
+            AccessSet::new(Vec::new(), vec![wa(&keyp, &value)], Vec::new()),
+        );
+        let old_id = *h.id();
+        assert!(h.engage());
+        tctx.tmon.begin_tx(&old_id);
+        let (_peer, peer_ctx) = new_algo_from_backend(backend.clone()).await;
+        peer_ctx.tmon.preempt_tx(&old_id).await.unwrap();
+        let acknowledgement = Arc::new(tokio::sync::Semaphore::new(0));
+        backend.set_before({
+            let old_path = ObjectPath::Transaction {
+                db_prefix: test_db_prefix(),
+                id: old_id,
+            }
+            .to_string();
+            let acknowledgement = acknowledgement.clone();
+            move |op| {
+                let blocked = matches!(op, BackendOp::WriteIf { path, .. } if *path == old_path);
+                let acknowledgement = acknowledgement.clone();
+                let future: HookFuture = Box::pin(async move {
+                    if blocked {
+                        acknowledgement.acquire_owned().await.unwrap().forget();
+                    }
+                    Ok(())
+                });
+                future
+            }
+        });
+
+        let decision = tokio::time::timeout(Duration::from_secs(1), tm.commit(&mut h))
+            .await
+            .expect("the replay waited for the wound acknowledgement")
+            .unwrap();
+        assert_eq!(decision, BodyDecision::ReplayBody);
+        assert_ne!(*h.id(), old_id);
+        assert_eq!(
+            tctx.tx_records
+                .commit_status_at(&old_id, Requirement::ANY)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Wounded
+        );
+
+        acknowledgement.add_permits(1);
+        await_tx_status(&tctx, &old_id, TxCommitStatus::Aborted).await;
+        tm.end(&mut h).await.unwrap();
+    }
+
+    // The background acknowledgement keeps the collection rollback of the
+    // synchronous one: the wounded identity's prepared collection is reclaimed
+    // after the abort is acknowledged.
+    #[tokio::test(start_paused = true)]
+    async fn a_background_wound_acknowledgement_reclaims_prepared_collections() {
+        let (tm, tctx) = new_algo_from_backend_with_cache_policy_and_retirement(
+            Arc::new(MemoryBackend::new()),
+            1024,
+            NodeSizePolicy::default(),
+            true,
+        )
+        .await;
+        let prepared = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([3; 16]));
+        let mut handle = tm.begin(
+            AccessSet::default(),
+            CatalogAccesses {
+                reads: Vec::new(),
+                changes: vec![CollectionChange {
+                    parent: test_collection(),
+                    name: CollectionName::new("prepared").unwrap(),
+                    collection: prepared.clone(),
+                    expected: None,
+                    op: CollectionOp::Create,
+                }],
+            },
+        );
+        tm.collection_commit
+            .prepare(&mut handle.collections)
+            .await
+            .unwrap();
+        let old_id = *handle.id();
+        tm.mon.begin_tx(&old_id);
+        assert!(handle.engage());
+        tctx.tmon.preempt_tx(&old_id).await.unwrap();
+        tctx.records
+            .load_record(&prepared, Requirement::ANY)
+            .await
+            .expect("preparation creates the collection record");
+
+        assert_eq!(
+            tm.commit(&mut handle).await.unwrap(),
+            BodyDecision::ReplayBody
+        );
+
+        await_tx_status(&tctx, &old_id, TxCommitStatus::Aborted).await;
+        let mut reclaimed = false;
+        for _ in 0..100 {
+            let requirement = Requirement::after(tctx.timeline.currentness_barrier());
+            if tctx
+                .records
+                .load_record(&prepared, requirement)
+                .await
+                .is_err()
+            {
+                reclaimed = true;
+                break;
+            }
+            rt::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(reclaimed, "the prepared collection was not reclaimed");
+        tm.end(&mut handle).await.unwrap();
+    }
+
+    // The background acknowledgement also clears the drop intents and the
+    // topology freeze that the wounded identity installed.
+    #[tokio::test(start_paused = true)]
+    async fn a_background_wound_acknowledgement_clears_drop_intents() {
+        let (tm, tctx) = new_algo_from_backend_with_cache_policy_and_retirement(
+            Arc::new(MemoryBackend::new()),
+            1024,
+            NodeSizePolicy::default(),
+            true,
+        )
+        .await;
+        let dropped = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([3; 16]));
+        assert!(
+            tctx.records
+                .create_record(&dropped, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        assert!(
+            tctx.nodes
+                .create_root(&dropped, &Node::leaf(LeafBody::new()))
+                .await
+                .unwrap()
+        );
+        let mut handle = tm.begin(
+            AccessSet::default(),
+            CatalogAccesses {
+                reads: Vec::new(),
+                changes: vec![CollectionChange {
+                    parent: test_collection(),
+                    name: CollectionName::new("dropped").unwrap(),
+                    collection: dropped.clone(),
+                    expected: Some(dropped.id()),
+                    op: CollectionOp::Drop,
+                }],
+            },
+        );
+        let old_id = *handle.id();
+        tm.mon.begin_tx(&old_id);
+        assert!(handle.engage());
+        tm.collection_commit
+            .fence(&old_id, &mut handle.collections)
+            .await
+            .unwrap();
+        tctx.tmon.preempt_tx(&old_id).await.unwrap();
+
+        assert_eq!(
+            tm.commit(&mut handle).await.unwrap(),
+            BodyDecision::ReplayBody
+        );
+
+        await_tx_status(&tctx, &old_id, TxCommitStatus::Aborted).await;
+        let mut cleared = false;
+        for _ in 0..100 {
+            let requirement = Requirement::after(tctx.timeline.currentness_barrier());
+            let (root, _) = tctx.nodes.load_root(&dropped, requirement).await.unwrap();
+            let (record, _) = tctx
+                .records
+                .load_record(&dropped, requirement)
+                .await
+                .unwrap();
+            if root.drop_intent().is_none() && record.topology_freeze().is_none() {
+                cleared = true;
+                break;
+            }
+            rt::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(cleared, "the drop intent or the topology freeze remained");
+        tm.end(&mut handle).await.unwrap();
+    }
+
+    async fn await_tx_status(tctx: &Tctx, id: &TxId, expected: TxCommitStatus) {
+        let mut status = TxCommitStatus::Unknown;
+        for _ in 0..100 {
+            let requirement = Requirement::after(tctx.timeline.currentness_barrier());
+            status = tctx
+                .tx_records
+                .commit_status_at(id, requirement)
+                .await
+                .unwrap()
+                .status;
+            if status == expected {
+                return;
+            }
+            rt::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("transaction {id} stayed {status:?}, expected {expected:?}");
     }
 
     // ADR-065: a timed-out parallel acquisition asks its owner to make the old
