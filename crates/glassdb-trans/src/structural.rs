@@ -7,23 +7,18 @@
 //! against cached state. Both kinds of change then run through one lifecycle:
 //! a structural intent written ahead of the change, a one-node structural
 //! gate, and parent reconciliation after the change. An independent loop
-//! completes the changes that a crash or an error interrupted. When the
-//! [`TopologyPolicy`] has a rule, as the avoidable time policy does, a third loop
-//! gives the measurements of each window to the rule, and queues the leaf
-//! changes that the rule asks for (ADR-074).
+//! completes the changes that a crash or an error interrupted. The
+//! [`TopologyPolicy`] decides which leaf changes the tree needs.
 
 mod candidates;
 mod change;
 mod contention;
-mod measurements;
 mod merge;
 mod nodes;
-mod paid_rate;
 mod policy;
 mod reclamation;
 mod reconcile;
 mod recovery;
-mod rule;
 mod sink;
 mod split;
 mod stats;
@@ -58,8 +53,7 @@ use merge::MergeReason;
 use merge::Merger;
 use nodes::StructuralNodeAccess;
 use policy::{
-    AvoidableTimePolicy, SizeCausesPolicy, TopologyDecisions, TopologySettings, TopologySignals,
-    WritersPolicy,
+    SizeCausesPolicy, TopologyDecisions, TopologySettings, TopologySignals, WritersPolicy,
 };
 use reclamation::ReclamationReporter;
 use reconcile::ParentReconciler;
@@ -67,11 +61,9 @@ use recovery::{RecoveryAction, RecoveryStep, StructuralRecovery};
 use split::{SplitReason, Splitter};
 use stats::Stats;
 
-pub(crate) use measurements::TypicalTime;
-pub(crate) use policy::SignalKind;
-pub use rule::TopologyPolicy;
+pub use policy::TopologyPolicy;
 pub use sink::StructuralHintSink;
-pub use stats::{DemandMergeStats, InlinePressureStats, RestructurerStats, TopologyTimeStats};
+pub use stats::{InlinePressureStats, RestructurerStats};
 pub(crate) use topology::TopologyMembership;
 
 /// Back off empty structural-intent listings independently of candidates.
@@ -102,7 +94,6 @@ pub struct Restructurer {
     // The intake of the topology signals, which the coordinator and the other
     // producers receive.
     hints: StructuralHintSink,
-    signals: Arc<dyn TopologySignals>,
     stats: Arc<Stats>,
     splitter: Splitter,
     merger: Merger,
@@ -113,13 +104,12 @@ pub struct Restructurer {
 }
 
 /// What one topology policy gives the restructurer: the queue that the policy
-/// and the engine rules fill, the intake of the topology signals, and the policy
-/// behind its two traits.
+/// and the engine rules fill, the intake of the topology signals, and the
+/// decisions of the policy.
 pub(super) struct TopologyParts {
     sizes: NodeSizePolicy,
     queue: MaintenanceCandidates,
     hints: StructuralHintSink,
-    signals: Arc<dyn TopologySignals>,
     decisions: Arc<dyn TopologyDecisions>,
 }
 
@@ -181,10 +171,6 @@ impl TopologyParts {
                 let policy = SizeCausesPolicy::new(settings, queue.clone());
                 Self::of(queue, sizes, Arc::new(policy))
             }
-            TopologyPolicy::AvoidableTime => {
-                let policy = AvoidableTimePolicy::new(settings, queue.clone());
-                Self::of(queue, sizes, Arc::new(policy))
-            }
         }
     }
 
@@ -196,7 +182,6 @@ impl TopologyParts {
             sizes,
             hints: StructuralHintSink::new(queue.clone(), sizes, policy.clone()),
             queue,
-            signals: policy.clone(),
             decisions: policy,
         }
     }
@@ -253,16 +238,12 @@ impl Restructurer {
     }
 
     /// Returns and resets the counters of background split and merge
-    /// activity, and of the time that transactions reported to the topology
-    /// rule.
+    /// activity.
     pub fn stats_and_reset(&self) -> RestructurerStats {
-        let mut stats = self.stats.take();
-        stats.topology_time = self.signals.take_topology_time();
-        stats
+        self.stats.take()
     }
 
-    /// Starts independent candidate, structural-recovery, and topology rule
-    /// loops.
+    /// Starts independent candidate and structural-recovery loops.
     pub fn start(&self) {
         let Some(bg) = self.bg.upgrade() else {
             return;
@@ -274,15 +255,6 @@ impl Restructurer {
                 restructurer.run_once().await;
             }
         });
-        if let Some(window) = self.signals.window() {
-            let signals = self.signals.clone();
-            bg.spawn(async move {
-                loop {
-                    rt::sleep(window).await;
-                    signals.end_window();
-                }
-            });
-        }
         let recovery = self.clone();
         bg.spawn(async move {
             let minimum = recovery.mon.protocol_timing().pending_timeout();
@@ -327,7 +299,6 @@ impl Restructurer {
             sizes,
             queue: candidates,
             hints,
-            signals,
             decisions,
         } = parts;
         let stats = Arc::new(Stats::default());
@@ -360,7 +331,6 @@ impl Restructurer {
             candidates.clone(),
             sizes,
             decisions.clone(),
-            hints.clone(),
             stats.clone(),
             reclamation.clone(),
         );
@@ -372,7 +342,6 @@ impl Restructurer {
             mon.clone(),
             sizes,
             decisions,
-            hints.clone(),
             stats.clone(),
             reclamation.clone(),
         );
@@ -386,14 +355,12 @@ impl Restructurer {
             recovery_wake.clone(),
             splitter.clone(),
             merger.clone(),
-            hints.clone(),
         );
         Restructurer {
             bg,
             mon,
             candidates,
             hints,
-            signals,
             stats,
             splitter,
             merger,
@@ -408,10 +375,7 @@ impl Restructurer {
     /// transient error on one candidate only defers its change to a later
     /// cycle, so it is logged and the sweep continues.
     async fn run_once(&self) {
-        let (candidates, stale) = self.candidates.drain();
-        for candidate in &stale {
-            self.count_stale(candidate);
-        }
+        let candidates = self.candidates.drain();
         for candidate in &candidates {
             self.count_candidate(candidate);
         }
@@ -457,7 +421,7 @@ impl Restructurer {
             for batch in self.batches(round) {
                 // The changes of an earlier round changed the nodes of this
                 // one. A merge of a drained or split source then stops, or
-                // pays again for the new leaves, before it writes.
+                // checks the new leaves again, before it writes.
                 let batch = if index == 0 {
                     batch
                 } else {
@@ -601,20 +565,17 @@ impl Restructurer {
         }
     }
 
-    /// Divides the changes of one round into batches, and drops the stale
-    /// candidates (ADR-083) just before each batch runs.
+    /// Divides the changes of one round into batches.
     fn batches(&self, round: Vec<LocatedChange>) -> impl Iterator<Item = Vec<LocatedChange>> {
         // A participant stays in the collection record until the changes of
         // its batch end, so a batch is not larger than the changes that run
-        // at the same time. One sweep can take longer than the age of a stale
-        // request, so each batch checks the age again.
+        // at the same time.
         let mut round = round.into_iter().peekable();
         std::iter::from_fn(move || {
             round.peek()?;
             Some(
                 round
                     .by_ref()
-                    .filter(|change| !self.drop_if_stale(change.candidate()))
                     .take(STRUCTURAL_CHANGE_PARALLELISM.get())
                     .collect(),
             )
@@ -627,29 +588,6 @@ impl Restructurer {
         if candidate.cause.is_inline_pressure() {
             self.stats
                 .inline_pressure_candidates
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Counts `candidate` as dropped if it is stale (ADR-083), and tells if it
-    /// is.
-    fn drop_if_stale(&self, candidate: &MaintenanceCandidate) -> bool {
-        let stale = candidate.is_stale();
-        if stale {
-            self.count_stale(candidate);
-        }
-        stale
-    }
-
-    /// Counts one stale demand candidate that a sweep dropped.
-    fn count_stale(&self, candidate: &MaintenanceCandidate) {
-        self.stats.stale_demand.fetch_add(1, Ordering::Relaxed);
-        if matches!(
-            candidate.cause,
-            CandidateCause::Merge(MergeReason::Demand { .. })
-        ) {
-            self.stats
-                .demand_merge_stale
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -748,9 +686,8 @@ impl TopologySettler for Restructurer {
 /// changes of one node keep their order, except that a merge runs after the
 /// splits of its nodes. Each round keeps the order of `changes`.
 fn rounds_of_changes(changes: Vec<LocatedChange>) -> Vec<Vec<LocatedChange>> {
-    // A merge of a leaf that also needs a split waits for the split. The
-    // split removes the cause, and the merge then pays again for the leaves
-    // that the split made (ADR-076).
+    // A merge of a leaf that also needs a split waits for the split, so that
+    // the merge checks again the leaves that the split made.
     let mut changes: Vec<_> = changes.into_iter().enumerate().collect();
     changes.sort_by_key(|(_, change)| matches!(change, LocatedChange::Merge(_)));
     let mut rounds = Vec::<Vec<(usize, LocatedChange)>>::new();
@@ -780,13 +717,6 @@ fn rounds_of_changes(changes: Vec<LocatedChange>) -> Vec<Vec<LocatedChange>> {
 }
 
 impl LocatedChange {
-    fn candidate(&self) -> &MaintenanceCandidate {
-        match self {
-            Self::Split(split) => &split.candidate,
-            Self::Merge(merge) => &merge.candidate,
-        }
-    }
-
     fn into_candidate(self) -> MaintenanceCandidate {
         match self {
             Self::Split(split) => split.candidate,

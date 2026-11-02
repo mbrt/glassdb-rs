@@ -1,305 +1,45 @@
-//! Leaf splits and merges that the topology policies other than the default
-//! decide: the avoidable time policy (ADR-074), and the size causes.
+//! Leaf splits and merges that the size causes decide.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use glassdb::middleware::HookBackend;
-use glassdb::{
-    Backend, Collection, Database, Error, KeyScan, NodeSizePolicy, RestructurerStats,
-    TopologyPolicy,
-};
+use glassdb::{Database, KeyScan, NodeSizePolicy, TopologyPolicy};
 
 pub mod integration_support;
 
-use integration_support::{create_top, mem, open_top, write_int};
+use integration_support::{create_top, mem, write_int};
 
-const BACKEND_DELAY: Duration = Duration::from_millis(5);
-
-// Under paused time, the memory backend takes no time, and so would every
-// avoidable time. Each operation of this backend takes time.
-fn slow_mem() -> Arc<dyn Backend> {
-    let backend = HookBackend::new(mem());
-    backend.set_before(|_| {
-        Box::pin(async {
-            tokio::time::sleep(BACKEND_DELAY).await;
-            Ok(())
-        })
-    });
-    backend
-}
-
-fn leaves_of_at_most(entries: usize) -> NodeSizePolicy {
-    NodeSizePolicy::builder()
-        .leaf_max_entries(entries)
-        .leaf_min_entries(0)
-        .index_min_children(0)
-        .build()
-        .unwrap()
-}
-
-async fn open(backend: &Arc<dyn Backend>, sizes: NodeSizePolicy) -> Database {
-    open_with(backend, sizes, TopologyPolicy::AvoidableTime).await
-}
-
-async fn open_with(
-    backend: &Arc<dyn Backend>,
-    sizes: NodeSizePolicy,
-    policy: TopologyPolicy,
-) -> Database {
-    Database::builder("example", backend.clone())
-        .node_size_policy(sizes)
-        .topology_policy(policy)
-        .open()
-        .await
-        .unwrap()
-}
-
-async fn write_keys(coll: &Collection, keys: u8) {
-    for key in 0..keys {
-        coll.write(&[key], &write_int(0)).await.unwrap();
-    }
-}
-
-async fn scan_all(coll: &Collection) -> Vec<Vec<u8>> {
-    coll.scan_keys(KeyScan::all())
-        .await
-        .unwrap()
-        .keys()
-        .to_vec()
-}
-
-// Opens a collection of `keys` keys over leaves of at most 4 entries, and
-// returns the splits that the soft caps caused.
-async fn split_collection(backend: &Arc<dyn Backend>, keys: u8) -> u64 {
-    let db = open(backend, leaves_of_at_most(4)).await;
-    let coll = create_top(&db, b"split").await;
-    write_keys(&coll, keys).await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    let splits = db.stats().restructurer.splits;
-    db.shutdown().await;
-    splits
-}
-
-// The avoidable time policy decides only the changes that the node sizes do
-// not force.
+// Splits 5 keys into two leaves, and deletes all keys but the first and the
+// last, so that each leaf keeps exactly one live entry. The size causes merge
+// leaves below the underfull threshold of the node sizes, even when they still
+// have live entries.
 #[tokio::test(start_paused = true)]
-async fn leaves_over_a_soft_cap_still_split() {
-    assert!(split_collection(&slow_mem(), 16).await >= 3);
-}
-
-// A scan that continues into the next leaf reads one more leaf, which one
-// merge of the two leaves removes.
-#[tokio::test(start_paused = true)]
-async fn scans_that_cross_leaves_merge_them() {
-    let backend = slow_mem();
-    split_collection(&backend, 16).await;
-    let db = open(&backend, leaves_of_at_most(64)).await;
-    let coll = open_top(&db, b"split").await;
-
-    let until = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < until {
-        scan_all(&coll).await;
-    }
-
-    assert!(db.stats().restructurer.merges >= 1);
-    assert_eq!(scan_all(&coll).await.len(), 16);
-    db.shutdown().await;
-}
-
-// Regression: a body that returned an error replayed each time that a write
-// changed its reads in two adjacent leaves before the validation of the
-// reads. The time of these replays did not count for a merge of the leaves.
-#[tokio::test(start_paused = true)]
-async fn replays_of_failed_bodies_over_two_leaves_merge_them() {
-    let backend = slow_mem();
-    assert_eq!(split_collection(&backend, 5).await, 1);
-    let db = open(&backend, leaves_of_at_most(64)).await;
-    let coll = open_top(&db, b"split").await;
-    let writer = {
-        let coll = coll.clone();
-        tokio::spawn(async move {
-            let mut round = 0;
-            loop {
-                coll.write(&[0], &write_int(round)).await.unwrap();
-                coll.write(&[4], &write_int(round)).await.unwrap();
-                round += 1;
-            }
-        })
-    };
-
-    let c = &coll;
-    let until = tokio::time::Instant::now() + Duration::from_secs(10);
-    while tokio::time::Instant::now() < until {
-        let result = db
-            .tx(|tx| async move {
-                tx.read(c, &[0]).await?;
-                tx.read(c, &[4]).await?;
-                Err::<(), _>(Error::NotFound)
-            })
-            .await;
-        assert!(matches!(result, Err(Error::NotFound)), "{result:?}");
-    }
-    writer.abort();
-
-    assert!(db.stats().restructurer.merges >= 1);
-    db.shutdown().await;
-}
-
-// Regression: when a write changed the first leaf of a scan, the validation
-// of the scan read the next leaf again, and this read did not count for a
-// merge of the two leaves. Under a steady write load, these scans did not
-// merge their leaves.
-#[tokio::test(start_paused = true)]
-async fn scans_that_validate_again_after_a_write_merge_their_leaves() {
-    let backend = slow_mem();
-    assert_eq!(split_collection(&backend, 5).await, 1);
-    let db = open(&backend, leaves_of_at_most(64)).await;
-    let coll = open_top(&db, b"split").await;
-
-    let c = &coll;
-    let until = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut round = 0;
-    while tokio::time::Instant::now() < until {
-        db.tx(|tx| async move {
-            tx.scan_keys(c, KeyScan::all()).await?;
-            // The write lands before the validation of the scan.
-            c.write(&[0], &write_int(round)).await?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-        round += 1;
-    }
-
-    assert!(db.stats().restructurer.merges >= 1);
-    assert_eq!(scan_all(&coll).await.len(), 5);
-    db.shutdown().await;
-}
-
-// Regression: under the avoidable time policy, a leaf whose keys were all
-// deleted stayed, because no transaction used it again and so it got no
-// merge-side time. With a queue-like load, the leaves grew without a limit.
-#[tokio::test(start_paused = true)]
-async fn leaves_whose_keys_are_all_deleted_merge() {
-    let backend = slow_mem();
-    let splits = split_collection(&backend, 16).await;
-    let db = open(&backend, leaves_of_at_most(64)).await;
-    let coll = open_top(&db, b"split").await;
-
-    for key in 0..15 {
-        coll.delete(&[key]).await.unwrap();
-    }
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
-    // Each split added one leaf, and only the last leaf has a live entry.
-    assert_eq!(db.stats().restructurer.merges, splits);
-    assert_eq!(scan_all(&coll).await, vec![vec![15]]);
-    db.shutdown().await;
-}
-
-type Owner = fn(u8) -> usize;
-
-const HALVES: Owner = |key| usize::from(key / 4);
-const INTERLEAVED: Owner = |key| usize::from(key % 2);
-
-// Opens two database instances with the avoidable time policy over one leaf
-// of 8 keys, writes each key 200 times from the instance that `owner` gives,
-// and returns the sum of the restructurer stats of both instances.
-async fn contend(owner: Owner) -> RestructurerStats {
-    let backend = slow_mem();
-    let first = open(&backend, NodeSizePolicy::default()).await;
-    let second = open(&backend, NodeSizePolicy::default()).await;
-    let coll = create_top(&first, b"contended").await;
-    write_keys(&coll, 8).await;
-    let colls = [coll, open_top(&second, b"contended").await];
-
-    let writers = (0u8..8).map(|key| {
-        let coll = colls[owner(key)].clone();
-        tokio::spawn(async move {
-            for round in 0..200 {
-                coll.write(&[key], &write_int(round)).await.unwrap();
-            }
-        })
-    });
-    for writer in writers.collect::<Vec<_>>() {
-        writer.await.unwrap();
-    }
-
-    let mut stats = first.stats().restructurer;
-    stats += second.stats().restructurer;
-    first.shutdown().await;
-    second.shutdown().await;
-    stats
-}
-
-// Two database instances that write different halves of one leaf lose CASes
-// to each other, which one split between the halves can remove. The soft caps
-// do not split the leaf. The writers of one instance share rounds, so they
-// alone cause no avoidable time.
-#[tokio::test(start_paused = true)]
-async fn a_leaf_splits_between_the_instances_that_contend_on_it() {
-    let stats = contend(HALVES).await;
-
-    assert!(stats.splits >= 1, "{stats:?}");
-    assert!(
-        !stats.topology_time.lost_cas.is_zero(),
-        "the stats show the time that paid for the split: {stats:?}"
-    );
-}
-
-// A split at the median leaves writers of both instances in each half, so the
-// CASes that they lose are not avoidable time.
-#[tokio::test(start_paused = true)]
-async fn a_leaf_that_instances_write_interleaved_keys_of_does_not_split() {
-    let stats = contend(INTERLEAVED).await;
-
-    assert_eq!(stats.splits, 0, "{stats:?}");
-}
-
-// Splits 5 keys into two leaves under `policy`, and deletes all keys but the
-// first and the last, so that each leaf keeps exactly one live entry. Returns
-// the merges that follow.
-async fn merges_of_two_leaves_of_one_live_entry(policy: TopologyPolicy) -> u64 {
+async fn the_size_causes_merge_leaves_below_the_underfull_threshold() {
     let sizes = NodeSizePolicy::builder()
         .leaf_max_entries(4)
         .leaf_min_entries(2)
         .index_min_children(0)
         .build()
         .unwrap();
-    let db = open_with(&mem(), sizes, policy).await;
+    let db = Database::builder("example", mem())
+        .node_size_policy(sizes)
+        .topology_policy(TopologyPolicy::SizeCauses)
+        .open()
+        .await
+        .unwrap();
     let coll = create_top(&db, b"sizes").await;
-    write_keys(&coll, 5).await;
+    for key in 0..5u8 {
+        coll.write(&[key], &write_int(0)).await.unwrap();
+    }
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert_eq!(db.stats().restructurer.splits, 1);
 
-    for key in 1..4 {
+    for key in 1..4u8 {
         coll.delete(&[key]).await.unwrap();
     }
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    let merges = db.stats().restructurer.merges;
-    assert_eq!(scan_all(&coll).await, vec![vec![0], vec![4]]);
+    assert_eq!(db.stats().restructurer.merges, 1);
+    let keys = coll.scan_keys(KeyScan::all()).await.unwrap();
+    assert_eq!(keys.keys(), [vec![0], vec![4]]);
     db.shutdown().await;
-    merges
-}
-
-// The size causes merge leaves below the underfull threshold of the node
-// sizes, even when they still have live entries.
-#[tokio::test(start_paused = true)]
-async fn the_size_causes_merge_leaves_below_the_underfull_threshold() {
-    assert_eq!(
-        merges_of_two_leaves_of_one_live_entry(TopologyPolicy::SizeCauses).await,
-        1
-    );
-}
-
-// The avoidable time policy merges for the leaf sizes only the leaves with no
-// live entries.
-#[tokio::test(start_paused = true)]
-async fn the_avoidable_time_policy_keeps_leaves_with_live_entries() {
-    assert_eq!(
-        merges_of_two_leaves_of_one_live_entry(TopologyPolicy::AvoidableTime).await,
-        0
-    );
 }

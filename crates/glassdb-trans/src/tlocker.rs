@@ -563,11 +563,6 @@ impl MemberPolicy for WriteBackOperation {
         true
     }
 
-    // The transaction committed before its write-back.
-    fn delays_transaction(&self) -> bool {
-        false
-    }
-
     fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
         // Exhaustion proves neither publication nor that gate acquisition
         // removed our holder. Re-descend and keep converging from current
@@ -693,12 +688,6 @@ impl MemberPolicy for ReleaseOperation {
 
     fn reorderable(&self) -> bool {
         true
-    }
-
-    // Identity retirement and garbage collection release holds after the
-    // transaction stopped using them.
-    fn delays_transaction(&self) -> bool {
-        false
     }
 
     fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {

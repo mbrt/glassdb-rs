@@ -46,23 +46,20 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
-use glassdb_data::{CollectionAddress, NodeId, ObjectPath, StructuralIntentId, TxId};
+use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::{
-    IndexNode, LeafObservation, Node, NodeSizePolicy, NodeStore, Payment, Requirement,
-    StorageError, Timeline, TreeRouter,
+    IndexNode, LeafObservation, Node, NodeSizePolicy, NodeStore, Requirement, StorageError,
+    Timeline, TreeRouter,
 };
 
 use crate::error::TransError;
 
 use super::candidates::{CandidateCause, MaintenanceCandidates};
 use super::change::{Applied, ParentRoute, Prepared};
-use super::measurements::ChangeKind;
 use super::policy::{SplitDecision, TopologyDecisions};
 use super::reclamation::{ReclamationReporter, reclaim_holder_free_tombstones};
 use super::recovery::{PreparedIntent, ReadyChange};
-use super::sink::StructuralHintSink;
 use super::stats::Stats;
 
 /// Decides which splits are necessary, and writes their nodes.
@@ -76,8 +73,6 @@ pub(super) struct Splitter {
     // The limits of nodes, which every topology policy keeps.
     sizes: NodeSizePolicy,
     decisions: Arc<dyn TopologyDecisions>,
-    // Receives the leaves that a split wrote.
-    hints: StructuralHintSink,
     stats: Arc<Stats>,
     reclamation: ReclamationReporter,
 }
@@ -90,15 +85,6 @@ pub(super) enum SplitReason {
     InlinePressure {
         key: Vec<u8>,
         value_len: usize,
-    },
-    /// A topology rule decided that the leaf splits (ADR-074). The split is
-    /// at the key for which the avoidable time of the leaf was measured, or at
-    /// the median without one. The leaf can change before the split, so a
-    /// measured median can differ from the median at the split.
-    Demand {
-        at: Option<Vec<u8>>,
-        /// The avoidable time in each second that pays for the split.
-        rate: Duration,
     },
     /// This database instance loses leaf CASes on the contended key `key` to
     /// other database instances, so the leaf of the key splits away from
@@ -155,7 +141,6 @@ impl Splitter {
         candidates: MaintenanceCandidates,
         sizes: NodeSizePolicy,
         decisions: Arc<dyn TopologyDecisions>,
-        hints: StructuralHintSink,
         stats: Arc<Stats>,
         reclamation: ReclamationReporter,
     ) -> Self {
@@ -166,7 +151,6 @@ impl Splitter {
             candidates,
             sizes,
             decisions,
-            hints,
             stats,
             reclamation,
         }
@@ -259,8 +243,8 @@ impl Splitter {
         } else {
             self.decide(target, &node, reason)
         };
-        let (at, paid_rate) = match decision {
-            SplitDecision::Split { at, paid_rate } => (at, paid_rate),
+        let at = match decision {
+            SplitDecision::Split { at } => at,
             SplitDecision::Reroute => return self.cancel(reason, SplitNeed::Reroute),
             SplitDecision::Wait | SplitDecision::NotNeeded if !reclaimed.is_empty() => {
                 return Prepared::ReclaimOnly { node, reclaimed };
@@ -269,10 +253,7 @@ impl Splitter {
                 return self.cancel(reason, SplitNeed::NotActionable);
             }
         };
-        let split = Split {
-            at: at.as_deref(),
-            paid_rate,
-        };
+        let split = Split { at: at.as_deref() };
         match target {
             SplitTarget::NonRoot(id) => {
                 self.plan_nonroot_split(id, split, prepared, node, worker, reclaimed)
@@ -425,7 +406,7 @@ impl Splitter {
         let right_id = prepared
             .nonroot_sibling()
             .expect("a prepared non-root intent always reserves one sibling");
-        let Some((right, split_key)) = split.divide(&mut source, right_id, prepared.id()) else {
+        let Some((right, split_key)) = split.divide(&mut source, right_id) else {
             return Prepared::Cancel(Ok(()));
         };
         source.remove_structural_gate(worker);
@@ -456,8 +437,7 @@ impl Splitter {
         let (left_id, right_id) = prepared
             .root_children()
             .expect("a prepared root intent always reserves two children");
-        let (left, right, split_key) =
-            split_into_children(split, node, right_id, prepared.id(), worker);
+        let (left, right, split_key) = split_into_children(split, node, right_id, worker);
         let index = Node::index(IndexNode::from_children([
             (Vec::new(), left_id),
             (split_key.clone(), right_id),
@@ -508,14 +488,6 @@ impl Splitter {
     ) {
         self.reclamation.record(reclaimed, false);
         self.stats.record_split();
-        let leaves: Vec<NodeId> = outputs
-            .iter()
-            .filter(|(_, node)| node.as_leaf().is_some())
-            .map(|(id, _)| **id)
-            .collect();
-        let paid = outputs[0].1.paid_rate().map(|paid| &paid.intent);
-        self.hints
-            .leaves_changed(collection, &leaves, ChangeKind::Split, paid);
         for (id, node) in outputs {
             self.enqueue_if_over_soft_cap(collection, id, node);
         }
@@ -568,9 +540,8 @@ impl SplitReason {
             SplitReason::SoftCap => 0,
             SplitReason::InlinePressure { .. } => 1,
             SplitReason::Capacity => 2,
-            SplitReason::Demand { .. } => 3,
-            // The merge reasons use 4 to 6.
-            SplitReason::Contention { .. } => 7,
+            SplitReason::Contention { .. } => 3,
+            // The merge reasons use 4 and 5.
         }
     }
 
@@ -579,7 +550,7 @@ impl SplitReason {
     fn key(&self) -> Option<&[u8]> {
         match self {
             SplitReason::InlinePressure { key, .. } | SplitReason::Contention { key } => Some(key),
-            SplitReason::SoftCap | SplitReason::Capacity | SplitReason::Demand { .. } => None,
+            SplitReason::SoftCap | SplitReason::Capacity => None,
         }
     }
 
@@ -589,29 +560,18 @@ impl SplitReason {
 }
 
 /// A split of one node, as the topology policy decided it: at a key, or at
-/// the median, and with the paid rate of its leaves.
+/// the median.
 #[derive(Clone, Copy)]
 struct Split<'a> {
     at: Option<&'a [u8]>,
-    paid_rate: Option<Duration>,
 }
 
 impl Split<'_> {
     /// Divides `node` like [`Node::split`], at the key of the split, if any.
-    /// Both halves keep the paid rate of the split, if any (ADR-076).
-    fn divide(
-        &self,
-        node: &mut Node,
-        right_id: NodeId,
-        intent: &StructuralIntentId,
-    ) -> Option<(Node, Vec<u8>)> {
-        let paid = self.paid_rate.map(|per_second| Payment {
-            per_second,
-            intent: *intent,
-        });
+    fn divide(&self, node: &mut Node, right_id: NodeId) -> Option<(Node, Vec<u8>)> {
         match self.at {
-            Some(key) => node.split_leaf_at(right_id, key, paid),
-            None => node.split(right_id, paid),
+            Some(key) => node.split_leaf_at(right_id, key),
+            None => node.split(right_id),
         }
     }
 }
@@ -632,12 +592,11 @@ fn split_into_children(
     split: Split<'_>,
     node: &Node,
     right_id: NodeId,
-    intent: &StructuralIntentId,
     structure_holder: &TxId,
 ) -> (Node, Node, Vec<u8>) {
     let mut source = node.clone();
     let (right, split_key) = split
-        .divide(&mut source, right_id, intent)
+        .divide(&mut source, right_id)
         .expect("a split source has entries or children in both halves");
     source.remove_structural_gate(structure_holder);
     (source, right, split_key)

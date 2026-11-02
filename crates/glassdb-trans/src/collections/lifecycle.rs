@@ -885,7 +885,7 @@ mod tests {
             .load_node(&collection(), &SOURCE, Requirement::ANY)
             .await
             .unwrap();
-        let (right, _) = shrunk.split(RIGHT, None).unwrap();
+        let (right, _) = shrunk.split(RIGHT).unwrap();
         shrunk.remove_structural_gate(&split_id);
         assert!(
             primary

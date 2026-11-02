@@ -460,7 +460,7 @@ What decides when the leaves of one database instance split and merge.
 _Avoid_: Leaf changes, split policy
 
 **Topology signal**:
-A measurement or an event of one database instance that a topology policy decides from, such as a lost leaf CAS, the time that a coordinator round lost, or a split that landed.
+An event of one database instance that a topology policy decides from, such as a stored leaf, a lost leaf CAS, or a committed transaction.
 _Avoid_: Observation (the state of a stored object), topology hint
 
 **Divided round**:
@@ -470,14 +470,6 @@ _Avoid_: Shared round, split round
 **Write limit**:
 The rate of writes to one partition of the backend above which the backend throttles them.
 _Avoid_: Throttle, backend limit
-
-**Write price**:
-The time that the avoidable time rule counts for each backend write that a split adds or a merge saves.
-_Avoid_: Write cost, throttle cost
-
-**Paid rate**:
-The rate of avoidable time that paid for the last split or merge that a topology rule asked for, kept in the leaves of that change with its kind. The opposite change of these leaves must pay more.
-_Avoid_: Change record, change justification, change cost
 
 **Write span**:
 The first and the last key of the entries of one recent writer of two or more entries in one leaf or in two adjacent leaves. A split between these two keys divides the keys that the writer committed together.

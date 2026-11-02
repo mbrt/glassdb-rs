@@ -8,7 +8,6 @@ use super::reconcile::{
     DEFERRED_RECONCILIATION_CAP, ParentReconciler, PendingReconciliation, ReconciliationOutcome,
 };
 use super::recovery::ChangeKind;
-use super::rule::RuleRequest;
 use super::split::{SplitNeed, SplitReason, SplitTarget};
 use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::leaf_coord::StructuralHinter;
@@ -291,13 +290,6 @@ impl TestTopology {
         }
     }
 
-    fn avoidable_time(sizes: NodeSizePolicy) -> Self {
-        Self {
-            policy: TopologyPolicy::AvoidableTime,
-            ..Self::writers(sizes)
-        }
-    }
-
     fn with_inline(self, inline: InlinePolicy) -> Self {
         Self { inline, ..self }
     }
@@ -385,29 +377,6 @@ fn restructurer_with_parts(
     )
 }
 
-// A restructurer with the avoidable time policy over leaves of `sizes`, and
-// the policy, whose measurements a test reads.
-fn avoidable_time_restructurer(
-    store: &TestStore,
-    bg: &Arc<Background>,
-    sizes: NodeSizePolicy,
-) -> (Restructurer, Arc<AvoidableTimePolicy>) {
-    let mon = store.foundation.monitor_for(
-        bg,
-        RetrySchedule::default(),
-        crate::monitor::ProtocolTiming::default(),
-    );
-    let queue = MaintenanceCandidates::new();
-    let settings = TopologySettings {
-        sizes,
-        inline: InlinePolicy::default(),
-    };
-    let policy = Arc::new(AvoidableTimePolicy::new(settings, queue.clone()));
-    let parts = TopologyParts::of(queue, sizes, policy.clone());
-    let restructurer = restructurer_with_parts(store, bg, mon, parts, GcHints::default());
-    (restructurer, policy)
-}
-
 fn restructurer_and_monitor(
     store: &TestStore,
     bg: &Arc<Background>,
@@ -479,13 +448,6 @@ fn test_index(children: &[(&[u8], &str)]) -> IndexNode {
 // of a write span with the other keys of `writer` (ADR-084).
 fn written_by(key: &[u8], writer: &TxId) -> LeafEntry {
     LeafEntry::new(key).with_current(CurrentState::External { writer: *writer })
-}
-
-// Queues one change that a topology rule asked for, as the avoidable time
-// policy does at the end of a window.
-fn push_request(queue: &MaintenanceCandidates, request: RuleRequest) {
-    let (path, cause) = crate::structural::policy::request_candidate(request);
-    queue.push_expiring(&path, cause, crate::structural::policy::DEMAND_MAX_AGE);
 }
 
 // A recent transaction identity.

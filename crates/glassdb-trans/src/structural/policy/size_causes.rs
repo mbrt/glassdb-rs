@@ -48,12 +48,11 @@ impl SizeCausesPolicy {
     }
 
     /// The decision of a merge whose leaf stays at or below half of each
-    /// split threshold, with no paid rate.
+    /// split threshold.
     pub(crate) fn half(&self) -> MergeDecision {
         MergeDecision::Within {
             max_entries: self.settings.sizes.leaf_max_entries() / 2,
             max_inline_bytes: self.settings.inline.max_leaf_bytes / 2,
-            paid_rate: None,
         }
     }
 

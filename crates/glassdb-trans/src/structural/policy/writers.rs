@@ -10,10 +10,9 @@ use crate::access::AccessSet;
 use crate::monitor::Monitor;
 use crate::structural::candidates::{CandidateCause, MaintenanceCandidates};
 use crate::structural::contention::Contention;
-use crate::structural::measurements::written_pair;
 use crate::structural::merge::{MergeReason, MergeVeto};
 use crate::structural::split::{SplitReason, SplitTarget};
-use crate::structural::write_spans::{self, SoftCapSplit};
+use crate::structural::write_spans::{self, SoftCapSplit, written_pair};
 
 use super::{
     MergeDecision, SizeCausesPolicy, SplitDecision, TopologyDecisions, TopologySettings,
@@ -149,13 +148,11 @@ impl TopologyDecisions for WritersPolicy {
                     MergeDecision::Within {
                         max_entries: sizes.leaf_max_entries().saturating_mul(2),
                         max_inline_bytes: self.base.settings().inline.max_leaf_bytes / 4 * 3,
-                        paid_rate: None,
                     }
                 } else {
                     MergeDecision::Veto(MergeVeto::NotNeeded)
                 }
             }
-            _ => self.base.merge(left, right, reason),
         }
     }
 }

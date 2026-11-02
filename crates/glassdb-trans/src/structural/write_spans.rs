@@ -5,11 +5,13 @@
 //! transaction are the keys that it committed together. The decisions read
 //! them from the leaves, which every database instance sees alike.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
-use glassdb_data::TxId;
+use glassdb_data::{NodeId, ObjectPath, TxId};
 use glassdb_storage::{LeafBody, Node, NodeSizePolicy};
+
+use crate::access::AccessSet;
 
 /// The age of a writer after which its entries no longer count as keys that
 /// transactions commit together. A transaction that wrote many keys once, for
@@ -132,6 +134,31 @@ pub(super) fn is_recent(writer: &TxId, now: SystemTime) -> bool {
     }
 }
 
+/// Returns the left one of two adjacent leaves, when the written keys of
+/// `accesses` are in both, as their reads observed them, with the entries of
+/// the two leaves as observed. A written key that was not read has no leaf.
+pub(super) fn written_pair(accesses: &AccessSet) -> Option<(ObjectPath, usize)> {
+    let mut leaves: BTreeMap<&ObjectPath, (Option<NodeId>, usize)> = BTreeMap::new();
+    for point in accesses.points().filter(|point| point.write.is_some()) {
+        let observation = point.read?.observation();
+        leaves.entry(observation.path()).or_insert_with(|| {
+            let node = observation.value().map(|node| &**node);
+            let entries = node.and_then(Node::as_leaf).map_or(0, LeafBody::len);
+            (node.and_then(Node::right_sibling), entries)
+        });
+    }
+    let [(a_path, a), (b_path, b)] =
+        <[_; 2]>::try_from(leaves.into_iter().collect::<Vec<_>>()).ok()?;
+    let left = if links_right_to(a_path, a.0, b_path) {
+        a_path
+    } else if links_right_to(b_path, b.0, a_path) {
+        b_path
+    } else {
+        return None;
+    };
+    Some((left.clone(), a.1 + b.1))
+}
+
 /// Returns the write spans of the entries of `left`, and of `right` after it,
 /// whose writers are recent.
 fn spans<'a>(left: &'a LeafBody, right: Option<&'a LeafBody>, now: SystemTime) -> Vec<Span<'a>> {
@@ -186,6 +213,21 @@ fn middle_half<'a>(keys: &'a [&'a [u8]]) -> impl Iterator<Item = (usize, &'a [u8
         .enumerate()
         .skip(quarter.max(1))
         .take(keys.len().saturating_sub(2 * quarter.max(1)))
+}
+
+/// Reports whether the leaf at `path`, with the right sibling `sibling`, has
+/// the leaf at `right` as its right sibling.
+fn links_right_to(path: &ObjectPath, sibling: Option<NodeId>, right: &ObjectPath) -> bool {
+    match (path, right) {
+        (
+            ObjectPath::Node {
+                collection: left_collection,
+                ..
+            },
+            ObjectPath::Node { collection, id },
+        ) => left_collection == collection && sibling == Some(*id),
+        _ => false,
+    }
 }
 
 #[cfg(test)]

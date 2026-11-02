@@ -38,7 +38,5 @@ pub use leaf_coord::LeafCoordinatorStats;
 pub use monitor::{MonitorStats, ProtocolTiming};
 pub use reader::{ReadOutcome, ReadValue};
 pub use retry_timing::RetryTiming;
-pub use structural::{
-    DemandMergeStats, InlinePressureStats, RestructurerStats, TopologyPolicy, TopologyTimeStats,
-};
+pub use structural::{InlinePressureStats, RestructurerStats, TopologyPolicy};
 pub use tlocker::LockerStats;

@@ -152,7 +152,6 @@ mod tests {
                 candidates: 3,
                 splits: 2,
                 deferred: 1,
-                stale_demand: 2,
                 tombstones_reclaimed: 4,
                 splits_avoided: 1,
                 merges: 2,
@@ -164,8 +163,6 @@ mod tests {
                     deferred: 1,
                     discarded: 0,
                 },
-                topology_time: Default::default(),
-                demand_merges: Default::default(),
             },
         };
         let after = Stats {
@@ -205,7 +202,6 @@ mod tests {
                 candidates: 5,
                 splits: 3,
                 deferred: 1,
-                stale_demand: 6,
                 tombstones_reclaimed: 9,
                 splits_avoided: 3,
                 merges: 5,
@@ -217,8 +213,6 @@ mod tests {
                     deferred: 1,
                     discarded: 1,
                 },
-                topology_time: Default::default(),
-                demand_merges: Default::default(),
             },
         };
         assert_eq!(
@@ -260,7 +254,6 @@ mod tests {
                     candidates: 2,
                     splits: 1,
                     deferred: 0,
-                    stale_demand: 4,
                     tombstones_reclaimed: 5,
                     splits_avoided: 2,
                     merges: 3,
@@ -272,8 +265,6 @@ mod tests {
                         deferred: 0,
                         discarded: 1,
                     },
-                    topology_time: Default::default(),
-                    demand_merges: Default::default(),
                 },
             }
         );

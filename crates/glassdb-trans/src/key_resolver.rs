@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 
-use glassdb_concurr::{map_all_bounded, rt};
+use glassdb_concurr::map_all_bounded;
 use glassdb_data::{CollectionAddress, LogicalKey, TxId};
 use glassdb_storage::{LeafEntry, Requirement, RoutedLeaf, StorageError, TreeRouter};
 
@@ -15,7 +15,6 @@ use crate::access::{LeafCoverage, ScanAccess, ScanEvidence, ScanMutation, ScanRa
 use crate::error::{TransError, trans_to_storage};
 use crate::key_state_resolver::{KeyStateResolver, WriterResolution};
 use crate::monitor::KeyCommitStatus;
-use crate::structural::StructuralHintSink;
 
 /// The result of a phantom-safe scan: the live keys in key order, the covered
 /// leaves' membership dependencies, and the effective page frontier.
@@ -58,24 +57,19 @@ pub(crate) struct KeyResolver {
     router: TreeRouter,
     state: KeyStateResolver,
     parallelism: NonZeroUsize,
-    structural_hints: StructuralHintSink,
 }
 
 impl KeyResolver {
     /// Creates key resolution over a tree router and loaded-state resolver.
-    /// Scans report to `structural_hints` the time to read the next leaf,
-    /// which a merge of the two leaves removes (ADR-074).
     pub(crate) fn new(
         router: TreeRouter,
         state: KeyStateResolver,
         parallelism: NonZeroUsize,
-        structural_hints: StructuralHintSink,
     ) -> Self {
         Self {
             router,
             state,
             parallelism,
-            structural_hints,
         }
     }
 
@@ -230,7 +224,6 @@ impl KeyResolver {
                     if target.is_some_and(|target| node.covers(target)) {
                         break;
                     }
-                    let started = rt::Instant::now();
                     let Some(next) = self
                         .router
                         .next_leaf(collection, &loc, requirement)
@@ -239,11 +232,6 @@ impl KeyResolver {
                     else {
                         break;
                     };
-                    self.structural_hints.scan_crossing_time(
-                        loc.observation.path(),
-                        next.observation.path(),
-                        started.elapsed(),
-                    );
                     floor = node.high_key().map(<[u8]>::to_vec);
                     loc = next;
                 }
@@ -293,9 +281,6 @@ impl KeyResolver {
             if frontier.is_some_and(|end| leaf.node().is_some_and(|node| node.covers(end))) {
                 return Ok(covered);
             }
-            // A validation that reads the next leaf again pays for the
-            // crossing too, so a merge of the two leaves removes this time.
-            let started = rt::Instant::now();
             let Some(next) = self
                 .router
                 .next_leaf(collection, &leaf, requirement)
@@ -304,11 +289,6 @@ impl KeyResolver {
             else {
                 return Ok(covered);
             };
-            self.structural_hints.scan_crossing_time(
-                leaf.observation.path(),
-                next.observation.path(),
-                started.elapsed(),
-            );
             leaf = next;
         }
     }
@@ -594,7 +574,6 @@ mod tests {
                 TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN),
                 state,
                 std::num::NonZeroUsize::MIN,
-                StructuralHintSink::detached(),
             ),
             mon,
             timeline,
