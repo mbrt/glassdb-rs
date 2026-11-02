@@ -620,9 +620,11 @@ Splits and merges share one lifecycle and one parent reconciliation step. The
 
 ### The topology policy decides, the restructurer changes
 
-Each topology policy is one struct with two traits. `SizeLimitsPolicy` has
-the soft caps, the underfull threshold, and inline pressure. The other
-policies contain one, and give it the reasons that they do not refine.
+Each topology policy is one struct with two traits. `SizeCausesPolicy` has
+the soft caps, the underfull threshold, and inline pressure, and only the leaf
+sizes decide. `TopologyPolicy::SizeCauses` selects it alone, for a topology
+that is predictable. The other policies contain one, and give it the reasons
+that they do not refine.
 `TopologySignals`
 receives the topology signals of the transactions, the scans, the leaf
 coordinator, and the changes that landed, and queues candidates.
@@ -643,7 +645,7 @@ round, so that a policy does not cost what it does not use.
 `MaintenanceCandidates` is only the queue.
 
 Committed leaf writes, parent reconciliation, and capacity rejections queue
-candidates. With the default size causes topology policy, the soft caps, the
+candidates. With the default writers topology policy, the soft caps, the
 underfull threshold, and inline pressure decide, and the write spans that the
 writers of the leaf entries show move soft cap splits and cause merges
 ([ADR-084](adr/084-size-causes-are-the-default-topology-policy.md)). A database
@@ -670,7 +672,7 @@ of the same node go in different batches, because the gate or the reservation
 of one stops the other. The batches come from cached state, so a change of a
 batch can still meet another one, and defer.
 
-A sweep takes the splits of the size causes first, because a full leaf can
+A sweep takes the splits that the leaf sizes cause first, because a full leaf can
 stop writes. Then it takes the splits and merges of a rule together, the
 highest rate first, and the underfull merges last. So after a change of the
 load, the changes of the new load do not wait behind the old requests until

@@ -1429,9 +1429,9 @@ mod tests {
     }
 
     /// Builds an algo whose leaves split on inline pressure (ADR-056).
-    pub(super) async fn new_size_causes_algo_from_backend(b: Arc<dyn Backend>) -> (Algo, Tctx) {
+    pub(super) async fn new_writers_algo_from_backend(b: Arc<dyn Backend>) -> (Algo, Tctx) {
         let mut config = test_engine_config(1024, NodeSizePolicy::default());
-        config.set_topology_policy(crate::structural::TopologyPolicy::SizeCauses);
+        config.set_topology_policy(crate::structural::TopologyPolicy::Writers);
         new_algo_from_config(b, config, false).await
     }
 

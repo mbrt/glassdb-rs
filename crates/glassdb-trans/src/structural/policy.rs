@@ -12,7 +12,7 @@
 
 mod avoidable_time;
 mod size_causes;
-mod size_limits;
+mod writers;
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -32,7 +32,7 @@ pub(crate) use avoidable_time::AvoidableTimePolicy;
 #[cfg(test)]
 pub(crate) use avoidable_time::{DEMAND_MAX_AGE, request_candidate};
 pub(crate) use size_causes::SizeCausesPolicy;
-pub(crate) use size_limits::SizeLimitsPolicy;
+pub(crate) use writers::WritersPolicy;
 
 /// One kind of topology signal that costs its producer real work to measure,
 /// so that the producer measures it only for a policy that asks for it. The
@@ -149,7 +149,7 @@ pub(crate) trait TopologySignals: Send + Sync {
 }
 
 /// The decisions of one topology policy on current nodes, for the changes that
-/// the restructurer runs. A policy that refines [`SizeLimitsPolicy`] gives it
+/// the restructurer runs. A policy that refines [`SizeCausesPolicy`] gives it
 /// the reasons that it does not refine.
 pub(crate) trait TopologyDecisions: Send + Sync {
     /// Decides the split of the leaf `node`, the node of `target`, for

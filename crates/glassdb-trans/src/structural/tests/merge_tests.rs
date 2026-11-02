@@ -422,7 +422,7 @@ async fn merge_compacts_the_cold_tombstones_of_its_target() {
     let sp = restructurer_with_topology_and_hints(
         &s,
         &bg,
-        TestTopology::size_causes(mergeable()),
+        TestTopology::writers(mergeable()),
         gc_hints.clone(),
     );
 

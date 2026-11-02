@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures::future::join_all;
 use glassdb::middleware::HookBackend;
-use glassdb::{Backend, Collection, Database, KeyScan, RestructurerStats};
+use glassdb::{Backend, Collection, Database, KeyScan, RestructurerStats, TopologyPolicy};
 
 pub mod integration_support;
 
@@ -28,13 +28,23 @@ fn slow_mem() -> Arc<dyn Backend> {
     backend
 }
 
-// Four database instances over one collection of 8 keys, which the first one
-// wrote. The leaf of the 8 keys is below the soft cap.
+// Four database instances with the default topology policy over one
+// collection of 8 keys, which the first one wrote. The leaf of the 8 keys is
+// below the soft cap.
 async fn four_instances() -> (Vec<Database>, Vec<Collection>) {
+    four_instances_with(TopologyPolicy::default()).await
+}
+
+async fn four_instances_with(policy: TopologyPolicy) -> (Vec<Database>, Vec<Collection>) {
     let backend = slow_mem();
     let mut dbs = Vec::new();
     for _ in 0..4 {
-        dbs.push(Database::open("example", backend.clone()).await.unwrap());
+        let db = Database::builder("example", backend.clone())
+            .topology_policy(policy)
+            .open()
+            .await
+            .unwrap();
+        dbs.push(db);
     }
     let coll = create_top(&dbs[0], b"contended").await;
     for key in 0..8 {
@@ -106,6 +116,20 @@ async fn the_keys_of_database_instances_split_apart() {
     assert!(stats.kept_apart >= 1, "{stats:?}");
     let keys = colls[0].scan_keys(KeyScan::all()).await.unwrap();
     assert_eq!(keys.keys().len(), 8);
+    shutdown(dbs).await;
+}
+
+// Only the leaf sizes decide the size causes, so the leaf below the soft cap
+// does not split, even when the database instances lose leaf CASes to each
+// other.
+#[tokio::test(start_paused = true)]
+async fn the_size_causes_do_not_split_the_keys_of_database_instances_apart() {
+    let (dbs, colls) = four_instances_with(TopologyPolicy::SizeCauses).await;
+
+    write_one_key_each(&colls).await;
+
+    let stats = sum(&dbs);
+    assert_eq!((stats.splits, stats.contention_splits), (0, 0), "{stats:?}");
     shutdown(dbs).await;
 }
 

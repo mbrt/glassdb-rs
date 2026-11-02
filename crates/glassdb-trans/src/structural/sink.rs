@@ -15,7 +15,7 @@ use super::measurements::ChangeKind;
 use super::merge::MergeReason;
 use super::policy::{Interests, SignalKind, TopologySignals};
 #[cfg(test)]
-use super::policy::{SizeLimitsPolicy, TopologySettings};
+use super::policy::{SizeCausesPolicy, TopologySettings};
 use super::split::SplitReason;
 
 /// The intake of the topology signals of the transactions, the scans, the
@@ -128,11 +128,7 @@ impl StructuralHintSink {
             sizes: NodeSizePolicy::default(),
             inline: glassdb_storage::InlinePolicy::default(),
         };
-        let policy = Arc::new(SizeLimitsPolicy::new(
-            settings,
-            settings.sizes.leaf_min_entries(),
-            queue.clone(),
-        ));
+        let policy = Arc::new(SizeCausesPolicy::new(settings, queue.clone()));
         Self::new(queue, settings.sizes, policy)
     }
 

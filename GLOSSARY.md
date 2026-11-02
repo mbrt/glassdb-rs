@@ -456,7 +456,7 @@ The time of backend operations that transactions spend because of the current to
 _Avoid_: Topology cost, contention cost, structural pressure
 
 **Topology policy**:
-What decides when the leaves of one database instance split and merge: the node sizes, or the avoidable time.
+What decides when the leaves of one database instance split and merge.
 _Avoid_: Leaf changes, split policy
 
 **Topology signal**:

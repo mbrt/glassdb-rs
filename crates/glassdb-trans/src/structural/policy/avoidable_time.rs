@@ -19,7 +19,7 @@ use crate::structural::split::{SplitReason, SplitTarget};
 use crate::structural::stats::TopologyTimeStats;
 
 use super::{
-    Interests, MergeDecision, SignalKind, SizeLimitsPolicy, SplitDecision, TopologyDecisions,
+    Interests, MergeDecision, SignalKind, SizeCausesPolicy, SplitDecision, TopologyDecisions,
     TopologySettings, TopologySignals,
 };
 
@@ -35,7 +35,7 @@ pub(crate) const DEMAND_MAX_AGE: Duration = TOPOLOGY_WINDOW.saturating_mul(3);
 /// leaf, and no transaction may use a leaf with no live entries again, so such
 /// a leaf merges as underfull.
 pub(crate) struct AvoidableTimePolicy {
-    base: SizeLimitsPolicy,
+    base: SizeCausesPolicy,
     measurements: TopologyMeasurements,
     paid_rates: PaidRates,
     rule: Mutex<AvoidableTimeRule>,
@@ -47,7 +47,7 @@ impl AvoidableTimePolicy {
     /// in `queue`.
     pub(crate) fn new(settings: TopologySettings, queue: MaintenanceCandidates) -> Self {
         Self {
-            base: SizeLimitsPolicy::new(settings, 1, queue.clone()),
+            base: SizeCausesPolicy::with_underfull_live(settings, 1, queue.clone()),
             measurements: TopologyMeasurements::new(),
             paid_rates: PaidRates::default(),
             rule: Mutex::default(),

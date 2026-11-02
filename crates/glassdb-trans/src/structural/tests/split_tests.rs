@@ -53,7 +53,7 @@ async fn root_reclamation_can_avoid_an_actionable_split() {
     let sp = restructurer_with_topology_and_hints(
         &s,
         &bg,
-        TestTopology::size_causes(tiny()),
+        TestTopology::writers(tiny()),
         gc_hints.clone(),
     );
     sp.hints.observe_leaf(&root_path(), root.as_leaf().unwrap());
@@ -181,7 +181,7 @@ async fn failed_compaction_does_not_publish_reclamation_outcomes() {
     let sp = restructurer_with_topology_and_hints(
         &s,
         &bg,
-        TestTopology::size_causes(tiny()),
+        TestTopology::writers(tiny()),
         gc_hints.clone(),
     );
     sp.hints.observe_leaf(&root_path(), root.as_leaf().unwrap());
@@ -231,7 +231,7 @@ async fn nonroot_split_partitions_the_compacted_leaf() {
     let sp = restructurer_with_topology_and_hints(
         &s,
         &bg,
-        TestTopology::size_causes(tiny()),
+        TestTopology::writers(tiny()),
         gc_hints.clone(),
     );
     sp.hints
@@ -1155,7 +1155,7 @@ async fn feed_drives_run_once() {
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
 
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(tiny()));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(tiny()));
     // Under the cap: not enqueued.
     sp.hints.observe_leaf(
         &root_path(),
@@ -1208,7 +1208,7 @@ async fn one_hint_cascades_until_every_leaf_is_under_cap() {
         .index_max_children(100)
         .build()
         .unwrap();
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(policy));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(policy));
     sp.hints.observe_leaf(&root_path(), root.as_leaf().unwrap());
 
     // 9 -> 4+5 -> 2+2+2+3 -> 2+2+2+1+2.
@@ -1256,8 +1256,7 @@ async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
     ]));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let topology =
-        TestTopology::size_causes(NodeSizePolicy::default()).with_inline(pressure_inline());
+    let topology = TestTopology::writers(NodeSizePolicy::default()).with_inline(pressure_inline());
     let sp = restructurer_with_topology(&s, &bg, topology);
     let root_path = root_path();
 
@@ -1365,8 +1364,7 @@ async fn inline_pressure_is_discarded_after_authoritative_revalidation() {
     let root = Node::leaf(LeafBody::from_entries([live(b"a"), live(b"b")]));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let topology =
-        TestTopology::size_causes(NodeSizePolicy::default()).with_inline(pressure_inline());
+    let topology = TestTopology::writers(NodeSizePolicy::default()).with_inline(pressure_inline());
     let sp = restructurer_with_topology(&s, &bg, topology);
     let root_path = root_path();
 
@@ -1423,7 +1421,7 @@ async fn contended_candidate_is_requeued() {
     let root = node;
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(tiny()));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(tiny()));
     sp.hints.observe_leaf(
         &root_path(),
         &LeafBody::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
@@ -1749,7 +1747,7 @@ async fn byte_cap_enqueues_and_splits_below_entry_cap() {
         .index_max_children(1000)
         .build()
         .unwrap();
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(policy));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(policy));
     sp.hints.observe_leaf(
         &root_path(),
         &LeafBody::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
@@ -2028,7 +2026,7 @@ async fn one_sweep_of_splits_writes_the_collection_record_twice() {
         .index_max_children(100)
         .build()
         .unwrap();
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(policy));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(policy));
     push_soft_cap_splits(&sp.candidates, LEAVES);
 
     sp.run_once().await;
@@ -2096,7 +2094,7 @@ async fn sibling_splits_of_one_batch_reconcile_their_parent_together() {
         .index_max_children(100)
         .build()
         .unwrap();
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(policy));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(policy));
     push_soft_cap_splits(&sp.candidates, LEAVES);
 
     sp.run_once().await;
@@ -2138,7 +2136,7 @@ async fn a_batch_that_cannot_join_the_topology_leaves_nothing_behind() {
     seed_sibling_leaves(&s, 3).await;
     // A live drop holds the topology freeze, so no participant can join.
     let bg = Arc::new(Background::new());
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(tiny()));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(tiny()));
     let holder = sp.candidates.new_id();
     sp.mon.begin_tx(&holder);
     let (mut record, observed) = s

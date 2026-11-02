@@ -1,4 +1,5 @@
-//! Leaf splits and merges that the avoidable time policy decides (ADR-074).
+//! Leaf splits and merges that the topology policies other than the default
+//! decide: the avoidable time policy (ADR-074), and the size causes.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,9 +39,17 @@ fn leaves_of_at_most(entries: usize) -> NodeSizePolicy {
 }
 
 async fn open(backend: &Arc<dyn Backend>, sizes: NodeSizePolicy) -> Database {
+    open_with(backend, sizes, TopologyPolicy::AvoidableTime).await
+}
+
+async fn open_with(
+    backend: &Arc<dyn Backend>,
+    sizes: NodeSizePolicy,
+    policy: TopologyPolicy,
+) -> Database {
     Database::builder("example", backend.clone())
         .node_size_policy(sizes)
-        .topology_policy(TopologyPolicy::AvoidableTime)
+        .topology_policy(policy)
         .open()
         .await
         .unwrap()
@@ -246,4 +255,51 @@ async fn a_leaf_that_instances_write_interleaved_keys_of_does_not_split() {
     let stats = contend(INTERLEAVED).await;
 
     assert_eq!(stats.splits, 0, "{stats:?}");
+}
+
+// Splits 5 keys into two leaves under `policy`, and deletes all keys but the
+// first and the last, so that each leaf keeps exactly one live entry. Returns
+// the merges that follow.
+async fn merges_of_two_leaves_of_one_live_entry(policy: TopologyPolicy) -> u64 {
+    let sizes = NodeSizePolicy::builder()
+        .leaf_max_entries(4)
+        .leaf_min_entries(2)
+        .index_min_children(0)
+        .build()
+        .unwrap();
+    let db = open_with(&mem(), sizes, policy).await;
+    let coll = create_top(&db, b"sizes").await;
+    write_keys(&coll, 5).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(db.stats().restructurer.splits, 1);
+
+    for key in 1..4 {
+        coll.delete(&[key]).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    let merges = db.stats().restructurer.merges;
+    assert_eq!(scan_all(&coll).await, vec![vec![0], vec![4]]);
+    db.shutdown().await;
+    merges
+}
+
+// The size causes merge leaves below the underfull threshold of the node
+// sizes, even when they still have live entries.
+#[tokio::test(start_paused = true)]
+async fn the_size_causes_merge_leaves_below_the_underfull_threshold() {
+    assert_eq!(
+        merges_of_two_leaves_of_one_live_entry(TopologyPolicy::SizeCauses).await,
+        1
+    );
+}
+
+// The avoidable time policy merges for the leaf sizes only the leaves with no
+// live entries.
+#[tokio::test(start_paused = true)]
+async fn the_avoidable_time_policy_keeps_leaves_with_live_entries() {
+    assert_eq!(
+        merges_of_two_leaves_of_one_live_entry(TopologyPolicy::AvoidableTime).await,
+        0
+    );
 }

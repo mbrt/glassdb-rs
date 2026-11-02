@@ -49,9 +49,15 @@ pub enum TopologyPolicy {
     /// no live entries still merge.
     AvoidableTime,
     /// Soft caps, underfull thresholds, and inline pressure decide (ADR-031,
-    /// ADR-056, ADR-073). The default (ADR-084).
-    #[default]
+    /// ADR-056, ADR-073). Only the leaf sizes decide, so that the topology is
+    /// predictable.
     SizeCauses,
+    /// The size causes decide, refined by the writers of the leaf entries:
+    /// write spans move soft cap splits and cause merges (ADR-084), and the
+    /// keys that several database instances write in one leaf split apart
+    /// (ADR-085). The default.
+    #[default]
+    Writers,
 }
 
 /// Decides the splits and merges of leaves from one window of measurements.

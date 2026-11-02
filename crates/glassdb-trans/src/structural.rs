@@ -59,6 +59,7 @@ use merge::Merger;
 use nodes::StructuralNodeAccess;
 use policy::{
     AvoidableTimePolicy, SizeCausesPolicy, TopologyDecisions, TopologySettings, TopologySignals,
+    WritersPolicy,
 };
 use reclamation::ReclamationReporter;
 use reconcile::ParentReconciler;
@@ -172,8 +173,12 @@ impl TopologyParts {
         let queue = MaintenanceCandidates::new();
         let settings = TopologySettings { sizes, inline };
         match policy {
+            TopologyPolicy::Writers => {
+                let policy = WritersPolicy::new(settings, mon, queue.clone());
+                Self::of(queue, sizes, Arc::new(policy))
+            }
             TopologyPolicy::SizeCauses => {
-                let policy = SizeCausesPolicy::new(settings, mon, queue.clone());
+                let policy = SizeCausesPolicy::new(settings, queue.clone());
                 Self::of(queue, sizes, Arc::new(policy))
             }
             TopologyPolicy::AvoidableTime => {

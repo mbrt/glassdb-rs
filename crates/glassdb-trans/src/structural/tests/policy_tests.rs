@@ -14,8 +14,8 @@ fn causes(sp: &Restructurer) -> Vec<CandidateCause> {
         .collect()
 }
 
-// Gives `sp` the signals that only one of the two policies uses: an inline
-// pressure, lost leaf CASes on one key, and a leaf delay.
+// Gives `sp` the signals that not every policy uses: an inline pressure, lost
+// leaf CASes on one key, and a leaf delay.
 fn send_policy_signals(sp: &Restructurer) {
     sp.hints.observe_inline_pressure(&root_path(), b"b", 8);
     let round = BTreeSet::from([b"b".to_vec()]);
@@ -30,10 +30,31 @@ fn send_policy_signals(sp: &Restructurer) {
     );
 }
 
-// The size causes split for inline pressure and for contended keys, and take
-// no measurements of time.
+// The writers policy splits for inline pressure and for contended keys, and
+// takes no measurements of time.
 #[tokio::test]
-async fn the_size_causes_queue_splits_and_measure_no_time() {
+async fn the_writers_policy_queues_splits_and_measures_no_time() {
+    let s = store();
+    let bg = Arc::new(Background::new());
+    let topology = TestTopology::writers(NodeSizePolicy::default()).with_inline(pressure_inline());
+    let sp = restructurer_with_topology(&s, &bg, topology);
+
+    send_policy_signals(&sp);
+
+    let causes = causes(&sp);
+    assert!(causes.iter().any(|cause| cause.is_inline_pressure()));
+    assert!(
+        causes
+            .iter()
+            .any(|cause| matches!(cause, CandidateCause::Split(SplitReason::Contention { .. })))
+    );
+    assert!(sp.stats_and_reset().topology_time.lost_cas.is_zero());
+}
+
+// The size causes split only for the leaf sizes: inline pressure splits, and
+// lost leaf CASes do not.
+#[tokio::test]
+async fn the_size_causes_queue_only_size_splits_and_measure_no_time() {
     let s = store();
     let bg = Arc::new(Background::new());
     let topology =
@@ -45,7 +66,7 @@ async fn the_size_causes_queue_splits_and_measure_no_time() {
     let causes = causes(&sp);
     assert!(causes.iter().any(|cause| cause.is_inline_pressure()));
     assert!(
-        causes
+        !causes
             .iter()
             .any(|cause| matches!(cause, CandidateCause::Split(SplitReason::Contention { .. })))
     );

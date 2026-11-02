@@ -3525,7 +3525,7 @@ mod tests {
         }
     }
 
-    // ADR-085: the size causes take no measurements, but a leaf CAS lost to
+    // ADR-085: the writers policy takes no measurements, but a leaf CAS lost to
     // other keys reaches the hinter with the keys of the round. A loss to the
     // same keys does not, because a split cannot remove it.
     #[tokio::test(start_paused = true)]

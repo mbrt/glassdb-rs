@@ -46,13 +46,13 @@ virtual time.
 | The cases of [Default experiments](#default-experiments) | `default` | Single transactions of one worker with warm caches, and their backend costs, and four shapes at the same time on one leaf. Each case has a fixed length of 10 s. |
 | `inline-pressure` | `any-time` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
 | `contention` | `any-time` | Five writers whose transactions share some of their 1 to 6 keys. |
-| `split-merge-fight` | `real-time` | A stable load under which the topology policies of three instances disagree, with the `avoidable`, `fixed-1`, and `fixed-2` policies. |
+| `split-merge-fight` | `real-time` | A stable load under which both a split and a merge of one leaf make sense. The default topology policy must settle at one leaf or at two leaves, from a start of either one. |
 | `membership-churn` | `real-time` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
 | `mixed` | `real-time` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
 | `workers` | `real-time` | The worker grid of the canonical plots: 1 to 200 workers per shape, each count after the warm-up of the count before it. |
 | `affinity` | `real-time` | The affinity grid of the canonical plots: 5 affinities × 1, 3, 5, and 7 database instances. |
 | `load-shift` | `real-time` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
-| `false-sharing` | `real-time` | Four instances that each write one of four adjacent keys of one leaf, while one more instance reads and writes the keys around them (ADR-084), with three topology policies. |
+| `false-sharing` | `real-time` | Four instances that each write one of four adjacent keys of one leaf, while one more instance reads and writes the keys around them (ADR-084). The default topology policy must split the keys of the four instances apart. |
 | `fixed-ranges` | `real-time` | Transactions on fixed ranges of 16 and 64 keys, with transactions on single keys (ADR-084). |
 | `random-ranges` | `real-time` | Transactions on ranges of 16 and 64 adjacent keys from random starts, on fixed sets of 3 keys, and on single keys (ADR-084). |
 

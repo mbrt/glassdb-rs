@@ -1,7 +1,11 @@
-# A stable load under which the topology policies of database instances
-# disagree. Two writers of one key each lose leaf CASes to each other, so their
-# policy splits the leaf. A scanner then crosses into the right leaf, so its
-# policy merges the leaves again. The fixed policies keep one or two leaves.
+# A stable load under which both a split and a merge of one leaf make sense.
+# Two writers of one key each lose leaf CASes to each other, so a split of the
+# leaf between the two keys removes these losses. A scanner reads both keys, so
+# a merge of the two leaves removes a leaf read from each scan.
+#
+# The default topology policy must settle: after the warm-up, the collection
+# stays at one leaf or at two leaves, and the measurement shows no splits and
+# no merges. The axis `start` gives the shape that the cells start from.
 
 [pools.fight]
 keys = 2
@@ -51,30 +55,18 @@ duration = "60s"
 max-duration = "120s"
 
 [[axes]]
-name = "policy"
+name = "start"
 
+# The seed keeps the two keys in one leaf.
 [[axes.values]]
-label = "avoidable"
-[axes.values.set]
-"seed.database.topology" = "avoidable"
-"cell.database.topology" = "avoidable"
+label = "one-leaf"
 
-# The size causes with no underfull threshold keep the one leaf of the seed.
+# The seed splits the leaf between the two keys. The seed uses the size causes,
+# so that this start does not depend on changes to the default policy.
 [[axes.values]]
-label = "fixed-1"
+label = "two-leaves"
 [axes.values.set]
-"cell.database.topology" = "size"
-"cell.database.leaf-min-entries" = 0
-"cell.database.index-min-children" = 0
-
-# The seed splits the leaf between the two keys, and the cells keep both leaves.
-[[axes.values]]
-label = "fixed-2"
-[axes.values.set]
-"seed.database.topology" = "size"
+"seed.database.topology" = "size-causes"
 "seed.database.leaf-max-entries" = 1
 "seed.database.leaf-min-entries" = 0
 "seed.database.index-min-children" = 0
-"cell.database.topology" = "size"
-"cell.database.leaf-min-entries" = 0
-"cell.database.index-min-children" = 0

@@ -4,6 +4,10 @@
 
 Accepted — implemented.
 
+The policy that this ADR calls the size causes is now
+`TopologyPolicy::Writers`. `SizeCauses` now names the policy of the leaf sizes
+alone.
+
 Refined by [ADR-085](085-lost-leaf-cas-separates-the-keys-of-database-instances.md).
 
 Supersedes [ADR-075](075-avoidable-time-is-the-default-topology-policy.md).

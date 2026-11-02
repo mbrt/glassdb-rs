@@ -276,18 +276,25 @@ struct TestTopology {
 }
 
 impl TestTopology {
+    fn writers(sizes: NodeSizePolicy) -> Self {
+        Self {
+            policy: TopologyPolicy::Writers,
+            sizes,
+            inline: InlinePolicy::default(),
+        }
+    }
+
     fn size_causes(sizes: NodeSizePolicy) -> Self {
         Self {
             policy: TopologyPolicy::SizeCauses,
-            sizes,
-            inline: InlinePolicy::default(),
+            ..Self::writers(sizes)
         }
     }
 
     fn avoidable_time(sizes: NodeSizePolicy) -> Self {
         Self {
             policy: TopologyPolicy::AvoidableTime,
-            ..Self::size_causes(sizes)
+            ..Self::writers(sizes)
         }
     }
 
@@ -297,7 +304,7 @@ impl TestTopology {
 }
 
 fn restructurer(store: &TestStore, bg: &Arc<Background>, policy: NodeSizePolicy) -> Restructurer {
-    restructurer_with_topology(store, bg, TestTopology::size_causes(policy))
+    restructurer_with_topology(store, bg, TestTopology::writers(policy))
 }
 
 fn restructurer_with_topology(
@@ -412,7 +419,7 @@ fn restructurer_and_monitor(
         crate::monitor::ProtocolTiming::default(),
     );
     let restructurer =
-        restructurer_with_monitor(store, bg, mon.clone(), TestTopology::size_causes(policy));
+        restructurer_with_monitor(store, bg, mon.clone(), TestTopology::writers(policy));
     (restructurer, mon)
 }
 

@@ -201,8 +201,8 @@ pub struct NodeSizePolicy {
     node_soft_max_bytes: usize,
     /// Maximum index children (fan-out) before it is a split candidate.
     index_max_children: usize,
-    /// Minimum live leaf entries below which a leaf is a merge candidate, when
-    /// the size causes decide the merges of leaves (ADR-074).
+    /// Minimum live leaf entries below which a leaf is a merge candidate, with
+    /// every topology policy except the avoidable time policy (ADR-074).
     leaf_min_entries: usize,
     /// Minimum index children below which an index is a merge candidate.
     index_min_children: usize,
@@ -255,8 +255,8 @@ impl NodeSizePolicy {
         self.index_max_children
     }
 
-    /// Minimum live leaf entries below which a leaf is a merge candidate, when
-    /// the size causes decide the merges of leaves (ADR-074).
+    /// Minimum live leaf entries below which a leaf is a merge candidate, with
+    /// every topology policy except the avoidable time policy (ADR-074).
     pub fn leaf_min_entries(&self) -> usize {
         self.leaf_min_entries
     }
@@ -320,9 +320,9 @@ impl NodeSizePolicyBuilder {
         self
     }
 
-    /// Sets the live leaf entry count below which a merge is requested, when
-    /// the size causes decide the merges of leaves (ADR-074). Zero disables
-    /// these merges.
+    /// Sets the live leaf entry count below which a merge is requested, with
+    /// every topology policy except the avoidable time policy (ADR-074). Zero
+    /// disables these merges.
     pub fn leaf_min_entries(mut self, value: usize) -> Self {
         self.leaf_min_entries = value;
         self

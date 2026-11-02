@@ -18,7 +18,7 @@ use glassdb_concurr::{Tape, rt};
 use glassdb_storage::{InlinePolicy, NodeSizePolicy};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Database, Error, PersistentCacheConfig, ProtocolTiming, TopologyPolicy};
+use crate::{Database, Error, PersistentCacheConfig, ProtocolTiming};
 
 use self::client::ClientRunner;
 use self::nemesis::{FaultTransports, NemesisRunner};
@@ -124,19 +124,19 @@ impl<'a> Arbitrary<'a> for FaultConfig {
         })
     }
 }
-/// Opens a simulation database with the given node size, inline, and topology
-/// policies, and optional persistent-cache media.
+/// Opens a simulation database with the given node size and inline policies,
+/// and optional persistent-cache media. Every simulation database has the
+/// default topology policy, because it is the one that the simulation must
+/// cover.
 pub(crate) async fn open_det_db(
     backend: &Arc<dyn Backend>,
     node_size_policy: NodeSizePolicy,
     inline_policy: InlinePolicy,
-    topology_policy: TopologyPolicy,
     media: Option<SimMedia>,
 ) -> Result<Database, Error> {
     let builder = Database::builder(DB_NAME, backend.clone())
         .node_size_policy(node_size_policy)
         .inline_policy(inline_policy)
-        .topology_policy(topology_policy)
         .protocol_timing(ProtocolTiming::simulation());
     let builder = if let Some(media) = media {
         builder.simulated_persistent_cache(
@@ -301,7 +301,6 @@ pub trait SimWorkload: Clone + Default + 'static {
             backend,
             NodeSizePolicy::default(),
             InlinePolicy::default(),
-            TopologyPolicy::default(),
             media,
         )
     }
