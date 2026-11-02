@@ -333,7 +333,6 @@ def read_inline_pressure(paths: Sequence[Path]) -> pd.DataFrame:
         "splitCandidates": "split-candidates",
         "splitCompleted": "split-completed",
         "splitDeferred": "split-deferred",
-        "staleDemand": "stale-demand",
         "merges": "merges",
         # Earlier perfbench versions counted the inline pressure splits of
         # ADR-056 in fixed trigger and settle phases.
@@ -391,7 +390,6 @@ def _inline_phase(cell: dict[str, Any]) -> dict[str, Any]:
         "splitCandidates": total("splitCandidates"),
         "splitCompleted": total("splits"),
         "splitDeferred": total("splitDeferred"),
-        "staleDemand": total("staleDemand"),
         "merges": total("merges"),
     }
 

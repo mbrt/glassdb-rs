@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Superseded by [ADR-086](086-remove-the-avoidable-time-policy.md).
 
 This record replaces the proposal "Splits and merges at the write limit of a
 collection". The proposal used this number on a branch, was not accepted, and

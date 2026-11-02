@@ -1,5 +1,5 @@
 //! The end of the pressure phase of the `inline-pressure` experiment: the
-//! leaves adapt to their aggregate inline budget (ADR-056, ADR-074) when a
+//! leaves adapt to their aggregate inline budget (ADR-056) when a
 //! whole pass over the pressured keys commits without locks.
 
 use glassdb::Stats;

@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — implemented.
+Superseded by [ADR-086](086-remove-the-avoidable-time-policy.md).
 
 [ADR-075](075-avoidable-time-is-the-default-topology-policy.md)
 makes the avoidable time policy the default.

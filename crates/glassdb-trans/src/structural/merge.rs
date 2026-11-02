@@ -7,8 +7,7 @@
 //! the merge.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::Ordering;
 
 use glassdb_data::{CollectionAddress, NodeId, StructuralIntentId, TxId};
 use glassdb_storage::{
@@ -21,12 +20,10 @@ use crate::monitor::Monitor;
 
 use super::NODE_CAS_ATTEMPTS;
 use super::change::{Applied, ParentRoute, Prepared};
-use super::measurements::ChangeKind;
 use super::nodes::StructuralNodeAccess;
 use super::policy::{MergeDecision, TopologyDecisions};
 use super::reclamation::{ReclamationReporter, reclaim_holder_free_tombstones};
 use super::recovery::ReadyChange;
-use super::sink::StructuralHintSink;
 use super::stats::Stats;
 
 /// Safety bound on the right-link hops that the search for a merge target
@@ -37,9 +34,6 @@ const MAX_TARGET_SEARCH_HOPS: usize = 4096;
 /// Why a merge does not go ahead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MergeVeto {
-    /// The rate of a demand merge does not pay more than the paid rates of
-    /// the two leaves (ADR-076).
-    Unpaid,
     /// The merged node would be over half of a threshold of a split cause
     /// (ADR-073).
     TooLarge,
@@ -61,8 +55,6 @@ pub(super) struct Merger {
     // The limits of nodes, which every topology policy keeps.
     sizes: NodeSizePolicy,
     decisions: Arc<dyn TopologyDecisions>,
-    // Receives the leaves that a merge wrote.
-    hints: StructuralHintSink,
     stats: Arc<Stats>,
     reclamation: ReclamationReporter,
 }
@@ -75,11 +67,6 @@ pub(super) enum MergeReason {
     /// Transactions write keys of the leaf and of its right sibling together
     /// (ADR-084).
     WriteSpan,
-    /// A topology rule decided that the leaf merges.
-    Demand {
-        /// The avoidable time in each second that pays for the merge.
-        rate: Duration,
-    },
 }
 
 /// The node writes of one merge. The source gate protects them until the
@@ -89,8 +76,6 @@ pub(super) struct MergePlan {
     target: TargetState,
     merge: MergeTarget,
     reclaimed: Vec<TxId>,
-    /// The rate that pays for a merge that a topology rule asked for.
-    rate: Option<Duration>,
 }
 
 /// A merge target and the state that the merge decision used.
@@ -110,7 +95,6 @@ impl Merger {
         mon: Monitor,
         sizes: NodeSizePolicy,
         decisions: Arc<dyn TopologyDecisions>,
-        hints: StructuralHintSink,
         stats: Arc<Stats>,
         reclamation: ReclamationReporter,
     ) -> Self {
@@ -122,7 +106,6 @@ impl Merger {
             mon,
             sizes,
             decisions,
-            hints,
             stats,
             reclamation,
         }
@@ -145,21 +128,18 @@ impl Merger {
         {
             Ok((left, _)) => left,
             Err(StorageError::NotFound) => {
-                self.count_demand(reason, |stats| &stats.demand_merge_other);
                 return Ok(None);
             }
             Err(error) => return Err(error.into()),
         };
         let Some(boundary) = left.high_key().filter(|_| !left.is_drained()) else {
-            self.count_demand(reason, |stats| &stats.demand_merge_other);
             return Ok(None);
         };
         let Some(target) = self.target(collection, &left, Requirement::ANY).await? else {
-            self.count_demand(reason, |stats| &stats.demand_merge_other);
             return Ok(None);
         };
         if let Err(veto) = self.need(&left, &target.node, reason) {
-            self.count_veto(reason, veto);
+            self.count_veto(veto);
             return Ok(None);
         }
         // Merging the children of two parents would leave the left parent
@@ -173,7 +153,6 @@ impl Merger {
             .and_then(|parent| parent.node())
             .is_some_and(|parent| parent.covers(boundary))
         {
-            self.count_demand(reason, |stats| &stats.demand_merge_other);
             return Ok(None);
         }
         if left.locks().merge_reservation().is_some()
@@ -181,7 +160,6 @@ impl Merger {
             || self.has_live_holder(&left).await?
             || self.has_live_holder(&target.node).await?
         {
-            self.count_demand(reason, |stats| &stats.demand_merge_busy);
             return Err(TransError::Retry);
         }
         Ok(Some(target.id))
@@ -197,7 +175,7 @@ impl Merger {
         reason: MergeReason,
     ) -> Prepared<MergePlan> {
         let reclaimed = reclaim_holder_free_tombstones(&mut left);
-        let (target, rate) = match self.checked_target(collection, &left, reason).await {
+        let target = match self.checked_target(collection, &left, reason).await {
             Ok(Some(checked)) => checked,
             Ok(None) if !reclaimed.is_empty() => {
                 return Prepared::ReclaimOnly {
@@ -223,7 +201,6 @@ impl Merger {
                 target,
                 merge,
                 reclaimed,
-                rate,
             },
         }
     }
@@ -244,10 +221,9 @@ impl Merger {
             target,
             merge,
             reclaimed,
-            rate,
         } = plan;
         match self
-            .absorb(collection, &merge, &left, intent, target, rate)
+            .absorb(collection, &merge, &left, intent, target)
             .await?
         {
             Some(target_reclaimed) => self.reclamation.record(&target_reclaimed, false),
@@ -267,17 +243,6 @@ impl Merger {
         }
         self.reclamation.record(&reclaimed, false);
         self.stats.record_merge();
-        let leaves: &[NodeId] = if drained.as_leaf().is_some() {
-            &[*source, merge.node_id]
-        } else {
-            &[]
-        };
-        self.hints.leaves_changed(
-            collection,
-            leaves,
-            ChangeKind::Merge,
-            rate.is_some().then_some(intent),
-        );
         self.structural_nodes
             .remove_merge_reservation(collection, &merge.node_id, intent, Requirement::ANY)
             .await?;
@@ -288,37 +253,30 @@ impl Merger {
     }
 
     /// Finds the merge target of the gated `left` in current state and checks
-    /// the merge decision again, with the rate that the merge pays. `None`
-    /// cancels the merge.
+    /// the merge decision again. `None` cancels the merge.
     async fn checked_target(
         &self,
         collection: &CollectionAddress,
         left: &Node,
         reason: MergeReason,
-    ) -> Result<Option<(TargetState, Option<Duration>)>, TransError> {
+    ) -> Result<Option<TargetState>, TransError> {
         if left.is_drained() || left.high_key().is_none() {
-            self.count_demand(reason, |stats| &stats.demand_merge_other);
             return Ok(None);
         }
         let requirement = Requirement::after(self.timeline.currentness_barrier());
         let Some(target) = self.target(collection, left, requirement).await? else {
-            self.count_demand(reason, |stats| &stats.demand_merge_other);
             return Ok(None);
         };
-        let paid_rate = match self.need(left, &target.node, reason) {
-            Ok(paid_rate) => paid_rate,
-            Err(veto) => {
-                self.count_veto(reason, veto);
-                return Ok(None);
-            }
-        };
+        if let Err(veto) = self.need(left, &target.node, reason) {
+            self.count_veto(veto);
+            return Ok(None);
+        }
         if target.node.locks().merge_reservation().is_some()
             || self.has_live_holder(&target.node).await?
         {
-            self.count_demand(reason, |stats| &stats.demand_merge_busy);
             return Err(TransError::Retry);
         }
-        Ok(Some((target, paid_rate)))
+        Ok(Some(target))
     }
 
     /// Finds the node that receives a merge of `left`: the first node on its
@@ -350,17 +308,11 @@ impl Merger {
     }
 
     /// Reports whether `left` still has the need of `reason`, and whether its
-    /// merge with `right` fits, with the rate that the merge pays (ADR-076).
-    /// The topology policy decides whether two leaves merge, the limits of the
-    /// merged leaf, and its paid rate. The merge compacts both nodes, so their
+    /// merge with `right` fits. The topology policy decides whether two leaves
+    /// merge, and the limits of the merged leaf. The merge compacts both nodes, so their
     /// holder-free tombstones do not count. Only an underfull merge applies to
     /// index nodes.
-    fn need(
-        &self,
-        left: &Node,
-        right: &Node,
-        reason: MergeReason,
-    ) -> Result<Option<Duration>, MergeVeto> {
+    fn need(&self, left: &Node, right: &Node, reason: MergeReason) -> Result<(), MergeVeto> {
         let (mut left, mut right) = (left.clone(), right.clone());
         reclaim_holder_free_tombstones(&mut left);
         reclaim_holder_free_tombstones(&mut right);
@@ -369,13 +321,12 @@ impl Merger {
             <= policy.node_soft_max_bytes().min(policy.content_limit()) / 2;
         match (left.body(), right.body()) {
             (NodeBody::Leaf(left_leaf), NodeBody::Leaf(right_leaf)) => {
-                let (max_entries, max_inline_bytes, paid_rate) =
+                let (max_entries, max_inline_bytes) =
                     match self.decisions.merge(&left, &right, reason) {
                         MergeDecision::Within {
                             max_entries,
                             max_inline_bytes,
-                            paid_rate,
-                        } => (max_entries, max_inline_bytes, paid_rate),
+                        } => (max_entries, max_inline_bytes),
                         MergeDecision::Veto(veto) => return Err(veto),
                     };
                 let inline_len = |leaf: &LeafBody| -> usize {
@@ -385,7 +336,7 @@ impl Merger {
                     && inline_len(left_leaf) + inline_len(right_leaf) <= max_inline_bytes
                     && fits_bytes;
                 if fits {
-                    Ok(paid_rate)
+                    Ok(())
                 } else {
                     Err(MergeVeto::TooLarge)
                 }
@@ -397,33 +348,17 @@ impl Merger {
                 {
                     Err(MergeVeto::TooLarge)
                 } else {
-                    Ok(None)
+                    Ok(())
                 }
             }
             _ => Err(MergeVeto::NotNeeded),
         }
     }
 
-    /// Counts the veto of one attempt of a merge: each underfull merge that
-    /// waits for the writers of its leaves, and the other vetoes of the merges
-    /// that a topology rule asked for.
-    fn count_veto(&self, reason: MergeReason, veto: MergeVeto) {
-        let demand_counter: fn(&Stats) -> &AtomicU64 = match veto {
-            MergeVeto::KeptApart => {
-                self.stats.kept_apart.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            MergeVeto::Unpaid => |stats| &stats.demand_merge_unpaid,
-            MergeVeto::TooLarge => |stats| &stats.demand_merge_too_large,
-            MergeVeto::NotNeeded => |stats| &stats.demand_merge_other,
-        };
-        self.count_demand(reason, demand_counter);
-    }
-
-    /// Counts one outcome of a merge that a topology rule asked for.
-    fn count_demand(&self, reason: MergeReason, counter: impl FnOnce(&Stats) -> &AtomicU64) {
-        if matches!(reason, MergeReason::Demand { .. }) {
-            counter(&self.stats).fetch_add(1, Ordering::Relaxed);
+    /// Counts each underfull merge that waits for the writers of its leaves.
+    fn count_veto(&self, veto: MergeVeto) {
+        if veto == MergeVeto::KeptApart {
+            self.stats.kept_apart.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -460,7 +395,6 @@ impl Merger {
         left: &Node,
         intent: &StructuralIntentId,
         target: TargetState,
-        rate: Option<Duration>,
     ) -> Result<Option<Vec<TxId>>, TransError> {
         let mut current = (target.node, target.observation);
         for attempt in 0..NODE_CAS_ATTEMPTS {
@@ -490,7 +424,7 @@ impl Merger {
             // tombstones that have no holder when it lands. R's gate is not
             // necessary for that (ADR-073).
             let reclaimed = reclaim_holder_free_tombstones(&mut right);
-            right.absorb(left, *intent, rate)?;
+            right.absorb(left, *intent)?;
             let policy = &self.sizes;
             if right.content_encoded_len() > policy.content_limit()
                 || right.encoded_len() > policy.node_max_bytes()
@@ -514,8 +448,7 @@ impl MergeReason {
     pub(super) fn class(self) -> u8 {
         match self {
             MergeReason::Underfull => 4,
-            MergeReason::Demand { .. } => 5,
-            MergeReason::WriteSpan => 6,
+            MergeReason::WriteSpan => 5,
         }
     }
 }

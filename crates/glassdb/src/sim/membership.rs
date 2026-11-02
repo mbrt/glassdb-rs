@@ -7,7 +7,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
 
-use crate::{CollectionPath, Database, Error, KeyScan, TopologyPolicy};
+use crate::{CollectionPath, Database, Error, KeyScan};
 
 use super::harness::{SimWorkload, open_det_db};
 use super::{
@@ -210,7 +210,6 @@ impl SimWorkload for MembershipWorkload {
             backend,
             tiny_node_size_policy(),
             glassdb_storage::InlinePolicy::default(),
-            TopologyPolicy::default(),
             media,
         )
         .await
@@ -347,7 +346,6 @@ impl SimWorkload for MergingMembershipWorkload {
             backend,
             merging_node_size_policy(),
             glassdb_storage::InlinePolicy::default(),
-            TopologyPolicy::default(),
             media,
         )
         .await

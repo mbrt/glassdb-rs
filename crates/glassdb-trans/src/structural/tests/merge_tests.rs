@@ -1,9 +1,6 @@
 use super::*;
 
 use glassdb_backend::middleware::HookOutcome;
-use glassdb_storage::{PaidChange, Payment};
-
-use crate::structural::rule::{ChangeRequest, LeafId, RuleRequest};
 
 // Leaves below four live entries are underfull, and a merged leaf may hold at
 // most four entries.
@@ -127,133 +124,6 @@ async fn merge_now(sp: &Restructurer, name: &str, reason: MergeReason) -> Result
         .await
 }
 
-// Splits a leaf with `entries` at "m" for a topology rule, with a paid rate of
-// 1000 ms in each second, and returns its two halves.
-fn split_for_rule(entries: impl IntoIterator<Item = LeafEntry>) -> (Node, Node) {
-    let mut left = Node::leaf(LeafBody::from_entries(entries));
-    let paid = Payment {
-        per_second: Duration::from_secs(1),
-        intent: test_intent_id("paid"),
-    };
-    let (right, _) = left
-        .split_leaf_at(test_node_id("L1"), b"m", Some(paid))
-        .unwrap();
-    (left, right)
-}
-
-// L0 and L1 as a split for a topology rule left them.
-async fn seed_split_leaves(s: &TestStore) {
-    let (left, right) = split_for_rule([live(b"a"), live(b"b"), live(b"m"), live(b"n")]);
-    seed_leaves(s, left, right).await;
-}
-
-// L0 with no live entries and L1, as a split for a topology rule left them.
-async fn seed_split_leaves_with_empty_left(s: &TestStore) {
-    let deleted = tombstone(b"a", tx_id(b"deleter"));
-    let (left, right) = split_for_rule([deleted, live(b"m"), live(b"n")]);
-    seed_leaves(s, left, right).await;
-}
-
-// A restructurer whose leaves merge only when a topology rule asks.
-fn rule_restructurer(s: &TestStore, bg: &Arc<Background>) -> Restructurer {
-    let candidates = TestTopology::avoidable_time(mergeable());
-    restructurer_with_topology(s, bg, candidates)
-}
-
-async fn demand_merge_l0(sp: &Restructurer, rate: Duration) -> Result<(), TransError> {
-    merge_now(sp, "L0", MergeReason::Demand { rate }).await
-}
-
-// ADR-076: the leaves of a split that a topology rule asked for keep its paid
-// rate. A merge that a rule asks for must pay more than 1.5 times it, and the
-// leaf that receives the entries keeps the paid rate of the merge.
-#[tokio::test(start_paused = true)]
-async fn a_demand_merge_must_pay_more_than_the_paid_rate_of_the_split() {
-    let s = store();
-    seed_split_leaves(&s).await;
-    let bg = Arc::new(Background::new());
-    let sp = rule_restructurer(&s, &bg);
-
-    demand_merge_l0(&sp, Duration::from_millis(1500))
-        .await
-        .unwrap();
-    assert_not_merged(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
-    assert_eq!(
-        sp.stats_and_reset().demand_merges,
-        DemandMergeStats {
-            unpaid: 1,
-            ..DemandMergeStats::default()
-        }
-    );
-
-    demand_merge_l0(&sp, Duration::from_millis(1600))
-        .await
-        .unwrap();
-    assert_merged(&s).await;
-    let kept = current_node(&s, "L1").await.paid_rate().cloned().unwrap();
-    assert_eq!(
-        (kept.change, kept.per_second),
-        (PaidChange::Merge, Duration::from_millis(1600))
-    );
-}
-
-// ADR-076: a paid rate halves each minute after this database instance first
-// compared a request with it, so that a change of the load can change the
-// topology again.
-#[tokio::test(start_paused = true)]
-async fn a_paid_rate_holds_less_as_it_gets_older() {
-    let s = store();
-    seed_split_leaves(&s).await;
-    let bg = Arc::new(Background::new());
-    let sp = rule_restructurer(&s, &bg);
-
-    demand_merge_l0(&sp, Duration::from_millis(1000))
-        .await
-        .unwrap();
-    assert_not_merged(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
-
-    tokio::time::advance(Duration::from_secs(60)).await;
-    demand_merge_l0(&sp, Duration::from_millis(1000))
-        .await
-        .unwrap();
-    assert_merged(&s).await;
-}
-
-// A paid rate holds only the changes that a topology rule asks for. A leaf
-// with no live entries still merges, and the merged leaf keeps no paid rate.
-#[tokio::test(start_paused = true)]
-async fn a_paid_rate_does_not_hold_the_merge_of_an_empty_leaf() {
-    let s = store();
-    seed_split_leaves_with_empty_left(&s).await;
-    let bg = Arc::new(Background::new());
-    let sp = rule_restructurer(&s, &bg);
-
-    merge_l0(&sp).await.unwrap();
-
-    let merged = current_node(&s, "L1").await;
-    assert_eq!(keys(&merged), [b"m", b"n"]);
-    assert_eq!(merged.paid_rate(), None);
-}
-
-// Regression: a merge that a topology rule asked for, and that went ahead
-// only because its source had no live entries, kept its rate as a paid rate,
-// although that rate did not pay for it.
-#[tokio::test(start_paused = true)]
-async fn a_demand_merge_of_an_empty_leaf_keeps_no_paid_rate() {
-    let s = store();
-    seed_split_leaves_with_empty_left(&s).await;
-    let bg = Arc::new(Background::new());
-    let sp = rule_restructurer(&s, &bg);
-
-    demand_merge_l0(&sp, Duration::from_millis(10))
-        .await
-        .unwrap();
-
-    let merged = current_node(&s, "L1").await;
-    assert_eq!(keys(&merged), [b"m", b"n"]);
-    assert_eq!(merged.paid_rate(), None);
-}
-
 #[tokio::test]
 async fn underfull_leaf_merges_into_its_right_sibling() {
     let s = store();
@@ -346,56 +216,6 @@ async fn merge_is_vetoed_when_the_merged_leaf_would_split_soon() {
     merge_l0(&sp).await.unwrap();
 
     assert_not_merged(&s, &[b"a"], &[b"m", b"n", b"o", b"p"]).await;
-    assert_eq!(
-        sp.stats_and_reset().demand_merges,
-        DemandMergeStats::default(),
-        "only the merges of a topology rule count"
-    );
-}
-
-// The size veto of ADR-073 also stops the merges of a topology rule, and the
-// stats show it.
-#[tokio::test]
-async fn a_demand_merge_that_would_split_soon_counts_as_too_large() {
-    let s = store();
-    seed_two_leaves(&s, &[b"a"], &[b"m", b"n", b"o", b"p"]).await;
-    let bg = Arc::new(Background::new());
-    let sp = rule_restructurer(&s, &bg);
-
-    demand_merge_l0(&sp, Duration::from_secs(1)).await.unwrap();
-
-    assert_not_merged(&s, &[b"a"], &[b"m", b"n", b"o", b"p"]).await;
-    assert_eq!(
-        sp.stats_and_reset().demand_merges,
-        DemandMergeStats {
-            too_large: 1,
-            ..DemandMergeStats::default()
-        }
-    );
-}
-
-// ADR-083: a sweep drops a merge that a topology rule asked for more than
-// three windows before.
-#[tokio::test(start_paused = true)]
-async fn a_sweep_drops_a_stale_demand_merge() {
-    let s = store();
-    seed_two_leaves(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
-    let bg = Arc::new(Background::new());
-    let sp = rule_restructurer(&s, &bg);
-
-    push_request(
-        &sp.candidates,
-        RuleRequest {
-            change: ChangeRequest::Merge(LeafId::new(node_path("L0"))),
-            rate: Duration::from_secs(1),
-        },
-    );
-    tokio::time::advance(Duration::from_secs(4)).await;
-    sp.run_once().await;
-
-    assert_not_merged(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
-    let stats = sp.stats_and_reset();
-    assert_eq!((stats.stale_demand, stats.demand_merges.stale), (1, 1));
 }
 
 // After a bulk delete, the target holds mostly cold tombstones. Counted as
@@ -422,7 +242,7 @@ async fn merge_compacts_the_cold_tombstones_of_its_target() {
     let sp = restructurer_with_topology_and_hints(
         &s,
         &bg,
-        TestTopology::size_causes(mergeable()),
+        TestTopology::writers(mergeable()),
         gc_hints.clone(),
     );
 
@@ -659,52 +479,6 @@ async fn a_deferred_candidate_waits_for_the_sweep_interval() {
 
     rt::sleep(SWEEP_INTERVAL).await;
     assert_eq!(sp.stats_and_reset(), deferred_once);
-}
-
-// Regression: the typical merge time included the time before the merge held
-// its gate, mostly a wait for the writers of the leaf. One slow start then
-// raised the merge threshold of the database instance for a long time. The
-// test makes the start slow with a slow write of the structural intent,
-// which also comes before the gate.
-#[tokio::test(start_paused = true)]
-async fn the_time_before_a_merge_holds_its_gate_is_not_its_typical_time() {
-    const SLOW_START: Duration = Duration::from_secs(20);
-    let hook = HookBackend::new(Arc::new(MemoryBackend::new()));
-    let s = store_with_backend(hook.clone());
-    seed_two_leaves(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
-    let bg = Arc::new(Background::new());
-    let (sp, policy) = avoidable_time_restructurer(&s, &bg, mergeable());
-    let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
-    // The intent is written before the merge gets its gate.
-    hook.set_before(move |op| {
-        let intent =
-            matches!(op, BackendOp::WriteIfNotExists { .. }) && op.path().starts_with(&prefix);
-        Box::pin(async move {
-            if intent {
-                rt::sleep(SLOW_START).await;
-            }
-            rt::sleep(Duration::from_millis(1)).await;
-            Ok(())
-        })
-    });
-
-    push_request(
-        &sp.candidates,
-        RuleRequest {
-            change: ChangeRequest::Merge(LeafId::new(node_path("L0"))),
-            rate: Duration::from_secs(1),
-        },
-    );
-    sp.run_once().await;
-
-    assert_merged(&s).await;
-    let window = policy.measurements().take_window();
-    // Below the default of 500 ms, so the merge recorded its time.
-    assert!(
-        window.merge_time < Duration::from_millis(400),
-        "{:?}",
-        window.merge_time
-    );
 }
 
 // A merge is optional maintenance, so it never aborts a user transaction.
@@ -984,7 +758,7 @@ async fn seed_interrupted_merge(s: &TestStore, sp: &Restructurer, crash: MergeCr
         return generation;
     }
 
-    right.absorb(&left, intent_id, None).unwrap();
+    right.absorb(&left, intent_id).unwrap();
     assert!(
         s.store_node(COLL, "L1", &right, Some(&observed))
             .await
@@ -1154,9 +928,7 @@ fn push_underfull_merges(sp: &Restructurer, names: &[&str]) {
         sp.candidates.push(MaintenanceCandidate {
             path: node_path(name),
             priority: sp.candidates.new_id(),
-            requested: rt::Instant::now(),
             cause: CandidateCause::Merge(MergeReason::Underfull),
-            max_age: None,
         });
     }
 }
@@ -1191,8 +963,7 @@ async fn root_children(s: &TestStore) -> IndexNode {
     root.as_index().unwrap().clone()
 }
 
-// Under a load that crosses many leaf boundaries, a topology rule asks for
-// many more merges than one merge at a time can make. The merges of different
+// A sweep can take many more merges than one merge at a time can make. The merges of different
 // nodes in one sweep run together, and join and leave the topology with one
 // CAS of the collection record.
 #[tokio::test]
@@ -1262,12 +1033,9 @@ async fn a_second_reason_to_merge_a_drained_leaf_stops_in_the_same_sweep() {
     let bg = Arc::new(Background::new());
     let sp = restructurer(&s, &bg, mergeable());
     push_underfull_merges(&sp, &["L0"]);
-    push_request(
-        &sp.candidates,
-        RuleRequest {
-            change: ChangeRequest::Merge(LeafId::new(node_path("L0"))),
-            rate: Duration::from_secs(1),
-        },
+    sp.candidates.push_cause(
+        &node_path("L0"),
+        CandidateCause::Merge(MergeReason::WriteSpan),
     );
 
     let record_writes = record_writes_of(&backend, sp.run_once()).await;
@@ -1280,16 +1048,6 @@ async fn a_second_reason_to_merge_a_drained_leaf_stops_in_the_same_sweep() {
     assert_no_intents(&s).await;
 }
 
-fn push_demand(sp: &Restructurer, change: ChangeRequest, millis: u64) {
-    push_request(
-        &sp.candidates,
-        RuleRequest {
-            change,
-            rate: Duration::from_millis(millis),
-        },
-    );
-}
-
 // A split adds a separator to the parent and a merge removes one. When they
 // land in one batch, one reconciliation of the parent must make both
 // changes.
@@ -1300,7 +1058,13 @@ async fn one_batch_splits_and_merges_under_one_parent() {
     for (name, keys, low, high, right) in [
         ("L0", &[b"a"][..], &b""[..], Some(&b"b"[..]), Some("L1")),
         ("L1", &[b"b"][..], b"b", Some(b"m"), Some("L2")),
-        ("L2", &[b"m", b"n", b"o", b"p"][..], b"m", None, None),
+        (
+            "L2",
+            &[b"m", b"n", b"o", b"p", b"q", b"r", b"s", b"t", b"u"][..],
+            b"m",
+            None,
+            None,
+        ),
     ] {
         let keys: Vec<&[u8]> = keys.iter().map(|key| key.as_slice()).collect();
         let node = leaf_node(&keys, high, right).with_low_key(low.to_vec());
@@ -1313,9 +1077,12 @@ async fn one_batch_splits_and_merges_under_one_parent() {
     .await
     .unwrap();
     let bg = Arc::new(Background::new());
-    let sp = rule_restructurer(&s, &bg);
-    push_demand(&sp, ChangeRequest::Merge(LeafId::new(node_path("L0"))), 500);
-    push_demand(&sp, ChangeRequest::Split(LeafId::new(node_path("L2"))), 100);
+    let sp = restructurer(&s, &bg, mergeable());
+    push_underfull_merges(&sp, &["L0"]);
+    sp.candidates.push_cause(
+        &node_path("L2"),
+        CandidateCause::Split(SplitReason::SoftCap),
+    );
 
     let record_writes = record_writes_of(&backend, sp.run_once()).await;
 
@@ -1327,35 +1094,12 @@ async fn one_batch_splits_and_merges_under_one_parent() {
     assert_eq!(children.len(), 3, "{children:?}");
     assert_eq!(children[0], (&b""[..], test_node_id("L1")));
     assert_eq!(children[1], (&b"m"[..], test_node_id("L2")));
-    assert_eq!(children[2].0, b"o");
+    assert_eq!(children[2].0, b"q");
     assert_eq!(keys(&current_node(&s, "L1").await), [b"a", b"b"]);
-    assert_eq!(keys(&current_node(&s, "L2").await), [b"m", b"n"]);
-    assert_no_intents(&s).await;
-}
-
-// A merge into a leaf that also needs a split waits for the split, even when
-// the merge has the higher rate. If the merge ran first, the paid rate of the
-// merged leaf would stop the split.
-#[tokio::test(start_paused = true)]
-async fn a_merge_into_a_leaf_that_needs_a_split_waits_for_the_split() {
-    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
-    let s = store_with_backend(backend.clone() as Arc<dyn Backend>);
-    seed_two_leaves(&s, &[b"a"], &[b"m", b"n", b"o"]).await;
-    let bg = Arc::new(Background::new());
-    let sp = rule_restructurer(&s, &bg);
-    push_demand(&sp, ChangeRequest::Merge(LeafId::new(node_path("L0"))), 500);
-    push_demand(&sp, ChangeRequest::Split(LeafId::new(node_path("L1"))), 100);
-
-    let record_writes = record_writes_of(&backend, sp.run_once()).await;
-
-    let stats = sp.stats_and_reset();
-    assert_eq!((stats.splits, stats.merges, stats.deferred), (1, 1, 0));
-    assert_eq!(record_writes, 4, "one batch for the split, then the merge");
-    assert!(current_node(&s, "L0").await.is_drained());
-    let merged = current_node(&s, "L1").await;
-    assert_eq!(merged.low_key(), b"");
-    assert_eq!(keys(&merged)[0], b"a");
-    assert!(keys(&merged).len() < 4, "the merge went into one half");
+    assert_eq!(
+        keys(&current_node(&s, "L2").await),
+        [b"m", b"n", b"o", b"p"]
+    );
     assert_no_intents(&s).await;
 }
 

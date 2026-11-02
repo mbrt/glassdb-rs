@@ -1,7 +1,4 @@
 use super::*;
-use crate::structural::rule::{ChangeRequest, LeafId, RuleRequest};
-
-use glassdb_storage::PaidChange;
 
 #[test]
 fn reclamation_removes_only_holder_free_tombstones() {
@@ -53,7 +50,7 @@ async fn root_reclamation_can_avoid_an_actionable_split() {
     let sp = restructurer_with_topology_and_hints(
         &s,
         &bg,
-        TestTopology::size_causes(tiny()),
+        TestTopology::writers(tiny()),
         gc_hints.clone(),
     );
     sp.hints.observe_leaf(&root_path(), root.as_leaf().unwrap());
@@ -181,7 +178,7 @@ async fn failed_compaction_does_not_publish_reclamation_outcomes() {
     let sp = restructurer_with_topology_and_hints(
         &s,
         &bg,
-        TestTopology::size_causes(tiny()),
+        TestTopology::writers(tiny()),
         gc_hints.clone(),
     );
     sp.hints.observe_leaf(&root_path(), root.as_leaf().unwrap());
@@ -231,7 +228,7 @@ async fn nonroot_split_partitions_the_compacted_leaf() {
     let sp = restructurer_with_topology_and_hints(
         &s,
         &bg,
-        TestTopology::size_causes(tiny()),
+        TestTopology::writers(tiny()),
         gc_hints.clone(),
     );
     sp.hints
@@ -413,186 +410,6 @@ async fn root_leaf_splits_in_place_into_an_index() {
     );
 }
 
-// ADR-074: avoidable time pays for the split that separates the keys that it
-// was measured for. The leaf can change before the split and move its median,
-// so the split is at the measured key, or not at all.
-#[tokio::test]
-async fn a_demand_split_divides_the_leaf_at_its_measured_key() {
-    let s = store();
-    s.create_root(COLL, &abcd_leaf()).await.unwrap();
-    let bg = Arc::new(Background::new());
-    let sp = restructurer_with_topology(
-        &s,
-        &bg,
-        TestTopology::avoidable_time(NodeSizePolicy::default()),
-    );
-
-    let above_every_key = SplitReason::Demand {
-        at: Some(b"e".to_vec()),
-        rate: Duration::from_secs(1),
-    };
-    split_path(&sp, &root_path(), &above_every_key)
-        .await
-        .unwrap();
-    assert_eq!(leaf_keys(&s).await.len(), 1, "a half would be empty");
-
-    let measured = SplitReason::Demand {
-        at: Some(b"b".to_vec()),
-        rate: Duration::from_secs(1),
-    };
-    split_path(&sp, &root_path(), &measured).await.unwrap();
-    assert_eq!(leaf_keys(&s).await, a_then_bcd());
-}
-
-// The leaf changes after each measurement, so of the demand splits that wait
-// for one sweep, the newest split key is the one that most likely still
-// divides the leaf.
-#[tokio::test]
-async fn queued_demand_splits_of_a_leaf_divide_it_at_the_newest_key() {
-    let s = store();
-    s.create_root(COLL, &abcd_leaf()).await.unwrap();
-    let bg = Arc::new(Background::new());
-    let sp = restructurer_with_topology(
-        &s,
-        &bg,
-        TestTopology::avoidable_time(NodeSizePolicy::default()),
-    );
-    for at in [b"e", b"b"] {
-        sp.candidates.push(MaintenanceCandidate {
-            path: root_path(),
-            priority: sp.candidates.new_id(),
-            requested: rt::Instant::now(),
-            cause: CandidateCause::Split(SplitReason::Demand {
-                at: Some(at.to_vec()),
-                rate: Duration::from_secs(1),
-            }),
-            max_age: Some(crate::structural::policy::DEMAND_MAX_AGE),
-        });
-    }
-
-    sp.run_once().await;
-
-    assert_eq!(leaf_keys(&s).await, a_then_bcd());
-}
-
-// The restructurer can make fewer splits than a topology rule asks for. Then
-// the queue keeps requests for a load that stopped, and splits after it
-// (ADR-083).
-#[tokio::test(start_paused = true)]
-async fn a_sweep_drops_a_demand_split_older_than_three_windows() {
-    let s = store();
-    s.create_root(COLL, &abcd_leaf()).await.unwrap();
-    let bg = Arc::new(Background::new());
-    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
-
-    push_request(&sp.candidates, root_split_request());
-    tokio::time::advance(Duration::from_secs(4)).await;
-    sp.run_once().await;
-
-    assert_eq!(sp.stats_and_reset().stale_demand, 1);
-    assert_eq!(leaf_keys(&s).await.len(), 1, "the stale split did not land");
-}
-
-// A new request for the same change shows that the load continues, so the
-// queued change is not stale.
-#[tokio::test(start_paused = true)]
-async fn a_new_request_keeps_a_queued_demand_split() {
-    let s = store();
-    s.create_root(COLL, &abcd_leaf()).await.unwrap();
-    let bg = Arc::new(Background::new());
-    let sp = restructurer_with_topology(
-        &s,
-        &bg,
-        TestTopology::avoidable_time(NodeSizePolicy::default()),
-    );
-
-    push_request(&sp.candidates, root_split_request());
-    tokio::time::advance(Duration::from_secs(4)).await;
-    push_request(&sp.candidates, root_split_request());
-    sp.run_once().await;
-
-    let stats = sp.stats_and_reset();
-    assert_eq!((stats.splits, stats.stale_demand), (1, 0));
-}
-
-// The cause of a size split stays in the node until a change removes it, so
-// its age does not matter.
-#[tokio::test(start_paused = true)]
-async fn a_sweep_keeps_an_old_soft_cap_split() {
-    let s = store();
-    s.create_root(COLL, &abcd_leaf()).await.unwrap();
-    let bg = Arc::new(Background::new());
-    let sp = restructurer(&s, &bg, tiny());
-
-    sp.hints
-        .observe_leaf(&root_path(), abcd_leaf().as_leaf().unwrap());
-    tokio::time::advance(Duration::from_secs(60)).await;
-    sp.run_once().await;
-
-    let stats = sp.stats_and_reset();
-    assert_eq!(stats.stale_demand, 0);
-    assert!(stats.splits > 0, "the soft cap split landed");
-}
-
-fn root_split_request() -> RuleRequest {
-    RuleRequest {
-        change: ChangeRequest::Split(LeafId::new(root_path())),
-        rate: Duration::from_secs(1),
-    }
-}
-
-fn abcd_leaf() -> Node {
-    Node::leaf(LeafBody::from_entries(
-        [b"a".as_slice(), b"b", b"c", b"d"].iter().map(|k| live(k)),
-    ))
-}
-
-fn a_then_bcd() -> Vec<Vec<Vec<u8>>> {
-    vec![
-        vec![b"a".to_vec()],
-        vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()],
-    ]
-}
-
-// Returns the paid rate of each leaf, in key order.
-async fn leaf_paid_rates(s: &TestStore) -> Vec<Option<(PaidChange, Duration)>> {
-    let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
-        .leaves(
-            &collection(),
-            Requirement::after(s.timeline.currentness_barrier()),
-        )
-        .await
-        .unwrap();
-    leaves
-        .iter()
-        .map(|leaf| {
-            let paid = leaf.node().unwrap().paid_rate();
-            paid.map(|paid| (paid.change, paid.per_second))
-        })
-        .collect()
-}
-
-// A root leaf that a merge for a topology rule left, with a paid rate of
-// 1000 ms in each second.
-fn merged_abcd_leaf() -> Node {
-    let left = Node::leaf(LeafBody::from_entries([live(b"a"), live(b"b")]))
-        .with_high_key(Some(b"c".to_vec()));
-    let mut leaf =
-        Node::leaf(LeafBody::from_entries([live(b"c"), live(b"d")])).with_low_key(b"c".to_vec());
-    let intent = test_intent_id("merge");
-    leaf.absorb(&left, intent, Some(Duration::from_secs(1)))
-        .unwrap();
-    leaf.remove_merge_reservation(&intent);
-    leaf
-}
-
-fn demand_split(millis: u64) -> SplitReason {
-    SplitReason::Demand {
-        at: None,
-        rate: Duration::from_millis(millis),
-    }
-}
-
 async fn leaf_keys(s: &TestStore) -> Vec<Vec<Vec<u8>>> {
     let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
         .leaves(
@@ -608,48 +425,6 @@ async fn leaf_keys(s: &TestStore) -> Vec<Vec<Vec<u8>>> {
             keys.map(|entry| entry.key.clone()).collect()
         })
         .collect()
-}
-
-// ADR-076: a split that a topology rule asks for must pay more than 1.5 times
-// the paid rate of the merge that made the leaf, and both leaves of the split
-// keep the paid rate of the split.
-#[tokio::test(start_paused = true)]
-async fn a_demand_split_must_pay_more_than_the_paid_rate_of_the_merge() {
-    let s = store();
-    s.create_root(COLL, &merged_abcd_leaf()).await.unwrap();
-    let bg = Arc::new(Background::new());
-    let sp = restructurer_with_topology(
-        &s,
-        &bg,
-        TestTopology::avoidable_time(NodeSizePolicy::default()),
-    );
-
-    split_path(&sp, &root_path(), &demand_split(1500))
-        .await
-        .unwrap();
-    assert_eq!(leaf_keys(&s).await.len(), 1);
-
-    split_path(&sp, &root_path(), &demand_split(1600))
-        .await
-        .unwrap();
-    let paid = Some((PaidChange::Split, Duration::from_millis(1600)));
-    assert_eq!(leaf_paid_rates(&s).await, vec![paid, paid]);
-}
-
-// A split for a cap is not held by a paid rate, and its leaves keep no paid
-// rate, because no topology rule asked for it.
-#[tokio::test(start_paused = true)]
-async fn a_split_for_a_cap_removes_the_paid_rate() {
-    let s = store();
-    s.create_root(COLL, &merged_abcd_leaf()).await.unwrap();
-    let bg = Arc::new(Background::new());
-    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
-
-    split_path(&sp, &root_path(), &SplitReason::Capacity)
-        .await
-        .unwrap();
-
-    assert_eq!(leaf_paid_rates(&s).await, vec![None, None]);
 }
 
 // A standalone leaf over the cap half-splits: the upper half moves to a fresh
@@ -1155,14 +930,14 @@ async fn feed_drives_run_once() {
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
 
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(tiny()));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(tiny()));
     // Under the cap: not enqueued.
     sp.hints.observe_leaf(
         &root_path(),
         &LeafBody::from_entries([live(b"a"), live(b"b")]),
     );
     assert!(
-        sp.candidates.drain().0.is_empty(),
+        sp.candidates.drain().is_empty(),
         "at-cap leaf is not a candidate"
     );
     // Over the cap: enqueued and split by a sweep.
@@ -1208,7 +983,7 @@ async fn one_hint_cascades_until_every_leaf_is_under_cap() {
         .index_max_children(100)
         .build()
         .unwrap();
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(policy));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(policy));
     sp.hints.observe_leaf(&root_path(), root.as_leaf().unwrap());
 
     // 9 -> 4+5 -> 2+2+2+3 -> 2+2+2+1+2.
@@ -1256,8 +1031,7 @@ async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
     ]));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let topology =
-        TestTopology::size_causes(NodeSizePolicy::default()).with_inline(pressure_inline());
+    let topology = TestTopology::writers(NodeSizePolicy::default()).with_inline(pressure_inline());
     let sp = restructurer_with_topology(&s, &bg, topology);
     let root_path = root_path();
 
@@ -1365,8 +1139,7 @@ async fn inline_pressure_is_discarded_after_authoritative_revalidation() {
     let root = Node::leaf(LeafBody::from_entries([live(b"a"), live(b"b")]));
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let topology =
-        TestTopology::size_causes(NodeSizePolicy::default()).with_inline(pressure_inline());
+    let topology = TestTopology::writers(NodeSizePolicy::default()).with_inline(pressure_inline());
     let sp = restructurer_with_topology(&s, &bg, topology);
     let root_path = root_path();
 
@@ -1423,7 +1196,7 @@ async fn contended_candidate_is_requeued() {
     let root = node;
     s.create_root(COLL, &root).await.unwrap();
     let bg = Arc::new(Background::new());
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(tiny()));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(tiny()));
     sp.hints.observe_leaf(
         &root_path(),
         &LeafBody::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
@@ -1749,7 +1522,7 @@ async fn byte_cap_enqueues_and_splits_below_entry_cap() {
         .index_max_children(1000)
         .build()
         .unwrap();
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(policy));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(policy));
     sp.hints.observe_leaf(
         &root_path(),
         &LeafBody::from_entries([live(b"a"), live(b"b"), live(b"c"), live(b"d")]),
@@ -2028,7 +1801,7 @@ async fn one_sweep_of_splits_writes_the_collection_record_twice() {
         .index_max_children(100)
         .build()
         .unwrap();
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(policy));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(policy));
     push_soft_cap_splits(&sp.candidates, LEAVES);
 
     sp.run_once().await;
@@ -2096,7 +1869,7 @@ async fn sibling_splits_of_one_batch_reconcile_their_parent_together() {
         .index_max_children(100)
         .build()
         .unwrap();
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(policy));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(policy));
     push_soft_cap_splits(&sp.candidates, LEAVES);
 
     sp.run_once().await;
@@ -2138,7 +1911,7 @@ async fn a_batch_that_cannot_join_the_topology_leaves_nothing_behind() {
     seed_sibling_leaves(&s, 3).await;
     // A live drop holds the topology freeze, so no participant can join.
     let bg = Arc::new(Background::new());
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::size_causes(tiny()));
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(tiny()));
     let holder = sp.candidates.new_id();
     sp.mon.begin_tx(&holder);
     let (mut record, observed) = s
@@ -2160,11 +1933,7 @@ async fn a_batch_that_cannot_join_the_topology_leaves_nothing_behind() {
             ..RestructurerStats::default()
         }
     );
-    assert_eq!(
-        sp.candidates.drain().0.len(),
-        3,
-        "each candidate is requeued"
-    );
+    assert_eq!(sp.candidates.drain().len(), 3, "each candidate is requeued");
     let (record, _) = s
         .records
         .load_record(
@@ -2205,21 +1974,12 @@ async fn two_causes_split_one_node_one_after_the_other() {
         .index_max_children(100)
         .build()
         .unwrap();
-    let sp = restructurer_with_topology(&s, &bg, TestTopology::avoidable_time(policy));
+    let sp = restructurer(&s, &bg, policy);
     for cause in [
         CandidateCause::Split(SplitReason::SoftCap),
-        CandidateCause::Split(SplitReason::Demand {
-            at: Some(b"b".to_vec()),
-            rate: Duration::from_secs(1),
-        }),
+        CandidateCause::Split(SplitReason::Capacity),
     ] {
-        sp.candidates.push(MaintenanceCandidate {
-            path: node_path("L"),
-            priority: sp.candidates.new_id(),
-            requested: rt::Instant::now(),
-            cause,
-            max_age: None,
-        });
+        sp.candidates.push_cause(&node_path("L"), cause);
     }
 
     sp.run_once().await;
@@ -2261,55 +2021,39 @@ async fn seed_sibling_leaves(s: &TestStore, count: usize) -> Vec<String> {
 /// [`seed_sibling_leaves`].
 fn push_soft_cap_splits(candidates: &MaintenanceCandidates, count: usize) {
     for leaf in 0..count {
-        candidates.push(MaintenanceCandidate {
-            path: node_path(&format!("L{leaf}")),
-            priority: candidates.new_id(),
-            requested: rt::Instant::now(),
-            cause: CandidateCause::Split(SplitReason::SoftCap),
-            max_age: None,
-        });
+        candidates.push_cause(
+            &node_path(&format!("L{leaf}")),
+            CandidateCause::Split(SplitReason::SoftCap),
+        );
     }
 }
 
-// While the queue is long, the demand changes that remove the most avoidable
-// time must land first, after the splits that a size cause asks for. After a
-// change of the load, a demand merge with a high rate must not wait for all
-// the demand splits of the earlier load.
+// A sweep takes the splits first, because a full leaf can stop writes, and the
+// merges last.
 #[test]
-fn a_sweep_orders_changes_by_cause_and_rate() {
+fn a_sweep_takes_the_splits_before_the_merges() {
     let candidates = MaintenanceCandidates::new();
-    let push = |name: &str, cause: CandidateCause| {
-        candidates.push(MaintenanceCandidate {
-            path: node_path(name),
-            priority: candidates.new_id(),
-            requested: rt::Instant::now(),
-            cause,
-            max_age: None,
-        })
-    };
-    push("merge", CandidateCause::Merge(MergeReason::Underfull));
-    push("slow", CandidateCause::Split(demand_split(10)));
-    push("fast", CandidateCause::Split(demand_split(500)));
-    push("cap", CandidateCause::Split(SplitReason::SoftCap));
-    push("medium", CandidateCause::Split(demand_split(100)));
-    push(
-        "demand-merge",
-        CandidateCause::Merge(MergeReason::Demand {
-            rate: Duration::from_millis(200),
-        }),
+    candidates.push_cause(
+        &node_path("a"),
+        CandidateCause::Merge(MergeReason::Underfull),
+    );
+    candidates.push_cause(&node_path("b"), CandidateCause::Split(SplitReason::SoftCap));
+    candidates.push_cause(
+        &node_path("c"),
+        CandidateCause::Merge(MergeReason::WriteSpan),
+    );
+    candidates.push_cause(
+        &node_path("d"),
+        CandidateCause::Split(SplitReason::Contention { key: b"d".to_vec() }),
     );
 
     let order: Vec<_> = candidates
         .drain()
-        .0
         .into_iter()
         .map(|candidate| candidate.path)
         .collect();
 
-    assert_eq!(
-        order,
-        ["cap", "fast", "demand-merge", "medium", "slow", "merge"].map(node_path)
-    );
+    assert_eq!(order, ["b", "d", "a", "c"].map(node_path));
 }
 
 // A leaf L0 with the keys "a" to "d" under the root index, over the soft cap

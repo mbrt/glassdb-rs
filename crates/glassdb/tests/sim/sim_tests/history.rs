@@ -200,7 +200,7 @@ fn shared_collection_history_holds_with_slow_mutations() {
 /// split puts the keys in two leaves. Client 0 then deletes key 1 and then key
 /// 0. With either split key, the last delete leaves the left leaf with no live
 /// entries and the right leaf with key 2 alone, so the left leaf merges into
-/// its right sibling (ADR-074). The scans give the changes the time to land
+/// its right sibling (ADR-073). The scans give the changes the time to land
 /// while the clients still run.
 fn shrinking_history() -> Covered<HistoryWorkload> {
     let scans = |count| {

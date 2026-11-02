@@ -117,7 +117,7 @@ fn fill_all_keys() -> Covered<MembershipWorkload> {
 
 /// Fills the key universe, lets the fill split leaves, and then deletes all keys
 /// except key 5. Only a committed leaf write queues a merge candidate, and only
-/// a leaf with no live entries merges (ADR-074). Clients 0 and 1 share one
+/// an underfull leaf merges (ADR-073). Clients 0 and 1 share one
 /// instance, and each deletes its keys from right to left, so that their last
 /// deletes write to the leftmost leaf. Client 2 deletes key 2 after the fill.
 /// The leftmost leaf then has no live entries, and merges into its right

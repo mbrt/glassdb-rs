@@ -4,6 +4,10 @@
 
 Accepted — implemented.
 
+The policy that this ADR calls the size causes is now
+`TopologyPolicy::Writers`. `SizeCauses` now names the policy of the leaf sizes
+alone.
+
 Refines [ADR-084](084-size-causes-are-the-default-topology-policy.md). The size
 causes stay the default topology policy, and this decision adds a split cause
 and a merge condition to them.

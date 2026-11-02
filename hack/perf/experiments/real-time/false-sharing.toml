@@ -1,7 +1,10 @@
 # False sharing: four database instances each write one of the adjacent keys 0
 # to 3, which share a leaf, while one more instance reads and writes the keys
-# around them (ADR-084). The axis `policy` selects the topology: the engine
-# defaults, the avoidable time policy, or one key in each leaf.
+# around them (ADR-084).
+#
+# The default topology policy must split the keys of the four instances apart
+# (ADR-085), and then keep them apart, while the keys of the background
+# instance stay in moderate leaves.
 
 [pools.false-sharing]
 keys = 4096
@@ -72,6 +75,7 @@ shapes = { bg-rmw-seq = 8, bg-read-seq = 8, bg-rmw-pool = 8, bg-read-pool = 8 }
 
 [seed]
 quiet-period = "10s"
+timeout = "600s"
 
 [cell]
 workload = "false-sharing"
@@ -87,31 +91,3 @@ timeout = "120s"
 until = "duration"
 duration = "60s"
 max-duration = "120s"
-
-[[axes]]
-name = "policy"
-
-[[axes.values]]
-label = "default"
-[axes.values.set]
-"seed.timeout" = "600s"
-
-[[axes.values]]
-label = "avoidable"
-[axes.values.set]
-"seed.timeout" = "600s"
-"seed.database.topology" = "avoidable"
-"cell.database.topology" = "avoidable"
-
-# The seed has one key in each leaf, which takes longer to settle.
-[[axes.values]]
-label = "fixed-1"
-[axes.values.set]
-"seed.timeout" = "1800s"
-"seed.database.topology" = "size"
-"seed.database.leaf-max-entries" = 1
-"seed.database.leaf-min-entries" = 0
-"seed.database.index-min-children" = 0
-"cell.database.topology" = "size"
-"cell.database.leaf-min-entries" = 0
-"cell.database.index-min-children" = 0

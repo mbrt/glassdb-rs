@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — implemented.
+Superseded by [ADR-086](086-remove-the-avoidable-time-policy.md).
 
 Refines [ADR-074](074-avoidable-time-drives-splits-and-merges.md). A change
 that the topology rule asked for is a candidate for at most three windows. The

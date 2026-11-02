@@ -14,9 +14,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
 
-use crate::{
-    Collection, CollectionPath, Database, Error, InlinePolicy, KeyScan, TopologyPolicy, Transaction,
-};
+use crate::{Collection, CollectionPath, Database, Error, InlinePolicy, KeyScan, Transaction};
 
 use super::harness::{SimWorkload, open_det_db};
 use super::{CLIENT_COUNT, SimMedia, key_name, tiny_node_size_policy};
@@ -1230,7 +1228,6 @@ impl SimWorkload for HistoryWorkload {
             backend,
             tiny_node_size_policy(),
             InlinePolicy::default(),
-            TopologyPolicy::default(),
             media,
         )
     }

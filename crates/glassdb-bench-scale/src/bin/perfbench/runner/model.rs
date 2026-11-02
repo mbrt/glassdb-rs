@@ -107,9 +107,9 @@ pub(crate) struct DatabaseOptions {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum Topology {
-    Avoidable,
+    SizeCauses,
     #[default]
-    Size,
+    Writers,
 }
 
 /// The parameters of a cell that are not part of its workload.
@@ -429,8 +429,8 @@ impl DatabaseOptions {
         builder = builder
             .protocol_timing(crate::TIMING)
             .topology_policy(match self.topology {
-                Topology::Avoidable => TopologyPolicy::AvoidableTime,
-                Topology::Size => TopologyPolicy::SizeCauses,
+                Topology::SizeCauses => TopologyPolicy::SizeCauses,
+                Topology::Writers => TopologyPolicy::Writers,
             });
         if self.leaf_max_entries.is_some()
             || self.leaf_min_entries.is_some()

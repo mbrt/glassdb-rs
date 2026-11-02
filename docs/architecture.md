@@ -620,16 +620,16 @@ Splits and merges share one lifecycle and one parent reconciliation step. The
 
 ### The topology policy decides, the restructurer changes
 
-Each topology policy is one struct with two traits. `SizeLimitsPolicy` has
-the soft caps, the underfull threshold, and inline pressure. The other
-policies contain one, and give it the reasons that they do not refine.
-`TopologySignals`
-receives the topology signals of the transactions, the scans, the leaf
-coordinator, and the changes that landed, and queues candidates.
-`TopologyDecisions` answers the split and merge modules, which check each
-candidate again on the current node: whether and where a leaf splits, whether
-two leaves merge, and the paid rate of the change. Each policy keeps the
-measurements that its decisions need. The split and merge modules keep the
+Each topology policy is one struct with two traits. `SizeCausesPolicy` has
+the soft caps, the underfull threshold, and inline pressure, and only the leaf
+sizes decide. `TopologyPolicy::SizeCauses` selects it alone, for a topology
+that is predictable. `WritersPolicy`, the default, contains one, and gives it
+the reasons that it does not refine.
+`TopologySignals` receives the topology signals of the transactions and the
+leaf coordinator, and queues candidates. `TopologyDecisions` answers the split
+and merge modules, which check each candidate again on the current node:
+whether and where a leaf splits, and whether two leaves merge. Each policy
+keeps the state that its decisions need. The split and merge modules keep the
 checks that do not depend on the policy, with their own node size limits:
 capacity splits, index nodes, tombstone reclamation, and the limits that a
 node must fit.
@@ -637,13 +637,10 @@ node must fit.
 `StructuralHintSink` is the single intake of the topology signals. It queues
 the capacity splits and the merges of underfull index nodes itself, with every
 policy. It gives the other signals to the policy, which ignores the ones that
-it does not use. A producer asks it first only for a signal that costs real
-work to measure, today the leaf delays that the coordinator tracks for every
-round, so that a policy does not cost what it does not use.
-`MaintenanceCandidates` is only the queue.
+it does not use. `MaintenanceCandidates` is only the queue.
 
 Committed leaf writes, parent reconciliation, and capacity rejections queue
-candidates. With the default size causes topology policy, the soft caps, the
+candidates. With the default writers topology policy, the soft caps, the
 underfull threshold, and inline pressure decide, and the write spans that the
 writers of the leaf entries show move soft cap splits and cause merges
 ([ADR-084](adr/084-size-causes-are-the-default-topology-policy.md)). A database
@@ -653,31 +650,24 @@ recently live values of both leaves of the merge, or when one of them has no
 live value of a recent writer. It knows its own writers from the transaction
 identities of its recent owner operations
 ([ADR-085](adr/085-lost-leaf-cas-separates-the-keys-of-database-instances.md)).
-With the avoidable time policy, a rule decides the other leaf splits and merges
-once per window ([ADR-074](adr/074-avoidable-time-drives-splits-and-merges.md)).
-A new candidate wakes the restructurer after a short delay, so that one sweep
-takes a burst of writes. A deferred candidate waits for the next sweep, which
-comes at most a fixed interval later, so a busy node cannot cause a tight retry
-loop. A sweep does not start a change that a rule asked for more than three
-windows before ([ADR-083](adr/083-drop-stale-topology-requests.md)). A merge
+No policy merges leaves because scans cross their boundary
+([ADR-086](adr/086-remove-the-avoidable-time-policy.md)). A new candidate wakes
+the restructurer after a short delay, so that one sweep takes a burst of
+writes. A deferred candidate waits for the next sweep, which comes at most a
+fixed interval later, so a busy node cannot cause a tight retry loop. A merge
 defers while a live transaction holds a lock on its source or target.
 
-Under load, a rule asks for many more leaf changes than one change at a time
-can make, and the tree does not settle. So a sweep changes different nodes at
-the same time, in batches of a fixed size. Each change keeps its own topology
-participant, but the participants of one collection share one CAS. Two changes
-of the same node go in different batches, because the gate or the reservation
-of one stops the other. The batches come from cached state, so a change of a
-batch can still meet another one, and defer.
+A sweep can have many more leaf changes than one change at a time can make. So
+it changes different nodes at the same time, in batches of a fixed size. Each
+change keeps its own topology participant, but the participants of one
+collection share one CAS. Two changes of the same node go in different batches,
+because the gate or the reservation of one stops the other. The batches come
+from cached state, so a change of a batch can still meet another one, and
+defer.
 
-A sweep takes the splits of the size causes first, because a full leaf can
-stop writes. Then it takes the splits and merges of a rule together, the
-highest rate first, and the underfull merges last. So after a change of the
-load, the changes of the new load do not wait behind the old requests until
-they are stale. For the changes of a rule, this order replaces the rule of
-ADR-073 that splits go before merges. A merge of a node that also needs a
-split waits for the split. The merge then pays again for the leaves of the
-split (ADR-076).
+A sweep takes the splits first, because a full leaf can stop writes, and the
+merges last. A merge of a node that also needs a split waits for the split,
+and then checks again the leaves that the split made.
 
 The changes of one batch often have the same parent. A batch makes the node
 writes of its changes first, and then reconciles the parent of each collection
@@ -690,14 +680,6 @@ mostly find parents that already agree. So a reconciliation takes the gate of a
 parent only if a read shows that the parent does not agree with its children
 yet. Without this read, these reconciliations hold the gates that the sweep
 needs.
-
-Each database instance decides on its own transactions, so instances can
-disagree on a leaf. A split or merge that a rule asks for keeps its paid rate
-in the leaves that it writes, and the opposite change of these leaves must pay
-more than 1.5 times the paid rate
-([ADR-076](adr/076-paid-rates-hold-the-topology.md)). The paid rate halves
-each minute, on the clock of each instance from when it first sees the paid
-rate, so that no instance compares its clock with another one.
 
 ### Fence on the recorded revision
 

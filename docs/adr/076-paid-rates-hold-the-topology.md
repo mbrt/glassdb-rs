@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted — implemented.
+Superseded by [ADR-086](086-remove-the-avoidable-time-policy.md).
 
 Refines [ADR-074](074-avoidable-time-drives-splits-and-merges.md). A split or
 merge that a topology rule asks for keeps its paid rate in its leaves, and the

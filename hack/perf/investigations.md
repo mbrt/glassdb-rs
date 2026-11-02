@@ -9,6 +9,63 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-11-02: the avoidable time policy against the default
+
+Status: the default topology policy (`writers`) settled in each cell of
+`split-merge-fight`, `membership-churn`, and `false-sharing`, and the avoidable
+time policy did not. The default had more throughput for the writers in all
+three, and less for the scans and the reads that the avoidable time policy
+helps with merges. The avoidable time policy is removed (ADR-086).
+
+The experiments of earlier entries left out scans, and ADR-084 did not measure
+them. The entry of 2026-10-26 has the comparison on `workers`, `mixed`, and
+`load-shift`, where the size causes had the same or more throughput in all
+cells.
+
+All runs used `--backend=memory --delays=s3 --delay-scale=0.2
+--prefix-depth=3 --drain-timeout=90s` in real time at `b9413e26e`, two runs of
+each policy, alternated. The `avoidable` runs passed
+`--set cell.database.topology="avoidable"`, and also the seed topology in
+`membership-churn` and `false-sharing`. Throughputs are in transactions per
+second, and changes are splits/merges.
+
+### `split-merge-fight`
+
+| Start | Policy | Changes in the warm-up | Changes in the measurement | Each writer | Scanner | Backend ops/tx |
+| --- | --- | --- | --- | --- | ---: | --- |
+| `one-leaf` | default | 0/0, 0/0 | 1/0, 1/0 | 7.4 to 7.7 | 144 to 148 | 1.09 to 1.12 |
+| `one-leaf` | avoidable | 1/0, 1/0 | 0/1, 0/1 | 3.8 to 7.1 | 170 to 220 | 0.71 to 0.99 |
+| `two-leaves` | default | 0/0, 0/0 | 0/0, 0/0 | 7.7 to 7.8 | 138 to 140 | 1.22 |
+| `two-leaves` | avoidable | 0/0, 0/1 | 1/1, 1/0 | 3.5 to 7.3 | 170 to 241 | 0.60 to 0.96 |
+
+- With the default, the `one-leaf` start split once, after the warm-up of
+  10 s, and then kept two leaves.
+- With the avoidable time policy, the scanner merged the two leaves, and the
+  writers split them again. One writer fell to 3.5 to 3.8 tx/s in two runs.
+
+### `membership-churn`
+
+| Policy | Changes in the measurement | Transactions | Backend ops/tx | Direct churner | Locked churner | Scan churner |
+| --- | --- | ---: | --- | --- | --- | --- |
+| default | 0/0, 0/0 | 3,266 to 3,343 | 2.25 to 2.28 | 3.6 to 6.8 | 1.5 to 1.6 | 47 to 49 |
+| avoidable | 6/5, 3/1 | 1,437 to 1,863 | 6.3 to 9.9 | 15 to 18 | 0.3 to 0.6 | 6 to 15 |
+
+### `false-sharing`
+
+| Policy | Changes in the warm-up | Changes in the measurement | Each hot writer | `bg-rmw-seq` | `bg-read-seq` | `bg-rmw-pool` |
+| --- | --- | --- | --- | --- | --- | --- |
+| default | 67/0, 67/0 | 0/0, 0/0 | 7.9 to 8.1 | 72 to 76 | 156 to 163 | 121 to 122 |
+| avoidable | 1/0, 0/0 | 8/0, 13/0 | 1.8 to 4.4 | 19 to 28 | 200 to 228 | 89 to 93 |
+
+### Conclusions
+
+- The default settles on each of these loads. The avoidable time policy keeps
+  changing the topology during the measurement.
+- The avoidable time policy is the only one that merges two leaves because
+  scans cross their boundary. On these loads, its gain for the scans came
+  with a loss for the writers of the same leaves.
+- The GCS delay model was not measured.
+
 ## 2026-10-30: lost leaf CASes separate the keys of database instances
 
 Status: with the size causes, a split for the keys on which a database instance

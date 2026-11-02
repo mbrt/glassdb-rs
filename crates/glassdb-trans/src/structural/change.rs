@@ -11,7 +11,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Duration;
 
 use glassdb_concurr::{join_all_bounded, rt};
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
@@ -21,7 +20,6 @@ use tokio::sync::Notify;
 use crate::error::TransError;
 use crate::node_locking::GateAcquisition;
 
-use super::measurements;
 use super::merge::{MergeReason, Merger};
 use super::nodes::StructuralNodeAccess;
 use super::reclamation::ReclamationReporter;
@@ -30,7 +28,6 @@ use super::recovery::{
     ChangeKind, PreparedIntent, PreparedIntentCancellation, ReadyChange, ReadyIntent,
     ReadyIntentCompletion, ReadyIntentTransition, StructuralRecovery,
 };
-use super::sink::StructuralHintSink;
 use super::split::{SplitReason, SplitTarget, Splitter};
 use super::topology::TopologyMembership;
 
@@ -47,8 +44,6 @@ pub(super) struct ChangeLifecycle {
     recovery_wake: Arc<Notify>,
     splitter: Splitter,
     merger: Merger,
-    // Receives the time of each leaf change that lands.
-    hints: StructuralHintSink,
 }
 
 /// The structural change that one attempt makes.
@@ -179,8 +174,6 @@ impl UnreconciledParents {
 struct LandedChange {
     ready: ReadyIntent,
     route: Option<ParentRoute>,
-    /// The time that a change of a leaf held the gate.
-    gate_time: Option<Duration>,
 }
 
 /// One change of a sweep, which owns its topology participant `worker`.
@@ -200,7 +193,6 @@ impl ChangeLifecycle {
         recovery_wake: Arc<Notify>,
         splitter: Splitter,
         merger: Merger,
-        hints: StructuralHintSink,
     ) -> Self {
         Self {
             recovery,
@@ -211,7 +203,6 @@ impl ChangeLifecycle {
             recovery_wake,
             splitter,
             merger,
-            hints,
         }
     }
 
@@ -448,14 +439,6 @@ impl<'a> PlannedChange<'a> {
             Self::Merge { .. } => ChangeKind::Merge,
         }
     }
-
-    /// Returns the kind of the change for its typical time.
-    fn measured_kind(self) -> measurements::ChangeKind {
-        match self {
-            Self::Split { .. } => measurements::ChangeKind::Split,
-            Self::Merge { .. } => measurements::ChangeKind::Merge,
-        }
-    }
 }
 
 impl ChangeAttemptOutcome {
@@ -658,12 +641,6 @@ impl StructuralChangeAttempt<'_> {
                 return Coordinated::Ended(ChangeAttemptOutcome::retry_cleanly(Err(error)));
             }
         };
-        // The time of a leaf change is the time that it holds the gate, until
-        // the node writes land. Only then do the transactions of the leaf
-        // wait for the change. The wait for the gate depends on the writers
-        // of the leaf instead.
-        let gated = rt::Instant::now();
-        let leaf = node.as_leaf().is_some();
         let (ready, applied) = match self.change {
             PlannedChange::Split { target, reason, .. } => {
                 let planned =
@@ -693,13 +670,8 @@ impl StructuralChangeAttempt<'_> {
                 (ready, applied)
             }
         };
-        let gate_time = leaf.then(|| gated.elapsed());
         match applied {
-            Ok(Applied::Landed(route)) => Coordinated::Landed(LandedChange {
-                ready,
-                route,
-                gate_time,
-            }),
+            Ok(Applied::Landed(route)) => Coordinated::Landed(LandedChange { ready, route }),
             Ok(Applied::Stopped) => Coordinated::Ended(self.stop_ready(ready).await),
             Err(error) => Coordinated::Ended(ChangeAttemptOutcome::recovery_required(ready, error)),
         }
@@ -746,21 +718,10 @@ impl StructuralChangeAttempt<'_> {
         landed: LandedChange,
         reconciled: Result<(), TransError>,
     ) -> ChangeAttemptOutcome {
-        let LandedChange {
-            ready, gate_time, ..
-        } = landed;
         if let Err(error) = reconciled {
-            return ChangeAttemptOutcome::recovery_required(ready, error);
+            return ChangeAttemptOutcome::recovery_required(landed.ready, error);
         }
-        let outcome = self.finish_ready(ready).await;
-        if let Some(time) = gate_time
-            && outcome.result.is_ok()
-        {
-            self.lifecycle
-                .hints
-                .change_timed(self.change.measured_kind(), time);
-        }
-        outcome
+        self.finish_ready(landed.ready).await
     }
 
     /// Releases the source gate of a Ready change that did not take effect,

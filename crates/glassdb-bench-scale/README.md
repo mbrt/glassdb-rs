@@ -257,7 +257,7 @@ make a topology that the cells then keep:
 
 | Path | Default | Meaning |
 | --- | --- | --- |
-| `<db>.topology` | `"size"` | `"size"` (ADR-031, ADR-056, ADR-073, ADR-084), or `"avoidable"` (ADR-074). |
+| `<db>.topology` | `"writers"` | `"writers"` (ADR-084, ADR-085), or `"size-causes"` (ADR-031, ADR-056, ADR-073). |
 | `<db>.leaf-max-entries` | engine default | Soft cap on leaf entries. |
 | `<db>.leaf-min-entries` | engine default | Underfull threshold of leaves. |
 | `<db>.index-min-children` | engine default | Underfull threshold of index nodes. |
@@ -349,8 +349,8 @@ start = "seed"
 name = "policy"
 start = "seed"
 values = [
-  { label = "band" },
-  { label = "avoidable", set = { "cell.database.topology" = "avoidable" } },
+  { label = "writers" },
+  { label = "size-causes", set = { "cell.database.topology" = "size-causes" } },
 ]
 ```
 

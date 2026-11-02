@@ -269,17 +269,15 @@ impl Engine {
         EngineTransaction(self.algo.begin(accesses, catalog_accesses))
     }
 
-    /// Replaces the logical accesses of an uncommitted transaction, with the
-    /// time of the body run that made them.
+    /// Replaces the logical accesses of an uncommitted transaction.
     pub fn reset_transaction(
         &self,
         tx: &mut EngineTransaction,
         accesses: AccessSet,
         catalog_accesses: CatalogAccesses,
-        body_time: Duration,
     ) {
         self.algo
-            .reset_with_collections(&mut tx.0, accesses, catalog_accesses, body_time);
+            .reset_with_collections(&mut tx.0, accesses, catalog_accesses);
     }
 
     /// Validates read-only accesses and reports whether the body must run again.
@@ -581,12 +579,7 @@ impl DormantEngine {
             topology_policy,
             gc_hints.clone(),
         );
-        let resolver = KeyResolver::new(
-            router.clone(),
-            key_state,
-            transaction_leaf_parallelism,
-            restructurer.hint_sink(),
-        );
+        let resolver = KeyResolver::new(router.clone(), key_state, transaction_leaf_parallelism);
         let reader = Reader::new(resolver.clone(), timeline.clone(), retry.wait);
         let locker = Locker::new(
             coord.clone(),

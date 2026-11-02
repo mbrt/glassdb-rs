@@ -1,161 +1,146 @@
-//! The size causes, the default topology policy (ADR-084, ADR-085).
+//! The size causes, the topology policy of the leaf sizes alone, which every
+//! topology policy refines (ADR-031, ADR-056, ADR-073).
 
-use std::collections::BTreeSet;
-
-use glassdb_concurr::rt;
 use glassdb_data::ObjectPath;
-use glassdb_storage::{LeafBody, Node};
+use glassdb_storage::{LeafBody, LeafEntry, Node};
 
-use crate::access::AccessSet;
-use crate::monitor::Monitor;
 use crate::structural::candidates::{CandidateCause, MaintenanceCandidates};
-use crate::structural::contention::Contention;
-use crate::structural::measurements::written_pair;
 use crate::structural::merge::{MergeReason, MergeVeto};
 use crate::structural::split::{SplitReason, SplitTarget};
-use crate::structural::write_spans::{self, SoftCapSplit};
 
-use super::{
-    MergeDecision, SizeLimitsPolicy, SplitDecision, TopologyDecisions, TopologySettings,
-    TopologySignals,
-};
+use super::{MergeDecision, SplitDecision, TopologyDecisions, TopologySettings, TopologySignals};
 
-/// Soft caps, underfull thresholds, and inline pressure decide. Write spans
-/// move soft cap splits and cause merges (ADR-084), and the keys that several
-/// database instances write in one leaf split apart (ADR-085).
+/// A leaf over a soft cap splits at its median, and so does a leaf whose
+/// values the inline budget cannot carry. A non-root leaf with fewer live
+/// entries than a threshold merges into its right sibling when the merged
+/// leaf stays at or below half of each split threshold, so that it does not
+/// split again soon.
 pub(crate) struct SizeCausesPolicy {
-    base: SizeLimitsPolicy,
-    contention: Contention,
+    settings: TopologySettings,
+    underfull_live: usize,
     queue: MaintenanceCandidates,
 }
 
 impl SizeCausesPolicy {
-    /// The size causes of `settings`, for the database instance of `mon`,
-    /// which queue their candidates in `queue`.
-    pub(crate) fn new(
+    /// The size causes of `settings`, with the underfull threshold of its node
+    /// sizes, which queue their candidates in `queue`.
+    pub(crate) fn new(settings: TopologySettings, queue: MaintenanceCandidates) -> Self {
+        Self::with_underfull_live(settings, settings.sizes.leaf_min_entries(), queue)
+    }
+
+    /// The size causes of `settings`, where a non-root leaf with fewer than
+    /// `underfull_live` live entries is underfull, which queue their
+    /// candidates in `queue`.
+    pub(crate) fn with_underfull_live(
         settings: TopologySettings,
-        mon: Monitor,
+        underfull_live: usize,
         queue: MaintenanceCandidates,
     ) -> Self {
         Self {
-            base: SizeLimitsPolicy::new(settings, settings.sizes.leaf_min_entries(), queue.clone()),
-            contention: Contention::new(mon),
+            settings,
+            underfull_live,
             queue,
         }
     }
 
-    /// Decides the soft cap split of the leaf `node`, at a key that keeps its
-    /// write spans (ADR-084). A root leaf splits at its median: it is the
-    /// whole collection, and its split cannot defer in cached state.
-    fn soft_cap_split(&self, target: SplitTarget<'_>, node: &Node) -> SplitDecision {
-        if !node.over_soft_cap(&self.base.settings().sizes) {
-            return SplitDecision::NotNeeded;
-        }
-        if let SplitTarget::Root = target {
-            return SplitDecision::median();
-        }
-        match write_spans::soft_cap_split(node, &self.base.settings().sizes, rt::system_now()) {
-            SoftCapSplit::Median => SplitDecision::median(),
-            SoftCapSplit::At(key) => SplitDecision::at(key),
-            SoftCapSplit::Wait => SplitDecision::Wait,
+    pub(crate) fn settings(&self) -> &TopologySettings {
+        &self.settings
+    }
+
+    /// The decision of a merge whose leaf stays at or below half of each
+    /// split threshold.
+    pub(crate) fn half(&self) -> MergeDecision {
+        MergeDecision::Within {
+            max_entries: self.settings.sizes.leaf_max_entries() / 2,
+            max_inline_bytes: self.settings.inline.max_leaf_bytes / 2,
         }
     }
 
-    /// Decides the split that separates the contended key `key` of the leaf
-    /// `node` from the keys of other database instances (ADR-085).
-    fn contention_split(&self, node: &Node, key: &[u8]) -> SplitDecision {
-        if node.as_leaf().is_none() || !node.covers(key) {
+    /// Whether `leaf` has fewer live entries than the underfull threshold.
+    pub(crate) fn underfull(&self, leaf: &LeafBody) -> bool {
+        leaf.entries().filter(|entry| entry.exists()).count() < self.underfull_live
+    }
+
+    fn inline_pressure_split(&self, node: &Node, key: &[u8], value_len: usize) -> SplitDecision {
+        let Some(leaf) = node.as_leaf() else {
+            return SplitDecision::Reroute;
+        };
+        if !node.covers(key) {
             return SplitDecision::Reroute;
         }
-        match self.contention.split_key(node, key, rt::system_now()) {
-            Some(at) => SplitDecision::at(at),
-            None => SplitDecision::NotNeeded,
+        let inline = &self.settings.inline;
+        if !inline.admits_value(value_len)
+            || leaf.len() < 2
+            || !leaf.lookup(key).is_some_and(LeafEntry::exists)
+        {
+            return SplitDecision::NotNeeded;
+        }
+        let other_inline_bytes = leaf
+            .entries()
+            .filter(|entry| entry.key.as_slice() != key)
+            .map(|entry| entry.current.inline_len())
+            .sum();
+        if inline.admits(other_inline_bytes, value_len) {
+            SplitDecision::NotNeeded
+        } else {
+            SplitDecision::median()
         }
     }
 }
 
 impl TopologySignals for SizeCausesPolicy {
+    /// Queues the split of the leaf at `path`, now `leaf`, when it is over a
+    /// soft cap, or its merge when it is underfull. A leaf needs at least two
+    /// entries to be divisible, so a single hot key never splits. The byte
+    /// size is a hint that the splitter checks again against the full node,
+    /// which adds a little framing.
     fn observe_leaf(&self, path: &ObjectPath, leaf: &LeafBody) {
-        self.base.observe_leaf(path, leaf);
-    }
-
-    fn lost_leaf_cas(&self, path: &ObjectPath, round_keys: &BTreeSet<Vec<u8>>) {
-        let (ObjectPath::TreeRoot { collection } | ObjectPath::Node { collection, .. }) = path
-        else {
+        let sizes = &self.settings.sizes;
+        let over_cap = leaf.len() >= 2
+            && (leaf.len() > sizes.leaf_max_entries()
+                || leaf.encoded_len() > sizes.node_soft_max_bytes());
+        let cause = if over_cap {
+            CandidateCause::Split(SplitReason::SoftCap)
+        } else if matches!(path, ObjectPath::Node { .. }) && self.underfull(leaf) {
+            CandidateCause::Merge(MergeReason::Underfull)
+        } else {
             return;
         };
-        if let Some(key) = self.contention.lost_leaf_cas(collection, round_keys) {
-            self.queue
-                .push_cause(path, CandidateCause::Split(SplitReason::Contention { key }));
-        }
+        self.queue.push_cause(path, cause);
     }
 
-    /// When the transaction wrote keys in two adjacent leaves, their merge may
-    /// keep its write span in one leaf (ADR-084). Two leaves that were too
-    /// large to merge when the transaction read them ask for no merge, so that
-    /// their commits do not fill the queue.
-    fn observe_commit(&self, accesses: &AccessSet) {
-        let max_entries = self
-            .base
-            .settings()
-            .sizes
-            .leaf_max_entries()
-            .saturating_mul(2);
-        if let Some((left, _)) =
-            written_pair(accesses).filter(|(_, entries)| *entries <= max_entries)
-        {
-            self.queue
-                .push_cause(&left, CandidateCause::Merge(MergeReason::WriteSpan));
-        }
-    }
-
+    /// Queues the inline pressure split of `key` in the leaf at `path`, when
+    /// the inline budget could carry the value alone.
     fn inline_pressure(&self, path: &ObjectPath, key: &[u8], value_len: usize) {
-        self.base.inline_pressure(path, key, value_len);
+        if self.settings.inline.admits_value(value_len) {
+            let reason = SplitReason::InlinePressure {
+                key: key.to_vec(),
+                value_len,
+            };
+            self.queue.push_cause(path, CandidateCause::Split(reason));
+        }
     }
 }
 
 impl TopologyDecisions for SizeCausesPolicy {
-    /// A soft cap split waits for the write spans of its leaf (ADR-084).
-    fn soft_cap_splits_wait(&self) -> bool {
-        true
-    }
-
-    fn split(&self, target: SplitTarget<'_>, node: &Node, reason: &SplitReason) -> SplitDecision {
+    fn split(&self, _target: SplitTarget<'_>, node: &Node, reason: &SplitReason) -> SplitDecision {
         match reason {
-            SplitReason::SoftCap => self.soft_cap_split(target, node),
-            SplitReason::Contention { key } => self.contention_split(node, key),
-            _ => self.base.split(target, node, reason),
+            SplitReason::SoftCap if node.over_soft_cap(&self.settings.sizes) => {
+                SplitDecision::median()
+            }
+            SplitReason::InlinePressure { key, value_len } => {
+                self.inline_pressure_split(node, key, *value_len)
+            }
+            _ => SplitDecision::NotNeeded,
         }
     }
 
-    /// An underfull merge waits while another database instance writes one
-    /// of the two leaves, and this one does not (ADR-085). A merge for write
-    /// spans can make a leaf of up to twice the soft cap of entries, because
-    /// its soft cap split then keeps the write spans. It keeps a quarter of
-    /// the inline budget free, so that the next writes of the merged leaf do
-    /// not cause inline pressure at once (ADR-084).
-    fn merge(&self, left: &Node, right: &Node, reason: MergeReason) -> MergeDecision {
-        let now = rt::system_now();
+    fn merge(&self, left: &Node, _right: &Node, reason: MergeReason) -> MergeDecision {
         match reason {
-            MergeReason::Underfull => match self.base.merge(left, right, reason) {
-                MergeDecision::Within { .. } if self.contention.keeps_apart(left, right, now) => {
-                    MergeDecision::Veto(MergeVeto::KeptApart)
-                }
-                decision => decision,
-            },
-            MergeReason::WriteSpan => {
-                let sizes = &self.base.settings().sizes;
-                if write_spans::pays_for_merge(left, right, sizes, now) {
-                    MergeDecision::Within {
-                        max_entries: sizes.leaf_max_entries().saturating_mul(2),
-                        max_inline_bytes: self.base.settings().inline.max_leaf_bytes / 4 * 3,
-                        paid_rate: None,
-                    }
-                } else {
-                    MergeDecision::Veto(MergeVeto::NotNeeded)
-                }
+            MergeReason::Underfull if left.as_leaf().is_some_and(|leaf| self.underfull(leaf)) => {
+                self.half()
             }
-            _ => self.base.merge(left, right, reason),
+            _ => MergeDecision::Veto(MergeVeto::NotNeeded),
         }
     }
 }
