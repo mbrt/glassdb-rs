@@ -45,7 +45,6 @@
 //! leaving the independent collection record untouched.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::{
@@ -185,7 +184,7 @@ impl Splitter {
         {
             Ok(located) => located,
             Err(StorageError::NotFound) => {
-                self.record_discarded(reason);
+                self.stats.count_discarded_split(reason);
                 return Ok(None);
             }
             Err(error) => return Err(error.into()),
@@ -201,7 +200,7 @@ impl Splitter {
         {
             SplitNeed::Split => Ok(Some(located.path)),
             SplitNeed::NotActionable => {
-                self.record_discarded(reason);
+                self.stats.count_discarded_split(reason);
                 Ok(None)
             }
             SplitNeed::Reroute => Err(TransError::Retry),
@@ -337,9 +336,7 @@ impl Splitter {
         path: &ObjectPath,
         reason: &SplitReason,
     ) -> Result<bool, TransError> {
-        let (SplitReason::SoftCap, ObjectPath::Node { id, .. }, true) =
-            (reason, path, self.decisions.soft_cap_splits_wait())
-        else {
+        let (SplitReason::SoftCap, ObjectPath::Node { id, .. }) = (reason, path) else {
             return Ok(false);
         };
         let mut node = match self.nodes.load_node(collection, id, Requirement::ANY).await {
@@ -384,7 +381,7 @@ impl Splitter {
     fn cancel(&self, reason: &SplitReason, need: SplitNeed) -> Prepared<SplitPlan> {
         let result = match need {
             SplitNeed::NotActionable => {
-                self.record_discarded(reason);
+                self.stats.count_discarded_split(reason);
                 Ok(())
             }
             SplitNeed::Reroute => Err(TransError::Retry),
@@ -487,26 +484,9 @@ impl Splitter {
         outputs: [(&NodeId, &Node); 2],
     ) {
         self.reclamation.record(reclaimed, false);
-        self.stats.record_split();
+        self.stats.record_split(reason);
         for (id, node) in outputs {
             self.enqueue_if_over_soft_cap(collection, id, node);
-        }
-        if reason.is_inline_pressure() {
-            self.stats
-                .inline_pressure_completed
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        if matches!(reason, SplitReason::Contention { .. }) {
-            self.stats.contention_splits.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Counts a split candidate that is no longer actionable.
-    fn record_discarded(&self, reason: &SplitReason) {
-        if reason.is_inline_pressure() {
-            self.stats
-                .inline_pressure_discarded
-                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -552,10 +532,6 @@ impl SplitReason {
             SplitReason::InlinePressure { key, .. } | SplitReason::Contention { key } => Some(key),
             SplitReason::SoftCap | SplitReason::Capacity => None,
         }
-    }
-
-    pub(super) fn is_inline_pressure(&self) -> bool {
-        matches!(self, SplitReason::InlinePressure { .. })
     }
 }
 

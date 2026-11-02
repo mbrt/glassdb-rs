@@ -74,11 +74,14 @@ async fn root_reclamation_can_avoid_an_actionable_split() {
     );
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            candidates: 1,
+        TopologyStats {
+            splits: SplitStats {
+                candidates: 1,
+                avoided: 1,
+                ..SplitStats::default()
+            },
             tombstones_reclaimed: 2,
-            splits_avoided: 1,
-            ..RestructurerStats::default()
+            ..TopologyStats::default()
         }
     );
     assert_eq!(gc_hints.pending(), vec![first, second]);
@@ -113,7 +116,7 @@ async fn root_leaf_gate_acquisition_uses_one_coordinator_round() {
     assert_eq!(observation.path(), &root_path());
     assert_eq!(
         sp.changes.structural_nodes.coord.stats_and_reset(),
-        crate::leaf_coord::LeafCoordinatorStats {
+        crate::leaf_coord::CoordinatorStats {
             submissions: 1,
             rounds: 1,
             cas_retries: 0,
@@ -188,10 +191,13 @@ async fn failed_compaction_does_not_publish_reclamation_outcomes() {
     assert!(failed.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            candidates: 1,
-            deferred: 1,
-            ..RestructurerStats::default()
+        TopologyStats {
+            splits: SplitStats {
+                candidates: 1,
+                deferred: 1,
+                ..SplitStats::default()
+            },
+            ..TopologyStats::default()
         }
     );
     assert!(gc_hints.pending().is_empty());
@@ -256,11 +262,14 @@ async fn nonroot_split_partitions_the_compacted_leaf() {
     }));
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            candidates: 1,
-            splits: 1,
+        TopologyStats {
+            splits: SplitStats {
+                candidates: 1,
+                completed: 1,
+                ..SplitStats::default()
+            },
             tombstones_reclaimed: 1,
-            ..RestructurerStats::default()
+            ..TopologyStats::default()
         }
     );
     assert_eq!(gc_hints.pending(), vec![writer]);
@@ -957,14 +966,17 @@ async fn feed_drives_run_once() {
     assert_eq!(leaves.len(), 2, "the fed candidate was split");
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            candidates: 1,
-            splits: 1,
-            deferred: 0,
-            ..RestructurerStats::default()
+        TopologyStats {
+            splits: SplitStats {
+                candidates: 1,
+                completed: 1,
+                deferred: 0,
+                ..SplitStats::default()
+            },
+            ..TopologyStats::default()
         }
     );
-    assert_eq!(sp.stats_and_reset(), RestructurerStats::default());
+    assert_eq!(sp.stats_and_reset(), TopologyStats::default());
 }
 
 // One large mutation can overshoot the soft cap by enough that halving the
@@ -1053,15 +1065,18 @@ async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
     );
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            candidates: 1,
-            splits: 1,
-            inline_pressure: InlinePressureStats {
+        TopologyStats {
+            splits: SplitStats {
                 candidates: 1,
                 completed: 1,
-                ..InlinePressureStats::default()
+                inline_pressure: SplitCauseStats {
+                    candidates: 1,
+                    completed: 1,
+                    ..SplitCauseStats::default()
+                },
+                ..SplitStats::default()
             },
-            ..RestructurerStats::default()
+            ..TopologyStats::default()
         }
     );
 
@@ -1106,15 +1121,18 @@ async fn repeated_inline_pressure_performs_one_rerouted_median_split_each() {
     );
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            candidates: 1,
-            splits: 1,
-            inline_pressure: InlinePressureStats {
+        TopologyStats {
+            splits: SplitStats {
                 candidates: 1,
                 completed: 1,
-                ..InlinePressureStats::default()
+                inline_pressure: SplitCauseStats {
+                    candidates: 1,
+                    completed: 1,
+                    ..SplitCauseStats::default()
+                },
+                ..SplitStats::default()
             },
-            ..RestructurerStats::default()
+            ..TopologyStats::default()
         }
     );
     let target = router
@@ -1147,14 +1165,17 @@ async fn inline_pressure_is_discarded_after_authoritative_revalidation() {
     sp.run_once().await;
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            candidates: 1,
-            inline_pressure: InlinePressureStats {
+        TopologyStats {
+            splits: SplitStats {
                 candidates: 1,
-                discarded: 1,
-                ..InlinePressureStats::default()
+                inline_pressure: SplitCauseStats {
+                    candidates: 1,
+                    discarded: 1,
+                    ..SplitCauseStats::default()
+                },
+                ..SplitStats::default()
             },
-            ..RestructurerStats::default()
+            ..TopologyStats::default()
         },
         "a value that now fits does not reshape the tree"
     );
@@ -1163,14 +1184,17 @@ async fn inline_pressure_is_discarded_after_authoritative_revalidation() {
     sp.run_once().await;
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            candidates: 1,
-            inline_pressure: InlinePressureStats {
+        TopologyStats {
+            splits: SplitStats {
                 candidates: 1,
-                discarded: 1,
-                ..InlinePressureStats::default()
+                inline_pressure: SplitCauseStats {
+                    candidates: 1,
+                    discarded: 1,
+                    ..SplitCauseStats::default()
+                },
+                ..SplitStats::default()
             },
-            ..RestructurerStats::default()
+            ..TopologyStats::default()
         },
         "a key that disappeared does not reshape the tree"
     );
@@ -1205,11 +1229,14 @@ async fn contended_candidate_is_requeued() {
     sp.run_once().await;
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            candidates: 1,
-            splits: 0,
-            deferred: 1,
-            ..RestructurerStats::default()
+        TopologyStats {
+            splits: SplitStats {
+                candidates: 1,
+                completed: 0,
+                deferred: 1,
+                ..SplitStats::default()
+            },
+            ..TopologyStats::default()
         }
     );
     assert!(
@@ -1233,11 +1260,14 @@ async fn contended_candidate_is_requeued() {
     sp.run_once().await;
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            candidates: 1,
-            splits: 1,
-            deferred: 0,
-            ..RestructurerStats::default()
+        TopologyStats {
+            splits: SplitStats {
+                candidates: 1,
+                completed: 1,
+                deferred: 0,
+                ..SplitStats::default()
+            },
+            ..TopologyStats::default()
         }
     );
     assert!(
@@ -1807,7 +1837,7 @@ async fn one_sweep_of_splits_writes_the_collection_record_twice() {
     sp.run_once().await;
     backend.clear_before();
 
-    assert_eq!(sp.stats_and_reset().splits, LEAVES as u64);
+    assert_eq!(sp.stats_and_reset().splits.completed, LEAVES as u64);
     assert_eq!(
         record_writes.load(std::sync::atomic::Ordering::SeqCst),
         2,
@@ -1876,7 +1906,10 @@ async fn sibling_splits_of_one_batch_reconcile_their_parent_together() {
     backend.clear_before();
 
     let stats = sp.stats_and_reset();
-    assert_eq!((stats.splits, stats.deferred), (LEAVES as u64, 0));
+    assert_eq!(
+        (stats.splits.completed, stats.splits.deferred),
+        (LEAVES as u64, 0)
+    );
     // One write gates the root, one adds the separators of all the splits
     // and opens the gate.
     assert_eq!(root_writes.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -1927,10 +1960,13 @@ async fn a_batch_that_cannot_join_the_topology_leaves_nothing_behind() {
 
     assert_eq!(
         sp.stats_and_reset(),
-        RestructurerStats {
-            candidates: 3,
-            deferred: 3,
-            ..RestructurerStats::default()
+        TopologyStats {
+            splits: SplitStats {
+                candidates: 3,
+                deferred: 3,
+                ..SplitStats::default()
+            },
+            ..TopologyStats::default()
         }
     );
     assert_eq!(sp.candidates.drain().len(), 3, "each candidate is requeued");
@@ -1985,7 +2021,7 @@ async fn two_causes_split_one_node_one_after_the_other() {
     sp.run_once().await;
 
     let stats = sp.stats_and_reset();
-    assert_eq!((stats.splits, stats.deferred), (2, 0));
+    assert_eq!((stats.splits.completed, stats.splits.deferred), (2, 0));
     let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
         .leaves(
             &collection(),
@@ -2254,7 +2290,17 @@ async fn contended_key_splits_away_from_the_keys_of_other_database_instances() {
     assert_eq!(keys, [b"a".as_slice(), b"b"]);
     assert_eq!(left.high_key(), Some(b"c".as_slice()));
     let stats = sp.stats_and_reset();
-    assert_eq!((stats.splits, stats.contention_splits), (1, 1));
+    assert_eq!(
+        (stats.splits.completed, stats.splits.contention.completed),
+        (1, 1)
+    );
+    assert_eq!(
+        (stats.splits.candidates, stats.splits.contention.candidates),
+        (1, 1),
+        "the cause group counts the candidate besides the total"
+    );
+    assert_eq!(stats.splits.inline_pressure, SplitCauseStats::default());
+    assert_eq!(stats.merges, MergeStats::default());
 }
 
 // ADR-085: a root leaf splits in place for a contended key, at the edge of the
@@ -2298,7 +2344,10 @@ async fn contended_key_of_a_root_leaf_splits_in_place() {
         .collect();
     assert_eq!(separators, [b"".as_slice(), b"c"]);
     let stats = sp.stats_and_reset();
-    assert_eq!((stats.splits, stats.contention_splits), (1, 1));
+    assert_eq!(
+        (stats.splits.completed, stats.splits.contention.completed),
+        (1, 1)
+    );
 }
 
 // The split target of the node at `path`.

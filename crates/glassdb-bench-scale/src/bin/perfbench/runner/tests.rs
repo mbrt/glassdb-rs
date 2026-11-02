@@ -161,12 +161,12 @@ fn groups_run_their_shapes_on_their_own_instances() -> Result<(), Box<dyn Error>
     );
     let instances = &cells[0]["groups"];
     assert!(
-        instances[0]["instances"][0]["directLanded"]
+        instances[0]["instances"][0]["directCompleted"]
             .as_u64()
             .unwrap()
             > 0
     );
-    assert_eq!(instances[1]["instances"][0]["directLanded"], 0);
+    assert_eq!(instances[1]["instances"][0]["directCompleted"], 0);
     Ok(())
 }
 

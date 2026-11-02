@@ -417,7 +417,7 @@ impl Database {
             locker: engine.locker,
             coordinator: engine.coordinator,
             direct_commit: engine.direct_commit,
-            restructurer: engine.restructurer,
+            topology: engine.topology,
             gc: engine.gc,
             ..Default::default()
         };

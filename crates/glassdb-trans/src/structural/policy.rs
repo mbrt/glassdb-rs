@@ -71,12 +71,6 @@ pub(crate) trait TopologyDecisions: Send + Sync {
     /// `reason`.
     fn split(&self, target: SplitTarget<'_>, node: &Node, reason: &SplitReason) -> SplitDecision;
 
-    /// Whether a soft cap split of a non-root leaf can wait. Only then does the
-    /// splitter check it in cached state before it takes a structural gate.
-    fn soft_cap_splits_wait(&self) -> bool {
-        false
-    }
-
     /// Decides the merge of the leaf `left` into its right sibling `right`
     /// for `reason`. Holder-free tombstones are already removed from both.
     fn merge(&self, left: &Node, right: &Node, reason: MergeReason) -> MergeDecision;

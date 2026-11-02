@@ -1640,7 +1640,7 @@ async fn direct_blind_puts_cover_two_eight_and_thirty_two_keys() {
         tm.direct_commit_stats_and_reset(),
         DirectCommitStats {
             candidates: 3,
-            landed: 3,
+            completed: 3,
         }
     );
 }
@@ -1677,7 +1677,7 @@ async fn multi_key_aggregate_rejection_is_atomic_and_does_not_hint() {
         tm.direct_commit_stats_and_reset(),
         DirectCommitStats {
             candidates: 1,
-            landed: 0,
+            completed: 0,
         }
     );
     assert_eq!(
@@ -1792,7 +1792,7 @@ async fn direct_mixed_member_is_atomic_and_advances_membership_once() {
         tm.direct_commit_stats_and_reset(),
         DirectCommitStats {
             candidates: 1,
-            landed: 1,
+            completed: 1,
         }
     );
     for (key, current) in [
@@ -1947,7 +1947,7 @@ async fn direct_commit_reroutes_once_then_falls_back() {
         tm.direct_commit_stats_and_reset(),
         DirectCommitStats {
             candidates: 1,
-            landed: 0,
+            completed: 0,
         }
     );
 }

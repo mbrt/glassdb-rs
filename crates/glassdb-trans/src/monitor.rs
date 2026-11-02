@@ -42,27 +42,27 @@ const MAX_RECENT_LOCAL: usize = 65_536;
 pub struct MonitorStats {
     /// Final-status cache lookups that found a committed, wounded, or aborted
     /// status.
-    pub final_status_hits: u64,
+    pub hits: u64,
     /// Final-status cache lookups that found no status.
-    pub final_status_misses: u64,
+    pub misses: u64,
 }
 
 impl AddAssign for MonitorStats {
     fn add_assign(&mut self, rhs: Self) {
-        self.final_status_hits += rhs.final_status_hits;
-        self.final_status_misses += rhs.final_status_misses;
+        // Destructuring fails to compile when a field is added and not summed.
+        let Self { hits, misses } = rhs;
+        self.hits += hits;
+        self.misses += misses;
     }
 }
 
 impl Sub for MonitorStats {
     type Output = Self;
 
-    fn sub(self, rhs: Self) -> Self::Output {
+    fn sub(self, rhs: Self) -> Self {
         Self {
-            final_status_hits: self.final_status_hits.saturating_sub(rhs.final_status_hits),
-            final_status_misses: self
-                .final_status_misses
-                .saturating_sub(rhs.final_status_misses),
+            hits: self.hits.saturating_sub(rhs.hits),
+            misses: self.misses.saturating_sub(rhs.misses),
         }
     }
 }
@@ -494,9 +494,9 @@ impl FinalStatusCache {
     fn get(&mut self, tid: &TxId) -> Option<FinalStatus> {
         let status = self.entries.to_back(tid).copied();
         if status.is_some() {
-            self.stats.final_status_hits += 1;
+            self.stats.hits += 1;
         } else {
-            self.stats.final_status_misses += 1;
+            self.stats.misses += 1;
         }
         status
     }
@@ -2565,22 +2565,13 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(reader.tx_status(&tid).await.unwrap(), status);
-            assert_eq!(
-                clone.stats_and_reset(),
-                MonitorStats {
-                    final_status_hits: 0,
-                    final_status_misses: 1,
-                }
-            );
+            assert_eq!(clone.stats_and_reset(), MonitorStats { hits: 0, misses: 1 });
 
             operations.lock().unwrap().clear();
             assert_eq!(clone.tx_status(&tid).await.unwrap(), status);
             assert_eq!(
                 reader.stats_and_reset(),
-                MonitorStats {
-                    final_status_hits: 1,
-                    final_status_misses: 0,
-                }
+                MonitorStats { hits: 1, misses: 0 }
             );
             assert!(operations.lock().unwrap().is_empty());
             assert_eq!(clone.stats_and_reset(), MonitorStats::default());
@@ -2615,10 +2606,7 @@ mod tests {
         }
         assert_eq!(
             reader.stats_and_reset(),
-            MonitorStats {
-                final_status_hits: 0,
-                final_status_misses: 2,
-            }
+            MonitorStats { hits: 0, misses: 2 }
         );
     }
 

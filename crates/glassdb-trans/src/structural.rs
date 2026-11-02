@@ -27,7 +27,6 @@ mod write_spans;
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -63,7 +62,7 @@ use stats::Stats;
 
 pub use policy::TopologyPolicy;
 pub use sink::StructuralHintSink;
-pub use stats::{InlinePressureStats, RestructurerStats};
+pub use stats::{MergeStats, SplitCauseStats, SplitStats, TopologyStats};
 pub(crate) use topology::TopologyMembership;
 
 /// Back off empty structural-intent listings independently of candidates.
@@ -239,7 +238,7 @@ impl Restructurer {
 
     /// Returns and resets the counters of background split and merge
     /// activity.
-    pub fn stats_and_reset(&self) -> RestructurerStats {
+    pub fn stats_and_reset(&self) -> TopologyStats {
         self.stats.take()
     }
 
@@ -377,7 +376,7 @@ impl Restructurer {
     async fn run_once(&self) {
         let candidates = self.candidates.drain();
         for candidate in &candidates {
-            self.count_candidate(candidate);
+            self.stats.count_candidate(&candidate.cause);
         }
         self.change_all(candidates).await;
         // Re-drive reconciliations a previous cycle could not land, so parents
@@ -582,22 +581,11 @@ impl Restructurer {
         })
     }
 
-    /// Counts one candidate that a sweep processes.
-    fn count_candidate(&self, candidate: &MaintenanceCandidate) {
-        self.stats.candidates.fetch_add(1, Ordering::Relaxed);
-        if candidate.cause.is_inline_pressure() {
-            self.stats
-                .inline_pressure_candidates
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     /// Requeues `candidate` when a transient error deferred its change.
     fn settle_candidate(&self, candidate: MaintenanceCandidate, result: Result<(), TransError>) {
         let Err(e) = result else {
             return;
         };
-        let stats = &self.stats;
         let pressure = candidate.cause.is_inline_pressure();
         tracing::debug!(
             target: "glassdb::restructurer",
@@ -608,16 +596,11 @@ impl Restructurer {
         let discard =
             pressure && matches!(e, TransError::InvalidInput(_) | TransError::StaleCollection);
         if discard {
-            stats
-                .inline_pressure_discarded
-                .fetch_add(1, Ordering::Relaxed);
-        } else if !matches!(e, TransError::InvalidInput(_)) {
-            stats.deferred.fetch_add(1, Ordering::Relaxed);
-            if pressure {
-                stats
-                    .inline_pressure_deferred
-                    .fetch_add(1, Ordering::Relaxed);
+            if let CandidateCause::Split(reason) = &candidate.cause {
+                self.stats.count_discarded_split(reason);
             }
+        } else if !matches!(e, TransError::InvalidInput(_)) {
+            self.stats.count_deferred(&candidate.cause);
             self.candidates.requeue(candidate);
         }
     }

@@ -31,14 +31,14 @@ async fn the_size_causes_merge_leaves_below_the_underfull_threshold() {
         coll.write(&[key], &write_int(0)).await.unwrap();
     }
     tokio::time::sleep(Duration::from_secs(5)).await;
-    assert_eq!(db.stats().restructurer.splits, 1);
+    assert_eq!(db.stats().topology.splits.completed, 1);
 
     for key in 1..4u8 {
         coll.delete(&[key]).await.unwrap();
     }
     tokio::time::sleep(Duration::from_secs(10)).await;
 
-    assert_eq!(db.stats().restructurer.merges, 1);
+    assert_eq!(db.stats().topology.merges.completed, 1);
     let keys = coll.scan_keys(KeyScan::all()).await.unwrap();
     assert_eq!(keys.keys(), [vec![0], vec![4]]);
     db.shutdown().await;

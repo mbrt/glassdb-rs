@@ -7,7 +7,6 @@
 //! the merge.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use glassdb_data::{CollectionAddress, NodeId, StructuralIntentId, TxId};
 use glassdb_storage::{
@@ -358,7 +357,7 @@ impl Merger {
     /// Counts each underfull merge that waits for the writers of its leaves.
     fn count_veto(&self, veto: MergeVeto) {
         if veto == MergeVeto::KeptApart {
-            self.stats.kept_apart.fetch_add(1, Ordering::Relaxed);
+            self.stats.record_kept_apart();
         }
     }
 

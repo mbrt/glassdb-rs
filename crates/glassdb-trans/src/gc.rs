@@ -1255,18 +1255,29 @@ pub struct GcStats {
 
 impl AddAssign for GcStats {
     fn add_assign(&mut self, rhs: Self) {
-        self.dropped_candidates += rhs.dropped_candidates;
-        self.failures += rhs.failures;
-        self.progress += rhs.progress;
-        self.lists += rhs.lists;
-        self.checks += rhs.checks;
-        self.deferred_checks += rhs.deferred_checks;
-        self.writes += rhs.writes;
+        // Destructuring fails to compile when a field is added and not summed.
+        let Self {
+            dropped_candidates,
+            failures,
+            progress,
+            lists,
+            checks,
+            deferred_checks,
+            writes,
+        } = rhs;
+        self.dropped_candidates += dropped_candidates;
+        self.failures += failures;
+        self.progress += progress;
+        self.lists += lists;
+        self.checks += checks;
+        self.deferred_checks += deferred_checks;
+        self.writes += writes;
     }
 }
 
 impl Sub for GcStats {
     type Output = Self;
+
     fn sub(self, rhs: Self) -> Self {
         Self {
             dropped_candidates: self

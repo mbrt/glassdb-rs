@@ -28,20 +28,30 @@ pub struct CacheStats {
 
 impl AddAssign for CacheStats {
     fn add_assign(&mut self, rhs: Self) {
-        self.l1_hits += rhs.l1_hits;
-        self.l1_misses += rhs.l1_misses;
-        self.l2_hits += rhs.l2_hits;
-        self.l2_misses += rhs.l2_misses;
-        self.l2_bytes_read += rhs.l2_bytes_read;
-        self.l2_bytes_written += rhs.l2_bytes_written;
-        self.l2_errors += rhs.l2_errors;
+        // Destructuring fails to compile when a field is added and not summed.
+        let Self {
+            l1_hits,
+            l1_misses,
+            l2_hits,
+            l2_misses,
+            l2_bytes_read,
+            l2_bytes_written,
+            l2_errors,
+        } = rhs;
+        self.l1_hits += l1_hits;
+        self.l1_misses += l1_misses;
+        self.l2_hits += l2_hits;
+        self.l2_misses += l2_misses;
+        self.l2_bytes_read += l2_bytes_read;
+        self.l2_bytes_written += l2_bytes_written;
+        self.l2_errors += l2_errors;
     }
 }
 
 impl Sub for CacheStats {
     type Output = Self;
 
-    fn sub(self, rhs: Self) -> Self::Output {
+    fn sub(self, rhs: Self) -> Self {
         Self {
             l1_hits: self.l1_hits.saturating_sub(rhs.l1_hits),
             l1_misses: self.l1_misses.saturating_sub(rhs.l1_misses),

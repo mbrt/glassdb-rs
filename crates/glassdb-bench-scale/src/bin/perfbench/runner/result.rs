@@ -75,8 +75,8 @@ pub(crate) struct CellResult {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WarmupResult {
-    pub(crate) splits: u64,
-    pub(crate) merges: u64,
+    pub(crate) split_completed: u64,
+    pub(crate) merge_completed: u64,
     pub(crate) wall_ms: u64,
     /// Whether the rate of splits and merges went down to the quiet rate
     /// before the warm-up timeout.
@@ -93,8 +93,8 @@ pub(crate) struct MeasureResult {
     pub(crate) wall_ms: u64,
     /// Whether the end condition was met before the maximum duration.
     pub(crate) met: bool,
-    pub(crate) splits: u64,
-    pub(crate) merges: u64,
+    pub(crate) split_completed: u64,
+    pub(crate) merge_completed: u64,
     /// The wall time after the measurement until all workers stopped.
     pub(crate) worker_drain_ms: f64,
 }
@@ -127,17 +127,17 @@ pub(crate) struct InstanceResult {
     replays: u64,
     lock_calls: u64,
     direct_candidates: u64,
-    direct_landed: u64,
-    obj_reads: u64,
-    obj_writes: u64,
-    obj_lists: u64,
+    direct_completed: u64,
+    reads: u64,
+    writes: u64,
+    lists: u64,
     coordinator_submissions: u64,
     coordinator_rounds: u64,
     coordinator_cas_retries: u64,
     split_candidates: u64,
-    splits: u64,
+    split_completed: u64,
     split_deferred: u64,
-    merges: u64,
+    merge_completed: u64,
 }
 
 /// Backend-op counters normalized per transaction.
@@ -148,9 +148,9 @@ pub(crate) struct OpsPerTx {
     txn: u64,
     /// Physical `Database::tx` calls, including unknown-outcome replays.
     attempted_txn: u64,
-    obj_reads_per_tx: f64,
-    obj_writes_per_tx: f64,
-    obj_lists_per_tx: f64,
+    reads_per_tx: f64,
+    writes_per_tx: f64,
+    lists_per_tx: f64,
     total_ops_per_tx: f64,
     replays_per_tx: f64,
     /// The backend operations and bytes of all object roles, as the storage
@@ -169,7 +169,7 @@ pub(crate) struct ProtocolPerTx {
     coordinator_members_per_round: f64,
     coordinator_cas_retries_per_tx: f64,
     direct_candidates_per_tx: f64,
-    direct_landed_per_tx: f64,
+    direct_completed_per_tx: f64,
     direct_land_rate: f64,
     lock_calls: u64,
     replays: u64,
@@ -213,8 +213,8 @@ pub(crate) struct TimelineEntry {
     /// Whether the second is in the measurement, and not in the warm-up.
     pub(crate) measured: bool,
     /// The splits and merges of each instance, in the order of the groups.
-    pub(crate) splits: Vec<u64>,
-    pub(crate) merges: Vec<u64>,
+    pub(crate) split_completed: Vec<u64>,
+    pub(crate) merge_completed: Vec<u64>,
 }
 
 impl From<GcStats> for GcResult {
@@ -238,17 +238,17 @@ impl InstanceResult {
             replays: stats.transactions.replays,
             lock_calls: stats.locker.calls,
             direct_candidates: stats.direct_commit.candidates,
-            direct_landed: stats.direct_commit.landed,
-            obj_reads: stats.backend.obj_reads,
-            obj_writes: stats.backend.obj_writes,
-            obj_lists: stats.backend.obj_lists,
+            direct_completed: stats.direct_commit.completed,
+            reads: stats.backend.reads,
+            writes: stats.backend.writes,
+            lists: stats.backend.lists,
             coordinator_submissions: stats.coordinator.submissions,
             coordinator_rounds: stats.coordinator.rounds,
             coordinator_cas_retries: stats.coordinator.cas_retries,
-            split_candidates: stats.restructurer.candidates,
-            splits: stats.restructurer.splits,
-            split_deferred: stats.restructurer.deferred,
-            merges: stats.restructurer.merges,
+            split_candidates: stats.topology.splits.candidates,
+            split_completed: stats.topology.splits.completed,
+            split_deferred: stats.topology.splits.deferred,
+            merge_completed: stats.topology.merges.completed,
         }
     }
 }
@@ -257,16 +257,16 @@ impl OpsPerTx {
     pub(crate) fn of(total: &Stats, logical_txn: u64, backend: BackendBreakdown) -> Self {
         let denominator = logical_txn.max(1) as f64;
         let (reads, writes, lists) = (
-            total.backend.obj_reads,
-            total.backend.obj_writes,
-            total.backend.obj_lists,
+            total.backend.reads,
+            total.backend.writes,
+            total.backend.lists,
         );
         Self {
             txn: logical_txn,
             attempted_txn: total.transactions.completed,
-            obj_reads_per_tx: reads as f64 / denominator,
-            obj_writes_per_tx: writes as f64 / denominator,
-            obj_lists_per_tx: lists as f64 / denominator,
+            reads_per_tx: reads as f64 / denominator,
+            writes_per_tx: writes as f64 / denominator,
+            lists_per_tx: lists as f64 / denominator,
             total_ops_per_tx: (reads + writes + lists) as f64 / denominator,
             replays_per_tx: total.transactions.replays as f64 / denominator,
             backend_ops: backend.total(),
@@ -291,11 +291,11 @@ impl ProtocolPerTx {
             },
             coordinator_cas_retries_per_tx: total.coordinator.cas_retries as f64 / denominator,
             direct_candidates_per_tx: candidates as f64 / denominator,
-            direct_landed_per_tx: total.direct_commit.landed as f64 / denominator,
+            direct_completed_per_tx: total.direct_commit.completed as f64 / denominator,
             direct_land_rate: if candidates == 0 {
                 0.0
             } else {
-                total.direct_commit.landed as f64 / candidates as f64
+                total.direct_commit.completed as f64 / candidates as f64
             },
             lock_calls: total.locker.calls,
             replays: total.transactions.replays,
@@ -353,9 +353,9 @@ pub(crate) fn costs(workload: Window, shutdown: Window, transactions: u64) -> se
     let n = transactions.max(1) as f64;
     let window = |window: &Window| {
         serde_json::json!({
-            "reads": window.stats.backend.obj_reads as f64 / n,
-            "writes": window.stats.backend.obj_writes as f64 / n,
-            "lists": window.stats.backend.obj_lists as f64 / n,
+            "reads": window.stats.backend.reads as f64 / n,
+            "writes": window.stats.backend.writes as f64 / n,
+            "lists": window.stats.backend.lists as f64 / n,
             "readBodyBytes": window.breakdown.read_bytes() as f64 / n,
             "writeBodyBytes": window.breakdown.write_bytes() as f64 / n,
             "coordinatorSubmissions": window.stats.coordinator.submissions as f64 / n,

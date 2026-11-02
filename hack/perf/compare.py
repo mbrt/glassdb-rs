@@ -545,7 +545,7 @@ def inline_pressure_table(a: pd.DataFrame, b: pd.DataFrame) -> pd.DataFrame:
         d = d[d["phase"] != "shutdown"].copy()
         logical_tx = d["logical-tx"].where(d["logical-tx"] > 0)
         direct_candidates = d["direct-candidates"].where(d["direct-candidates"] > 0)
-        d["direct-land-rate"] = d["direct-landed"] / direct_candidates
+        d["direct-complete-rate"] = d["direct-completed"] / direct_candidates
         d["lock-calls-per-tx"] = d["lock-calls"] / logical_tx
         d["backend-ops-per-tx"] = d["backend-ops"] / logical_tx
         d["write-bytes-per-tx"] = d["write-bytes"] / logical_tx
@@ -610,8 +610,8 @@ def contention_stats_table(a: pd.DataFrame, b: pd.DataFrame):
             if "direct-candidates" in d.columns
             else "direct-attempts"
         )
-        landed_col = (
-            "direct-landed" if "direct-landed" in d.columns else "direct-commits"
+        completed_col = (
+            "direct-completed" if "direct-completed" in d.columns else "direct-commits"
         )
         d["tx-per-sec"] = (
             d["count"] * 1000.0 / d["cell-duration-ms"].where(d["cell-duration-ms"] > 0)
@@ -621,7 +621,7 @@ def contention_stats_table(a: pd.DataFrame, b: pd.DataFrame):
         d["direct-candidates-per-tx"] = d[candidates_col] / d["count"].where(
             d["count"] > 0
         )
-        d["direct-land-rate"] = d[landed_col] / d[candidates_col].where(
+        d["direct-complete-rate"] = d[completed_col] / d[candidates_col].where(
             d[candidates_col] > 0
         )
         return d[
@@ -631,7 +631,7 @@ def contention_stats_table(a: pd.DataFrame, b: pd.DataFrame):
                 "tx-per-sec",
                 "replays-per-tx",
                 "direct-candidates-per-tx",
-                "direct-land-rate",
+                "direct-complete-rate",
                 "worker-drain-ms",
             ]
         ]
@@ -641,7 +641,7 @@ def contention_stats_table(a: pd.DataFrame, b: pd.DataFrame):
         "tx-per-sec",
         "replays-per-tx",
         "direct-candidates-per-tx",
-        "direct-land-rate",
+        "direct-complete-rate",
         "worker-drain-ms",
     ]:
         merged[f"{metric}-ratio"] = merged.apply(
@@ -1254,8 +1254,8 @@ def main() -> int:
             "tx-per-sec_b",
             "tx-per-sec-ratio",
             "p50-ms-ratio",
-            "direct-land-rate_a",
-            "direct-land-rate_b",
+            "direct-complete-rate_a",
+            "direct-complete-rate_b",
             "lock-calls-per-tx_a",
             "lock-calls-per-tx_b",
             "backend-ops-per-tx_a",
@@ -1266,8 +1266,8 @@ def main() -> int:
             "write-bytes-per-tx-ratio",
             "split-completed_a",
             "split-completed_b",
-            "merges_a",
-            "merges_b",
+            "merge-completed_a",
+            "merge-completed_b",
             "pressure-completed_a",
             "pressure-completed_b",
         ]
@@ -1301,9 +1301,9 @@ def main() -> int:
             )
         if not recovery.empty:
             summaries.append(
-                "inline-recovery-direct-land-rate: "
-                f"{la}={recovery['direct-land-rate_a'].median():.3f} "
-                f"{lb}={recovery['direct-land-rate_b'].median():.3f}"
+                "inline-recovery-direct-complete-rate: "
+                f"{la}={recovery['direct-complete-rate_a'].median():.3f} "
+                f"{lb}={recovery['direct-complete-rate_b'].median():.3f}"
             )
         if not total.empty:
             summaries.append(
@@ -1379,8 +1379,8 @@ def main() -> int:
             "replays-per-tx-ratio",
             "direct-candidates-per-tx_a",
             "direct-candidates-per-tx_b",
-            "direct-land-rate_a",
-            "direct-land-rate_b",
+            "direct-complete-rate_a",
+            "direct-complete-rate_b",
             "worker-drain-ms_a",
             "worker-drain-ms_b",
         ]
@@ -1391,7 +1391,7 @@ def main() -> int:
             ("tx-per-sec", False),
             ("replays-per-tx", True),
             ("direct-candidates-per-tx", True),
-            ("direct-land-rate", False),
+            ("direct-complete-rate", False),
             ("worker-drain-ms", True),
         ]:
             summaries.append(

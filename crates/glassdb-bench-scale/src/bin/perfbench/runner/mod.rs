@@ -36,7 +36,7 @@ use result::{
     CellResult, GroupResult, InstanceResult, MeasureResult, OpsPerTx, ProtocolPerTx, RunResult,
     ShapeResult, THROUGHPUT_WINDOWS, TimelineEntry, WarmupResult,
 };
-use seed::{Seeds, Storage, gc_stats, millis, restructurer_stats, structural_changes};
+use seed::{Seeds, Storage, gc_stats, millis, structural_changes, topology_stats};
 use sources::Family;
 use workers::{Opener, Outcome, OwnInstances, Pause, ShapeRun, Shared, Target, Worker};
 
@@ -315,7 +315,7 @@ async fn run_cell(
     let mut timeline = Timeline::new(&databases);
     let warm_start = Instant::now();
     let warm_model_start = rt::Instant::now();
-    let changes_start = restructurer_stats(&databases);
+    let changes_start = topology_stats(&databases);
     let gc_start = gc_stats(&databases);
     let warm_up = &spec.params.warm_up;
     let (warm_stage, mut measure_stage) = Stage::split(
@@ -359,10 +359,10 @@ async fn run_cell(
             }
         }
     };
-    let changes_end = restructurer_stats(&databases);
+    let changes_end = topology_stats(&databases);
     let warmup = WarmupResult {
-        splits: changes_end.splits - changes_start.splits,
-        merges: changes_end.merges - changes_start.merges,
+        split_completed: changes_end.splits.completed - changes_start.splits.completed,
+        merge_completed: changes_end.merges.completed - changes_start.merges.completed,
         wall_ms: millis(warm_start.elapsed()),
         quiet,
         change_rate,
@@ -371,8 +371,8 @@ async fn run_cell(
     crate::progress::log!(
         "  warm-up took {}ms: {} splits and {} merges{}{}",
         warmup.wall_ms,
-        warmup.splits,
-        warmup.merges,
+        warmup.split_completed,
+        warmup.merge_completed,
         change_rate
             .map(|rate| format!(", {rate:.2} changes/s at the end"))
             .unwrap_or_default(),
@@ -596,8 +596,8 @@ async fn run_cell(
         measure: MeasureResult {
             wall_ms: millis(measure_wall),
             met: outcome == Outcome::Met,
-            splits: total.restructurer.splits,
-            merges: total.restructurer.merges,
+            split_completed: total.topology.splits.completed,
+            merge_completed: total.topology.merges.completed,
             worker_drain_ms: drain.as_secs_f64() * 1000.0,
         },
         shapes: shape_results,
@@ -708,15 +708,18 @@ impl Timeline {
             .zip(&self.last)
             .map(|(now, last)| {
                 let delta = *now - *last;
-                (delta.restructurer.splits, delta.restructurer.merges)
+                (
+                    delta.topology.splits.completed,
+                    delta.topology.merges.completed,
+                )
             })
             .unzip();
         self.last = now;
         self.entries.push(TimelineEntry {
             second: self.entries.len() as u64 + 1,
             measured,
-            splits,
-            merges,
+            split_completed: splits,
+            merge_completed: merges,
         });
     }
 }

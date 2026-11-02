@@ -9,9 +9,9 @@
           "affinityPct": 0,
           "aggregateOps": {
             "attemptedTxn": 10922,
-            "objListsPerTx": 0.013916865043032411,
-            "objReadsPerTx": 3.345632668009522,
-            "objWritesPerTx": 1.532869437831899,
+            "listsPerTx": 0.013916865043032411,
+            "readsPerTx": 3.345632668009522,
+            "writesPerTx": 1.532869437831899,
             "replaysPerTx": 0.015381798205456876,
             "totalOpsPerTx": 4.892418970884453,
             "txn": 10922
@@ -23,7 +23,7 @@
             "coordinatorSubmissionsPerTx": 0.9962461087712873,
             "directCandidatesPerTx": 0.14246475004577916,
             "directLandRate": 0.9852185089974294,
-            "directLandedPerTx": 0.140358908624794
+            "directCompletedPerTx": 0.140358908624794
           },
           "databaseLimit": 4,
           "databases": 4,
@@ -79,9 +79,9 @@
           "affinityPct": 25,
           "aggregateOps": {
             "attemptedTxn": 8716,
-            "objListsPerTx": 0.0025240936209270305,
-            "objReadsPerTx": 3.279486002753557,
-            "objWritesPerTx": 1.721317117944011,
+            "listsPerTx": 0.0025240936209270305,
+            "readsPerTx": 3.279486002753557,
+            "writesPerTx": 1.721317117944011,
             "replaysPerTx": 0.015603487838458009,
             "totalOpsPerTx": 5.003327214318495,
             "txn": 8716
@@ -93,7 +93,7 @@
             "coordinatorSubmissionsPerTx": 1.1531665901789812,
             "directCandidatesPerTx": 0.13090867370353373,
             "directLandRate": 0.9737072743207712,
-            "directLandedPerTx": 0.12746672785681507
+            "directCompletedPerTx": 0.12746672785681507
           },
           "databaseLimit": 4,
           "databases": 4,
@@ -149,9 +149,9 @@
           "affinityPct": 50,
           "aggregateOps": {
             "attemptedTxn": 9608,
-            "objListsPerTx": 0.021128226477935053,
-            "objReadsPerTx": 3.148730224812656,
-            "objWritesPerTx": 1.6123022481265612,
+            "listsPerTx": 0.021128226477935053,
+            "readsPerTx": 3.148730224812656,
+            "writesPerTx": 1.6123022481265612,
             "replaysPerTx": 0.017589508742714404,
             "totalOpsPerTx": 4.782160699417152,
             "txn": 9608
@@ -163,7 +163,7 @@
             "coordinatorSubmissionsPerTx": 1.1188592839300582,
             "directCandidatesPerTx": 0.15632805995004162,
             "directLandRate": 0.9846870838881492,
-            "directLandedPerTx": 0.15393422148209826
+            "directCompletedPerTx": 0.15393422148209826
           },
           "databaseLimit": 4,
           "databases": 4,
@@ -219,9 +219,9 @@
           "affinityPct": 75,
           "aggregateOps": {
             "attemptedTxn": 8152,
-            "objListsPerTx": 0.002208047105004907,
-            "objReadsPerTx": 2.8568449460255154,
-            "objWritesPerTx": 1.5598626104023552,
+            "listsPerTx": 0.002208047105004907,
+            "readsPerTx": 2.8568449460255154,
+            "writesPerTx": 1.5598626104023552,
             "replaysPerTx": 0.017051030421982336,
             "totalOpsPerTx": 4.418915603532875,
             "txn": 8152
@@ -233,7 +233,7 @@
             "coordinatorSubmissionsPerTx": 1.224730127576055,
             "directCandidatesPerTx": 0.16989695780176645,
             "directLandRate": 0.9783393501805054,
-            "directLandedPerTx": 0.16621687929342494
+            "directCompletedPerTx": 0.16621687929342494
           },
           "databaseLimit": 4,
           "databases": 4,
@@ -289,9 +289,9 @@
           "affinityPct": 100,
           "aggregateOps": {
             "attemptedTxn": 4105,
-            "objListsPerTx": 0.0,
-            "objReadsPerTx": 2.1386114494518877,
-            "objWritesPerTx": 1.6959805115712545,
+            "listsPerTx": 0.0,
+            "readsPerTx": 2.1386114494518877,
+            "writesPerTx": 1.6959805115712545,
             "replaysPerTx": 0.007551766138855055,
             "totalOpsPerTx": 3.8345919610231425,
             "txn": 4105
@@ -303,7 +303,7 @@
             "coordinatorSubmissionsPerTx": 1.9580998781973202,
             "directCandidatesPerTx": 0.210231425091352,
             "directLandRate": 0.9930475086906141,
-            "directLandedPerTx": 0.2087697929354446
+            "directCompletedPerTx": 0.2087697929354446
           },
           "databaseLimit": 4,
           "databases": 4,
@@ -359,9 +359,9 @@
           "affinityPct": 0,
           "aggregateOps": {
             "attemptedTxn": 3825,
-            "objListsPerTx": 0.00522875816993464,
-            "objReadsPerTx": 2.0036601307189543,
-            "objWritesPerTx": 1.0616993464052287,
+            "listsPerTx": 0.00522875816993464,
+            "readsPerTx": 2.0036601307189543,
+            "writesPerTx": 1.0616993464052287,
             "replaysPerTx": 0.42169934640522877,
             "totalOpsPerTx": 3.070588235294118,
             "txn": 3825
@@ -373,7 +373,7 @@
             "coordinatorSubmissionsPerTx": 1.2645751633986928,
             "directCandidatesPerTx": 0.3801307189542484,
             "directLandRate": 0.3005502063273728,
-            "directLandedPerTx": 0.1142483660130719
+            "directCompletedPerTx": 0.1142483660130719
           },
           "databaseLimit": 4,
           "databases": 4,
@@ -429,9 +429,9 @@
           "affinityPct": 25,
           "aggregateOps": {
             "attemptedTxn": 3126,
-            "objListsPerTx": 0.006078055022392835,
-            "objReadsPerTx": 2.125399872040947,
-            "objWritesPerTx": 1.165067178502879,
+            "listsPerTx": 0.006078055022392835,
+            "readsPerTx": 2.125399872040947,
+            "writesPerTx": 1.165067178502879,
             "replaysPerTx": 0.49488163787587974,
             "totalOpsPerTx": 3.296545105566219,
             "txn": 3126
@@ -443,7 +443,7 @@
             "coordinatorSubmissionsPerTx": 1.5019193857965452,
             "directCandidatesPerTx": 0.49296225207933464,
             "directLandRate": 0.31797534068786504,
-            "directLandedPerTx": 0.15674984005118361
+            "directCompletedPerTx": 0.15674984005118361
           },
           "databaseLimit": 4,
           "databases": 4,
@@ -499,9 +499,9 @@
           "affinityPct": 50,
           "aggregateOps": {
             "attemptedTxn": 3472,
-            "objListsPerTx": 0.005472350230414746,
-            "objReadsPerTx": 1.9475806451612903,
-            "objWritesPerTx": 1.0388824884792627,
+            "listsPerTx": 0.005472350230414746,
+            "readsPerTx": 1.9475806451612903,
+            "writesPerTx": 1.0388824884792627,
             "replaysPerTx": 0.4317396313364055,
             "totalOpsPerTx": 2.9919354838709675,
             "txn": 3472
@@ -513,7 +513,7 @@
             "coordinatorSubmissionsPerTx": 1.4792626728110598,
             "directCandidatesPerTx": 0.4536290322580645,
             "directLandRate": 0.2787301587301587,
-            "directLandedPerTx": 0.1264400921658986
+            "directCompletedPerTx": 0.1264400921658986
           },
           "databaseLimit": 4,
           "databases": 4,
@@ -569,9 +569,9 @@
           "affinityPct": 75,
           "aggregateOps": {
             "attemptedTxn": 4494,
-            "objListsPerTx": 0.004450378282153983,
-            "objReadsPerTx": 1.6475300400534045,
-            "objWritesPerTx": 0.8146417445482866,
+            "listsPerTx": 0.004450378282153983,
+            "readsPerTx": 1.6475300400534045,
+            "writesPerTx": 0.8146417445482866,
             "replaysPerTx": 0.35736537605696483,
             "totalOpsPerTx": 2.466622162883845,
             "txn": 4494
@@ -583,7 +583,7 @@
             "coordinatorSubmissionsPerTx": 1.2676902536715622,
             "directCandidatesPerTx": 0.3553627058299956,
             "directLandRate": 0.2517219787100814,
-            "directLandedPerTx": 0.08945260347129506
+            "directCompletedPerTx": 0.08945260347129506
           },
           "databaseLimit": 4,
           "databases": 4,
@@ -639,9 +639,9 @@
           "affinityPct": 100,
           "aggregateOps": {
             "attemptedTxn": 6733,
-            "objListsPerTx": 0.0,
-            "objReadsPerTx": 0.22709045002227832,
-            "objWritesPerTx": 0.20807960790138125,
+            "listsPerTx": 0.0,
+            "readsPerTx": 0.22709045002227832,
+            "writesPerTx": 0.20807960790138125,
             "replaysPerTx": 0.2795187880588148,
             "totalOpsPerTx": 0.4351700579236596,
             "txn": 6733
@@ -653,7 +653,7 @@
             "coordinatorSubmissionsPerTx": 0.6731026288430121,
             "directCandidatesPerTx": 0.34486855784939846,
             "directLandRate": 0.2885443583118002,
-            "directLandedPerTx": 0.09950987672657062
+            "directCompletedPerTx": 0.09950987672657062
           },
           "databaseLimit": 4,
           "databases": 4,

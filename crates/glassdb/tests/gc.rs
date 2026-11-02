@@ -55,7 +55,7 @@ async fn idle_instances_back_off_without_writes() {
         activity.gc.lists
     );
     assert_eq!(activity.gc.progress, 0);
-    assert_eq!(activity.backend.obj_writes, 0);
+    assert_eq!(activity.backend.writes, 0);
     assert_eq!(db.diagnostics().gc.prefix_count, 1);
     db.shutdown().await;
 }

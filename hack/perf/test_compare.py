@@ -262,7 +262,7 @@ class CompareTest(unittest.TestCase):
             p90_ms=20,
             replays=1,
             direct_candidates=2,
-            direct_landed=1,
+            direct_completed=1,
             worker_drain_ms=3,
         )
         report = envelope("contention", [{"run": 1, "cells": [cell]}])
@@ -274,7 +274,7 @@ class CompareTest(unittest.TestCase):
 
         self.assertEqual(table.loc[0, "p50_a"], 10)
         self.assertEqual(table.loc[0, "p90-ratio"], 1.0)
-        self.assertEqual(stats.loc[0, "direct-landed"], 1)
+        self.assertEqual(stats.loc[0, "direct-completed"], 1)
         self.assertEqual(stats.loc[0, "num-replays"], 1)
 
     def test_an_experiment_is_found_in_a_result_of_several(self) -> None:
@@ -407,7 +407,7 @@ class CompareTest(unittest.TestCase):
                         "backend-ops": 192,
                         "write-bytes": 64_000,
                         "direct-candidates": 64,
-                        "direct-landed": int(64 * land_rate),
+                        "direct-completed": int(64 * land_rate),
                     }
                     for run, (tps, land_rate) in enumerate(
                         zip(throughput, landed, strict=True), start=1
@@ -431,7 +431,7 @@ class CompareTest(unittest.TestCase):
 
         self.assertEqual(table["run"].tolist(), [1, 2])
         self.assertEqual(table["tx-per-sec-ratio"].tolist(), [1.5, 0.5])
-        self.assertEqual(table["direct-land-rate_b"].tolist(), [1, 1])
+        self.assertEqual(table["direct-complete-rate_b"].tolist(), [1, 1])
         self.assertEqual(table["backend-ops-per-tx_a"].tolist(), [3, 3])
 
 

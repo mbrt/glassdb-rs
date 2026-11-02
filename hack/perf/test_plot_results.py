@@ -327,7 +327,7 @@ class GenericPlotterTest(unittest.TestCase):
                 committed=2,
                 tx_per_sec=2.0,
                 direct_candidates=2,
-                direct_landed=2,
+                direct_completed=2,
                 worker_drain_ms=1,
             )
 
