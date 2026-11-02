@@ -524,7 +524,8 @@ The `Monitor` handles a crash or a dropped transaction future:
    can still publish changes `Wounded` to `Aborted`. Only then does normal GC
    retention apply. Local pending state cannot rule out a wound from another
    instance, so a confirmed wound always causes identity renewal and a body
-   replay.
+   replay. The replay does not depend on the acknowledgement, so the owner
+   acknowledges the wound in the background and the replay does not wait.
 4. **Retirement handoff.** Cancellation, unwinding, and failed finalization keep
    the retirement guard armed, and the handoff gives the identity to waited
    recovery before control leaves the owner. A failed retirement is only a
@@ -822,7 +823,8 @@ dependency at the validation barrier. Committed and aborted statuses never
 change, so the cache can keep them forever. `Wounded` can still change to
 `Aborted`, so the object cache checks it again. The final-status cache of the
 monitor keeps `Wounded` as well, because both mean that the identity never
-commits. Owner acknowledgement and GC read the durable record. A cached committed status can outlive the
+commits. GC reads the durable record. Owner acknowledgement starts from its own
+durable observation of the wound. A cached committed status can outlive the
 cached record body. If the body is missing, the module that owns the referring
 observation reloads at a newer bound and retries. A missing historical body
 never becomes a missing key or a missing collection.
