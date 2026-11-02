@@ -114,11 +114,6 @@ impl TopologySignals for WritersPolicy {
 }
 
 impl TopologyDecisions for WritersPolicy {
-    /// A soft cap split waits for the write spans of its leaf (ADR-084).
-    fn soft_cap_splits_wait(&self) -> bool {
-        true
-    }
-
     fn split(&self, target: SplitTarget<'_>, node: &Node, reason: &SplitReason) -> SplitDecision {
         match reason {
             SplitReason::SoftCap => self.soft_cap_split(target, node),

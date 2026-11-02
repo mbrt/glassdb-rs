@@ -337,9 +337,7 @@ impl Splitter {
         path: &ObjectPath,
         reason: &SplitReason,
     ) -> Result<bool, TransError> {
-        let (SplitReason::SoftCap, ObjectPath::Node { id, .. }, true) =
-            (reason, path, self.decisions.soft_cap_splits_wait())
-        else {
+        let (SplitReason::SoftCap, ObjectPath::Node { id, .. }) = (reason, path) else {
             return Ok(false);
         };
         let mut node = match self.nodes.load_node(collection, id, Requirement::ANY).await {
