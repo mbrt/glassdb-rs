@@ -302,9 +302,9 @@ def read_contention(paths: Sequence[Path]) -> pd.DataFrame:
                         )
                         * committed
                     ),
-                    "direct-landed": round(
+                    "direct-completed": round(
                         _number(
-                            protocol.get("directLandedPerTx"), f"{label}.directLandedPerTx"
+                            protocol.get("directCompletedPerTx"), f"{label}.directCompletedPerTx"
                         )
                         * committed
                     ),
@@ -327,7 +327,7 @@ def read_inline_pressure(paths: Sequence[Path]) -> pd.DataFrame:
         "replays": "replays",
         "lockCalls": "lock-calls",
         "directCandidates": "direct-candidates",
-        "directLanded": "direct-landed",
+        "directCompleted": "direct-completed",
         "backendOps": "backend-ops",
         "writeBytes": "write-bytes",
         # Before the split and merge counters separated, these two columns
@@ -335,7 +335,7 @@ def read_inline_pressure(paths: Sequence[Path]) -> pd.DataFrame:
         "splitCandidates": "split-candidates",
         "splitCompleted": "split-completed",
         "splitDeferred": "split-deferred",
-        "merges": "merges",
+        "mergeCompleted": "merge-completed",
         # Earlier perfbench versions counted the inline pressure splits of
         # ADR-056 in fixed trigger and settle phases.
         "pressureCandidates": "pressure-candidates",
@@ -386,13 +386,13 @@ def _inline_phase(cell: dict[str, Any]) -> dict[str, Any]:
         "replays": protocol.get("replays", 0),
         "lockCalls": protocol.get("lockCalls", 0),
         "directCandidates": total("directCandidates"),
-        "directLanded": total("directLanded"),
+        "directCompleted": total("directCompleted"),
         "backendOps": ops.get("backendOps"),
         "writeBytes": ops.get("writeBytes"),
         "splitCandidates": total("splitCandidates"),
-        "splitCompleted": total("splits"),
+        "splitCompleted": total("splitCompleted"),
         "splitDeferred": total("splitDeferred"),
-        "merges": total("merges"),
+        "mergeCompleted": total("mergeCompleted"),
     }
 
 

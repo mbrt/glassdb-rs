@@ -361,8 +361,8 @@ async fn run_cell(
     };
     let changes_end = topology_stats(&databases);
     let warmup = WarmupResult {
-        splits: changes_end.splits.completed - changes_start.splits.completed,
-        merges: changes_end.merges.completed - changes_start.merges.completed,
+        split_completed: changes_end.splits.completed - changes_start.splits.completed,
+        merge_completed: changes_end.merges.completed - changes_start.merges.completed,
         wall_ms: millis(warm_start.elapsed()),
         quiet,
         change_rate,
@@ -371,8 +371,8 @@ async fn run_cell(
     crate::progress::log!(
         "  warm-up took {}ms: {} splits and {} merges{}{}",
         warmup.wall_ms,
-        warmup.splits,
-        warmup.merges,
+        warmup.split_completed,
+        warmup.merge_completed,
         change_rate
             .map(|rate| format!(", {rate:.2} changes/s at the end"))
             .unwrap_or_default(),
@@ -596,8 +596,8 @@ async fn run_cell(
         measure: MeasureResult {
             wall_ms: millis(measure_wall),
             met: outcome == Outcome::Met,
-            splits: total.topology.splits.completed,
-            merges: total.topology.merges.completed,
+            split_completed: total.topology.splits.completed,
+            merge_completed: total.topology.merges.completed,
             worker_drain_ms: drain.as_secs_f64() * 1000.0,
         },
         shapes: shape_results,
@@ -718,8 +718,8 @@ impl Timeline {
         self.entries.push(TimelineEntry {
             second: self.entries.len() as u64 + 1,
             measured,
-            splits,
-            merges,
+            split_completed: splits,
+            merge_completed: merges,
         });
     }
 }

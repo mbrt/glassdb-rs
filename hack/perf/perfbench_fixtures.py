@@ -48,7 +48,7 @@ def contention_cell(
     p90_ms: float = 20.0,
     replays: int = 0,
     direct_candidates: int = 0,
-    direct_landed: int = 0,
+    direct_completed: int = 0,
     worker_drain_ms: float = 0,
 ) -> dict[str, Any]:
     """Return a contention cell of `num_keys` keys, `overlap` of them shared."""
@@ -60,7 +60,7 @@ def contention_cell(
         "aggregateProtocol": {
             "replays": replays,
             "directCandidatesPerTx": direct_candidates / per_tx,
-            "directLandedPerTx": direct_landed / per_tx,
+            "directCompletedPerTx": direct_completed / per_tx,
         },
         "shapes": [
             {
