@@ -1,9 +1,10 @@
 # GlassDB documentation
 
-Current documentation has three owners:
+Current documentation has four owners:
 
 | Area | Content | Lifecycle |
 | --- | --- | --- |
+| [`principles.md`](principles.md) | Design principles that every change must respect. | Changed only by an explicit decision. |
 | [`architecture.md`](architecture.md) | High-level current architecture and responsibility ownership. | Updated with the implementation. |
 | [`adr/`](adr/) | Significant decisions, their reasons, and trade-offs. | Frozen after acceptance, except for status and links to newer ADRs. |
 | [`guides/`](guides/) | Maintainer procedures and focused technical guidance. | Updated with the related workflow. |
@@ -32,8 +33,10 @@ proposal is retired or work develops on another branch.
 - [`guides/storage-consistency.md`](guides/storage-consistency.md) gives the
   correctness rules for timeline and observation types.
 - [`guides/releasing.md`](guides/releasing.md) describes the release process.
-- [`guides/reviewing-changes.md`](guides/reviewing-changes.md) defines the review
-  focus for ownership, policy, mechanism, and intended behavior.
+- [`guides/change-standards.md`](guides/change-standards.md) gives the standards
+  that every change must meet, for authors and reviewers.
+- [`guides/interface-design.md`](guides/interface-design.md) describes how to
+  design deep modules and where to put seams.
 - [`guides/perf.md`](guides/perf.md) records performance-affecting changes.
 - [`guides/testing-dst.md`](guides/testing-dst.md) describes deterministic
   simulation testing and its trade-offs.

@@ -15,25 +15,15 @@
 
 ## Development
 
-- Keep implementation methods in order of visibility
-- Comments should be used to explain why something is done, not what
-- When needing to explain what is done, consider whether the code can be refactored to make it self-explanatory instead
-- When code has to be complex and hard to understand, it must be for a good reason, and the reason must be commented
-- Functions' docstring should describe the function's purpose, not its implementation, nor callers
-- In comments and docs, do not mention Linear issues, local paths or anything that wouldn't be visible from a machine that only sees this repository (public URLs are OK)
+- Follow the standards in [docs/guides/change-standards.md](docs/guides/change-standards.md) when you write a change
 - Use `make format` to auto-format the code
-
-### Tests
-
-Use `make test` to run format checks, linting, and ordinary and simulation tests.
-Also run `make test-bench` for changes to benchmarks or CI comparison tools.
-
-- Test interfaces and intended behavior instead of internals
-- Avoid tautological tests
-- Strongly prefer integration tests over mocks
-- Always add deterministic regression tests when fixing bugs, they also serve as documentation
-- Return errors instead of using assertions in transaction bodies, as they are not snapshot-transparent
+- Use `make test` to run format checks, linting, and ordinary and simulation tests. Also run `make test-bench` for changes to benchmarks or CI comparison tools
 
 ## Verification
 
-After implementing a sizable chunk of work, ask for an adversarial review to a sub-agent, while passing the [reviewing-changes.md](docs/guides/reviewing-changes.md) guide and fix its findings. If they conflict with what was explicitly agreed with the user, stop and ask them.
+After you finish a sizable chunk of work, review it:
+
+- Do not review work that is still exploratory (an investigation, an experiment, or a design that is not agreed yet). Every chunk that you commit gets a review
+- Start a fresh sub-agent, not a fork, so that this conversation does not bias the review. Tell it to use the `glassdb-review` skill
+- Give it the inputs listed in the skill: the target (the diff since the last review, or the branch against its merge-base with `main`), the goal, and the decisions agreed with the user. Do not give it your arguments for why the change is correct, or a summary of the conversation
+- Handle its findings with the `glassdb-triage` skill

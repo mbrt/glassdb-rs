@@ -39,7 +39,7 @@ See [adr-design.md](./adr-design.md) for guidance on writing ADRs.
 
 Before updating code, consider where functionality should live and which component(s) should own it.
 
-See [interface-design.md](./interface-design.md) for guidance on well-structured interfaces and ways to improve them.
+See [interface-design.md](../../../docs/guides/interface-design.md) for guidance on well-structured interfaces and ways to improve them.
 
 ## Refactor
 
@@ -51,4 +51,10 @@ Identify refactoring opportunities when:
 
 A good refactor reduces complexity and the number of lines of code (excluding tests).
 
-See [interface-design.md](./interface-design.md) for guidance on designing interfaces and seams.
+See [interface-design.md](../../../docs/guides/interface-design.md) for guidance on designing interfaces and seams.
+
+Before spawning sub-agents for parallel design, write a user-facing explanation of the problem space:
+
+- The constraints any new interface would need to satisfy
+- The dependencies it would rely on
+- A rough illustrative code sketch to ground the constraints, not a proposal, just a way to make the constraints concrete
