@@ -69,12 +69,6 @@ When refactoring to make modules deeper, consider:
 - Don't expose internal seams through the interface just because tests use them.
 - Explore alternative interfaces through parallel design. Based on "Design It Twice" (Ousterhout): your first idea is unlikely to be the best.
 
-Before spawning sub-agents for parallel design, write a user-facing explanation of the problem space:
-
-- The constraints any new interface would need to satisfy
-- The dependencies it would rely on
-- A rough illustrative code sketch to ground the constraints, not a proposal, just a way to make the constraints concrete
-
 ### Testing strategy: replace, don't layer
 
 - Old unit tests on shallow modules become waste once tests at the deepened module's interface exist; delete them.
