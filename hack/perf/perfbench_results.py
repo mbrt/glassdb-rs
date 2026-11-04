@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -31,6 +32,10 @@ SHAPE_NAMES = {
 MIXED_MODES = {"low-conflict": "lo", "high-conflict": "hi"}
 # The experiments whose cells are mixed workloads.
 MIXED_EXPERIMENTS = ("mixed", "ci", "workers", "affinity")
+# The pool of the `conflict-sweep` experiment, and the label of its cells
+# (`keys<K>-pool<N>`: keys for each transaction, and keys of the pool).
+CONFLICT_POOL_PATH = "pools.sweep.keys"
+CONFLICT_LABEL = re.compile(r"keys([1-9][0-9]*)-pool[1-9][0-9]*")
 
 
 class ReportError(ValueError):
@@ -252,6 +257,107 @@ def read_mixed(
 
     if not rows:
         raise ReportError(f"{source}: report has no mixed cells")
+    return meta, pd.DataFrame(rows)
+
+
+def conflict_probability(pool_keys: int, tx_keys: int, workers: int) -> float:
+    """Return the chance that a transaction shares a key with a concurrent one.
+
+    All `workers` run a transaction of `tx_keys` distinct keys, drawn at random
+    from `pool_keys` keys. The result is the chance that a given transaction
+    shares at least one key with at least one of the other `workers - 1`
+    transactions. It is an upper bound for the transactions that really
+    overlap in time, because a worker is not always inside a transaction.
+    """
+    if tx_keys >= pool_keys:
+        return 1.0 if workers > 1 else 0.0
+    # The chance that two transactions share no key.
+    disjoint = math.comb(pool_keys - tx_keys, tx_keys) / math.comb(pool_keys, tx_keys)
+    return 1.0 - disjoint ** (workers - 1)
+
+
+def read_conflict_sweep(
+    path: Path, *, require_converged: bool, name: str | None = None
+) -> tuple[ReportMetadata, pd.DataFrame]:
+    """Load the `conflict-sweep` experiment `name` of a report into one row per
+    run and cell.
+
+    A cell has one shape: read-modify-write transactions of `tx_keys` keys
+    from a pool of `pool_keys` keys, on `databases` database instances. `conflict_probability` is the chance that
+    a transaction shares a key with a concurrent one (see
+    `conflict_probability`), and `replays_per_tx` is what the run measured.
+    The throughput and latency columns are those of `read_mixed`.
+    """
+    source = str(path)
+    report = check_envelope(_load(path), source, "conflict-sweep", name)
+    meta = metadata(report, source)
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for run_id, run in runs(report, source):
+        cells = _array(run.get("cells"), f"{source}: run {run_id}.cells")
+        for index, value in enumerate(cells):
+            label = f"{source}: run {run_id} cell {index}"
+            cell = _object(value, label)
+            failures = _integer(cell.get("failures"), f"{label}.failures")
+            if failures:
+                raise ReportError(f"{label}: contains {failures} failures")
+            databases = _integer(cell.get("databases"), f"{label}.databases", minimum=1)
+            cell_label = (cell.get("labels") or {}).get("conflict", "")
+            match = CONFLICT_LABEL.fullmatch(str(cell_label))
+            if match is None:
+                raise ReportError(
+                    f"{label}: conflict label {cell_label!r} is not keys<K>-pool<N>"
+                )
+            tx_keys = int(match.group(1))
+            pool_keys = _integer(
+                (cell.get("parameters") or {}).get(CONFLICT_POOL_PATH),
+                f"{label}.parameters.{CONFLICT_POOL_PATH}",
+                minimum=1,
+            )
+            shapes = _array(cell.get("shapes"), f"{label}.shapes")
+            if len(shapes) != 1:
+                raise ReportError(f"{label}: expected one shape")
+            shape = _object(shapes[0], f"{label}.shapes[0]")
+            workers = _integer(shape.get("workers"), f"{label}.workers", minimum=1)
+            if require_converged and shape.get("converged") is not True:
+                raise ReportError(f"{label}: cell did not converge")
+            identity = (run_id, databases, tx_keys, pool_keys)
+            if identity in seen:
+                raise ReportError(f"{label}: duplicate conflict cell {identity}")
+            seen.add(identity)
+            p50_ms = _number(shape.get("p50Ms"), f"{label}.p50Ms")
+            p90_ms = _number(shape.get("p90Ms"), f"{label}.p90Ms")
+            if p90_ms < p50_ms:
+                raise ReportError(f"{label}: p90Ms={p90_ms} is below p50Ms={p50_ms}")
+            throughput = _number(shape.get("txPerSec"), f"{label}.txPerSec")
+            throughput_p10, throughput_p50, throughput_p90 = _window_percentiles(
+                shape, label
+            )
+            if math.isnan(throughput_p50):
+                throughput_p50 = throughput
+            ops = _object(cell.get("aggregateOps"), f"{label}.aggregateOps")
+            rows.append(
+                {
+                    "run": run_id,
+                    "databases": databases,
+                    "tx_keys": tx_keys,
+                    "pool_keys": pool_keys,
+                    "workers": workers,
+                    "conflict_probability": conflict_probability(
+                        pool_keys, tx_keys, workers
+                    ),
+                    "replays_per_tx": body_replays_per_tx(ops),
+                    "throughput": throughput,
+                    "throughput_p10": throughput_p10,
+                    "throughput_p50": throughput_p50,
+                    "throughput_p90": throughput_p90,
+                    "p50_ms": p50_ms,
+                    "p90_ms": p90_ms,
+                    "converged": shape.get("converged") is True,
+                }
+            )
+    if not rows:
+        raise ReportError(f"{source}: report has no conflict cells")
     return meta, pd.DataFrame(rows)
 
 

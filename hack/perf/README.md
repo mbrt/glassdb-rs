@@ -50,7 +50,8 @@ virtual time.
 | `membership-churn` | `real-time` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
 | `mixed` | `real-time` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
 | `workers` | `real-time` | The worker grid of the canonical plots: 1 to 200 workers per shape, each count after the warm-up of the count before it. |
-| `affinity` | `real-time` | The affinity grid of the canonical plots: 5 affinities × 1, 3, 5, and 7 database instances. |
+| `affinity` | `real-time` | The affinity grid: 5 affinities × 1, 3, 5, and 7 database instances. It is not part of the canonical plots. |
+| `conflict-sweep` | `real-time` | The conflict grid of the canonical plots: 20 workers on 1 and on 5 database instances run read-modify-write transactions of 1 or 4 keys on one pool, from 5,000 keys down to 5 keys (1 key) or 100 keys (4 keys). A smaller pool gives more conflicts. |
 | `load-shift` | `real-time` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
 | `false-sharing` | `real-time` | Four instances that each write one of four adjacent keys of one leaf, while one more instance reads and writes the keys around them (ADR-084). The default topology policy must split the keys of the four instances apart. |
 | `fixed-ranges` | `real-time` | Transactions on fixed ranges of 16 and 64 keys, with transactions on single keys (ADR-084). |
@@ -97,7 +98,7 @@ The `costs` of each cell are the numbers that the CI comparison checks.
 
 ### Canonical sweep plots
 
-The canonical plots come from the `workers` and `affinity` experiments, in
+The canonical plots come from the `workers` and `conflict-sweep` experiments, in
 `hack/perf/out-sweeps/`. They use the local S3 model. `--prefix-depth=3` gives
 each collection its own simulated S3 request-rate limit:
 
@@ -108,16 +109,22 @@ common=(--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
 e=hack/perf/experiments/real-time
 target/release/perfbench "${common[@]}" --experiment=$e/workers.toml \
   --output=hack/perf/out-sweeps/workers.json
-target/release/perfbench "${common[@]}" --experiment=$e/affinity.toml \
-  --output=hack/perf/out-sweeps/affinity.json
+target/release/perfbench "${common[@]}" --experiment=$e/conflict-sweep.toml \
+  --output=hack/perf/out-sweeps/conflict-sweep.json
 uv run hack/perf/plot_results.py --canonical
 ```
 
 The canonical mode needs three clean, converged runs. Throughput shows the p50
 of the throughput windows as a line and their p10 to p90 range as a band.
 Latency shows the p50 as a line and the p50 to p90 range as a band. Both use the
-median over the runs. Each affinity figure has one panel for each database
-instance count, with all shapes. The four figures go to `hack/perf/out-sweeps/`.
+median over the runs. The two conflict figures have one panel for each database
+instance count (1 and 5), and one line for each number of keys of a transaction.
+Both figures have a log y axis and a linear x axis. The second line of each
+title says "log scale". The x axis is the probability that a transaction shares
+a key with a concurrent one, from the size of the pool, the keys of the
+transaction, and the workers (`perfbench_results.conflict_probability`). It is
+an upper bound, because a worker is not always inside a transaction. The four
+figures go to `hack/perf/out-sweeps/`.
 
 ### Plotting any result file
 
@@ -132,14 +139,16 @@ uv run hack/perf/plot_results.py hack/aws-bench/out/mixed.json \
 
 A mixed experiment (`mixed`, `ci`, `workers`, or `affinity`) must sweep exactly
 one of affinity or workers; it gets one panel for each conflict level (`lo` and
-`hi`). A `contention` experiment shows the 100% overlap cells by contended keys.
-A file with several experiments, such as the result of `make bench-all`, gets
-the figures of each experiment that has them, named
-`<file>-<experiment>-*.png`. `--canonical` reads the `workers` and `affinity`
-experiments, so `--workers` and `--affinity` can be the same file.
-Shapes that did not converge are plotted with a warning. Both `plot_results.py`
-and `compare.py` read result files through `perfbench_results.py`, which owns the
-JSON schema. `make test-bench` runs their tests.
+`hi`). A `conflict-sweep` experiment gets the two conflict figures, with no
+check of the grid. A `contention` experiment shows the 100% overlap cells by
+contended keys. A file with several experiments, such as the result of `make
+bench-all`, gets the figures of each experiment that has them, named
+`<file>-<experiment>-*.png`. `--canonical` reads the `workers` and
+`conflict-sweep` experiments, so `--workers` and `--conflicts` can be the same
+file. Shapes that did not converge are plotted with a warning. Both
+`plot_results.py` and `compare.py` read result files through
+`perfbench_results.py`, which owns the JSON schema. `make test-bench` runs their
+tests.
 
 ## Comparing revisions
 

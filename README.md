@@ -4,9 +4,9 @@
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-glassdb-66c2a5?style=for-the-badge&labelColor=555555&logo=docs.rs" height="20">](https://docs.rs/glassdb)
 [<img alt="build status" src="https://img.shields.io/github/actions/workflow/status/mbrt/glassdb-rs/build.yml?style=for-the-badge" height="20">](https://github.com/mbrt/glassdb-rs/actions?query=branch%3Amain)
 
-Glass DB is a pure Rust key/value store on top of object storage (Amazon S3 or
+GlassDB is a pure Rust key/value store on top of object storage (Amazon S3 or
 Google Cloud Storage) that is _stateless_ and supports _ACID transactions_.
-Clients import Glass DB as a library and don't need to deploy, nor depend on any
+Clients import GlassDB as a library and don't need to deploy, nor depend on any
 additional services. Everything is built on top of object storage.
 
 This project started as the Rust implementation of the original [Go
@@ -132,7 +132,7 @@ This project makes the following specific tradeoffs:
 - Small key-value records are the target workload (<=1 KiB), but larger values
   work as well, depending on transaction size.
 
-Glass DB makes sense in contexts where there are many writers that rarely write
+GlassDB makes sense in contexts where there are many writers that rarely write
 to the same keys or reads are more frequent than writes.
 
 Why rewrite in Rust? Because having proper [DST
@@ -160,8 +160,8 @@ choices today?
 Neither seem cost effective in the scenario. We are talking about $10 a month,
 which is not huge, but can we do better?
 
-Yes. With Glass DB you only pay for each query and long term storage. In the
-case of GCS (as of 2023) we are talking about:
+Yes. With GlassDB you only pay for each query and long term storage. In the case
+of GCS (as of 2023) we are talking about:
 
 - $0.020 per GB per month
 - $0.05 per 10k write / list ops
@@ -180,7 +180,7 @@ a shape better suited for the query layer.
 
 Compaction and ingestion are mostly independent, but we must make sure to be
 robust to crashes and restarts (avoiding e.g. double-counting or event
-duplicates). This can be ensured with transactions provided by Glass DB. If most
+duplicates). This can be ensured with transactions provided by GlassDB. If most
 transactions don't conflict with each other, the throughput will scale mostly
 linearly (See [Performance](#performance)).
 
@@ -234,8 +234,35 @@ rises when hitting S3 prefix write limits:
 
 ![](docs/img/tx-latency.png)
 
-The p50-p90 bands also show tail-latency growth. Body replays can add more delay
+The p50-p90 bands also shows tail-latency growth. Body replays can add more delay
 after an invalidated read.
+
+### Conflicts
+
+Following from the optimistic concurrency design, GlassDB transaction throughput
+and latency are affected by conflicts. While undesirable, this is the expected
+trade-off we're making, for scalability of the low conflict case.
+
+The benchmark below shows the effects of increasing the probability of conflicts
+between transactions, while varying the number of keys updated in each
+transaction and the number of database instances.
+
+![](docs/img/conflict-throughput.png)
+
+![](docs/img/conflict-latency.png)
+
+A transaction that loses a conflict replays its body, so throughput falls and
+tail latency grows as the probability goes up. Transactions of more keys are hit
+sooner, because they have more keys to conflict on.
+
+A single instance batches the commits of its workers into shared rounds, so it
+conflicts less than five instances with the same workers. This shows how
+conflicts within the same database instance are handled better than across
+instances, especially at moderate level of conflicts.
+
+There's no solution to high conflict rates, as [Two-Phase
+Commit](https://en.wikipedia.org/wiki/Two-phase_commit_protocol) is notorious
+for thrashing under high contention.
 
 ## Development
 

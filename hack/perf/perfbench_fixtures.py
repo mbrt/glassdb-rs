@@ -74,6 +74,41 @@ def contention_cell(
     }
 
 
+def conflict_cell(
+    tx_keys: int,
+    pool_keys: int,
+    *,
+    workers: int = 20,
+    databases: int = 5,
+    value: float = 100.0,
+    converged: bool = True,
+) -> dict[str, Any]:
+    """Return a `conflict-sweep` cell of `tx_keys` keys in a pool of `pool_keys`."""
+    return {
+        "failures": 0,
+        "databases": databases,
+        "labels": {"conflict": f"keys{tx_keys}-pool{pool_keys}"},
+        "parameters": {
+            "cell.workload": f"rw-{tx_keys}",
+            "pools.sweep.keys": pool_keys,
+        },
+        "aggregateOps": {"replaysPerTx": value / 100},
+        "shapes": [
+            {
+                "shape": f"rw-{tx_keys}",
+                "workers": workers,
+                "committed": 500,
+                "txPerSec": value,
+                "p50Ms": value * 2,
+                "p90Ms": value * 4,
+                "windowMs": 100.0,
+                "windowCounts": [round(value / 10)] * 10,
+                "converged": converged,
+            }
+        ],
+    }
+
+
 def report(scenario: str, runs: list[dict[str, Any]], **fields: Any) -> dict[str, Any]:
     """Return a result with the one experiment `scenario`."""
     return {
