@@ -15,7 +15,9 @@ The kind of each experiment selects the figures:
 * `mixed`, `workers`, and `affinity`: throughput and latency by shape, one panel
   per mode. The x-axis is the one dimension that varies: affinity or workers per
   shape;
-* `contention`: throughput and latency by number of contended keys.
+* `contention`: throughput and latency by number of contended keys;
+* `conflict-sweep`: throughput and latency by probability of conflict, one line
+  for each number of keys of a transaction.
 
 A file with several experiments gets figures named `<file>-<experiment>-*.png`.
 `--series LABEL=FILE` (at least twice) overlays files of one experiment instead.
@@ -25,7 +27,7 @@ Lines show the p50. Bands show the p10 to p90 range of a shape's throughput
 windows for throughput, and the p50 to p90 range of its transaction latencies
 for latency. With
 several runs in a file, lines and band edges show the cross-run median. Pass `--canonical`
-to render the four fixed worker and affinity figures of the local S3 model
+to render the four fixed worker and conflict figures of the local S3 model
 instead; that mode insists on the complete grids described in the README.
 """
 
@@ -40,6 +42,8 @@ from typing import Any, Iterable, Mapping
 import matplotlib
 
 matplotlib.use("Agg")
+
+import matplotlib.ticker
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -57,11 +61,16 @@ SHAPE_LABELS = {
 }
 WORKER_POINTS = (1, *range(10, 201, 10))
 WORKER_TICKS = WORKER_POINTS
-AFFINITY_POINTS = (0, 25, 50, 75, 100)
-AFFINITY_DATABASES = (1, 3, 5, 7)
 EXPECTED_RUNS = (1, 2, 3)
-FIXED_AFFINITY_WORKERS = 20
 WORKER_DATABASE_LIMIT = 5
+# The cells of `conflict-sweep`: the database instances, the pools of each
+# number of keys for a transaction, and the workers.
+CONFLICT_DATABASES = (1, 5)
+CONFLICT_POOLS = {
+    1: (5000, 1000, 500, 200, 100, 50, 20, 10, 5),
+    4: (5000, 2000, 1000, 500, 300, 200, 100),
+}
+CONFLICT_WORKERS = 20
 METRICS = (
     "throughput",
     "throughput_p10",
@@ -75,6 +84,8 @@ THROUGHPUT_BAND = ("throughput_p50", "throughput_p10", "throughput_p90")
 LATENCY_BAND = ("p50_ms", "p50_ms", "p90_ms")
 THROUGHPUT_BAND_TITLE = "p50 line; p10–p90 band"
 LATENCY_BAND_TITLE = "p50 line; p50–p90 band"
+# Metrics of a conflict sweep, as `METRICS` for the mixed reports.
+CONFLICT_METRICS = (*METRICS, "conflict_probability", "replays_per_tx")
 # One line style per overlaid source; shapes keep their colors.
 SOURCE_STYLES = ("-", "--", ":", "-.")
 # Dimensions that a generic mixed report may sweep along its x-axis.
@@ -120,19 +131,19 @@ def validate_worker_sweep(data: pd.DataFrame) -> None:
     )
 
 
-def validate_affinity_sweep(data: pd.DataFrame) -> None:
-    """Require the canonical low-contention affinity and Database grid."""
-    _require_values(data, "run", EXPECTED_RUNS, "affinity sweep")
-    _require_values(data, "mode", ("lo",), "affinity sweep")
-    _require_values(data, "affinity", AFFINITY_POINTS, "affinity sweep")
-    _require_values(data, "database_limit", AFFINITY_DATABASES, "affinity sweep")
-    _require_values(data, "workers", (FIXED_AFFINITY_WORKERS,), "affinity sweep")
-    _require_complete_grid(
-        data,
-        ["mode", "affinity", "database_limit", "workers"],
-        len(EXPECTED_RUNS) * len(AFFINITY_POINTS) * len(AFFINITY_DATABASES),
-        "affinity sweep",
-    )
+def validate_conflict_sweep(data: pd.DataFrame) -> None:
+    """Require the canonical conflict cells."""
+    _require_values(data, "run", EXPECTED_RUNS, "conflict sweep")
+    _require_values(data, "databases", CONFLICT_DATABASES, "conflict sweep")
+    _require_values(data, "workers", (CONFLICT_WORKERS,), "conflict sweep")
+    _require_values(data, "tx_keys", sorted(CONFLICT_POOLS), "conflict sweep")
+    for tx_keys, pools in CONFLICT_POOLS.items():
+        selected = data[data["tx_keys"] == tx_keys]
+        label = f"conflict sweep with {tx_keys} keys"
+        _require_values(selected, "pool_keys", sorted(pools), label)
+        expected = len(EXPECTED_RUNS) * len(CONFLICT_DATABASES) * len(pools)
+        if len(selected) != expected:
+            raise ReportError(f"{label}: report does not contain the complete cell grid")
 
 
 def median_rows(data: pd.DataFrame, dimensions: list[str]) -> pd.DataFrame:
@@ -239,79 +250,103 @@ def plot_worker_latency(data: pd.DataFrame, out_dir: Path) -> Path:
     return _save(fig, out_dir, "worker-latency.png")
 
 
-def _database_title(databases: int) -> str:
-    suffix = "instance" if databases == 1 else "instances"
-    return f"{databases} DB {suffix}"
+def median_conflict_rows(data: pd.DataFrame) -> pd.DataFrame:
+    """Return cross-run median metrics for each instance count, transaction
+    size, and pool."""
+    return (
+        data.groupby(["databases", "tx_keys", "pool_keys"], as_index=False, sort=True)[
+            list(CONFLICT_METRICS)
+        ]
+        .median()
+        .reset_index(drop=True)
+    )
 
 
-def plot_affinity_throughput(data: pd.DataFrame, out_dir: Path) -> Path:
-    medians = median_rows(data, ["database_limit", "affinity"])
-    colors = _shape_colors()
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
-    for index, (ax, databases) in enumerate(
-        zip(axes.flat, AFFINITY_DATABASES, strict=True)
-    ):
-        database_medians = medians[medians["database_limit"] == databases]
-        _plot_shape_bands(
-            ax,
-            database_medians,
-            "affinity",
-            THROUGHPUT_BAND,
-            colors,
-            labels=index == 0,
+def _conflict_title(metric: str) -> str:
+    """Return the two-line title: the metric, then the bands and the log scale."""
+    band = THROUGHPUT_BAND_TITLE if metric == "throughput" else LATENCY_BAND_TITLE
+    name = "Throughput" if metric == "throughput" else "Latency"
+    return f"{name} by p(conflict)\n{band} (log scale)"
+
+
+def _plot_conflict(data: pd.DataFrame, out_dir: Path, metric: str, name: str) -> Path:
+    """One panel for each instance count, stacked and sharing both axes."""
+    band = THROUGHPUT_BAND if metric == "throughput" else LATENCY_BAND
+    line_column, low_column, high_column = band
+    medians = median_conflict_rows(data)
+    sizes = sorted(medians["tx_keys"].unique())
+    colors = dict(zip(sizes, sns.color_palette("colorblind", len(sizes)), strict=True))
+    instances = sorted(medians["databases"].unique())
+    fig, axes = plt.subplots(
+        len(instances),
+        1,
+        figsize=(12, 4.5 * len(instances)),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+    for ax, databases in zip(axes.flat, instances, strict=True):
+        for size in sizes:
+            line = medians[
+                (medians["databases"] == databases) & (medians["tx_keys"] == size)
+            ].sort_values("conflict_probability")
+            x = 100 * line["conflict_probability"].to_numpy()
+            low, high = line[low_column].to_numpy(), line[high_column].to_numpy()
+            if not pd.isna(high).all():
+                ax.fill_between(
+                    x, low, high, color=colors[size], alpha=0.15, linewidth=0
+                )
+            ax.plot(
+                x,
+                line[line_column].to_numpy(),
+                color=colors[size],
+                marker="o",
+                label=f"{size} key" + ("" if size == 1 else "s"),
+            )
+        ax.set_xlim(0, 100)
+        ax.set_xticks(range(0, 101, 10))
+        ax.xaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda value, _: f"{value:g}%")
         )
-        ax.set_title(_database_title(databases))
-        ax.set_xlabel("Home-collection affinity (%)")
-        ax.set_ylabel("Transactions / sec")
-        ax.set_xticks(AFFINITY_POINTS)
-    handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.suptitle(
-        f"Throughput by home-collection affinity — {THROUGHPUT_BAND_TITLE}", y=0.99
-    )
-    fig.legend(
-        handles,
-        labels,
-        title="Transaction shape",
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.94),
-        ncol=4,
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.80))
-    return _save(fig, out_dir, "affinity-throughput.png")
-
-
-def plot_affinity_latency(data: pd.DataFrame, out_dir: Path) -> Path:
-    medians = median_rows(data, ["database_limit", "affinity"])
-    colors = _shape_colors()
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
-    for index, (ax, databases) in enumerate(
-        zip(axes.flat, AFFINITY_DATABASES, strict=True)
-    ):
-        database_medians = medians[medians["database_limit"] == databases]
-        _plot_shape_bands(
-            ax,
-            database_medians,
-            "affinity",
-            LATENCY_BAND,
-            colors,
-            labels=index == 0,
+        ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+        ax.set_title(f"{databases} DB instance" + ("" if databases == 1 else "s"))
+        ax.set_ylabel(
+            "Transactions / sec" if metric == "throughput" else "Latency (ms)"
         )
-        ax.set_title(_database_title(databases))
-        ax.set_xlabel("Home-collection affinity (%)")
-        ax.set_ylabel("Latency (ms)")
-        ax.set_xticks(AFFINITY_POINTS)
-    handles, labels = axes.flat[0].get_legend_handles_labels()
-    fig.suptitle(f"Latency by home-collection affinity — {LATENCY_BAND_TITLE}", y=0.99)
-    fig.legend(
-        handles,
-        labels,
-        title="Transaction shape",
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.94),
-        ncol=4,
+    axes.flat[-1].set_xlabel("Probability of conflict")
+    axes.flat[0].set_yscale("log")
+    axes.flat[0].legend(title="Keys per transaction")
+    fig.suptitle(_conflict_title(metric))
+    fig.tight_layout()
+    return _save(fig, out_dir, name)
+
+
+def plot_conflict_throughput(data: pd.DataFrame, out_dir: Path) -> Path:
+    return _plot_conflict(data, out_dir, "throughput", "conflict-throughput.png")
+
+
+def plot_conflict_latency(data: pd.DataFrame, out_dir: Path) -> Path:
+    return _plot_conflict(data, out_dir, "latency", "conflict-latency.png")
+
+
+def plot_conflict_report(
+    series: Mapping[str, Path], out_dir: Path, stem: str, name: str | None = None
+) -> list[Path]:
+    """Plot throughput and latency of a conflict sweep against the probability
+    of conflict. It does not overlay several files."""
+    if len(series) != 1:
+        raise ReportError("a conflict sweep cannot be overlaid")
+    path = next(iter(series.values()))
+    _, data = perfbench_results.read_conflict_sweep(
+        path, require_converged=False, name=name
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.80))
-    return _save(fig, out_dir, "affinity-latency.png")
+    unconverged = int((~data["converged"]).sum())
+    if unconverged:
+        print(f"warning: {path}: {unconverged} cells did not converge")
+    return [
+        _plot_conflict(data, out_dir, "throughput", f"{stem}-throughput.png"),
+        _plot_conflict(data, out_dir, "latency", f"{stem}-latency.png"),
+    ]
 
 
 def _mixed_axis(data: pd.DataFrame) -> str:
@@ -510,6 +545,7 @@ def plot_contention_report(
 
 PLOTTERS = {
     "mixed": plot_mixed_report,
+    "conflict-sweep": plot_conflict_report,
     "contention": plot_contention_report,
 }
 
@@ -562,17 +598,17 @@ def _scenario(path: Path, name: str | None) -> str:
     return perfbench_results.read_envelope(path, name)["scenario"]
 
 
-def render(worker_path: Path, affinity_path: Path, out_dir: Path) -> list[Path]:
+def render(worker_path: Path, conflict_path: Path, out_dir: Path) -> list[Path]:
     """Validate both canonical reports and render their four figures."""
     worker_metadata, workers = perfbench_results.read_mixed(
         worker_path, require_converged=True, name="workers"
     )
-    affinity_metadata, affinities = perfbench_results.read_mixed(
-        affinity_path, require_converged=True, name="affinity"
+    conflict_metadata, conflicts = perfbench_results.read_conflict_sweep(
+        conflict_path, require_converged=True, name="conflict-sweep"
     )
-    if _model(worker_metadata) != _model(affinity_metadata):
+    if _model(worker_metadata) != _model(conflict_metadata):
         raise ReportError(
-            "worker and affinity reports must use the same backend and model-time speedup"
+            "worker and conflict reports must use the same backend and model-time speedup"
         )
     if worker_metadata.backend != "memory" or not math.isclose(
         worker_metadata.model_time_speedup, 5.0
@@ -581,12 +617,12 @@ def render(worker_path: Path, affinity_path: Path, out_dir: Path) -> list[Path]:
             "canonical sweeps require --backend=memory and --delay-scale=0.2"
         )
     validate_worker_sweep(workers)
-    validate_affinity_sweep(affinities)
+    validate_conflict_sweep(conflicts)
     return [
         plot_worker_throughput(workers, out_dir),
         plot_worker_latency(workers, out_dir),
-        plot_affinity_throughput(affinities, out_dir),
-        plot_affinity_latency(affinities, out_dir),
+        plot_conflict_throughput(conflicts, out_dir),
+        plot_conflict_latency(conflicts, out_dir),
     ]
 
 
@@ -614,10 +650,12 @@ def main() -> int:
     parser.add_argument(
         "--canonical",
         action="store_true",
-        help="render the fixed worker and affinity figures instead of FILES",
+        help="render the fixed worker and conflict figures instead of FILES",
     )
     parser.add_argument("--workers", type=Path, default=sweeps / "workers.json")
-    parser.add_argument("--affinity", type=Path, default=sweeps / "affinity.json")
+    parser.add_argument(
+        "--conflicts", type=Path, default=sweeps / "conflict-sweep.json"
+    )
     args = parser.parse_args()
     modes = [bool(args.files), bool(args.series), args.canonical]
     if sum(modes) != 1:
@@ -627,7 +665,7 @@ def main() -> int:
 
     sns.set_theme(style="whitegrid", context="talk")
     if args.canonical:
-        render(args.workers, args.affinity, args.out or sweeps)
+        render(args.workers, args.conflicts, args.out or sweeps)
     elif args.series:
         plot_overlay(_parse_series(parser, args.series), args.out)
     else:

@@ -1,0 +1,71 @@
+# The conflict grid of the canonical plots, on 1 and on 5 database instances.
+# All workers run read-modify-write transactions of `keys` random keys from one
+# pool. The size of the pool sets how often two concurrent transactions share a
+# key: a large pool gives rare conflicts, a small pool gives frequent conflicts.
+#
+# A single instance batches the commits of its workers, so it conflicts less
+# than five instances with the same workers. Each pool size has its own seed,
+# and both instance counts share it.
+
+[pools.sweep]
+keys = 5000
+
+[shapes.rw-1]
+kind = "read-modify-write"
+pool = "sweep"
+source = "pool"
+keys = 1
+
+[shapes.rw-4]
+kind = "read-modify-write"
+pool = "sweep"
+source = "pool"
+keys = 4
+
+[workloads.rw-1.groups.all]
+shapes = { rw-1 = "cell" }
+
+[workloads.rw-4.groups.all]
+shapes = { rw-4 = "cell" }
+
+[cell]
+workload = "rw-1"
+workers = 20
+# One pool for all instances, so that every worker can conflict with every other.
+collections = 1
+
+[cell.warm-up]
+timeout = "10s"
+
+# A cell of four-key transactions on a small pool needs more than the default
+# 60 s to commit the target of the windows.
+[cell.measure]
+max-duration = "200s"
+
+# One cell for each pool size of each transaction size. A transaction of four keys
+# conflicts with a concurrent one with a chance above 99% in a pool of 50 keys or
+# fewer, so its pools stop at 100 keys, where the plot can still tell the cells apart.
+[[axes]]
+name = "conflict"
+values = [
+  { label = "keys1-pool5000", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 5000 } },
+  { label = "keys1-pool1000", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 1000 } },
+  { label = "keys1-pool500", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 500 } },
+  { label = "keys1-pool200", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 200 } },
+  { label = "keys1-pool100", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 100 } },
+  { label = "keys1-pool50", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 50 } },
+  { label = "keys1-pool20", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 20 } },
+  { label = "keys1-pool10", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 10 } },
+  { label = "keys1-pool5", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 5 } },
+  { label = "keys4-pool5000", set = { "cell.workload" = "rw-4", "pools.sweep.keys" = 5000 } },
+  { label = "keys4-pool2000", set = { "cell.workload" = "rw-4", "pools.sweep.keys" = 2000 } },
+  { label = "keys4-pool1000", set = { "cell.workload" = "rw-4", "pools.sweep.keys" = 1000 } },
+  { label = "keys4-pool500", set = { "cell.workload" = "rw-4", "pools.sweep.keys" = 500 } },
+  { label = "keys4-pool300", set = { "cell.workload" = "rw-4", "pools.sweep.keys" = 300 } },
+  { label = "keys4-pool200", set = { "cell.workload" = "rw-4", "pools.sweep.keys" = 200 } },
+  { label = "keys4-pool100", set = { "cell.workload" = "rw-4", "pools.sweep.keys" = 100 } },
+]
+
+[[axes]]
+path = "cell.databases"
+values = [1, 5]

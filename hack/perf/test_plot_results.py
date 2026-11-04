@@ -21,7 +21,7 @@ from unittest import mock
 
 import perfbench_results
 import plot_results as plotter
-from perfbench_fixtures import contention_cell, mixed_cell
+from perfbench_fixtures import conflict_cell, contention_cell, mixed_cell
 
 
 def read_canonical(path: Path):
@@ -97,25 +97,27 @@ def worker_report() -> dict:
     )
 
 
-def affinity_report() -> dict:
+def conflict_report() -> dict:
     return report(
         [
             {
                 "run": run,
                 "cells": [
-                    cell(
-                        run,
-                        affinity,
-                        databases,
-                        plotter.FIXED_AFFINITY_WORKERS,
+                    conflict_cell(
+                        tx_keys,
+                        pool_keys,
+                        workers=plotter.CONFLICT_WORKERS,
+                        databases=databases,
+                        value=float(run * 100 + pool_keys + databases),
                     )
-                    for affinity in plotter.AFFINITY_POINTS
-                    for databases in plotter.AFFINITY_DATABASES
+                    for tx_keys, pools in plotter.CONFLICT_POOLS.items()
+                    for pool_keys in pools
+                    for databases in plotter.CONFLICT_DATABASES
                 ],
             }
             for run in plotter.EXPECTED_RUNS
         ],
-        "affinity",
+        "conflict-sweep",
     )
 
 
@@ -129,17 +131,19 @@ class MixedSweepPlotterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory_name:
             directory = Path(directory_name)
             workers_path = self.write_report(directory, "workers.json", worker_report())
-            affinity_path = self.write_report(
-                directory, "affinity.json", affinity_report()
+            conflict_path = self.write_report(
+                directory, "conflict-sweep.json", conflict_report()
             )
             worker_metadata, workers = read_canonical(workers_path)
-            affinity_metadata, affinities = read_canonical(affinity_path)
+            conflict_metadata, conflicts = perfbench_results.read_conflict_sweep(
+                conflict_path, require_converged=True
+            )
 
         self.assertEqual(
-            plotter._model(worker_metadata), plotter._model(affinity_metadata)
+            plotter._model(worker_metadata), plotter._model(conflict_metadata)
         )
         plotter.validate_worker_sweep(workers)
-        plotter.validate_affinity_sweep(affinities)
+        plotter.validate_conflict_sweep(conflicts)
         medians = plotter.median_rows(workers, ["workers"])
         row = medians[
             (medians["workers"] == 1) & (medians["shape"] == "rwSingle")
@@ -162,7 +166,7 @@ class MixedSweepPlotterTest(unittest.TestCase):
                 read_canonical(path)
 
     def test_unconverged_shape_is_rejected(self) -> None:
-        invalid = affinity_report()
+        invalid = worker_report()
         runs_of(invalid)[0]["cells"][0]["shapes"][0]["converged"] = False
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write_report(Path(directory_name), "invalid.json", invalid)
@@ -225,12 +229,81 @@ class MixedSweepPlotterTest(unittest.TestCase):
         self.assertEqual(len(axis.collections), 0)
         plotter.plt.close(figure)
 
-    def test_affinity_figures_are_faceted_by_database_count(self) -> None:
+    def test_conflict_cells_have_probability_and_replays(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             path = self.write_report(
-                Path(directory_name), "affinity.json", affinity_report()
+                Path(directory_name), "conflict-sweep.json", conflict_report()
             )
-            _, affinities = read_canonical(path)
+            _, conflicts = perfbench_results.read_conflict_sweep(
+                path, require_converged=True
+            )
+
+        row = conflicts[
+            (conflicts["run"] == 1)
+            & (conflicts["databases"] == 5)
+            & (conflicts["tx_keys"] == 1)
+            & (conflicts["pool_keys"] == 5000)
+        ].iloc[0]
+        # 19 other transactions of one key each, in a pool of 5,000 keys.
+        self.assertAlmostEqual(row["conflict_probability"], 1 - (4999 / 5000) ** 19)
+        self.assertAlmostEqual(row["replays_per_tx"], 51.05)
+        self.assertEqual(row["p50_ms"], 10210.0)
+        self.assertAlmostEqual(row["throughput_p50"], 5100.0)
+
+    def test_conflict_probability_covers_the_edges(self) -> None:
+        probability = perfbench_results.conflict_probability
+        self.assertEqual(probability(10, 1, 1), 0.0)
+        self.assertEqual(probability(4, 4, 2), 1.0)
+        self.assertEqual(probability(3, 4, 2), 1.0)
+        # Two transactions of two keys in a pool of four share no key with
+        # chance 1/6.
+        self.assertAlmostEqual(probability(4, 2, 2), 5 / 6)
+
+    def test_conflict_grid_must_be_complete(self) -> None:
+        invalid = conflict_report()
+        del runs_of(invalid)[0]["cells"][0]
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(Path(directory_name), "invalid.json", invalid)
+            _, conflicts = perfbench_results.read_conflict_sweep(
+                path, require_converged=True
+            )
+        with self.assertRaisesRegex(plotter.ReportError, "complete cell grid"):
+            plotter.validate_conflict_sweep(conflicts)
+
+    def test_conflict_label_must_name_the_keys(self) -> None:
+        invalid = conflict_report()
+        runs_of(invalid)[0]["cells"][0]["labels"]["conflict"] = "wide"
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(Path(directory_name), "invalid.json", invalid)
+            with self.assertRaisesRegex(plotter.ReportError, "keys<K>-pool<N>"):
+                perfbench_results.read_conflict_sweep(path, require_converged=True)
+
+    def test_unconverged_conflict_cell_is_rejected_when_required(self) -> None:
+        invalid = conflict_report()
+        runs_of(invalid)[0]["cells"][0]["shapes"][0]["converged"] = False
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(Path(directory_name), "invalid.json", invalid)
+            with self.assertRaisesRegex(plotter.ReportError, "did not converge"):
+                perfbench_results.read_conflict_sweep(path, require_converged=True)
+            perfbench_results.read_conflict_sweep(path, require_converged=False)
+
+    def test_conflict_instance_counts_are_separate_cells(self) -> None:
+        invalid = conflict_report()
+        cells = runs_of(invalid)[0]["cells"]
+        cells.append(copy.deepcopy(cells[0]))
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(Path(directory_name), "invalid.json", invalid)
+            with self.assertRaisesRegex(plotter.ReportError, "duplicate"):
+                perfbench_results.read_conflict_sweep(path, require_converged=True)
+
+    def test_conflict_figures_have_one_line_and_band_per_size(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(
+                Path(directory_name), "conflict-sweep.json", conflict_report()
+            )
+            _, conflicts = perfbench_results.read_conflict_sweep(
+                path, require_converged=True
+            )
 
         figures = {}
 
@@ -239,73 +312,58 @@ class MixedSweepPlotterTest(unittest.TestCase):
             return out_dir / name
 
         with mock.patch.object(plotter, "_save", side_effect=capture):
-            plotter.plot_affinity_throughput(affinities, Path("plots"))
-            plotter.plot_affinity_latency(affinities, Path("plots"))
+            plotter.plot_conflict_throughput(conflicts, Path("plots"))
+            plotter.plot_conflict_latency(conflicts, Path("plots"))
 
-        expected_titles = [
-            "1 DB instance",
-            "3 DB instances",
-            "5 DB instances",
-            "7 DB instances",
-        ]
-        throughput = figures["affinity-throughput.png"]
-        latency = figures["affinity-latency.png"]
-        self.assertEqual(
-            [axis.get_title() for axis in throughput.axes], expected_titles
-        )
-        self.assertEqual([axis.get_title() for axis in latency.axes], expected_titles)
-        self.assertTrue(
-            all(len(axis.lines) == len(plotter.SHAPES) for axis in throughput.axes)
-        )
-        self.assertTrue(
-            all(
-                len(axis.collections) == len(plotter.SHAPES)
-                for axis in throughput.axes
+        for name in ("conflict-throughput.png", "conflict-latency.png"):
+            axes = figures[name].axes
+            self.assertEqual(
+                [axis.get_title() for axis in axes], ["1 DB instance", "5 DB instances"]
             )
-        )
-        self.assertTrue(
-            all(len(axis.lines) == len(plotter.SHAPES) for axis in latency.axes)
-        )
-        self.assertTrue(
-            all(len(axis.collections) == len(plotter.SHAPES) for axis in latency.axes)
-        )
-        self.assertEqual(len(latency.legends), 1)
-        self.assertEqual(
-            [text.get_text() for text in latency.legends[0].get_texts()],
-            [plotter.SHAPE_LABELS[shape] for shape in plotter.SHAPES],
-        )
-        plotter.plt.close(throughput)
-        plotter.plt.close(latency)
+            title = figures[name].get_suptitle().split("\n")
+            self.assertEqual(len(title), 2)
+            self.assertTrue(title[1].endswith("(log scale)"))
+            for axis in axes:
+                self.assertEqual(axis.get_yscale(), "log")
+                self.assertEqual(len(axis.lines), len(plotter.CONFLICT_POOLS))
+                self.assertEqual(len(axis.collections), len(plotter.CONFLICT_POOLS))
+                self.assertEqual(axis.get_xscale(), "linear")
+                self.assertEqual(axis.get_xlim(), (0, 100))
+            self.assertEqual(
+                [text.get_text() for text in axes[0].get_legend().get_texts()],
+                ["1 key", "4 keys"],
+            )
+            plotter.plt.close(figures[name])
 
     def test_render_writes_all_four_figures(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
             directory = Path(directory_name)
             workers_path = self.write_report(directory, "workers.json", worker_report())
-            affinity_path = self.write_report(
-                directory, "affinity.json", affinity_report()
+            conflict_path = self.write_report(
+                directory, "conflict-sweep.json", conflict_report()
             )
-            outputs = plotter.render(workers_path, affinity_path, directory / "plots")
+            outputs = plotter.render(workers_path, conflict_path, directory / "plots")
 
             self.assertEqual(
                 {path.name for path in outputs},
                 {
                     "worker-throughput.png",
                     "worker-latency.png",
-                    "affinity-throughput.png",
-                    "affinity-latency.png",
+                    "conflict-throughput.png",
+                    "conflict-latency.png",
                 },
             )
             self.assertTrue(all(path.stat().st_size > 0 for path in outputs))
 
     def test_reports_must_use_the_same_backend_configuration(self) -> None:
-        affinity = copy.deepcopy(affinity_report())
-        affinity["modelTimeSpeedup"] = 1.0
+        conflict = copy.deepcopy(conflict_report())
+        conflict["modelTimeSpeedup"] = 1.0
         with tempfile.TemporaryDirectory() as directory_name:
             directory = Path(directory_name)
             workers_path = self.write_report(directory, "workers.json", worker_report())
-            affinity_path = self.write_report(directory, "affinity.json", affinity)
+            conflict_path = self.write_report(directory, "conflict-sweep.json", conflict)
             with self.assertRaisesRegex(plotter.ReportError, "same backend"):
-                plotter.render(workers_path, affinity_path, directory / "plots")
+                plotter.render(workers_path, conflict_path, directory / "plots")
 
 
 class GenericPlotterTest(unittest.TestCase):
@@ -415,6 +473,30 @@ class GenericPlotterTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(plotter.ReportError, "exactly one"):
                 plotter.plot_file(path, directory)
+
+    def test_conflict_report_is_plotted_without_canonical_grid(self) -> None:
+        value = report(
+            [{"run": 1, "cells": [conflict_cell(1, 100), conflict_cell(1, 10)]}],
+            "conflict-sweep",
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            path = self.write_report(directory, "probe.json", value)
+            outputs = plotter.plot_file(path, directory / "plots")
+
+            self.assertEqual(
+                {output.name for output in outputs},
+                {"probe-throughput.png", "probe-latency.png"},
+            )
+
+    def test_conflict_reports_are_not_overlaid(self) -> None:
+        value = report([{"run": 1, "cells": [conflict_cell(1, 100)]}], "conflict-sweep")
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            a = self.write_report(directory, "a.json", value)
+            b = self.write_report(directory, "b.json", value)
+            with self.assertRaisesRegex(plotter.ReportError, "cannot be overlaid"):
+                plotter.plot_overlay({"a": a, "b": b}, directory / "plots")
 
     def test_contention_report_plots_full_overlap_cells(self) -> None:
         with tempfile.TemporaryDirectory() as directory_name:
