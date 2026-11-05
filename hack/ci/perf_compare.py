@@ -72,13 +72,22 @@ def capture(command: list[str], cwd: Path) -> str:
 
 
 def snapshot(repo: Path, destination: Path, revision: str | None) -> None:
+    """Copy the files of `revision`, or of the working tree, to `destination`.
+
+    Each file gets the current time as its modification time. Cargo treats an
+    artifact as fresh when it is newer than its sources, so a snapshot that
+    kept older times could reuse artifacts that another snapshot built into the
+    same target directory.
+    """
     destination.mkdir()
     if revision:
         with subprocess.Popen(
             ["git", "archive", revision], cwd=repo, stdout=subprocess.PIPE
         ) as source:
             subprocess.run(
-                ["tar", "-x", "-C", str(destination)], stdin=source.stdout, check=True
+                ["tar", "-x", "-m", "-C", str(destination)],
+                stdin=source.stdout,
+                check=True,
             )
             if source.wait() != 0:
                 raise RuntimeError(f"cannot archive revision {revision}")
@@ -92,7 +101,7 @@ def snapshot(repo: Path, destination: Path, revision: str | None) -> None:
             if source.is_file() or source.is_symlink():
                 target = destination / name
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, target, follow_symlinks=False)
+                shutil.copy(source, target, follow_symlinks=False)
 
 
 def use_harness(candidate: Path, base: Path) -> str:
@@ -190,8 +199,6 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         snapshot(
             repo, snapshots / "pr", manifest["candidateCommit"] if candidate else None
         )
-        # Keep a pristine copy for the fallback below, as use_harness overwrites.
-        shutil.copytree(snapshots / "main", snapshots / "main-own")
         manifest["harnessSha256"] = use_harness(snapshots / "pr", snapshots / "main")
         targets = repo / "target/performance"
         try:
@@ -202,17 +209,18 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
             # The candidate harness needs APIs that the base lacks. Measure both
             # engines with the base harness, so that the sides stay comparable.
             print(f"{error}; retrying with the base harness", file=sys.stderr)
-            manifest["harnessSha256"] = use_harness(
-                snapshots / "main-own", snapshots / "pr"
-            )
+            # use_harness replaced the harness of the base snapshot. A new
+            # snapshot is also newer than the artifacts of the failed build, so
+            # cargo does not reuse the candidate harness that they came from.
+            shutil.rmtree(snapshots / "main")
+            snapshot(repo, snapshots / "main", manifest["baseCommit"])
+            manifest["harnessSha256"] = use_harness(snapshots / "main", snapshots / "pr")
             manifest["harness"] = "base"
             manifest["warnings"].append(
                 f"The candidate harness does not build against {base}; "
                 "both revisions were measured with the harness of the base."
             )
-            manifest["main"] = build(
-                snapshots / "main-own", targets / "main", output, "main"
-            )
+            manifest["main"] = build(snapshots / "main", targets / "main", output, "main")
         manifest["pr"] = build(snapshots / "pr", targets / "pr", output, "pr")
         # The candidate snapshot has the harness that both sides use, and the
         # measurement reads its experiment files after the snapshots are gone.

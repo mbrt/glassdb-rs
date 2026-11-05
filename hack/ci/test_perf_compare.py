@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,8 +37,10 @@ class HarnessTest(unittest.TestCase):
         """Prepare a comparison of fake snapshots, and return what the sides
         built, the manifest, and the experiment file that both sides read."""
         built = []
+        self.events = []
 
         def fake_snapshot(repo, destination, revision):
+            self.events.append(("snapshot", destination.name))
             harness = destination / "crates/glassdb-bench-scale"
             harness.mkdir(parents=True)
             (harness / "main.rs").write_text(destination.name)
@@ -49,6 +53,7 @@ class HarnessTest(unittest.TestCase):
         def fake_build(source, target, output, side, log=None):
             harness = (source / "crates/glassdb-bench-scale/main.rs").read_text()
             built.append((side, harness))
+            self.events.append(("build", side))
             if fail_candidate_harness and side == "main" and harness == "pr":
                 raise RuntimeError("unsupported comparison")
             return {"perfbench": f"{side}-perfbench"}
@@ -84,6 +89,19 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(manifest["harness"], "base")
         self.assertEqual(len(manifest["warnings"]), 1)
         self.assertEqual(experiment, "main")
+        # The base snapshot of the second build must be newer than the
+        # artifacts of the failed build in the same target directory.
+        self.assertEqual(
+            self.events,
+            [
+                ("snapshot", "main"),
+                ("snapshot", "pr"),
+                ("build", "main"),
+                ("snapshot", "main"),
+                ("build", "main"),
+                ("build", "pr"),
+            ],
+        )
 
     def test_a_base_harness_without_experiment_files_is_unsupported(self):
         with self.assertRaisesRegex(RuntimeError, "harness has no"):
@@ -106,6 +124,32 @@ class HarnessTest(unittest.TestCase):
             self.assertEqual((root / "copy/untracked").read_text(), "new file")
             self.assertFalse((root / "copy/deleted").exists())
             self.assertFalse((root / "copy/.git").exists())
+
+    def test_snapshots_are_newer_than_artifacts_built_before_them(self):
+        # Cargo reuses an artifact that is newer than its sources, so a snapshot
+        # must not keep the commit time or the time of the working-tree file.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "source"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / "file").write_text("old")
+            past = "2001-01-01T00:00:00Z"
+            os.utime(repo / "file", (978307200, 978307200))
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"],
+                cwd=repo,
+                check=True,
+                env={**os.environ, "GIT_AUTHOR_DATE": past, "GIT_COMMITTER_DATE": past},
+            )
+            start = time.time() - 1
+            perf_compare.snapshot(repo, root / "revision", "HEAD")
+            perf_compare.snapshot(repo, root / "worktree", None)
+            for copy in ("revision", "worktree"):
+                with self.subTest(copy=copy):
+                    self.assertEqual((root / copy / "file").read_text(), "old")
+                    self.assertGreater((root / copy / "file").stat().st_mtime, start)
 
 
 class MeasurementTest(unittest.TestCase):

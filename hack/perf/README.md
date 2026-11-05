@@ -160,8 +160,11 @@ tests.
 candidate's `glassdb-bench-scale` crate into disposable snapshots of both
 revisions, then builds each against its own engine. Both sides run the
 experiments of the candidate that have the tag `ci`. The current
-source tree is not changed. Unsupported engine APIs fail the comparison; old
-workloads are not silently substituted.
+source tree is not changed.
+
+If the candidate's harness does not build against the base engine, for example
+because it uses an API that the base does not have, both sides use the harness
+of the base, and the report says so.
 
 ```bash
 # main against the current worktree
