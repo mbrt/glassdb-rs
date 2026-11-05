@@ -12,12 +12,16 @@ const MEMORY_MODEL: [&str; 5] = [
     "--progress=never",
 ];
 
+macro_rules! experiments {
+    () => {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../hack/perf/experiments")
+    };
+}
+
+const EXPERIMENTS: &str = experiments!();
+
 /// The experiments that CI compares.
-const DEFAULT_EXPERIMENTS: &str = concat!(
-    "--experiment=",
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../hack/perf/experiments/default"
-);
+const CI_EXPERIMENTS: [&str; 2] = [concat!("--experiment=", experiments!()), "--tag=ci"];
 
 fn perfbench(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_perfbench"))
@@ -26,8 +30,8 @@ fn perfbench(arguments: &[&str]) -> Output {
         .unwrap()
 }
 
-fn virtual_default_report() -> Value {
-    let output = perfbench(&[&MEMORY_MODEL[..], &["--time=virtual", DEFAULT_EXPERIMENTS]].concat());
+fn virtual_ci_report() -> Value {
+    let output = perfbench(&[&MEMORY_MODEL[..], &["--time=virtual"], &CI_EXPERIMENTS].concat());
     assert!(output.status.success(), "{output:?}");
     serde_json::from_slice(&output.stdout).unwrap()
 }
@@ -35,7 +39,7 @@ fn virtual_default_report() -> Value {
 /// The experiments whose persisted records carry a timestamp. The anchor of the wall
 /// clock is the start time of the process, so the size of these records, and
 /// with it the delay of their writes, moves by under 1% between processes.
-const TIMESTAMPED_EXPERIMENTS: [&str; 2] = ["rmw_external_1025", "rmw_five_leaves"];
+const TIMESTAMPED_EXPERIMENTS: [&str; 2] = ["rmw-external", "rmw-five-leaves"];
 
 /// The numbers that a comparison of two revisions reads.
 fn measured(report: &Value) -> Vec<Value> {
@@ -61,10 +65,15 @@ fn measured(report: &Value) -> Vec<Value> {
 // reason to use virtual time.
 #[test]
 fn virtual_runs_repeat_exactly() {
-    let first = virtual_default_report();
-    let second = virtual_default_report();
+    let first = virtual_ci_report();
+    let second = virtual_ci_report();
 
-    assert_eq!(first["experiments"].as_array().unwrap().len(), 9);
+    let experiments = first["experiments"].as_array().unwrap();
+    assert!(!experiments.is_empty());
+    for experiment in experiments {
+        let tags = experiment["tags"].as_array().unwrap();
+        assert!(tags.contains(&"ci".into()), "{experiment}");
+    }
     assert_eq!(first["timeMode"], "virtual");
     assert_eq!(first["modelTimeSpeedup"], 1.0);
     assert_eq!(measured(&first), measured(&second));
@@ -74,15 +83,15 @@ fn virtual_runs_repeat_exactly() {
 fn virtual_time_rejects_what_it_cannot_skip() {
     for (arguments, message) in [
         (
-            ["--backend=fakes3", "--time=virtual", DEFAULT_EXPERIMENTS].as_slice(),
+            ["--backend=fakes3", "--time=virtual"].as_slice(),
             "needs --backend=memory",
         ),
         (
-            ["--time=virtual", "--delay-scale=0.2", DEFAULT_EXPERIMENTS].as_slice(),
+            ["--time=virtual", "--delay-scale=0.2"].as_slice(),
             "does not combine with --delay-scale",
         ),
     ] {
-        let output = perfbench(arguments);
+        let output = perfbench(&[arguments, &CI_EXPERIMENTS].concat());
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains(message), "{stderr}");
@@ -93,18 +102,14 @@ fn virtual_time_rejects_what_it_cannot_skip() {
 fn a_failed_experiment_keeps_the_results_of_the_experiments_before_it() {
     let dir = std::env::temp_dir().join(format!("perfbench-partial-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let default = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../hack/perf/experiments/default"
-    );
-    let first = format!("--experiment={default}/warm_read.toml");
+    let first = format!("--experiment={EXPERIMENTS}/read-warm.toml");
     // A pass condition needs a sequence source, and the runner finds out only
     // when the cell starts.
     let failing = dir.join("no_passes.toml");
     std::fs::write(
         &failing,
         format!(
-            "include = [\"{default}/../../configs/default.toml\"]\n\
+            "include = [\"{EXPERIMENTS}/../configs/default.toml\"]\n\
              [cell]\nworkload = \"diag-read\"\n[cell.measure]\nuntil = \"passes\"\n"
         ),
     )
@@ -136,6 +141,6 @@ fn a_failed_experiment_keeps_the_results_of_the_experiments_before_it() {
         .iter()
         .map(|experiment| experiment["name"].clone())
         .collect();
-    assert_eq!(names, ["warm_read"]);
+    assert_eq!(names, ["read-warm"]);
     std::fs::remove_dir_all(&dir).unwrap();
 }

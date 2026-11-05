@@ -1,8 +1,8 @@
-# The settings of the default experiments, which CI compares between two
-# revisions: single transactions of one worker with warm caches, and four
-# shapes at the same time on one leaf. Each experiment of
-# `experiments/default/` includes this file and selects one workload. The
-# experiments are the cases of the former Criterion suite, with their names.
+# The settings of the experiments with the tag `ci`, which CI compares between
+# two revisions: single transactions of one worker with warm caches, and four
+# shapes at the same time on one leaf. Each of these experiments includes this
+# file and selects one workload. The experiments are the cases of the former
+# Criterion suite.
 #
 # The window of 10 s ends before the first background pass of the garbage
 # collector, so the counters of a run do not depend on the random cadence of

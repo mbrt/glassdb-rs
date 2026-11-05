@@ -229,8 +229,8 @@ cells were within 0.99 to 1.04.
 ## 2026-10-29: experiments that need real time
 
 Status: of the experiments that had no known time mode, `inline-pressure` and
-`contention` show the same behavior in virtual time, so they are in
-`hack/perf/experiments/any-time`. `split-merge-fight` and `membership-churn`
+`contention` show the same behavior in virtual time, so they have the tag
+`time/virtual`. `split-merge-fight` and `membership-churn`
 need real time: in virtual time, the `avoidable` policy does not split, and the
 direct churner is 13 times as fast.
 
@@ -267,8 +267,8 @@ set of runs, which ran alternated.
 
 ### Loads
 
-The `perfbench` experiments `hack/perf/experiments/real-time/random-ranges.toml`
-and `hack/perf/experiments/real-time/fixed-ranges.toml` have one collection of
+The `perfbench` experiments `hack/perf/experiments/random-ranges.toml`
+and `hack/perf/experiments/fixed-ranges.toml` have one collection of
 20,000 keys, with 8 workers of `rw-single` and of `ro-single`, and two cells:
 one database instance, and five that share the collection.
 
@@ -673,7 +673,7 @@ quiet. Throughput and writes for each transaction, as ratios to A:
 
 ### False sharing
 
-The `perfbench` experiment `hack/perf/experiments/real-time/false-sharing.toml`
+The `perfbench` experiment `hack/perf/experiments/false-sharing.toml`
 has one collection of 4,096 keys. The runs of this entry used a version of it with
 other variants of the topology. Four database instances, each with 4 workers,
 wrote one key each: the keys 0 to 3. One more database instance, with 32

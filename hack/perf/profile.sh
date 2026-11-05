@@ -6,26 +6,35 @@
 #
 # Usage:
 #   hack/perf/profile.sh
-#   CASE=rmw_inline_1024 hack/perf/profile.sh
-#   EXPERIMENT=hack/perf/experiments/real-time/mixed.toml hack/perf/profile.sh
+#   CASE=rmw-inline hack/perf/profile.sh
+#   EXPERIMENT=hack/perf/experiments/mixed.toml hack/perf/profile.sh
 #
 # Tunables (env):
-#   EXPERIMENT        perfbench experiment file or directory
-#                     (default hack/perf/experiments/default)
-#   CASE              one experiment of hack/perf/experiments/default, in place
-#                     of EXPERIMENT (default: all)
-#   SECONDS_PER_CASE  measured wall time of each default experiment (default 10)
+#   EXPERIMENT        perfbench experiment file or directory (default: the
+#                     experiments of hack/perf/experiments with the tag `ci`)
+#   CASE              one experiment of hack/perf/experiments with the tag `ci`,
+#                     in place of EXPERIMENT (default: all)
+#   SECONDS_PER_CASE  measured wall time of each experiment with the tag `ci`
+#                     (default 10)
 #   OUT               output directory for artifacts (default hack/perf)
 
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-DEFAULT=hack/perf/experiments/default
-EXPERIMENT="${EXPERIMENT:-$DEFAULT}"
+EXPERIMENTS=hack/perf/experiments
+EXPERIMENT="${EXPERIMENT:-}"
 CASE="${CASE:-}"
+# The CI experiments have a fixed length, which SECONDS_PER_CASE replaces.
+ci=false
 if [[ -n "$CASE" ]]; then
-	EXPERIMENT="$DEFAULT/$CASE.toml"
+	selection=(--experiment="$EXPERIMENTS/$CASE.toml" --tag=ci)
+	ci=true
+elif [[ -n "$EXPERIMENT" ]]; then
+	selection=(--experiment="$EXPERIMENT")
+else
+	selection=(--experiment="$EXPERIMENTS" --tag=ci)
+	ci=true
 fi
 SECONDS_PER_CASE="${SECONDS_PER_CASE:-10}"
 OUT="${OUT:-hack/perf}"
@@ -37,10 +46,10 @@ folded="$OUT/flamegraph.folded"
 cargo_sel=(-p glassdb-bench-scale --bin perfbench)
 run_args=(
 	--latency-jitter=false
-	--experiment="$EXPERIMENT"
+	"${selection[@]}"
 	--output="$OUT/profile.json"
 )
-if [[ "$(realpath -m "$EXPERIMENT")" == "$(realpath -m "$DEFAULT")"* ]]; then
+if [[ "$ci" == true ]]; then
 	# perfbench durations are model time, and the default model clock runs five
 	# times as fast as wall time.
 	model_seconds=$((SECONDS_PER_CASE * 5))

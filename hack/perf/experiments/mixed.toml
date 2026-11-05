@@ -1,5 +1,6 @@
 # Both conflict levels at five collection affinities.
-include = ["../../configs/common-workloads.toml"]
+tags = ["time/real", "area/mixed"]
+include = ["../configs/common-workloads.toml"]
 
 [[axes]]
 path = "cell.workload"

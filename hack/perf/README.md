@@ -14,54 +14,51 @@ Manual experiments that use these tools are recorded in
 | `compare_refs.sh` | Compares two revisions with the CI comparison driver. |
 | `perfbench_results.py` | Reads the result files; the other tools use it. |
 | `profile.sh` | Records a CPU flamegraph of one experiment. |
-| `experiments/` | The experiment files, each for `--experiment`, in a directory for the time mode that they need. [Experiments](#experiments) lists them. |
+| `experiments/` | The experiment files, each for `--experiment`. [Experiments](#experiments) lists them and their tags. |
 | `configs/` | Files that experiment files include. |
 
 ## Experiments
 
-The directory of an experiment in `hack/perf/experiments` tells which time mode
-it needs:
+Each file in `hack/perf/experiments` is one experiment. Its `tags` classify
+it, and `--tag` and `--exclude-tag` select experiments by them. A tag is a
+label, or a `<topic>/<value>` pair. perfbench does not check them. The
+repository uses these tags:
 
-- `default/`: the experiments of the CI comparison and of `make bench`. They
-  run in virtual time, so that two revisions compare with results that repeat.
-  Some of them do not give the results of real time, for example
-  `rmw_shared_leaf_three_transactions` (see `--time=virtual` in the crate
-  README).
-- `any-time/`: experiments that show the same behavior in virtual time and in
-  real time. Their absolute values can differ, because latencies in virtual
-  time have no timer rounding.
-- `real-time/`: experiments that need real time. In virtual time, CPU takes no
-  model time, and identical workers batch better (see `--time=virtual` in the
-  crate README), so they show a different behavior.
+| Tag | Meaning |
+| --- | --- |
+| `ci` | An experiment of the CI comparison and of `make bench`. These run in virtual time, so that two revisions compare with results that repeat. |
+| `time/virtual` | The experiment shows the behavior that it is for in virtual time. Its absolute values can differ from real time, because latencies in virtual time have no timer rounding. Some `ci` experiments do not give the results of real time, for example `rmw-shared-leaf` (see `--time=virtual` in the crate README). |
+| `time/real` | The experiment needs real time. In virtual time, CPU takes no model time, and identical workers batch better (see `--time=virtual` in the crate README), so it shows a different behavior. |
+| `canonical` | An input of the [canonical plots](#plotting-results). |
+| `area/<topic>` | The topic of the experiment: `read`, `inline`, `commit`, `contention`, `topology`, or `mixed` (the [mixed workloads](#mixed-workloads)). |
 
-Put a new experiment in `any-time/` when it shows the same behavior in virtual
-time, so that fast runs can use it.
+Give each experiment one `time/` tag. Give a new experiment `time/virtual` when
+it shows the same behavior in virtual time, so that fast runs can use it.
 
-perfbench does not check the time mode. `make bench-all` runs all experiments in
-real time, and `make bench-all TIME=virtual` runs `default/` and `any-time/` in
-virtual time.
+`make bench-all` runs all experiments in real time, and `make bench-all
+TIME=virtual` runs the experiments with the tag `time/virtual` in virtual time.
 
-| Experiment | Directory | What it measures |
+| Experiment | Time | What it measures |
 | --- | --- | --- |
-| The cases of [Default experiments](#default-experiments) | `default` | Single transactions of one worker with warm caches, and their backend costs, and four shapes at the same time on one leaf. Each case has a fixed length of 10 s. |
-| `inline-pressure` | `any-time` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
-| `contention` | `any-time` | Five writers whose transactions share some of their 1 to 6 keys. |
-| `split-merge-fight` | `real-time` | A stable load under which both a split and a merge of one leaf make sense. The default topology policy must settle at one leaf or at two leaves, from a start of either one. |
-| `membership-churn` | `real-time` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
-| `mixed` | `real-time` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
-| `workers` | `real-time` | The worker grid of the canonical plots: 1 to 200 workers per shape, each count after the warm-up of the count before it. |
-| `affinity` | `real-time` | The affinity grid: 5 affinities × 1, 3, 5, and 7 database instances. It is not part of the canonical plots. |
-| `conflict-sweep` | `real-time` | The conflict grid of the canonical plots: 20 workers on 1 and on 5 database instances run read-modify-write transactions of 1 or 4 keys on one pool, from 5,000 keys down to 5 keys (1 key) or 100 keys (4 keys). A smaller pool gives more conflicts. |
-| `load-shift` | `real-time` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
-| `false-sharing` | `real-time` | Four instances that each write one of four adjacent keys of one leaf, while one more instance reads and writes the keys around them (ADR-084). The default topology policy must split the keys of the four instances apart. |
-| `fixed-ranges` | `real-time` | Transactions on fixed ranges of 16 and 64 keys, with transactions on single keys (ADR-084). |
-| `random-ranges` | `real-time` | Transactions on ranges of 16 and 64 adjacent keys from random starts, on fixed sets of 3 keys, and on single keys (ADR-084). |
+| The cases of [CI experiments](#ci-experiments) | `time/virtual` | Single transactions of one worker with warm caches, and their backend costs, and four shapes at the same time on one leaf. Each case has a fixed length of 10 s. |
+| `inline-pressure` | `time/virtual` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
+| `contention` | `time/virtual` | Five writers whose transactions share some of their 1 to 6 keys. |
+| `split-merge-fight` | `time/real` | A stable load under which both a split and a merge of one leaf make sense. The default topology policy must settle at one leaf or at two leaves, from a start of either one. |
+| `membership-churn` | `time/real` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
+| `mixed` | `time/real` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
+| `workers` | `time/real` | The worker grid of the canonical plots: 1 to 200 workers per shape, each count after the warm-up of the count before it. |
+| `affinity` | `time/real` | The affinity grid: 5 affinities × 1, 3, 5, and 7 database instances. It is not part of the canonical plots. |
+| `conflict-sweep` | `time/real` | The conflict grid of the canonical plots: 20 workers on 1 and on 5 database instances run read-modify-write transactions of 1 or 4 keys on one pool, from 5,000 keys down to 5 keys (1 key) or 100 keys (4 keys). A smaller pool gives more conflicts. |
+| `load-shift` | `time/real` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
+| `false-sharing` | `time/real` | Four instances that each write one of four adjacent keys of one leaf, while one more instance reads and writes the keys around them (ADR-084). The default topology policy must split the keys of the four instances apart. |
+| `fixed-ranges` | `time/real` | Transactions on fixed ranges of 16 and 64 keys, with transactions on single keys (ADR-084). |
+| `random-ranges` | `time/real` | Transactions on ranges of 16 and 64 adjacent keys from random starts, on fixed sets of 3 keys, and on single keys (ADR-084). |
 
 The files in `hack/perf/configs` are not experiments:
 
 - `common-workloads.toml`: the pools, shapes, and workloads of the mixed
   workloads (`low-conflict`, `high-conflict`, and `crossing`).
-- `default.toml`: the settings and the parts of the default experiments.
+- `default.toml`: the settings and the parts of the CI experiments.
 
 ### Mixed workloads
 
@@ -71,9 +68,9 @@ In `high-conflict`, all workers share 8 keys. The stripes of a pool must give
 each worker at least the keys of a transaction; the loader rejects a smaller
 pool.
 
-### Default experiments
+### CI experiments
 
-The experiments of `hack/perf/experiments/default` replace the Criterion suite
+The experiments with the tag `ci` replace the Criterion suite
 of `glassdb`. Each one is a case of the CI comparison. Except for the last one,
 each case runs one worker on one instance with warm caches. A case warms up for
 1250 ms and measures for 10 s of model time. The cases include
@@ -82,15 +79,15 @@ Most cases use built-in parts:
 
 | Case | Shape |
 | --- | --- |
-| `warm_read` | A read of one key with a 256-byte value. |
-| `warm_read_external` | A read of a 1,025-byte value, which a transaction record stores. |
-| `fresh_client_read` | A read on a new database instance, which has no cache (the scenario kind `fresh-client-read`). The open is not in the time. |
-| `rmw_inline_1024` | A read-modify-write of one key with a 1,024-byte value, at the default inline limit. |
-| `rmw_external_1025` | The same with a 1,025-byte value, above the limit. |
-| `rmw_five_leaves` | One key in each of five collections (`collections = 5`). |
-| `read_long_keys_large_collection` | A read in a collection of 1,024 keys of 256 bytes (`key-bytes = 256`), after its splits. |
-| `rmw_shared_leaf_three_transactions` | Three workers that update their own key of one leaf. |
-| `shapes_shared_leaf` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time on one leaf, with `low-conflict` keys. |
+| `read-warm` | A read of one key with a 256-byte value. |
+| `read-warm-external` | A read of a 1,025-byte value, which a transaction record stores. |
+| `read-fresh-client` | A read on a new database instance, which has no cache (the scenario kind `fresh-client-read`). The open is not in the time. |
+| `rmw-inline` | A read-modify-write of one key with a 1,024-byte value, at the default inline limit. |
+| `rmw-external` | The same with a 1,025-byte value, above the limit. |
+| `rmw-five-leaves` | One key in each of five collections (`collections = 5`). |
+| `read-long-keys` | A read in a collection of 1,024 keys of 256 bytes (`key-bytes = 256`), after its splits. |
+| `rmw-shared-leaf` | Three workers that update their own key of one leaf. |
+| `shapes-shared-leaf` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time on one leaf, with `low-conflict` keys. |
 
 The `costs` of each cell are the numbers that the CI comparison checks.
 
@@ -106,7 +103,7 @@ each collection its own simulated S3 request-rate limit:
 cargo build --release -p glassdb-bench-scale --bin perfbench
 common=(--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
   --runs=3 --drain-timeout=90s)
-e=hack/perf/experiments/real-time
+e=hack/perf/experiments
 target/release/perfbench "${common[@]}" --experiment=$e/workers.toml \
   --output=hack/perf/out-sweeps/workers.json
 target/release/perfbench "${common[@]}" --experiment=$e/conflict-sweep.toml \
@@ -155,7 +152,7 @@ tests.
 `compare_refs.sh` uses the same comparison driver as CI. It copies the
 candidate's `glassdb-bench-scale` crate into disposable snapshots of both
 revisions, then builds each against its own engine. Both sides run the
-experiments of `hack/perf/experiments/default` of the candidate. The current
+experiments of the candidate that have the tag `ci`. The current
 source tree is not changed. Unsupported engine APIs fail the comparison; old
 workloads are not silently substituted.
 
@@ -199,7 +196,7 @@ attaches to the compiled `perfbench` executable.
 
 ```bash
 hack/perf/profile.sh
-CASE=rmw_inline_1024 hack/perf/profile.sh
+CASE=rmw-inline hack/perf/profile.sh
 make flamegraph
 ```
 
@@ -212,15 +209,15 @@ sample count per line).
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `EXPERIMENT` | `hack/perf/experiments/default` | The perfbench experiment file or directory. |
-| `CASE` | all cases | One experiment of `hack/perf/experiments/default`, in place of `EXPERIMENT`. |
-| `SECONDS_PER_CASE` | `10` | Measured wall time of each default experiment. |
+| `EXPERIMENT` | the experiments with the tag `ci` | The perfbench experiment file or directory. |
+| `CASE` | all cases | One experiment with the tag `ci`, by name, in place of `EXPERIMENT`. |
+| `SECONDS_PER_CASE` | `10` | Measured wall time of each experiment with the tag `ci`. |
 | `OUT` | `hack/perf` | Output directory for artifacts. |
 
 ### Target
 
-The script profiles perfbench experiments, by default the experiments of
-`hack/perf/experiments/default`: the single transactions of one worker with
+The script profiles perfbench experiments, by default the experiments with
+the tag `ci`: the single transactions of one worker with
 warm caches, and four shapes at the same time on one leaf. The seed and the
 warm-up appear in the profile; use the transaction stacks to inspect measured
 work. `CASE` selects one of these experiments.

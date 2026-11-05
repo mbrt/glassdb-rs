@@ -1,6 +1,7 @@
 # Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time
 # on one leaf, with `low-conflict` keys.
-include = ["../../configs/default.toml", "../../configs/common-workloads.toml"]
+tags = ["ci", "time/virtual", "area/mixed"]
+include = ["../configs/default.toml", "../configs/common-workloads.toml"]
 
 [pools.wide]
 keys = 128

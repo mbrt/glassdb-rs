@@ -81,6 +81,8 @@ pub(crate) struct CellPoint {
 pub(crate) struct Resolved {
     /// The stem of the experiment file.
     pub(crate) name: String,
+    /// The labels of the experiment file, for the selection of experiments.
+    pub(crate) tags: Vec<String>,
     /// The configuration after all layers and `--set`, as one TOML table
     /// without `axes`.
     pub(crate) base: Table,
@@ -96,21 +98,31 @@ pub(crate) struct Selection {
     pub(crate) experiments: Vec<PathBuf>,
     pub(crate) set: Vec<String>,
     pub(crate) only: Vec<String>,
+    /// Keep only the experiments that have all these tags.
+    pub(crate) tags: Vec<String>,
+    /// Remove the experiments that have any of these tags.
+    pub(crate) exclude_tags: Vec<String>,
 }
 
 impl Selection {
-    /// Resolves each selected experiment, in the order of the command line,
-    /// and applies `--set` and `--only` to each one.
+    /// Resolves each selected experiment that the tag filters keep, in the
+    /// order of the command line, and applies `--set` and `--only` to each one.
     pub(crate) fn resolve(&self) -> Result<Vec<Resolved>, Box<dyn Error>> {
         let files = experiment_files(&self.experiments)?;
         let mut common: Table = toml::from_str(BUILTIN).map_err(|e| format!("built-in: {e}"))?;
         for path in toml_files(&self.configs)? {
             merge(&mut common, read_layer(&path, &mut Vec::new())?);
         }
-        let mut resolved = files
-            .into_iter()
-            .map(|(name, path)| self.resolve_one(name, &path, &common))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut resolved = Vec::new();
+        for (name, path) in files {
+            let (tags, layer) = read_experiment(&path)?;
+            if self.keeps(&tags) {
+                resolved.push(self.resolve_one(name, tags, layer, &path, &common)?);
+            }
+        }
+        if resolved.is_empty() {
+            return Err("no experiment has the tags of --tag and --exclude-tag".into());
+        }
         for only in &self.only {
             keep_only(&mut resolved, only)?;
         }
@@ -120,15 +132,23 @@ impl Selection {
         Ok(resolved)
     }
 
-    /// Merges the experiment file at `path` over `common`, and applies `--set`.
+    fn keeps(&self, tags: &[String]) -> bool {
+        self.tags.iter().all(|tag| tags.contains(tag))
+            && !self.exclude_tags.iter().any(|tag| tags.contains(tag))
+    }
+
+    /// Merges the `layer` of the experiment file at `path` over `common`, and
+    /// applies `--set`.
     fn resolve_one(
         &self,
         name: String,
+        tags: Vec<String>,
+        layer: Table,
         path: &Path,
         common: &Table,
     ) -> Result<Resolved, Box<dyn Error>> {
         let mut base = common.clone();
-        merge(&mut base, read_layer(path, &mut Vec::new())?);
+        merge(&mut base, layer);
         let mut axes: Vec<Axis> = match base.remove("axes") {
             Some(axes) => axes
                 .try_into()
@@ -147,7 +167,12 @@ impl Selection {
         let _: Config = Value::Table(base.clone())
             .try_into()
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Resolved { name, base, axes })
+        Ok(Resolved {
+            name,
+            tags,
+            base,
+            axes,
+        })
     }
 }
 
@@ -205,6 +230,7 @@ impl Resolved {
     pub(crate) fn describe(&self) -> serde_json::Value {
         serde_json::json!({
             "name": self.name,
+            "tags": self.tags,
             "configuration": toml_to_json(&Value::Table(self.base.clone())),
             "axes": self.axes.iter().map(|axis| serde_json::to_value(axis).unwrap_or_default()).collect::<Vec<_>>(),
         })
@@ -440,17 +466,43 @@ fn toml_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     Ok(files)
 }
 
+/// Reads an experiment file: its `tags`, and its layer. Only the experiment
+/// file can have tags, so that the file shows all the tags of the experiment.
+fn read_experiment(path: &Path) -> Result<(Vec<String>, Table), Box<dyn Error>> {
+    let mut own = read_table(path)?;
+    let tags = match own.remove("tags") {
+        Some(value) => value
+            .try_into()
+            .map_err(|e| format!("{}: tags: {e}", path.display()))?,
+        None => Vec::new(),
+    };
+    Ok((tags, with_includes(path, own, &mut Vec::new())?))
+}
+
 /// Reads one file, with the files of its `include` merged before its own
 /// values. `including` holds the files whose includes are being read.
 fn read_layer(path: &Path, including: &mut Vec<PathBuf>) -> Result<Table, Box<dyn Error>> {
+    with_includes(path, read_table(path)?, including)
+}
+
+fn read_table(path: &Path) -> Result<Table, Box<dyn Error>> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?)
+}
+
+/// Merges the files that `own` includes, and then `own`, which are the values
+/// of the file at `path`.
+fn with_includes(
+    path: &Path,
+    mut own: Table,
+    including: &mut Vec<PathBuf>,
+) -> Result<Table, Box<dyn Error>> {
     let canonical = path
         .canonicalize()
         .map_err(|e| format!("{}: {e}", path.display()))?;
     if including.contains(&canonical) {
         return Err(format!("{}: includes itself", path.display()).into());
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut own: Table = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let includes: Vec<PathBuf> = match own.remove("include") {
         Some(value) => value
             .try_into()
@@ -550,12 +602,9 @@ pub(crate) const REPOSITORY_EXPERIMENTS: &str =
 /// Returns the file of the repository experiment `name`.
 #[cfg(test)]
 pub(crate) fn repository_experiment(name: &str) -> PathBuf {
-    let file = format!("{name}.toml");
-    std::fs::read_dir(REPOSITORY_EXPERIMENTS)
-        .unwrap()
-        .map(|entry| entry.unwrap().path().join(&file))
-        .find(|path| path.is_file())
-        .unwrap_or_else(|| panic!("no repository experiment {name:?}"))
+    let path = Path::new(REPOSITORY_EXPERIMENTS).join(format!("{name}.toml"));
+    assert!(path.is_file(), "no repository experiment {name:?}");
+    path
 }
 
 #[cfg(test)]
@@ -604,7 +653,7 @@ mod tests {
             configs: configs.iter().map(|path| dir.join(path)).collect(),
             experiments: experiments.iter().map(|path| dir.join(path)).collect(),
             set: set.iter().map(|s| s.to_string()).collect(),
-            only: Vec::new(),
+            ..Selection::default()
         }
         .resolve()
     }
@@ -684,6 +733,48 @@ mod tests {
         assert_eq!(get(b, "cell.gc"), Some(&Value::Boolean(false)));
         assert_eq!(get(b, "pools.wide"), None);
         Ok(())
+    }
+
+    #[test]
+    fn tag_filters_keep_the_experiments_with_all_tags_and_without_excluded_tags()
+    -> Result<(), Box<dyn Error>> {
+        let dir = write(&[
+            ("a.toml", "tags = [\"x\", \"y/1\"]\n"),
+            ("b.toml", "tags = [\"x\"]\n"),
+            ("c.toml", ""),
+        ]);
+        let names = |tags: &[&str], exclude: &[&str]| -> Result<Vec<String>, Box<dyn Error>> {
+            let resolved = Selection {
+                experiments: vec![dir.to_path_buf()],
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                exclude_tags: exclude.iter().map(|t| t.to_string()).collect(),
+                ..Selection::default()
+            }
+            .resolve()?;
+            Ok(resolved.into_iter().map(|r| r.name).collect())
+        };
+        assert_eq!(names(&[], &[])?, ["a", "b", "c"]);
+        assert_eq!(names(&["x", "y/1"], &[])?, ["a"]);
+        assert_eq!(names(&["x"], &["y/1"])?, ["b"]);
+        assert_eq!(names(&[], &["x"])?, ["c"]);
+        let error = names(&["z"], &[]).expect_err("no match").to_string();
+        assert!(error.contains("no experiment has the tags"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn only_the_experiment_file_has_tags() {
+        let dir = write(&[
+            ("shared.toml", "tags = [\"x\"]\n"),
+            ("x.toml", "include = [\"shared.toml\"]\n"),
+            ("y.toml", ""),
+        ]);
+        for (configs, experiment) in [(&[][..], "x.toml"), (&["shared.toml"][..], "y.toml")] {
+            let error = resolve(&dir, configs, &[experiment], &[])
+                .expect_err(experiment)
+                .to_string();
+            assert!(error.contains("unknown field `tags`"), "{error}");
+        }
     }
 
     /// The files of a test case, as `(PATH, TEXT)`.
@@ -867,7 +958,7 @@ mod tests {
         let mut selection = Selection {
             experiments: vec![
                 repository_experiment("inline-pressure"),
-                repository_experiment("warm_read"),
+                repository_experiment("read-warm"),
             ],
             only: vec!["phase=pressure".into()],
             ..Selection::default()
@@ -877,7 +968,7 @@ mod tests {
         assert_eq!(resolved[1].points().len(), 1);
         for (only, message) in [
             ("phase=missing", "has no value"),
-            ("case=warm_read", "no experiment has axis"),
+            ("case=read-warm", "no experiment has axis"),
         ] {
             selection.only = vec![only.into()];
             let error = selection.resolve().expect_err(only).to_string();

@@ -44,7 +44,7 @@ class HarnessTest(unittest.TestCase):
                 return
             experiments = destination / perf_compare.EXPERIMENTS
             experiments.mkdir(parents=True)
-            (experiments / "warm_read.toml").write_text(destination.name)
+            (experiments / "read-warm.toml").write_text(destination.name)
 
         def fake_build(source, target, output, side, log=None):
             harness = (source / "crates/glassdb-bench-scale/main.rs").read_text()
@@ -62,8 +62,10 @@ class HarnessTest(unittest.TestCase):
             manifest = perf_compare.prepare(Path(directory), output, "main", None)
             experiments = output / "harness" / perf_compare.EXPERIMENTS
             for arguments in (manifest["timingArgs"], manifest["counterArgs"]):
-                self.assertEqual(arguments[-1], f"--experiment={experiments}")
-            experiment = (experiments / "warm_read.toml").read_text()
+                self.assertEqual(
+                    arguments[-2:], [f"--experiment={experiments}", "--tag=ci"]
+                )
+            experiment = (experiments / "read-warm.toml").read_text()
         return built, manifest, experiment
 
     def test_both_sides_use_the_experiments_of_the_candidate_harness(self):
@@ -126,7 +128,7 @@ class MeasurementTest(unittest.TestCase):
             "schemaVersion": perf_compare.perf_report.MANIFEST_VERSION,
             "base": "base",
             "candidate": "candidate",
-            "cases": [*cases, "shapes_shared_leaf"],
+            "cases": [*cases, "shapes-shared-leaf"],
             "checkpoints": list(checkpoints),
             "completedPairs": 0,
             "latencyJitter": True,
@@ -194,10 +196,10 @@ class MeasurementTest(unittest.TestCase):
             timing, counters = self.read(side, 1, "timing"), self.read(side, 1, "counters")
             self.assertIs(timing["latencyJitter"], True)
             self.assertIs(counters["latencyJitter"], False)
-            # One process measures every case, including the shapes_shared_leaf workload.
+            # One process measures every case, including the shapes-shared-leaf workload.
             for result in (timing, counters):
                 names = [experiment["name"] for experiment in result["experiments"]]
-                self.assertEqual(names, ["a", "shapes_shared_leaf"])
+                self.assertEqual(names, ["a", "shapes-shared-leaf"])
         kinds = [row[1] for row in self.order(kind=None)[:4]]
         self.assertEqual(kinds, ["timing", "counters"] * 2)
 
@@ -227,7 +229,7 @@ class MeasurementTest(unittest.TestCase):
         self.assertEqual(manifest["completedPairs"], 0)
 
     def test_every_benchmark_gets_the_pairs_that_the_least_resolved_one_needs(self):
-        self.configure(factors={"b": [1.028, 1.052], "shapes_shared_leaf": [1.028, 1.052]})
+        self.configure(factors={"b": [1.028, 1.052], "shapes-shared-leaf": [1.028, 1.052]})
         manifest = self.manifest()
         perf_compare.measure(self.root, manifest)
         self.assertEqual(manifest["completedPairs"], 8)
@@ -261,7 +263,7 @@ class MeasurementTest(unittest.TestCase):
         self.assertNotIn("Measurement warnings", report)
 
     def test_unresolved_work_reaches_32_pairs_without_a_shared_deadline(self):
-        self.configure(factors={"a": [0.8, 1.2], "shapes_shared_leaf": [0.8, 1.2]})
+        self.configure(factors={"a": [0.8, 1.2], "shapes-shared-leaf": [0.8, 1.2]})
         manifest = self.manifest(cases=("a",), checkpoints=(8, 16, 32))
         # Simulate a minute of total elapsed time per completed process. Each
         # real subprocess still completes well within its own timeout.
@@ -363,7 +365,7 @@ jitter = settings.get('latencyJitter', '--latency-jitter=false' not in sys.argv)
 counters = {name: 0 for name in ('reads', 'writes', 'lists', 'readBodyBytes',
     'writeBodyBytes', 'coordinatorSubmissions', 'coordinatorRounds')}
 cells = []
-for case in [*cases, 'shapes_shared_leaf']:
+for case in [*cases, 'shapes-shared-leaf']:
     factors = settings.get('factors', {}).get(case, [1])
     factor = factors[(repetition - 1) % len(factors)] if side == 'pr' else 1
     costs = {'transactions': 30,
@@ -371,7 +373,7 @@ for case in [*cases, 'shapes_shared_leaf']:
     costs = settings.get('costRecord', costs)
     if settings.get('badCostAt') == [repetition, case, side] and kind == 'counters':
         costs = {}
-    if case == 'shapes_shared_leaf':
+    if case == 'shapes-shared-leaf':
         shapes = [{'shape': name, 'committed': 200, 'converged': True,
             'p50Ms': 10, 'p90Ms': 20, 'txPerSec': 100}
             for name in ('rw-single', 'rw-many', 'ro-single', 'ro-multi')]

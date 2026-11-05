@@ -48,6 +48,14 @@ struct Cli {
     /// once, and the experiments run one after the other.
     #[arg(long = "experiment")]
     experiments: Vec<PathBuf>,
+    /// Keep only the experiments that have this tag. It can be given more
+    /// than once, and an experiment must then have all the tags.
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+    /// Remove the experiments that have this tag. It can be given more than
+    /// once.
+    #[arg(long = "exclude-tag")]
+    exclude_tags: Vec<String>,
     /// Give a parameter of each experiment a fixed value, as `PATH=VALUE` with
     /// a TOML value. It removes the axis that sets `PATH`. It can be given more
     /// than once, and the last one wins.
@@ -136,6 +144,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         experiments: cli.experiments.clone(),
         set: cli.set.clone(),
         only: cli.only.clone(),
+        tags: cli.tags.clone(),
+        exclude_tags: cli.exclude_tags.clone(),
     };
     let resolved = selection.resolve()?;
     let model_time_speedup = cli.time.install(&cli.backend)?;

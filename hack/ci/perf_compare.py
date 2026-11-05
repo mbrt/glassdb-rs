@@ -28,23 +28,25 @@ CHECKPOINTS = [8, 16, 32]
 # cannot see.
 PROCESS_TIMEOUT = 120
 CASES = (
-    "warm_read",
-    "warm_read_external",
-    "fresh_client_read",
-    "rmw_inline_1024",
-    "rmw_external_1025",
-    "rmw_five_leaves",
-    "read_long_keys_large_collection",
-    "rmw_shared_leaf_three_transactions",
+    "read-warm",
+    "read-warm-external",
+    "read-fresh-client",
+    "rmw-inline",
+    "rmw-external",
+    "rmw-five-leaves",
+    "read-long-keys",
+    "rmw-shared-leaf",
     perf_report.SHARED_LEAF_CASE,
 )
 # Virtual time charges a long window only as CPU time. A long window averages
 # the jitter of the provider latency out of the percentile samples, so that
 # changes of a few percent remain visible.
 MEASURE_WINDOW = "300s"
-# The experiments that all comparisons measure, one for each case, and the
-# shared files that they include. They are part of the harness.
-EXPERIMENTS = Path("hack/perf/experiments/default")
+# The experiments, and the shared files that they include. They are part of
+# the harness. All comparisons measure the experiments with the tag `ci`, one
+# for each case.
+EXPERIMENTS = Path("hack/perf/experiments")
+SELECTION = "--tag=ci"
 CONFIGS = Path("hack/perf/configs")
 # The sources that the base revision takes from the harness. The crate must be
 # in the base revision; the experiment files can be new.
@@ -235,9 +237,9 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         for relative in (CONFIGS, EXPERIMENTS):
             if (snapshots / "pr" / relative).is_dir():
                 shutil.copytree(snapshots / "pr" / relative, harness / relative)
-        experiments = f"--experiment={harness / EXPERIMENTS}"
-        manifest["timingArgs"].append(experiments)
-        manifest["counterArgs"].append(experiments)
+        experiments = [f"--experiment={harness / EXPERIMENTS}", SELECTION]
+        manifest["timingArgs"].extend(experiments)
+        manifest["counterArgs"].extend(experiments)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return manifest
 

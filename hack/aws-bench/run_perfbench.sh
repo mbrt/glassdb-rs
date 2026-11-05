@@ -26,8 +26,8 @@ base64 -d <<<"$EXPERIMENT_FILES" | tar -C perf -xz
 
 IFS=',' read -r -a experiments <<<"$EXPERIMENTS"
 for experiment in "${experiments[@]}"; do
-  files=(perf/experiments/*/"$experiment".toml)
-  if [[ ! -f "${files[0]}" ]]; then
+  file="perf/experiments/$experiment.toml"
+  if [[ ! -f "$file" ]]; then
     echo "no experiment $experiment in hack/perf/experiments" >&2
     exit 1
   fi
@@ -35,6 +35,6 @@ for experiment in "${experiments[@]}"; do
   if [[ "$experiment" == "contention" ]]; then
     extra=(--set="cell.measure.duration=\"$CONTENTION_DURATION\"")
   fi
-  ./perfbench "${common[@]}" "${extra[@]}" --experiment="${files[0]}" \
+  ./perfbench "${common[@]}" "${extra[@]}" --experiment="$file" \
     --output="out/$experiment.json"
 done

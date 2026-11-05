@@ -24,7 +24,7 @@ SCHEMA_VERSION = 3
 # The version of the manifest that the driver writes.
 MANIFEST_VERSION = 3
 # The case with four shapes at the same time on one leaf.
-SHARED_LEAF_CASE = "shapes_shared_leaf"
+SHARED_LEAF_CASE = "shapes-shared-leaf"
 TIMING_FILE = "timing.json"
 COUNTERS_FILE = "counters.json"
 
