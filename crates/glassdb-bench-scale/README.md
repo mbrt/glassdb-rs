@@ -118,7 +118,9 @@ explicitly approximate probes.
 
 `--time=virtual` replaces the compression with virtual time. The process runs
 on one thread with a paused Tokio clock, and model time jumps over each wait of
-an idle process. The engine and `rt` are the same as in a real-time run. A run takes the time
+an idle process. The paused clock rounds each timer up to a whole millisecond,
+so `rt` runs model time 1000 times as slow as that clock: model waits are exact
+to a microsecond. The engine and `rt` are the same as in a real-time run. A run takes the time
 of its CPU work, not of its model duration. With `--latency-jitter=false`, two
 runs of the same revision give nearly the same result: the engine randomizes
 the cadence of its background tasks, so a window that holds a pass of the

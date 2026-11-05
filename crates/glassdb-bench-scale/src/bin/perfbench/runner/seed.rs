@@ -307,11 +307,7 @@ async fn write_pools(db: &Database, cell: &CellSpec) -> Result<(), GError> {
 }
 
 pub(crate) async fn shutdown(db: &Database, drain_timeout: Duration) -> Result<(), GError> {
-    shutdown_databases_until(
-        std::slice::from_ref(db),
-        tokio::time::Instant::now() + drain_timeout,
-    )
-    .await
+    shutdown_databases_until(std::slice::from_ref(db), rt::Instant::now() + drain_timeout).await
 }
 
 /// Returns the completed splits and merges of `databases`.
@@ -407,7 +403,7 @@ const GC_TIMEOUT: Duration = Duration::from_secs(600);
 pub(crate) async fn collect_garbage(database: &Database) -> Result<Collected, GError> {
     let timeout = GC_TIMEOUT;
     let started = Instant::now();
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = rt::Instant::now() + timeout;
     let mut deleted = 0;
     loop {
         let report = database.collect_garbage(FULL_GC_PARALLELISM).await?;
@@ -419,7 +415,7 @@ pub(crate) async fn collect_garbage(database: &Database) -> Result<Collected, GE
             });
         }
         let wait = report.retry_after.unwrap_or_default();
-        if tokio::time::Instant::now() + wait >= deadline {
+        if rt::Instant::now() + wait >= deadline {
             return Err(GError::internal(format!(
                 "garbage collection did not finish within {timeout:?}: {report:?}"
             )));

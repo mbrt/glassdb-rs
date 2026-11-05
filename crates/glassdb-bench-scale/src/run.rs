@@ -2,8 +2,8 @@
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use glassdb::{Database, Error};
+use glassdb_concurr::rt::{self, Instant};
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
 
 /// Waits for benchmark workers until `deadline`.
 ///
@@ -16,7 +16,8 @@ pub async fn join_tasks_until(
 ) -> Result<(), Error> {
     let mut pending: FuturesUnordered<_> = handles.into_iter().collect();
     while !pending.is_empty() {
-        let joined = match tokio::time::timeout_at(deadline, pending.next()).await {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let joined = match rt::timeout(left, pending.next()).await {
             Ok(Some(joined)) => joined,
             Ok(None) => return Ok(()),
             Err(_) => {
@@ -47,10 +48,13 @@ pub async fn shutdown_databases_until(
     deadline: Instant,
 ) -> Result<(), Error> {
     let shutdowns = futures::future::join_all(databases.iter().map(Database::shutdown));
-    tokio::time::timeout_at(deadline, shutdowns)
-        .await
-        .map(|_| ())
-        .map_err(|_| Error::internal("database shutdown exceeded the cell completion deadline"))
+    rt::timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        shutdowns,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|_| Error::internal("database shutdown exceeded the cell completion deadline"))
 }
 
 async fn abort_all(pending: &mut FuturesUnordered<JoinHandle<Result<(), Error>>>) {
