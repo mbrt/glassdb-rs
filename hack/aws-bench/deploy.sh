@@ -90,11 +90,10 @@ stack_output() {
 # Fails unless each name of EXPERIMENTS is one experiment file, so that a wrong
 # name fails before the stack starts to cost.
 check_experiments() {
-  local name names files
+  local name names
   IFS=',' read -r -a names <<<"$EXPERIMENTS"
   for name in "${names[@]}"; do
-    files=("$REPO_ROOT"/hack/perf/experiments/*/"$name".toml)
-    if [[ ${#files[@]} -ne 1 || ! -f "${files[0]}" ]]; then
+    if [[ ! -f "$REPO_ROOT/hack/perf/experiments/$name.toml" ]]; then
       echo "EXPERIMENTS: $name is not one file in hack/perf/experiments" >&2
       return 1
     fi

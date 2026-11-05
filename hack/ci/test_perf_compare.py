@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,8 +37,10 @@ class HarnessTest(unittest.TestCase):
         """Prepare a comparison of fake snapshots, and return what the sides
         built, the manifest, and the experiment file that both sides read."""
         built = []
+        self.events = []
 
         def fake_snapshot(repo, destination, revision):
+            self.events.append(("snapshot", destination.name))
             harness = destination / "crates/glassdb-bench-scale"
             harness.mkdir(parents=True)
             (harness / "main.rs").write_text(destination.name)
@@ -44,11 +48,12 @@ class HarnessTest(unittest.TestCase):
                 return
             experiments = destination / perf_compare.EXPERIMENTS
             experiments.mkdir(parents=True)
-            (experiments / "warm_read.toml").write_text(destination.name)
+            (experiments / "read-warm.toml").write_text(destination.name)
 
         def fake_build(source, target, output, side, log=None):
             harness = (source / "crates/glassdb-bench-scale/main.rs").read_text()
             built.append((side, harness))
+            self.events.append(("build", side))
             if fail_candidate_harness and side == "main" and harness == "pr":
                 raise RuntimeError("unsupported comparison")
             return {"perfbench": f"{side}-perfbench"}
@@ -62,8 +67,10 @@ class HarnessTest(unittest.TestCase):
             manifest = perf_compare.prepare(Path(directory), output, "main", None)
             experiments = output / "harness" / perf_compare.EXPERIMENTS
             for arguments in (manifest["timingArgs"], manifest["counterArgs"]):
-                self.assertEqual(arguments[-1], f"--experiment={experiments}")
-            experiment = (experiments / "warm_read.toml").read_text()
+                self.assertEqual(
+                    arguments[-2:], [f"--experiment={experiments}", "--tag=ci"]
+                )
+            experiment = (experiments / "read-warm.toml").read_text()
         return built, manifest, experiment
 
     def test_both_sides_use_the_experiments_of_the_candidate_harness(self):
@@ -82,6 +89,19 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(manifest["harness"], "base")
         self.assertEqual(len(manifest["warnings"]), 1)
         self.assertEqual(experiment, "main")
+        # The base snapshot of the second build must be newer than the
+        # artifacts of the failed build in the same target directory.
+        self.assertEqual(
+            self.events,
+            [
+                ("snapshot", "main"),
+                ("snapshot", "pr"),
+                ("build", "main"),
+                ("snapshot", "main"),
+                ("build", "main"),
+                ("build", "pr"),
+            ],
+        )
 
     def test_a_base_harness_without_experiment_files_is_unsupported(self):
         with self.assertRaisesRegex(RuntimeError, "harness has no"):
@@ -105,6 +125,32 @@ class HarnessTest(unittest.TestCase):
             self.assertFalse((root / "copy/deleted").exists())
             self.assertFalse((root / "copy/.git").exists())
 
+    def test_snapshots_are_newer_than_artifacts_built_before_them(self):
+        # Cargo reuses an artifact that is newer than its sources, so a snapshot
+        # must not keep the commit time or the time of the working-tree file.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "source"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            (repo / "file").write_text("old")
+            past = "2001-01-01T00:00:00Z"
+            os.utime(repo / "file", (978307200, 978307200))
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"],
+                cwd=repo,
+                check=True,
+                env={**os.environ, "GIT_AUTHOR_DATE": past, "GIT_COMMITTER_DATE": past},
+            )
+            start = time.time() - 1
+            perf_compare.snapshot(repo, root / "revision", "HEAD")
+            perf_compare.snapshot(repo, root / "worktree", None)
+            for copy in ("revision", "worktree"):
+                with self.subTest(copy=copy):
+                    self.assertEqual((root / copy / "file").read_text(), "old")
+                    self.assertGreater((root / copy / "file").stat().st_mtime, start)
+
 
 class MeasurementTest(unittest.TestCase):
     def setUp(self):
@@ -126,7 +172,6 @@ class MeasurementTest(unittest.TestCase):
             "schemaVersion": perf_compare.perf_report.MANIFEST_VERSION,
             "base": "base",
             "candidate": "candidate",
-            "cases": [*cases, "shapes_shared_leaf"],
             "checkpoints": list(checkpoints),
             "completedPairs": 0,
             "latencyJitter": True,
@@ -194,10 +239,10 @@ class MeasurementTest(unittest.TestCase):
             timing, counters = self.read(side, 1, "timing"), self.read(side, 1, "counters")
             self.assertIs(timing["latencyJitter"], True)
             self.assertIs(counters["latencyJitter"], False)
-            # One process measures every case, including the shapes_shared_leaf workload.
+            # One process measures every experiment.
             for result in (timing, counters):
                 names = [experiment["name"] for experiment in result["experiments"]]
-                self.assertEqual(names, ["a", "shapes_shared_leaf"])
+                self.assertEqual(names, ["a", "shapes-shared-leaf"])
         kinds = [row[1] for row in self.order(kind=None)[:4]]
         self.assertEqual(kinds, ["timing", "counters"] * 2)
 
@@ -209,9 +254,6 @@ class MeasurementTest(unittest.TestCase):
             )
         self.assertIn("--latency-jitter=true", perf_compare.TIMING_ARGS)
         self.assertIn("--latency-jitter=false", perf_compare.COUNTER_ARGS)
-        self.assertEqual(
-            perf_compare.CASES[-1], perf_compare.perf_report.SHARED_LEAF_CASE
-        )
 
     def test_wrong_latency_profile_fails_before_counting_the_pair(self):
         self.configure(latencyJitter=True)
@@ -227,7 +269,7 @@ class MeasurementTest(unittest.TestCase):
         self.assertEqual(manifest["completedPairs"], 0)
 
     def test_every_benchmark_gets_the_pairs_that_the_least_resolved_one_needs(self):
-        self.configure(factors={"b": [1.028, 1.052], "shapes_shared_leaf": [1.028, 1.052]})
+        self.configure(factors={"b": [1.028, 1.052], "shapes-shared-leaf": [1.028, 1.052]})
         manifest = self.manifest()
         perf_compare.measure(self.root, manifest)
         self.assertEqual(manifest["completedPairs"], 8)
@@ -261,7 +303,7 @@ class MeasurementTest(unittest.TestCase):
         self.assertNotIn("Measurement warnings", report)
 
     def test_unresolved_work_reaches_32_pairs_without_a_shared_deadline(self):
-        self.configure(factors={"a": [0.8, 1.2], "shapes_shared_leaf": [0.8, 1.2]})
+        self.configure(factors={"a": [0.8, 1.2], "shapes-shared-leaf": [0.8, 1.2]})
         manifest = self.manifest(cases=("a",), checkpoints=(8, 16, 32))
         # Simulate a minute of total elapsed time per completed process. Each
         # real subprocess still completes well within its own timeout.
@@ -363,7 +405,7 @@ jitter = settings.get('latencyJitter', '--latency-jitter=false' not in sys.argv)
 counters = {name: 0 for name in ('reads', 'writes', 'lists', 'readBodyBytes',
     'writeBodyBytes', 'coordinatorSubmissions', 'coordinatorRounds')}
 cells = []
-for case in [*cases, 'shapes_shared_leaf']:
+for case in [*cases, 'shapes-shared-leaf']:
     factors = settings.get('factors', {}).get(case, [1])
     factor = factors[(repetition - 1) % len(factors)] if side == 'pr' else 1
     costs = {'transactions': 30,
@@ -371,7 +413,7 @@ for case in [*cases, 'shapes_shared_leaf']:
     costs = settings.get('costRecord', costs)
     if settings.get('badCostAt') == [repetition, case, side] and kind == 'counters':
         costs = {}
-    if case == 'shapes_shared_leaf':
+    if case == 'shapes-shared-leaf':
         shapes = [{'shape': name, 'committed': 200, 'converged': True,
             'p50Ms': 10, 'p90Ms': 20, 'txPerSec': 100}
             for name in ('rw-single', 'rw-many', 'ro-single', 'ro-multi')]

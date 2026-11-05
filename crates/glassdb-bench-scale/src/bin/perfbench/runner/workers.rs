@@ -161,7 +161,7 @@ impl Pause {
             // A worker that stops with an error sets `stop` and never waits.
             tokio::select! {
                 () = changed => {}
-                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+                () = rt::sleep(Duration::from_millis(20)) => {}
             }
         }
     }
@@ -193,7 +193,7 @@ impl Pause {
             }
             tokio::select! {
                 () = changed => {}
-                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+                () = rt::sleep(Duration::from_millis(20)) => {}
             }
         }
     }

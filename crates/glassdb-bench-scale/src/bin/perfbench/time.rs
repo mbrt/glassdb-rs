@@ -31,21 +31,23 @@ impl TimeMode {
 
     /// Installs the process-wide model time, and returns its speedup.
     ///
-    /// The speedup is 1 for virtual time: the paused clock of the runtime
-    /// already is the model clock, so `rt` must only anchor wall timestamps to
-    /// it.
+    /// The speedup is 1 for virtual time: model time follows the paused clock
+    /// of the runtime, not wall time.
     pub(crate) fn install(self, backend: &backend::Options) -> Result<f64, Box<dyn Error>> {
-        let speedup = match self {
-            Self::Real => backend.model_time_speedup()?,
+        match self {
+            Self::Real => {
+                let speedup = backend.model_time_speedup()?;
+                if let Some(speedup) = speedup {
+                    rt::set_model_time_speedup(speedup)?;
+                }
+                Ok(speedup.unwrap_or(1.0))
+            }
             Self::Virtual => {
                 backend.check_virtual_time()?;
-                Some(1.0)
+                rt::set_paused_model_time()?;
+                Ok(1.0)
             }
-        };
-        if let Some(speedup) = speedup {
-            rt::set_model_time_speedup(speedup)?;
         }
-        Ok(speedup.unwrap_or(1.0))
     }
 
     /// Builds the runtime that drives the process.

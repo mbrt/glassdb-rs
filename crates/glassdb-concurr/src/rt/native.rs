@@ -43,6 +43,23 @@ pub fn set_model_time_speedup(speedup: f64) -> Result<(), ModelTimeError> {
         .map_err(|_| ModelTimeError::AlreadyInitialized)
 }
 
+/// The model-time speedup of a paused clock. Tokio rounds each timer up to a
+/// whole millisecond of its clock, so a paused clock that runs 1000 times as
+/// fast as model time makes model waits exact to a microsecond.
+const PAUSED_SPEEDUP: f64 = 0.001;
+
+/// Installs process-wide model time for a runtime whose clock is paused, so
+/// that model time advances only when the runtime is idle.
+///
+/// Model time then follows the paused clock, with a finer resolution than the
+/// timers of that clock. The paused clock still is not wall time, so
+/// `tokio::time` waits and instants do not show model time; use the waits and
+/// instants of this module. The setting must be installed before any
+/// model-time observation or wait.
+pub fn set_paused_model_time() -> Result<(), ModelTimeError> {
+    set_model_time_speedup(PAUSED_SPEEDUP)
+}
+
 #[derive(Clone, Copy)]
 struct ModelTime {
     speedup: f64,

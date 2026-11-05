@@ -1,6 +1,7 @@
 # Creates and deletes that change the key membership of one leaf while other
 # transactions scan it. A direct churner commits direct. A locked churner scans
 # first, so it takes key locks and the membership lock of the leaf.
+tags = ["time/real", "area/topology"]
 
 [pools.churn]
 # 6 churn workers with 4 own keys each.

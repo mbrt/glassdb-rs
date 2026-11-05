@@ -432,7 +432,7 @@ async fn run_cell(
     }
     let mut measure_wall = measure_start.elapsed();
     shared.stop.store(true, Ordering::Relaxed);
-    let deadline = tokio::time::Instant::now() + execution.drain_timeout;
+    let deadline = rt::Instant::now() + execution.drain_timeout;
     let joined = join_tasks_until(handles, deadline).await;
     let drain = measure_start.elapsed().saturating_sub(measure_wall);
     if let Err(error) = joined {
@@ -636,7 +636,7 @@ async fn close(
     drain_timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
     let databases: Vec<Database> = instances.into_iter().map(|i| i.db).collect();
-    shutdown_databases_until(&databases, tokio::time::Instant::now() + drain_timeout).await?;
+    shutdown_databases_until(&databases, rt::Instant::now() + drain_timeout).await?;
     Ok(())
 }
 

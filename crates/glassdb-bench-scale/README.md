@@ -50,6 +50,7 @@ A scenario never needs its own subcommand.
 | Group | Database instances that run the same shapes. The result reports each group and each shape apart. |
 | Workload | A named set of groups that run at the same time. |
 | Experiment | A TOML file with parameter values and axes. Its name is the file name without `.toml`. One invocation runs one or more experiments, one after the other. |
+| Tag | A label of an experiment, which selects it in `--tag` and `--exclude-tag`. |
 | Axis | An ordered list of values for one or more parameters, with a start rule. |
 | Cell | One warm-up and one measurement, with one value of each parameter. |
 | Run | One repetition of a whole experiment (`--runs`). |
@@ -63,10 +64,10 @@ composite levels.
 ```bash
 cargo build --release -p glassdb-bench-scale --bin perfbench
 e=hack/perf/experiments
-target/release/perfbench --experiment $e/real-time/mixed.toml
-target/release/perfbench --experiment $e/real-time/split-merge-fight.toml --runs 3
-target/release/perfbench --experiment $e/default                # a directory
-target/release/perfbench --experiment $e/real-time/*-ranges.toml
+target/release/perfbench --experiment $e/mixed.toml
+target/release/perfbench --experiment $e/split-merge-fight.toml --runs 3
+target/release/perfbench --experiment $e --tag ci               # a directory
+target/release/perfbench --experiment $e/*-ranges.toml
 target/release/perfbench --config my.toml --experiment probe.toml \
   --set cell.workers=50 --set shapes.rw-many.keys=4
 ```
@@ -75,6 +76,10 @@ target/release/perfbench --config my.toml --experiment probe.toml \
   `*.toml` files, in name order. It can be given more than once, and the
   experiments run one after the other, into one result. Two experiments with
   the same name are an error. There is no default.
+- `--tag TAG` keeps only the experiments that have the tag. It can be given
+  more than once, and an experiment must then have all the tags.
+  `--exclude-tag TAG` removes the experiments that have the tag, and it can
+  also be given more than once. It is an error if no experiment remains.
 - `--config PATH` loads a file, or the `*.toml` files of a directory, for every
   experiment. It can be given more than once.
 - `--set PATH=VALUE` gives one parameter of each experiment a fixed value. It
@@ -113,7 +118,9 @@ explicitly approximate probes.
 
 `--time=virtual` replaces the compression with virtual time. The process runs
 on one thread with a paused Tokio clock, and model time jumps over each wait of
-an idle process. The engine and `rt` are the same as in a real-time run. A run takes the time
+an idle process. The paused clock rounds each timer up to a whole millisecond,
+so `rt` runs model time 1000 times as slow as that clock: model waits are exact
+to a microsecond. The engine and `rt` are the same as in a real-time run. A run takes the time
 of its CPU work, not of its model duration. With `--latency-jitter=false`, two
 runs of the same revision give nearly the same result: the engine randomizes
 the cadence of its background tasks, so a window that holds a pass of the
@@ -160,7 +167,7 @@ other experiments. The values of an experiment win over the `--config` files.
 A file can include other files before its own values:
 
 ```toml
-include = ["../../configs/default.toml"]
+include = ["../configs/default.toml"]
 ```
 
 The paths are relative to the file. An included file can include other files.
@@ -320,12 +327,14 @@ use. The loader checks only these shapes, workloads, and pools.
 
 ## Experiments
 
-An experiment file has the values of the experiment, and `axes`: the axes, from
-the outer loop to the inner loop. With no axes, the experiment has one cell.
+An experiment file has its `tags`, the values of the experiment, and `axes`:
+the axes, from the outer loop to the inner loop. With no axes, the experiment
+has one cell.
 
 ```toml
 # An experiment of the mixed workloads at five affinities.
-include = ["../../configs/common-workloads.toml"]
+tags = ["time/real", "area/mixed"]
+include = ["../configs/common-workloads.toml"]
 
 [cell]
 workload = "low-conflict"
@@ -334,6 +343,11 @@ workload = "low-conflict"
 path = "cell.affinity"
 values = [0, 25, 50, 75, 100]
 ```
+
+The tags are labels that `--tag` and `--exclude-tag` select experiments by.
+perfbench does not interpret them. Only the experiment file can have tags, so
+that it shows all the tags of the experiment: `tags` in a `--config` file or in
+an included file is an error.
 
 An axis has one of two forms:
 
@@ -428,8 +442,8 @@ The checks before the first seed:
 The result has `schemaVersion` 3. It has `backend`, `timeMode`,
 `modelTimeSpeedup`, `latencyJitter`, the command-line `options`, and
 `experiments`: one entry for each experiment, in the order that they ran. Each
-entry has the `name` of the experiment, its resolved `configuration`, its
-`axes`, and its `runs`. Each run has its cells. Each cell has:
+entry has the `name` of the experiment, its `tags`, its resolved
+`configuration`, its `axes`, and its `runs`. Each run has its cells. Each cell has:
 
 - `labels` (the label of each axis value), `parameters` (the paths that the
   axes set, and a summary of the sources: `keys` and `shared` of an `overlap`
@@ -496,6 +510,6 @@ them.
 ## Experiments of the repository
 
 [hack/perf/README.md](../../hack/perf/README.md) lists the experiments of the
-repository, the time mode that each one needs, and the commands of the
+repository, their tags, and the commands of the
 canonical plots. [hack/aws-bench/README.md](../../hack/aws-bench/README.md)
 explains the real-S3 runner.

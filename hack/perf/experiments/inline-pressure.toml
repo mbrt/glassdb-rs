@@ -2,6 +2,7 @@
 # One worker fills the inline budget of the leaf, then updates the
 # next keys until one pass takes no locked commit. The pressure cell ends with
 # that pass, and the recovery cell repeats it.
+tags = ["time/virtual", "area/inline"]
 
 [pools.inline]
 keys = 192

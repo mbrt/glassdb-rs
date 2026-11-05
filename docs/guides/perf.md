@@ -18,7 +18,7 @@ configuration, for example `mixed`, and their results are of schema version 2.
 The experiments are now files in
 [hack/perf/experiments](../../hack/perf/experiments): give the path of the file
 to `--experiment`, for example
-`--experiment=hack/perf/experiments/real-time/mixed.toml`.
+`--experiment=hack/perf/experiments/mixed.toml`.
 
 The s3 delay profile limits each prefix of 3 path segments since 2026-10-20:
 each collection and each first symbol of a transaction ID has its own request
@@ -42,9 +42,9 @@ adjacent leaves merge for them.
   decision of one database instance.
 - `--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
   --drain-timeout=90s`, 2 runs of each, alternated.
-- fixed ranges: `--experiment=hack/perf/experiments/real-time/fixed-ranges.toml`;
+- fixed ranges: `--experiment=hack/perf/experiments/fixed-ranges.toml`;
   random ranges:
-  `--experiment=hack/perf/experiments/real-time/random-ranges.toml`;
+  `--experiment=hack/perf/experiments/random-ranges.toml`;
   `workers4` and `mixed` as in the entry of the first change below
 - ratio = target / base
 

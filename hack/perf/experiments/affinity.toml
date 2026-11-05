@@ -1,5 +1,6 @@
 # The affinity grid: 5 affinities at 1, 3, 5, and 7 database instances.
-include = ["../../configs/common-workloads.toml"]
+tags = ["time/real", "area/mixed"]
+include = ["../configs/common-workloads.toml"]
 
 [cell]
 workload = "low-conflict"

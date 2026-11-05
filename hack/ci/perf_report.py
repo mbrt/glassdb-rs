@@ -22,14 +22,11 @@ MODEL = {
 # The version of the perfbench results that the comparison reads.
 SCHEMA_VERSION = 3
 # The version of the manifest that the driver writes.
-MANIFEST_VERSION = 3
-# The case with four shapes at the same time on one leaf.
-SHARED_LEAF_CASE = "shapes_shared_leaf"
+MANIFEST_VERSION = 4
 TIMING_FILE = "timing.json"
 COUNTERS_FILE = "counters.json"
 
-SHARED_LEAF_SHAPES = ("rw-single", "rw-many", "ro-single", "ro-multi")
-# The latency metrics of every shape of every case.
+# The latency metrics of every shape of every cell.
 LATENCY_METRICS = (
     ("p50Ms", "model ms/tx", "time"),
     ("p90Ms", "model ms/tx", "time"),
@@ -92,25 +89,28 @@ def read_report(path: Path) -> dict:
     return report
 
 
-def read_case(path: Path, case: str, latency_jitter: bool) -> dict:
-    """Read the cell of the experiment `case` from a perfbench result.
+def read_cells(path: Path, latency_jitter: bool) -> list[tuple[str, dict]]:
+    """Read the cells of all experiments of a perfbench result, with their names.
 
-    The result must have the latency profile of the comparison, and the
-    experiment must have one run of one cell that did not fail.
+    The result must have the latency profile of the comparison, and one run of
+    each experiment. The name of a cell is the name of its experiment, and the
+    labels of the cell if the experiment has more than one cell.
     """
     report = read_report(path)
     if report.get("latencyJitter", True) is not latency_jitter:
-        raise ReportError(f"{case} latency profile differs from comparison settings")
-    experiments = [e for e in report["experiments"] if e["name"] == case]
-    if len(experiments) != 1:
-        raise ReportError(f"expected one {case} experiment, found {len(experiments)}")
-    runs = experiments[0]["runs"]
-    if len(runs) != 1 or len(runs[0]["cells"]) != 1:
-        raise ReportError(f"expected one run of one cell of {case}")
-    cell = runs[0]["cells"][0]
-    if cell["failures"]:
-        raise ReportError(f"{case} cell failed")
-    return cell
+        raise ReportError("latency profile differs from comparison settings")
+    if not report["experiments"]:
+        raise ReportError("no experiments")
+    cells = []
+    for experiment in report["experiments"]:
+        name, runs = experiment["name"], experiment["runs"]
+        if len(runs) != 1:
+            raise ReportError(f"expected one run of {name}")
+        many = len(runs[0]["cells"]) > 1
+        for cell in runs[0]["cells"]:
+            labels = list(cell["labels"].values()) if many else []
+            cells.append(("/".join([name, *labels]), cell))
+    return cells
 
 
 def add(metrics: dict, name: str, unit: str, kind: str, value) -> None:
@@ -121,12 +121,10 @@ def add(metrics: dict, name: str, unit: str, kind: str, value) -> None:
     metrics[name] = metric
 
 
-def read_measurement(
-    directory: Path, cases: list[str] | tuple[str, ...], *, latency_jitter: bool
-) -> tuple[dict, list[str]]:
-    """Read and validate the artifacts of all cases in a repetition.
+def read_measurement(directory: Path, *, latency_jitter: bool) -> tuple[dict, list[str]]:
+    """Read and validate the artifacts of all cells in a repetition.
 
-    The latency of a case comes from the process with the latency profile of the
+    The latency of a cell comes from the process with the latency profile of the
     comparison. Its counters come from a process without jitter: jitter moves
     the count of background operations, such as listings of the garbage
     collector, by one per process, which the counters cannot tell from a change.
@@ -134,25 +132,24 @@ def read_measurement(
     """
     metrics, warnings = {}, []
     side, repetition = directory.parent.name, directory.name
-    for name in cases:
-        label = f"{side}/{repetition}/{name}"
+    label = f"{side}/{repetition}"
+    for path, jitter, load, kind in (
+        (directory / TIMING_FILE, latency_jitter, load_latency, "latency"),
+        (directory / COUNTERS_FILE, False, load_costs, "counter"),
+    ):
         try:
-            timing = read_case(directory / TIMING_FILE, name, latency_jitter)
-            load_latency(name, timing, metrics, warnings, label)
+            for name, cell in read_cells(path, jitter):
+                if cell["failures"]:
+                    warnings.append(f"{label}/{name}: cell failed")
+                    continue
+                load(name, cell, metrics, warnings, f"{label}/{name}")
         except (ReportError, KeyError, TypeError, ValueError, IndexError) as error:
-            warnings.append(f"{label}: invalid latency measurement ({error})")
-        try:
-            counters = read_case(directory / COUNTERS_FILE, name, False)
-            load_costs(name, counters["costs"], metrics, warnings, label)
-        except (ReportError, KeyError, TypeError, ValueError, IndexError) as error:
-            warnings.append(f"{label}: invalid counter measurement ({error})")
+            warnings.append(f"{label}: invalid {kind} measurement ({error})")
     return metrics, warnings
 
 
 def load_latency(name, cell, metrics, warnings, label):
     try:
-        if name == SHARED_LEAF_CASE:
-            check_shared_leaf(cell)
         shapes = cell["shapes"]
         if not shapes:
             raise ReportError("no shapes")
@@ -162,7 +159,7 @@ def load_latency(name, cell, metrics, warnings, label):
                     f"{label}/{shape['shape']}: insufficient latency/throughput observations"
                 )
                 continue
-            # A case with one shape needs no shape in the name of its metrics.
+            # A cell with one shape needs no shape in the name of its metrics.
             prefix = name if len(shapes) == 1 else f"{name}/{shape['shape']}"
             for key, unit, kind in LATENCY_METRICS:
                 add(metrics, f"{prefix}: {key}", unit, kind, shape[key])
@@ -170,8 +167,9 @@ def load_latency(name, cell, metrics, warnings, label):
         warnings.append(f"{label}: invalid latency measurements ({error})")
 
 
-def load_costs(name, costs, metrics, warnings, label):
+def load_costs(name, cell, metrics, warnings, label):
     try:
+        costs = cell["costs"]
         if number(costs["transactions"]) == 0:
             raise ReportError("no completed transactions")
         for window in ("workload", "shutdown", "combined"):
@@ -188,21 +186,6 @@ def load_costs(name, costs, metrics, warnings, label):
                 add(metrics, f"{name}/{window}: {counter}", unit, "cost", costs[window][counter])
     except (ReportError, KeyError, TypeError) as error:
         warnings.append(f"{label}: invalid cost measurements ({error})")
-
-
-def check_shared_leaf(cell):
-    """Check that the case still has the settings that the comparison assumes."""
-    if (
-        cell["workload"] != "low-conflict"
-        or cell["affinityPct"] != 100
-        or cell["databases"] != 1
-        or cell["workersPerShape"] != 1
-    ):
-        raise ReportError("shared-leaf settings changed")
-    if {shape["shape"] for shape in cell["shapes"]} != set(SHARED_LEAF_SHAPES) or len(
-        cell["shapes"]
-    ) != len(SHARED_LEAF_SHAPES):
-        raise ReportError("shared-leaf shape set changed")
 
 
 @lru_cache(maxsize=None)
@@ -301,13 +284,8 @@ def escape(text: str) -> str:
 
 
 def validate_manifest(manifest: dict) -> None:
-    cases = manifest.get("cases")
     if (
         manifest.get("schemaVersion") != MANIFEST_VERSION
-        or not isinstance(cases, list)
-        or any(not isinstance(name, str) or not name for name in cases)
-        or len(set(cases)) != len(cases)
-        or SHARED_LEAF_CASE not in cases
         or type(manifest.get("latencyJitter")) is not bool
     ):
         raise ReportError("unsupported comparison manifest")
@@ -344,7 +322,7 @@ class Analysis:
 
 
 def analyze(root: Path, manifest: dict) -> Analysis:
-    """Evaluate all cases at the last completed, planned checkpoint."""
+    """Evaluate all cells at the last completed, planned checkpoint."""
     completed = manifest["completedPairs"]
     repetitions = max((n for n in manifest["checkpoints"] if n <= completed), default=0)
     result = Analysis(repetitions)
@@ -361,7 +339,6 @@ def analyze(root: Path, manifest: dict) -> Analysis:
         for repetition in range(1, repetitions + 1):
             samples, warnings = read_measurement(
                 root / side / f"{repetition:02d}",
-                manifest["cases"],
                 latency_jitter=manifest["latencyJitter"],
             )
             result.warnings.extend(warnings)
@@ -369,13 +346,12 @@ def analyze(root: Path, manifest: dict) -> Analysis:
                 add(metrics, key, sample.unit, sample.kind, sample.values[0])
         sides.append(metrics)
     base, candidate = sides
-    # Include every planned comparison, even if its measurements are missing.
-    # All checkpoints share the error budget; stopping early cannot narrow it.
-    shapes = sum(
-        len(SHARED_LEAF_SHAPES) if case == SHARED_LEAF_CASE else 1
-        for case in manifest["cases"]
-    )
-    family_size = shapes * len(LATENCY_METRICS) * len(manifest["checkpoints"])
+    # Include every comparison that any measurement has, even if the other
+    # measurements miss it. Both sides run the same experiments, so a metric
+    # that a repetition misses is still in the family. All checkpoints share the
+    # error budget; stopping early cannot narrow it.
+    timings = {name for side in sides for name, m in side.items() if m.kind != "cost"}
+    family_size = len(timings) * len(manifest["checkpoints"])
     for name in sorted(set(base) | set(candidate)):
         if (
             name not in base

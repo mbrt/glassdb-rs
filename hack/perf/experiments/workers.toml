@@ -1,6 +1,7 @@
 # The worker grid of the canonical plots. Each worker count continues from the
 # tree after the warm-up of the count before it.
-include = ["../../configs/common-workloads.toml"]
+tags = ["time/real", "canonical", "area/mixed"]
+include = ["../configs/common-workloads.toml"]
 
 [pools.wide]
 keys = 20000

@@ -23,33 +23,23 @@ else:
 # Planned checks bound the cost of repeated statistical decisions. Each count is
 # even so both revisions run first equally often at every possible stopping point.
 CHECKPOINTS = [8, 16, 32]
-# A process runs all cases on virtual time and takes a few seconds.
+# A process runs all experiments on virtual time and takes a few seconds.
 # Guard each process against hangs, such as a CPU livelock that virtual time
 # cannot see.
 PROCESS_TIMEOUT = 120
-CASES = (
-    "warm_read",
-    "warm_read_external",
-    "fresh_client_read",
-    "rmw_inline_1024",
-    "rmw_external_1025",
-    "rmw_five_leaves",
-    "read_long_keys_large_collection",
-    "rmw_shared_leaf_three_transactions",
-    perf_report.SHARED_LEAF_CASE,
-)
 # Virtual time charges a long window only as CPU time. A long window averages
 # the jitter of the provider latency out of the percentile samples, so that
 # changes of a few percent remain visible.
 MEASURE_WINDOW = "300s"
-# The experiments that all comparisons measure, one for each case, and the
-# shared files that they include. They are part of the harness.
-EXPERIMENTS = Path("hack/perf/experiments/default")
+# The experiments, and the shared files that they include. They are part of
+# the harness. All comparisons measure the experiments with the tag `ci`.
+EXPERIMENTS = Path("hack/perf/experiments")
+SELECTION = "--tag=ci"
 CONFIGS = Path("hack/perf/configs")
 # The sources that the base revision takes from the harness. The crate must be
 # in the base revision; the experiment files can be new.
 HARNESS = (Path("crates/glassdb-bench-scale"), CONFIGS, EXPERIMENTS)
-# The options of every compared process. One process runs all cases. The
+# The options of every compared process. One process runs all experiments. The
 # driver adds the experiments, from the copy of the harness in the output.
 COMMON_ARGS = [
     "--backend=memory",
@@ -82,13 +72,22 @@ def capture(command: list[str], cwd: Path) -> str:
 
 
 def snapshot(repo: Path, destination: Path, revision: str | None) -> None:
+    """Copy the files of `revision`, or of the working tree, to `destination`.
+
+    Each file gets the current time as its modification time. Cargo treats an
+    artifact as fresh when it is newer than its sources, so a snapshot that
+    kept older times could reuse artifacts that another snapshot built into the
+    same target directory.
+    """
     destination.mkdir()
     if revision:
         with subprocess.Popen(
             ["git", "archive", revision], cwd=repo, stdout=subprocess.PIPE
         ) as source:
             subprocess.run(
-                ["tar", "-x", "-C", str(destination)], stdin=source.stdout, check=True
+                ["tar", "-x", "-m", "-C", str(destination)],
+                stdin=source.stdout,
+                check=True,
             )
             if source.wait() != 0:
                 raise RuntimeError(f"cannot archive revision {revision}")
@@ -102,7 +101,7 @@ def snapshot(repo: Path, destination: Path, revision: str | None) -> None:
             if source.is_file() or source.is_symlink():
                 target = destination / name
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, target, follow_symlinks=False)
+                shutil.copy(source, target, follow_symlinks=False)
 
 
 def use_harness(candidate: Path, base: Path) -> str:
@@ -179,7 +178,6 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         "schemaVersion": perf_report.MANIFEST_VERSION,
         "checkpoints": CHECKPOINTS,
         "completedPairs": 0,
-        "cases": list(CASES),
         "latencyJitter": LATENCY_JITTER,
         "timingArgs": list(TIMING_ARGS),
         "counterArgs": list(COUNTER_ARGS),
@@ -201,8 +199,6 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         snapshot(
             repo, snapshots / "pr", manifest["candidateCommit"] if candidate else None
         )
-        # Keep a pristine copy for the fallback below, as use_harness overwrites.
-        shutil.copytree(snapshots / "main", snapshots / "main-own")
         manifest["harnessSha256"] = use_harness(snapshots / "pr", snapshots / "main")
         targets = repo / "target/performance"
         try:
@@ -213,17 +209,18 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
             # The candidate harness needs APIs that the base lacks. Measure both
             # engines with the base harness, so that the sides stay comparable.
             print(f"{error}; retrying with the base harness", file=sys.stderr)
-            manifest["harnessSha256"] = use_harness(
-                snapshots / "main-own", snapshots / "pr"
-            )
+            # use_harness replaced the harness of the base snapshot. A new
+            # snapshot is also newer than the artifacts of the failed build, so
+            # cargo does not reuse the candidate harness that they came from.
+            shutil.rmtree(snapshots / "main")
+            snapshot(repo, snapshots / "main", manifest["baseCommit"])
+            manifest["harnessSha256"] = use_harness(snapshots / "main", snapshots / "pr")
             manifest["harness"] = "base"
             manifest["warnings"].append(
                 f"The candidate harness does not build against {base}; "
                 "both revisions were measured with the harness of the base."
             )
-            manifest["main"] = build(
-                snapshots / "main-own", targets / "main", output, "main"
-            )
+            manifest["main"] = build(snapshots / "main", targets / "main", output, "main")
         manifest["pr"] = build(snapshots / "pr", targets / "pr", output, "pr")
         # The candidate snapshot has the harness that both sides use, and the
         # measurement reads its experiment files after the snapshots are gone.
@@ -235,9 +232,9 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         for relative in (CONFIGS, EXPERIMENTS):
             if (snapshots / "pr" / relative).is_dir():
                 shutil.copytree(snapshots / "pr" / relative, harness / relative)
-        experiments = f"--experiment={harness / EXPERIMENTS}"
-        manifest["timingArgs"].append(experiments)
-        manifest["counterArgs"].append(experiments)
+        experiments = [f"--experiment={harness / EXPERIMENTS}", SELECTION]
+        manifest["timingArgs"].extend(experiments)
+        manifest["counterArgs"].extend(experiments)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return manifest
 
@@ -301,9 +298,7 @@ def measure(output: Path, manifest: dict) -> None:
                 for side in sides:
                     directory = run_experiments(side, repetition)
                     _, warnings = perf_report.read_measurement(
-                        directory,
-                        manifest["cases"],
-                        latency_jitter=manifest["latencyJitter"],
+                        directory, latency_jitter=manifest["latencyJitter"]
                     )
                     if warnings:
                         raise perf_report.ReportError("; ".join(warnings))
