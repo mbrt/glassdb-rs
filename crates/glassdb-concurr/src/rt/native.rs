@@ -150,9 +150,60 @@ pub fn system_now() -> SystemTime {
         .expect("model wall time exceeded SystemTime's range")
 }
 
+/// The resolution of Tokio timers. On a live clock, the driver parks for a
+/// timeout of whole milliseconds, rounded up, so a timer of `k` whole
+/// milliseconds wakes after about `k + 1` ms (measured on Linux with
+/// Tokio 1.x).
+const TIMER_TICK: Duration = Duration::from_millis(1);
+
+/// Returns the request that makes a live Tokio timer wake as soon as possible
+/// after `wall`, but not before it: the wait rounded up to whole ticks, less
+/// one tick. The wait then ends about 70 µs after a whole tick, so it is late
+/// by less than one tick, instead of by up to two.
+fn live_timer_request(wall: Duration) -> Duration {
+    let tick = TIMER_TICK.as_nanos();
+    let ticks = wall.as_nanos().div_ceil(tick);
+    let request = ticks.saturating_sub(1) * tick;
+    // A zero request can fire before the driver parks. One microsecond makes
+    // the driver park for its shortest timeout, one tick.
+    u64::try_from(request)
+        .map(Duration::from_nanos)
+        // A request is shorter than the wait, so the wait bounds it.
+        .unwrap_or(wall)
+        .max(Duration::from_micros(1))
+}
+
+/// Returns the two timers of a wait for `wall`, a duration of the runtime
+/// clock: an early timer from [`live_timer_request`], then the deadline.
+///
+/// The early timer removes most of the lag of a live clock. It can wake
+/// before the deadline: a paused clock wakes each timer on its tick, and a
+/// busy runtime turns its driver between parks. The deadline timer then
+/// waits for the rest, so a wait is never shorter than `wall`.
+///
+/// Returns `None` when one Tokio timer is enough: virtual time runs its clock
+/// 1000 times as fast as model time, so its lag is already too small to
+/// matter, and Tokio clamps a deadline that it cannot represent.
+fn live_timers(wall: Duration) -> Option<(tokio::time::Instant, tokio::time::Instant)> {
+    if model_time().speedup == PAUSED_SPEEDUP {
+        return None;
+    }
+    let start = tokio::time::Instant::now();
+    let deadline = start.checked_add(wall)?;
+    let early = (start + live_timer_request(wall)).min(deadline);
+    Some((early, deadline))
+}
+
 /// Sleeps for `duration` in model time.
 pub async fn sleep(duration: Duration) {
-    tokio::time::sleep(model_wait(duration)).await;
+    let wall = model_wait(duration);
+    let Some((early, deadline)) = live_timers(wall) else {
+        return tokio::time::sleep(wall).await;
+    };
+    tokio::time::sleep_until(early).await;
+    if tokio::time::Instant::now() < deadline {
+        tokio::time::sleep_until(deadline).await;
+    }
 }
 
 /// Returns the host's available parallelism.
@@ -176,7 +227,42 @@ pub async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, Time
 where
     F: Future,
 {
-    tokio::time::timeout(model_wait(duration), future)
+    let wall = model_wait(duration);
+    let Some((early, deadline)) = live_timers(wall) else {
+        return tokio::time::timeout(wall, future)
+            .await
+            .map_err(|_| TimedOut);
+    };
+    let mut future = std::pin::pin!(future);
+    if let Ok(output) = tokio::time::timeout_at(early, &mut future).await {
+        return Ok(output);
+    }
+    tokio::time::timeout_at(deadline, future)
         .await
         .map_err(|_| TimedOut)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::live_timer_request;
+
+    #[test]
+    fn live_timer_request_is_one_tick_less_than_the_rounded_wait() {
+        let us = Duration::from_micros;
+        let ms = Duration::from_millis;
+        // A wait of one tick or less needs the shortest park.
+        assert_eq!(live_timer_request(Duration::from_nanos(1)), us(1));
+        assert_eq!(live_timer_request(ms(1)), us(1));
+        // A whole number of ticks parks one tick more than the request.
+        assert_eq!(live_timer_request(ms(20)), ms(19));
+        // A fractional wait ends at the end of its last tick.
+        assert_eq!(live_timer_request(us(1001)), ms(1));
+        assert_eq!(live_timer_request(us(4400)), ms(4));
+        // The wait bounds a request that nanoseconds cannot hold.
+        assert_eq!(live_timer_request(Duration::MAX), Duration::MAX);
+        let long = Duration::from_secs(u64::MAX / 1_000_000_000 + 1);
+        assert_eq!(live_timer_request(long), long);
+    }
 }

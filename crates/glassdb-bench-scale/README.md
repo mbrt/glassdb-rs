@@ -129,8 +129,10 @@ timestamp can change their size by a byte with the start time of the process.
 This moves the latency of large writes by under 1%. It needs `--backend=memory`
 and does not combine with `--delay-scale`: a paused clock also jumps while a
 task waits for the operating system, as for the socket of `fakes3`. Latencies
-are 10–25% lower than at the 5× scale, because they have no timer rounding, so
-a comparison must use one mode on both sides. The
+are 2–15% lower than at the 5× scale, so a comparison must use one mode on both
+sides. In real time, `rt` rounds each wait up to a whole millisecond of wall
+time, so each backend operation at the 5× scale takes about 5 ms of model time
+more. Short operations, such as reads, show the largest difference. The
 comparison of two revisions in CI uses it, because both sides have the same
 effects and the results repeat. Use it also for fast checks and for a first look
 at the shape of a sweep. These effects make it unfit for the canonical plots and
