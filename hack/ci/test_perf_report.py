@@ -10,7 +10,8 @@ from typing import Any
 
 from hack.ci import perf_report
 
-SHARED_LEAF = perf_report.SHARED_LEAF_CASE
+SHARED_LEAF = "shapes-shared-leaf"
+SHARED_LEAF_SHAPES = ("rw-single", "rw-many", "ro-single", "ro-multi")
 PAIRS = 4
 COUNTER_KEYS = (
     "reads",
@@ -70,7 +71,7 @@ def shared_leaf_cell():
                 "p90Ms": 20,
                 "txPerSec": 100,
             }
-            for name in perf_report.SHARED_LEAF_SHAPES
+            for name in SHARED_LEAF_SHAPES
         ],
         "costs": costs_record(),
     }
@@ -97,7 +98,6 @@ class PerfReportTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.manifest: dict[str, Any] = {
             "schemaVersion": perf_report.MANIFEST_VERSION,
-            "cases": ["example", SHARED_LEAF],
             "checkpoints": [PAIRS],
             "completedPairs": PAIRS,
             "latencyJitter": True,
@@ -336,8 +336,6 @@ class PerfReportTest(unittest.TestCase):
             {"completedPairs": 9},
             {"completedPairs": {"example": 4}},
             {"latencyJitter": "yes"},
-            {"cases": ["example"]},
-            {"cases": ["example", "example", SHARED_LEAF]},
             {"schemaVersion": 2},
         ):
             with self.subTest(changes=changes):
@@ -470,12 +468,42 @@ class PerfReportTest(unittest.TestCase):
         self.assertIn("Measurement warnings", report)
         self.assertIn("incomplete paired measurements", report)
 
-    def test_another_case_is_not_compared(self):
+    def test_an_experiment_of_one_side_is_not_compared(self):
         def rename(value):
             value["experiments"][0]["name"] = "other"
 
         self.update("timing", rename)
-        self.assertIn("expected one example experiment", self.report())
+        report = self.report()
+        self.assertIn("example: p50Ms: incomplete paired measurements", report)
+        self.assertIn("other: p50Ms: incomplete paired measurements", report)
+
+    def test_a_cell_of_an_experiment_with_several_cells_is_named_by_its_labels(self):
+        def split(value):
+            (experiment,) = [e for e in value["experiments"] if e["name"] == "example"]
+            (cell,) = experiment["runs"][0]["cells"]
+            experiment["runs"][0]["cells"] = [
+                {**cell, "labels": {"size": size, "keys": "keys1"}}
+                for size in ("small", "large")
+            ]
+
+        self.update("timing", split, sides=("main", "pr"))
+        self.update("counters", split, sides=("main", "pr"))
+        self.update_cell(
+            "timing",
+            "example",
+            lambda cell: cell.update(shapes=example_cell(130)["shapes"]),
+        )
+        report = self.report()
+        self.assertIn("regressed", self.row(report, "| example/small/keys1: p50Ms"))
+        self.assertNotIn("| example/large/keys1: p50Ms", report)
+        metrics, _ = perf_report.read_measurement(self.directory("pr", 1), latency_jitter=True)
+        self.assertIn("example/large/keys1/workload: reads", metrics)
+
+    def test_a_failed_cell_is_a_warning(self):
+        self.update_cell("counters", SHARED_LEAF, lambda cell: cell.update(failures=1))
+        report = self.report()
+        self.assertIn(f"{SHARED_LEAF}: cell failed", report)
+        self.assertIn("incomplete paired measurements", report)
 
     def test_invalid_numbers_and_low_sample_counts_are_warnings(self):
         self.update_cell(
@@ -497,10 +525,7 @@ class PerfReportTest(unittest.TestCase):
 
     def test_models_must_match_before_latency_is_compared(self):
         directory = self.directory("pr", 1)
-        cases = self.manifest["cases"]
-        metrics, warnings = perf_report.read_measurement(
-            directory, cases, latency_jitter=True
-        )
+        metrics, warnings = perf_report.read_measurement(directory, latency_jitter=True)
         self.assertFalse(warnings)
         self.assertIn("example: p50Ms", metrics)
         self.assertIn("example/workload: reads", metrics)
@@ -517,16 +542,14 @@ class PerfReportTest(unittest.TestCase):
             with self.subTest(key=key):
                 self.update("timing", lambda v: v.update({key: value}), repetitions=[1])
                 metrics, warnings = perf_report.read_measurement(
-                    directory, cases, latency_jitter=True
+                    directory, latency_jitter=True
                 )
                 # The counters come from another file, and stay valid.
                 self.assertNotIn("example: p50Ms", metrics)
                 self.assertIn("example/workload: reads", metrics)
                 self.assertIn("invalid latency measurement", warnings[0])
                 self.write(directory / "timing.json", result(True))
-        metrics, warnings = perf_report.read_measurement(
-            directory, cases, latency_jitter=False
-        )
+        metrics, warnings = perf_report.read_measurement(directory, latency_jitter=False)
         self.assertNotIn("example: p50Ms", metrics)
         self.assertIn("latency profile", warnings[0])
 
@@ -535,7 +558,7 @@ class PerfReportTest(unittest.TestCase):
             "counters", lambda v: v.update(latencyJitter=True), repetitions=[1]
         )
         metrics, warnings = perf_report.read_measurement(
-            self.directory("pr", 1), self.manifest["cases"], latency_jitter=True
+            self.directory("pr", 1), latency_jitter=True
         )
         self.assertIn("example: p50Ms", metrics)
         self.assertNotIn("example/workload: reads", metrics)

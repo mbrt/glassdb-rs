@@ -23,35 +23,23 @@ else:
 # Planned checks bound the cost of repeated statistical decisions. Each count is
 # even so both revisions run first equally often at every possible stopping point.
 CHECKPOINTS = [8, 16, 32]
-# A process runs all cases on virtual time and takes a few seconds.
+# A process runs all experiments on virtual time and takes a few seconds.
 # Guard each process against hangs, such as a CPU livelock that virtual time
 # cannot see.
 PROCESS_TIMEOUT = 120
-CASES = (
-    "read-warm",
-    "read-warm-external",
-    "read-fresh-client",
-    "rmw-inline",
-    "rmw-external",
-    "rmw-five-leaves",
-    "read-long-keys",
-    "rmw-shared-leaf",
-    perf_report.SHARED_LEAF_CASE,
-)
 # Virtual time charges a long window only as CPU time. A long window averages
 # the jitter of the provider latency out of the percentile samples, so that
 # changes of a few percent remain visible.
 MEASURE_WINDOW = "300s"
 # The experiments, and the shared files that they include. They are part of
-# the harness. All comparisons measure the experiments with the tag `ci`, one
-# for each case.
+# the harness. All comparisons measure the experiments with the tag `ci`.
 EXPERIMENTS = Path("hack/perf/experiments")
 SELECTION = "--tag=ci"
 CONFIGS = Path("hack/perf/configs")
 # The sources that the base revision takes from the harness. The crate must be
 # in the base revision; the experiment files can be new.
 HARNESS = (Path("crates/glassdb-bench-scale"), CONFIGS, EXPERIMENTS)
-# The options of every compared process. One process runs all cases. The
+# The options of every compared process. One process runs all experiments. The
 # driver adds the experiments, from the copy of the harness in the output.
 COMMON_ARGS = [
     "--backend=memory",
@@ -181,7 +169,6 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         "schemaVersion": perf_report.MANIFEST_VERSION,
         "checkpoints": CHECKPOINTS,
         "completedPairs": 0,
-        "cases": list(CASES),
         "latencyJitter": LATENCY_JITTER,
         "timingArgs": list(TIMING_ARGS),
         "counterArgs": list(COUNTER_ARGS),
@@ -303,9 +290,7 @@ def measure(output: Path, manifest: dict) -> None:
                 for side in sides:
                     directory = run_experiments(side, repetition)
                     _, warnings = perf_report.read_measurement(
-                        directory,
-                        manifest["cases"],
-                        latency_jitter=manifest["latencyJitter"],
+                        directory, latency_jitter=manifest["latencyJitter"]
                     )
                     if warnings:
                         raise perf_report.ReportError("; ".join(warnings))

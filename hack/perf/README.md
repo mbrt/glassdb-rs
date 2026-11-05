@@ -89,7 +89,14 @@ Most cases use built-in parts:
 | `rmw-shared-leaf` | Three workers that update their own key of one leaf. |
 | `shapes-shared-leaf` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time on one leaf, with `low-conflict` keys. |
 
-The `costs` of each cell are the numbers that the CI comparison checks.
+The CI comparison reads all cells of the experiments with the tag `ci`. It
+compares the p50 latency, the p90 latency, and the throughput of each shape,
+and the `costs` of each cell. The name of a metric is the experiment, then the
+labels of the cell if the experiment has more than one cell, then the shape if
+the cell has more than one shape, for example `shapes-shared-leaf/rw-single:
+p50Ms`. To add an experiment to the comparison, give it the tag `ci`. Each
+comparison runs each cell in up to 32 pairs of processes, so keep these
+experiments small.
 
 ## Plotting results
 

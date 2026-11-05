@@ -128,7 +128,6 @@ class MeasurementTest(unittest.TestCase):
             "schemaVersion": perf_compare.perf_report.MANIFEST_VERSION,
             "base": "base",
             "candidate": "candidate",
-            "cases": [*cases, "shapes-shared-leaf"],
             "checkpoints": list(checkpoints),
             "completedPairs": 0,
             "latencyJitter": True,
@@ -196,7 +195,7 @@ class MeasurementTest(unittest.TestCase):
             timing, counters = self.read(side, 1, "timing"), self.read(side, 1, "counters")
             self.assertIs(timing["latencyJitter"], True)
             self.assertIs(counters["latencyJitter"], False)
-            # One process measures every case, including the shapes-shared-leaf workload.
+            # One process measures every experiment.
             for result in (timing, counters):
                 names = [experiment["name"] for experiment in result["experiments"]]
                 self.assertEqual(names, ["a", "shapes-shared-leaf"])
@@ -211,9 +210,6 @@ class MeasurementTest(unittest.TestCase):
             )
         self.assertIn("--latency-jitter=true", perf_compare.TIMING_ARGS)
         self.assertIn("--latency-jitter=false", perf_compare.COUNTER_ARGS)
-        self.assertEqual(
-            perf_compare.CASES[-1], perf_compare.perf_report.SHARED_LEAF_CASE
-        )
 
     def test_wrong_latency_profile_fails_before_counting_the_pair(self):
         self.configure(latencyJitter=True)
