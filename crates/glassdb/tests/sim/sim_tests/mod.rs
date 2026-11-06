@@ -1,6 +1,7 @@
 mod api;
 mod commit_recovery;
 mod concurrent;
+mod contended_keys;
 mod cycle;
 mod fuzz_corpus;
 mod gc;

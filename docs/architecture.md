@@ -649,11 +649,15 @@ underfull threshold, and inline pressure decide, and the write spans that the
 writers of the leaf entries show move soft cap splits and cause merges
 ([ADR-084](adr/084-size-causes-are-the-default-topology-policy.md)). A database
 instance that loses leaf CASes on a key to other database instances also splits
-the key away from their keys. It merges an underfull leaf only when it wrote
-recently live values of both leaves of the merge, or when one of them has no
-live value of a recent writer. It knows its own writers from the transaction
+the key away from their keys. It knows its own writers from the transaction
 identities of its recent owner operations
 ([ADR-085](adr/085-lost-leaf-cas-separates-the-keys-of-database-instances.md)).
+Contention comes before write spans, and write spans come before leaf sizes. So
+a contention split can divide a write span, and a database instance merges two
+leaves, for either cause, only when all the recent writers of live values in
+the two leaves are local, or when one of the leaves has no live value of a
+recent writer
+([ADR-088](adr/088-contention-comes-before-write-spans-and-sizes.md)).
 No policy merges leaves because scans cross their boundary
 ([ADR-086](adr/086-remove-the-avoidable-time-policy.md)). A new candidate wakes
 the restructurer after a short delay, so that one sweep takes a burst of

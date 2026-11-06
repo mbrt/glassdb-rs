@@ -9,6 +9,138 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-11-06: contention comes before write spans and leaf sizes
+
+Status: ADR-088 changed `false-sharing`, `load-shift`, and `random-ranges` by
+no more than 3%, and `workers` by no more than 2% at 20 to 140 workers. At 200
+workers, it changed `workers` by no more than 3% when the order of the runs was
+rotated. It cost `fixed-ranges` with 5 database instances
+4 to 7% of its throughput, because its merge veto also keeps apart leaves that
+only a seed split divided. The cost is accepted: while two leaves are apart,
+nothing shows the lost leaf CASes that a merge would cause. In
+`false-sharing-spans`, where a write span crosses contended keys, ADR-088 gave
+each hot writer about 7.7 tx/s, against 0.3 to 4.3 tx/s when write spans come
+first. The [three-way runs](#three-way-runs) compare the two orders.
+
+All runs used `--backend=memory --delays=s3 --delay-scale=0.2
+--prefix-depth=3 --drain-timeout=90s` in real time. `base` is `15d82c940`, and
+`exp` is `base` with the change of ADR-088. Each pair ran `base` first, except
+where the text says otherwise. Ratios are the mean of the `exp` runs to the
+mean of the `base` runs.
+
+### Results
+
+| Experiment | Runs | Throughput, `exp` / `base` | Writes/tx, `base` | Writes/tx, `exp` | Changes in the measurement |
+| --- | ---: | --- | --- | --- | --- |
+| `false-sharing` | 3 | 0.997 | 0.56 | 0.56 | none in either |
+| `load-shift`, `crossing` | 3 | 0.979 | 1.36 to 1.40 | 1.40 to 1.44 | none in either |
+| `load-shift`, low conflict cells | 3 | 1.003 | 1.05 to 1.33 | 1.02 to 1.27 | splits only, in both |
+| `membership-churn` | 3 | 1.097 | 0.90 to 1.25 | 0.86 to 1.03 | none in either |
+| `random-ranges`, 1 instance | 1 | 1.002 | 1.45 | 1.45 | 8 splits, 7 merges; 8 splits, 6 merges |
+| `random-ranges`, 5 instances | 1 | 1.000 | 3.01 | 2.96 | 15 splits, 6 merges; 2 splits, 2 merges |
+| `fixed-ranges`, 1 instance | 1 | 1.003 | 0.98 | 0.98 | 2 splits, 2 merges in both |
+| `fixed-ranges`, 5 instances | 3 | 0.933 | 1.44 to 1.57 | 1.90 to 2.02 | `base`: 4 and 4, 5 and 1, 6 and 5; `exp`: 0 and 0, 1 and 0, 1 and 1 (splits and merges) |
+| `workers`, 20, 80, 140 | 1 each | 0.999, 0.984, 1.011 | 1.87, 1.11, 0.83 | 1.86, 1.10, 0.83 | `base`: 0, 6, and 0 splits; `exp`: 1, 0, and 1 splits; no merge |
+| `workers`, 200 | 4 | 0.959 | 0.63 to 0.68 | 0.62 to 0.65 | at most 2 splits, no merge |
+
+- Each hot writer of `false-sharing` committed 7.60 to 7.88 tx/s in `base`
+  and 7.64 to 7.84 tx/s in `exp`.
+- `membership-churn` was noisy: 44 to 63 tx/s in `base`, 48 to 67 tx/s in
+  `exp`.
+- `workers` at 200 was lower in `exp` in the three pairs that ran `base`
+  first. A fourth pair ran `exp` first and gave 0.993. Both sides had the same
+  splits, no merges, no leaf CAS retries, and the same direct commits for each
+  transaction, so the difference is likely the order of the runs. The
+  three-way runs, with the order rotated, gave 1.031.
+
+### `fixed-ranges` with 5 database instances
+
+| Measure | `base` | `exp` |
+| --- | --- | --- |
+| All shapes | 511 to 526 tx/s | 482 to 493 tx/s |
+| `fr16-1`, `fr16-4`, `fr16-9`, `fr16-12` | 5 to 15 tx/s each | 7 tx/s each |
+| Direct commits for each transaction | 0.59 to 0.61 | 0.49 to 0.51 |
+| Lock calls | 8,578 to 10,371 | 14,131 to 15,713 |
+| Leaf CAS retries for each transaction | 0.094 to 0.098 | 0.101 to 0.105 |
+
+A probe in `exp` printed each contention split and each merge veto, in one
+run. It printed no contention split. The merge for write spans waited about
+4,900 times, all but once at six boundaries: `01344`, `04352`, `09344`, and
+`12352`, inside the four slow 16-key ranges, and `15616` and `18112`, inside
+64-key ranges.
+Seed splits made these boundaries. Other database instances write single keys
+of the same leaves, so each leaf has a recent foreign writer, and the merge
+waits.
+
+These foreign keys are in the same leaf whether or not the leaves merge, so
+the veto does not remove their lost leaf CASes. It only removes the direct
+commits of the ranges. `base` made 1 to 5 merges and 4 to 6 splits in each
+measurement. The probe ran only in `exp`, so their causes are not known.
+
+### Three-way runs
+
+These runs compare three sides: `base`, `exp`, and `rev`. `rev` is `base` with
+only the merge condition of ADR-088 for underfull merges, so it puts write
+spans before contention: a contention split divides no write span, and a merge
+for write spans does not read the writers. Each iteration ran the three sides
+in a rotated order. The new experiment `false-sharing-spans` is
+`false-sharing` with the hot keys at 1 to 4, and one more instance whose
+transactions write the keys 0 and 5, so that its write span crosses the hot
+keys.
+
+| Experiment | Runs | `exp` / `base` | `rev` / `base` | Splits and merges in the measurement, `base`; `exp`; `rev` |
+| --- | ---: | --- | --- | --- |
+| `false-sharing-spans` | 3 | 1.086 | 0.959 | 6 and 0, 3 and 0, 0 and 0; 0 and 0, 0 and 0, 1 and 1; 0 and 0, 6 and 0, 0 and 0 |
+| `false-sharing` | 3 | 0.998 | 0.999 | none |
+| `fixed-ranges`, 5 instances | 3 | 0.962 | 1.034 | 3 and 3, 5 and 2, 4 and 1; 1 and 1, 1 and 1, 2 and 1; 4 and 2, 6 and 0, 5 and 1 |
+| `load-shift`, `crossing` and low conflict | 3 | 0.996, 1.008 | 1.001, 1.003 | splits only, in all |
+| `membership-churn` | 3 | 0.864 | 0.856 | none |
+| `random-ranges`, 1 and 5 instances | 2 | 0.998, 0.996 | 1.001, 1.010 | 3 to 12 splits and 2 to 11 merges, in all |
+| `workers`, 200 | 2 | 1.031 | 1.028 | at most 3 splits, no merge |
+
+`false-sharing-spans` in detail:
+
+| Measure | `base` | `exp` | `rev` |
+| --- | --- | --- | --- |
+| Each hot writer | 0.45 to 4.32 tx/s | 7.67 to 7.89 tx/s | 0.28 to 4.20 tx/s |
+| The writer of the span | 1.3 to 5.9 tx/s | 2.3 to 2.9 tx/s | 4.8 to 10.2 tx/s |
+| `bg-rmw-seq` | 16 to 50 tx/s | 83 to 90 tx/s | 13 to 50 tx/s |
+| Leaf CAS retries for each transaction | 0.027 to 0.040 | 0.004 to 0.006 | 0.025 to 0.041 |
+
+- In `base` and `rev`, the edges of the run of each hot key divide the write
+  span, so the contention split does not occur, and the hot keys stay in one
+  leaf with the span. The hot writers changed by a factor of ten from run to
+  run.
+- In `exp`, the hot keys split apart, and the writer of the span needs a
+  locked commit over two leaves.
+- `membership-churn` made no splits and no merges on any side, so its ratios
+  are noise. Its `base` runs were 63 to 68 tx/s here, against 44 to 63 tx/s in
+  the runs before.
+
+### Conclusions
+
+- Where a write span crosses contended keys, contention first gives every
+  writer of the leaf except the writer of the span several times the
+  throughput, and about one seventh of the leaf CAS retries.
+- Where the writers alone keep a write span divided, without contention,
+  write spans first gives about 7% more throughput than contention first, and
+  3% more than `base`.
+- With the merge condition of ADR-088, a leaf that several database instances
+  write does not merge. In `fixed-ranges` with 5 database instances, `exp`
+  made at most two splits and one merge in each measurement, against up to 6
+  and 5 in `base`. With one database instance, all writers are local, and both
+  sides made the same changes.
+- The merge veto reads the writers of the leaves. They do not tell a boundary
+  that a contention split made from one that a size split made, and a
+  database instance that writes a key next to the boundary of a range then
+  keeps the range divided.
+- While two leaves are apart, their write spans show the cost of the boundary,
+  but nothing shows the lost leaf CASes that a merge would cause. A measure
+  of both costs would be an estimate, as the avoidable time policy was
+  (ADR-086).
+- A contention split could mark its boundary in the leaf, so that only these
+  boundaries wait. This was not tried.
+
 ## 2026-11-02: the avoidable time policy against the default
 
 Status: the default topology policy (`writers`) settled in each cell of

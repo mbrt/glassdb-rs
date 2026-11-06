@@ -1,0 +1,104 @@
+# False sharing under a write span: four database instances each write one of
+# the adjacent keys 1 to 4, which share a leaf, and one more instance writes the
+# keys 0 and 5 in each of its transactions. Its write span crosses the four
+# contended keys. Another instance reads and writes the keys around them, as in
+# `false-sharing`.
+#
+# A split that separates the contended keys divides the write span (ADR-088).
+tags = ["time/real", "area/topology"]
+
+[pools.false-sharing]
+keys = 4096
+
+[shapes.hot1]
+kind = "write"
+pool = "false-sharing"
+source = { index = { keys = [1] } }
+
+[shapes.hot2]
+kind = "write"
+pool = "false-sharing"
+source = { index = { keys = [2] } }
+
+[shapes.hot3]
+kind = "write"
+pool = "false-sharing"
+source = { index = { keys = [3] } }
+
+[shapes.hot4]
+kind = "write"
+pool = "false-sharing"
+source = { index = { keys = [4] } }
+
+[shapes.span]
+kind = "read-modify-write"
+pool = "false-sharing"
+source = { index = { keys = [0, 5] } }
+keys = 2
+
+[shapes.bg-rmw-seq]
+kind = "read-modify-write"
+pool = "false-sharing"
+source = { sequence = { start = 6, count = 58, order = "ascending" } }
+keys = 1
+
+[shapes.bg-read-seq]
+kind = "read"
+pool = "false-sharing"
+source = { sequence = { start = 6, count = 58, order = "ascending" } }
+keys = 1
+
+[shapes.bg-rmw-pool]
+kind = "read-modify-write"
+pool = "false-sharing"
+source = "pool"
+keys = 1
+
+[shapes.bg-read-pool]
+kind = "read"
+pool = "false-sharing"
+source = "pool"
+keys = 1
+
+[workloads.false-sharing.groups.hot1]
+instances = 1
+shapes = { hot1 = 4 }
+
+[workloads.false-sharing.groups.hot2]
+instances = 1
+shapes = { hot2 = 4 }
+
+[workloads.false-sharing.groups.hot3]
+instances = 1
+shapes = { hot3 = 4 }
+
+[workloads.false-sharing.groups.hot4]
+instances = 1
+shapes = { hot4 = 4 }
+
+[workloads.false-sharing.groups.span]
+instances = 1
+shapes = { span = 4 }
+
+[workloads.false-sharing.groups.background]
+instances = 1
+shapes = { bg-rmw-seq = 8, bg-read-seq = 8, bg-rmw-pool = 8, bg-read-pool = 8 }
+
+[seed]
+quiet-period = "10s"
+timeout = "600s"
+
+[cell]
+workload = "false-sharing"
+collections = 1
+gc = false
+
+[cell.warm-up]
+minimum = "30s"
+quiet = "10s"
+timeout = "120s"
+
+[cell.measure]
+until = "duration"
+duration = "60s"
+max-duration = "120s"

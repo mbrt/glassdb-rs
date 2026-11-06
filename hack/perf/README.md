@@ -51,6 +51,7 @@ TIME=virtual` runs the experiments with the tag `time/virtual` in virtual time.
 | `conflict-sweep` | `time/real` | The conflict grid of the canonical plots: 20 workers on 1 and on 5 database instances run read-modify-write transactions of 1 or 4 keys on one pool, from 5,000 keys down to 5 keys (1 key) or 100 keys (4 keys). A smaller pool gives more conflicts. |
 | `load-shift` | `time/real` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
 | `false-sharing` | `time/real` | Four instances that each write one of four adjacent keys of one leaf, while one more instance reads and writes the keys around them (ADR-084). The default topology policy must split the keys of the four instances apart. |
+| `false-sharing-spans` | `time/real` | As `false-sharing`, but one more instance writes the two keys on both sides of the four contended keys in each transaction, so its write span crosses them (ADR-088). The default topology policy must still split the contended keys apart. |
 | `fixed-ranges` | `time/real` | Transactions on fixed ranges of 16 and 64 keys, with transactions on single keys (ADR-084). |
 | `random-ranges` | `time/real` | Transactions on ranges of 16 and 64 adjacent keys from random starts, on fixed sets of 3 keys, and on single keys (ADR-084). |
 

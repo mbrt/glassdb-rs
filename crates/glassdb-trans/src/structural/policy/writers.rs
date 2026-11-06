@@ -1,4 +1,4 @@
-//! The writers, the default topology policy (ADR-084, ADR-085).
+//! The writers, the default topology policy (ADR-084, ADR-085, ADR-088).
 
 use std::collections::BTreeSet;
 
@@ -22,6 +22,7 @@ use super::{
 /// The size causes decide, refined by the writers of the leaf entries. Write
 /// spans move soft cap splits and cause merges (ADR-084), and the keys that
 /// several database instances write in one leaf split apart (ADR-085).
+/// Contention comes before write spans and leaf sizes (ADR-088).
 pub(crate) struct WritersPolicy {
     base: SizeCausesPolicy,
     contention: Contention,
@@ -122,21 +123,16 @@ impl TopologyDecisions for WritersPolicy {
         }
     }
 
-    /// An underfull merge waits while another database instance writes one
-    /// of the two leaves, and this one does not (ADR-085). A merge for write
-    /// spans can make a leaf of up to twice the soft cap of entries, because
-    /// its soft cap split then keeps the write spans. It keeps a quarter of
-    /// the inline budget free, so that the next writes of the merged leaf do
-    /// not cause inline pressure at once (ADR-084).
+    /// A merge waits while another database instance writes one of the two
+    /// leaves (ADR-088). A merge for write spans can make a leaf of up to
+    /// twice the soft cap of entries, because its soft cap split then keeps
+    /// the write spans. It keeps a quarter of the inline budget free, so that
+    /// the next writes of the merged leaf do not cause inline pressure at once
+    /// (ADR-084).
     fn merge(&self, left: &Node, right: &Node, reason: MergeReason) -> MergeDecision {
         let now = rt::system_now();
-        match reason {
-            MergeReason::Underfull => match self.base.merge(left, right, reason) {
-                MergeDecision::Within { .. } if self.contention.keeps_apart(left, right, now) => {
-                    MergeDecision::Veto(MergeVeto::KeptApart)
-                }
-                decision => decision,
-            },
+        let decision = match reason {
+            MergeReason::Underfull => self.base.merge(left, right, reason),
             MergeReason::WriteSpan => {
                 let sizes = &self.base.settings().sizes;
                 if write_spans::pays_for_merge(left, right, sizes, now) {
@@ -148,6 +144,12 @@ impl TopologyDecisions for WritersPolicy {
                     MergeDecision::Veto(MergeVeto::NotNeeded)
                 }
             }
+        };
+        match decision {
+            MergeDecision::Within { .. } if self.contention.keeps_apart(left, right, now) => {
+                MergeDecision::Veto(MergeVeto::KeptApart)
+            }
+            decision => decision,
         }
     }
 }
