@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use glassdb_data::{CollectionAddress, TxId};
+use glassdb_data::{CollectionAddress, CollectionId, TxId};
 use glassdb_storage::{
     CollectionRecord, CurrentnessBarrier, NodeSizePolicy, Requirement, StorageError,
 };
@@ -83,14 +83,27 @@ impl CollectionCatalog {
         }
 
         for read in reads {
-            let Some(record) = records.get(&read.parent) else {
-                continue;
+            // A committed drop removes the binding of its collection and
+            // advances the generation of its parent. The records do not
+            // resolve atomically, so a parent's record can predate a drop that
+            // the resolution of the child found. Such a record cannot prove
+            // the reads of the bindings that the drop removed.
+            let is_dropped = |child: CollectionId| {
+                dropped.contains(&CollectionAddress::from_db_prefix(
+                    read.parent.db_prefix_component().clone(),
+                    child,
+                ))
             };
+            let record = records.get(&read.parent);
             let valid = match &read.kind {
-                DirectoryReadKind::Entry { name, collection } => record.child(name) == *collection,
-                DirectoryReadKind::Listing { generation } => {
-                    record.directory_generation() == *generation
+                DirectoryReadKind::Entry { name, collection } => {
+                    !collection.is_some_and(is_dropped)
+                        && record.is_none_or(|record| record.child(name) == *collection)
                 }
+                DirectoryReadKind::Listing { generation } => record.is_none_or(|record| {
+                    record.directory_generation() == *generation
+                        && !record.children().any(|(_, child)| is_dropped(child))
+                }),
             };
             if !valid {
                 return Ok(false);
@@ -145,7 +158,7 @@ mod tests {
 
     use glassdb_backend::memory::MemoryBackend;
     use glassdb_concurr::{Background, RetrySchedule};
-    use glassdb_data::{CollectionId, CollectionName, DbPrefix};
+    use glassdb_data::{CollectionName, DbPrefix};
     use glassdb_storage::transaction::{
         TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecord, TxRecordStore,
     };
@@ -154,7 +167,13 @@ mod tests {
     use super::*;
     use crate::monitor::Monitor;
 
-    fn new_catalog() -> (CollectionCatalog, CollectionStore, Monitor, Arc<Background>) {
+    fn new_catalog() -> (
+        CollectionCatalog,
+        CollectionStore,
+        Monitor,
+        Timeline,
+        Arc<Background>,
+    ) {
         let timeline = Timeline::new();
         let objects = CachedStore::new(
             Arc::new(MemoryBackend::new()),
@@ -175,17 +194,17 @@ mod tests {
         let state = CollectionStateResolver::new(
             records.clone(),
             transactions,
-            timeline,
+            timeline.clone(),
             monitor.clone(),
             RetrySchedule::default(),
         );
         let catalog = CollectionCatalog::new(state);
-        (catalog, records, monitor, background)
+        (catalog, records, monitor, timeline, background)
     }
 
     #[tokio::test]
     async fn snapshot_helps_a_committed_directory_holder() {
-        let (catalog, records, monitor, _background) = new_catalog();
+        let (catalog, records, monitor, _timeline, _background) = new_catalog();
         let parent = CollectionAddress::root("db");
         let child = CollectionAddress::new("db", CollectionId::from_bytes([1; 16]));
         let id = TxId::with_priority(0, &[1]);
@@ -215,5 +234,87 @@ mod tests {
             .await
             .unwrap();
         assert!(!record.directory_lock().contains(&id));
+    }
+
+    /// Stores a parent whose record still binds `name` to `child` after a
+    /// committed transaction dropped `child`. A validation sees this state when
+    /// it resolves the parent before the drop and the child after it.
+    async fn bind_dropped_child(
+        records: &CollectionStore,
+        monitor: &Monitor,
+        parent: &CollectionAddress,
+        name: &CollectionName,
+        child: &CollectionAddress,
+    ) -> u64 {
+        let mut parent_record = CollectionRecord::new();
+        assert!(parent_record.add_child(name.clone(), child.id()).unwrap());
+        assert!(records.create_record(parent, &parent_record).await.unwrap());
+        let dropper = TxId::with_priority(0, &[2]);
+        let mut child_record = CollectionRecord::new();
+        assert!(child_record.set_topology_freeze(dropper));
+        assert!(records.create_record(child, &child_record).await.unwrap());
+        monitor.begin_tx(&dropper);
+        let mut tx_record = TxRecord::new(dropper, TxCommitStatus::Committed);
+        tx_record.collection_changes.push(TxCollectionChange {
+            parent: parent.clone(),
+            name: name.clone(),
+            collection: child.clone(),
+            op: TxCollectionOp::Drop,
+        });
+        monitor.commit_tx(tx_record).await.unwrap();
+        parent_record.directory_generation()
+    }
+
+    async fn validate_reads(reads: impl FnOnce(u64) -> Vec<DirectoryRead>) -> bool {
+        let (catalog, records, monitor, timeline, _background) = new_catalog();
+        let parent = CollectionAddress::root("db");
+        let child = CollectionAddress::new("db", CollectionId::from_bytes([1; 16]));
+        let name = CollectionName::new("child").unwrap();
+        let generation = bind_dropped_child(&records, &monitor, &parent, &name, &child).await;
+        let mut reads = reads(generation);
+        // The body used the child, so its directory is a dependency too.
+        reads.push(DirectoryRead {
+            parent: child,
+            kind: DirectoryReadKind::Listing { generation: 0 },
+        });
+        catalog
+            .validate(
+                None,
+                &reads,
+                &[],
+                timeline.currentness_barrier(),
+                &NodeSizePolicy::default(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_entry_of_a_dropped_collection_is_invalid() {
+        let valid = validate_reads(|_| {
+            vec![DirectoryRead {
+                parent: CollectionAddress::root("db"),
+                kind: DirectoryReadKind::Entry {
+                    name: CollectionName::new("child").unwrap(),
+                    collection: Some(CollectionId::from_bytes([1; 16])),
+                },
+            }]
+        })
+        .await;
+
+        assert!(!valid);
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_binds_a_dropped_collection_is_invalid() {
+        let valid = validate_reads(|generation| {
+            vec![DirectoryRead {
+                parent: CollectionAddress::root("db"),
+                kind: DirectoryReadKind::Listing { generation },
+            }]
+        })
+        .await;
+
+        assert!(!valid);
     }
 }
