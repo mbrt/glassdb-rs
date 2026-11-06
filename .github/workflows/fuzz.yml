@@ -95,7 +95,7 @@ jobs:
         if ! make fuzz FUZZ_TIME="$per"; then
           echo "::error::fuzzing failed (build error or crash); if a crash, see the uploaded fuzz-crashes artifact"
           echo "To reproduce a downloaded crash file:"
-          echo "  cd fuzz && RUSTFLAGS=\"--cfg sim --cfg tokio_unstable\" cargo +nightly fuzz run <target> <crash-file>"
+          echo "  cd fuzz && RUSTFLAGS=\"--cfg sim --cfg tokio_unstable\" cargo +nightly fuzz run -s none <target> <crash-file>"
           echo "Or replay on stable: drop the file into fuzz/corpus/<target>/ and run 'make test-sim'."
           exit 1
         fi

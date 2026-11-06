@@ -56,7 +56,7 @@ fn replay_corpus_file(path: &Path, replay: ReplayFn) -> Result<(), String> {
 /// Replays every committed input under `fuzz/corpus/<target>` through `replay`,
 /// which panics on any invariant violation, and compares two back-to-back
 /// recorded op streams. On failure the offending file is named: it is the exact
-/// libFuzzer reproducer for `cargo +nightly fuzz run <target> <file>`.
+/// libFuzzer reproducer for `cargo +nightly fuzz run -s none <target> <file>`.
 fn replay_committed_corpus(target: &str, replay: ReplayFn) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../fuzz/corpus")

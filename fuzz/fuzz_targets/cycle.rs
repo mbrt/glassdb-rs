@@ -23,7 +23,7 @@
 //! must be passed through the environment:
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run cycle <crash-file>
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run -s none cycle <crash-file>
 //! ```
 #![no_main]
 use libfuzzer_sys::fuzz_target;

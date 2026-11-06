@@ -2,6 +2,8 @@
 /target
 /artifacts
 /coverage
+# Logs of the libFuzzer workers that `make fuzz` starts.
+/fuzz-*.log
 
 # The curated starter seeds under corpus/concurrent_tx/ are committed. libFuzzer
 # also appends its own discovered inputs there at runtime; those show up as

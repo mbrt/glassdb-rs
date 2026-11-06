@@ -12,7 +12,7 @@ members = [
     "crates/glassdb",
     "crates/glassdb-bench-scale",
 ]
-# The cargo-fuzz crate is its own workspace (needs nightly + a sanitizer); keep
+# The cargo-fuzz crate is its own workspace (needs nightly and libFuzzer); keep
 # it out of the main build/test graph.
 exclude = ["fuzz"]
 
