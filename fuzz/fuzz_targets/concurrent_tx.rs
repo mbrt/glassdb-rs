@@ -20,11 +20,11 @@
 //! (`acked <= final <= started`, plus non-negativity and serializability),
 //! which libFuzzer reports as a crash. `cargo fuzz` overrides the
 //! `fuzz/.cargo/config.toml` rustflags, so `--cfg sim --cfg tokio_unstable` must
-//! be passed through the environment (cargo-fuzz appends its sanitizer/coverage
-//! flags to it):
+//! be passed through the environment (cargo-fuzz appends its coverage flags to
+//! it):
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run concurrent-tx <crash-file>
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run -s none concurrent-tx <crash-file>
 //! ```
 #![no_main]
 use libfuzzer_sys::fuzz_target;

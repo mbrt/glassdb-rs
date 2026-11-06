@@ -1,5 +1,9 @@
 //! Schedule selection and deterministic executor entry points.
 
+use std::env::VarError;
+use std::num::NonZeroU64;
+use std::panic::{self, AssertUnwindSafe};
+
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::middleware::{OpLog, OpRecord};
 use glassdb_concurr::exec;
@@ -58,9 +62,11 @@ pub(super) fn run_fuzz_mode<W: SimWorkload>(
     fault_tape: Vec<u8>,
     media_tape: Option<Vec<u8>>,
 ) -> OpLog {
-    exec::block_on_with(exec::TapeScheduler::new(schedule_tape), seed, async move {
-        run_generic(workload, faults, seed, fault_tape, media_tape).await
-    })
+    exec::block_on_with(
+        exec::TapeScheduler::with_random_fallback(schedule_tape, seed),
+        seed,
+        async move { run_generic(workload, faults, seed, fault_tape, media_tape).await },
+    )
 }
 
 /// Decodes one libFuzzer input for workload `W` exactly as its target does and
@@ -152,15 +158,46 @@ pub fn pct_record<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) 
     )
 }
 
+/// Number of seeds in each [`pct_sweep`] of an ordinary test run.
+pub const PCT_DEFAULT_SEEDS: u64 = 256;
+
+/// Environment variable that sets the number of seeds in each [`pct_sweep`]. A
+/// deep sweep, for example a nightly CI job, sets it to run many more schedules
+/// than an ordinary test run.
+const PCT_SEEDS_VAR: &str = "GLASSDB_PCT_SEEDS";
+
 /// Seed-breadth sweep: runs `workload` under one PCT schedule per seed, asserting
 /// the invariant on each. This is the seed-loop entry that complements the
 /// coverage-guided tape fuzzer.
-pub fn pct_sweep<W: SimWorkload>(
-    workload: &W,
-    faults: FaultConfig,
-    seeds: impl IntoIterator<Item = u64>,
-) {
-    for seed in seeds {
-        pct_assert(workload, faults, seed);
+///
+/// The sweep runs N seeds, from 0 to N - 1. N is [`PCT_DEFAULT_SEEDS`], or the
+/// value of the `GLASSDB_PCT_SEEDS` environment variable. A failure names its
+/// seed, so [`pct_assert`] reproduces it.
+pub fn pct_sweep<W: SimWorkload>(workload: &W, faults: FaultConfig) {
+    let seeds = pct_seed_count();
+    for seed in 0..seeds.get() {
+        let run = panic::catch_unwind(AssertUnwindSafe(|| pct_assert(workload, faults, seed)));
+        if let Err(payload) = run {
+            eprintln!("PCT sweep failed at seed {seed} with faults {faults:?}");
+            panic::resume_unwind(payload);
+        }
+    }
+}
+
+/// Returns the number of seeds that the `PCT_SEEDS_VAR` environment variable sets.
+/// A count of zero would run no seeds and pass without a check, so the count
+/// must be a positive integer.
+fn pct_seed_count() -> NonZeroU64 {
+    let value = std::env::var(PCT_SEEDS_VAR);
+    match value {
+        Ok(value) => value.parse().unwrap_or_else(|_| {
+            panic!("{PCT_SEEDS_VAR} must be a positive integer, not {value:?}")
+        }),
+        Err(VarError::NotPresent) => {
+            NonZeroU64::new(PCT_DEFAULT_SEEDS).expect("the default seed count is positive")
+        }
+        Err(VarError::NotUnicode(value)) => {
+            panic!("{PCT_SEEDS_VAR} must be a positive integer, not {value:?}")
+        }
     }
 }

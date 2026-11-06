@@ -180,6 +180,6 @@ fn pct_seed_breadth_holds_serializability() {
     // Seed-breadth sweep: many PCT schedules over the contended workload, with
     // and without faults. Any invariant violation panics inside the sweep.
     let workload = contended_workload();
-    pct_sweep(&workload, FaultConfig::failures(7), 0..32);
-    pct_sweep(&workload, FaultConfig::none(), 0..16);
+    pct_sweep(&workload, FaultConfig::failures(7));
+    pct_sweep(&workload, FaultConfig::none());
 }

@@ -24,8 +24,8 @@ use self::client::ClientRunner;
 use self::nemesis::{FaultTransports, NemesisRunner};
 #[cfg(sim)]
 pub use self::scheduling::{
-    PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep, record_input,
-    replay_input,
+    PCT_DEFAULT_DEPTH, PCT_DEFAULT_SEEDS, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep,
+    record_input, replay_input,
 };
 use super::slow_backend;
 use super::{CLIENT_COUNT, CLIENTS_PER_INSTANCE, MAX_INSTANCES, MediaFaultProfile, SimMedia};

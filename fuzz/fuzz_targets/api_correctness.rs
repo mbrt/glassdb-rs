@@ -18,7 +18,7 @@
 //! collection names in the model.
 //!
 //! ```bash
-//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run api-correctness <crash-file>
+//! RUSTFLAGS="--cfg sim --cfg tokio_unstable" cargo +nightly fuzz run -s none api-correctness <crash-file>
 //! ```
 #![no_main]
 use libfuzzer_sys::fuzz_target;

@@ -84,5 +84,5 @@ fn api_model_holds_with_slow_mutations() {
 
 #[test]
 fn pct_seed_breadth_holds_api_model() {
-    pct_sweep(&contended_api_workload(), FaultConfig::failures(192), 0..16);
+    pct_sweep(&contended_api_workload(), FaultConfig::failures(192));
 }

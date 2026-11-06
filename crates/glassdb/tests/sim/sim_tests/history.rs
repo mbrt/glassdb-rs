@@ -134,7 +134,7 @@ fn exact_history_holds_with_slow_mutations() {
 fn pct_seed_breadth_holds_exact_history() {
     let workload = contended_history();
     let faults = FaultConfig::failures(7);
-    pct_sweep(&workload, faults, 0..16);
+    pct_sweep(&workload, faults);
 }
 
 #[test]
@@ -192,7 +192,7 @@ fn shared_collection_history() -> HistoryWorkload {
 fn shared_collection_history_holds_under_contention_and_failures() {
     let workload = shared_collection_history();
     for faults in [FaultConfig::none(), FaultConfig::failures(7)] {
-        pct_sweep(&workload, faults, 0..8);
+        pct_sweep(&workload, faults);
     }
 }
 
@@ -274,6 +274,6 @@ fn exact_history_holds_while_leaves_merge() {
 #[test]
 fn pct_seed_breadth_holds_exact_history_while_leaves_merge() {
     let workload = shrinking_history();
-    pct_sweep(&workload, FaultConfig::none(), 0..16);
-    pct_sweep(&workload, FaultConfig::failures(7), 0..16);
+    pct_sweep(&workload, FaultConfig::none());
+    pct_sweep(&workload, FaultConfig::failures(7));
 }
