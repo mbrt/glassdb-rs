@@ -42,9 +42,8 @@ use crate::collections::TopologySettler;
 use crate::error::TransError;
 use crate::gc::GcHints;
 use crate::key_state_resolver::KeyStateResolver;
-use crate::leaf_coord::LeafCoordinator;
+use crate::leaf_coord::{CoordinatorConfig, LeafCoordinator};
 use crate::monitor::Monitor;
-use crate::retry_timing::RetryTiming;
 
 use candidates::{CandidateCause, MaintenanceCandidate, MaintenanceCandidates};
 use change::{ChangeLifecycle, PlannedChange, StructuralTopology, SweepChange};
@@ -198,22 +197,18 @@ impl Restructurer {
         timeline: Timeline,
         mon: Monitor,
         key_state: KeyStateResolver,
-        retry: RetryTiming,
-        batching_window: Duration,
+        coordinator: CoordinatorConfig,
         db_prefix: DbPrefix,
-        policy: NodeSizePolicy,
         inline: InlinePolicy,
         topology: TopologyPolicy,
         gc_hints: GcHints,
     ) -> (LeafCoordinator, Self) {
-        let parts = TopologyParts::new(topology, policy, inline, mon.clone());
+        let parts = TopologyParts::new(topology, coordinator.node_size_policy, inline, mon.clone());
         let coord = LeafCoordinator::with_hinter(
             nodes.clone(),
             key_state.clone(),
             mon.clone(),
-            retry,
-            batching_window,
-            policy,
+            coordinator,
             Arc::new(parts.hints.clone()),
         );
         let restructurer = Restructurer::with_parts(

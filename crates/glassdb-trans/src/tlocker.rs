@@ -1454,7 +1454,7 @@ mod tests {
     use crate::collection_coordination::CollectionStateResolver;
     use crate::engine::{AssemblyFixture, EngineConfig};
     use crate::key_state_resolver::KeyStateResolver;
-    use crate::leaf_coord::StructuralHinter;
+    use crate::leaf_coord::{CoordinatorConfig, NoStructuralHints};
     use crate::monitor::ProtocolTiming;
     use futures::future::poll_fn;
     use glassdb_backend::middleware::{
@@ -1475,14 +1475,6 @@ mod tests {
     use std::task::Poll;
     use std::time::Duration;
     use tokio::sync::Notify;
-
-    struct NoStructuralHints;
-
-    impl StructuralHinter for NoStructuralHints {
-        fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
-
-        fn capacity_rejected(&self, _path: &ObjectPath) {}
-    }
 
     struct TlCtx {
         nodes: NodeStore,
@@ -1551,9 +1543,11 @@ mod tests {
             nodes.clone(),
             key_state,
             mon.clone(),
-            RetryTiming::default(),
-            batching_window,
-            policy,
+            CoordinatorConfig {
+                batching_window,
+                node_size_policy: policy,
+                ..CoordinatorConfig::default()
+            },
             Arc::new(NoStructuralHints),
         );
         let locker = Locker::new(

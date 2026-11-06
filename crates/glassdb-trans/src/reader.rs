@@ -312,21 +312,15 @@ mod tests {
                 _ => {
                     use crate::access::{AccessSet, WriteAccess};
                     use crate::collection_coordination::CollectionStateResolver;
-                    use crate::leaf_coord::{LeafCoordinator, StructuralHinter};
+                    use crate::leaf_coord::{
+                        CoordinatorConfig, LeafCoordinator, NoStructuralHints,
+                    };
                     use crate::tlocker::{LockOutcome, Locker};
-                    struct NoStructuralHints;
-                    impl StructuralHinter for NoStructuralHints {
-                        fn observe_leaf(&self, _: &glassdb_data::ObjectPath, _: &LeafBody) {}
-
-                        fn capacity_rejected(&self, _path: &glassdb_data::ObjectPath) {}
-                    }
                     let coord = LeafCoordinator::with_hinter(
                         local.nodes.clone(),
                         KeyStateResolver::new(local.monitor.clone()),
                         local.monitor.clone(),
-                        RetryTiming::default(),
-                        crate::leaf_coord::DEFAULT_BATCHING_WINDOW,
-                        glassdb_storage::NodeSizePolicy::default(),
+                        CoordinatorConfig::default(),
                         Arc::new(NoStructuralHints),
                     );
                     let state = CollectionStateResolver::new(

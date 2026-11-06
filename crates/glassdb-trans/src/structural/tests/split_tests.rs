@@ -1350,9 +1350,7 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
         other.nodes.clone(),
         other_key_state,
         other_mon.clone(),
-        RetryTiming::default(),
-        crate::leaf_coord::DEFAULT_BATCHING_WINDOW,
-        NodeSizePolicy::default(),
+        crate::leaf_coord::CoordinatorConfig::default(),
         Arc::new(NoStructuralHints),
     );
     let other_locker = crate::tlocker::Locker::new(

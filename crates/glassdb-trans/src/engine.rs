@@ -26,7 +26,9 @@ use crate::error::TransError;
 use crate::gc::{DEFAULT_GC_PARALLELISM, Gc, GcDiagnostics, GcHints, GcLimits, GcReport, GcStats};
 use crate::key_resolver::{KeyResolver, ScanResult};
 use crate::key_state_resolver::KeyStateResolver;
-use crate::leaf_coord::{CoordinatorStats, DEFAULT_BATCHING_WINDOW, LeafCoordinator};
+use crate::leaf_coord::{
+    CoordinatorConfig, CoordinatorStats, DEFAULT_BATCHING_WINDOW, LeafCoordinator,
+};
 use crate::monitor::{Monitor, MonitorStats, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
 use crate::retry_timing::RetryTiming;
@@ -581,10 +583,12 @@ impl DormantEngine {
             timeline.clone(),
             monitor.clone(),
             key_state.clone(),
-            retry,
-            batching_window,
+            CoordinatorConfig {
+                retry,
+                batching_window,
+                node_size_policy,
+            },
             db_prefix,
-            node_size_policy,
             inline_policy,
             topology_policy,
             gc_hints.clone(),
