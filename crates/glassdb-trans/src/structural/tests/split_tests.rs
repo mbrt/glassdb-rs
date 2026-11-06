@@ -1351,6 +1351,7 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
         other_key_state,
         other_mon.clone(),
         RetryTiming::default(),
+        crate::leaf_coord::DEFAULT_BATCHING_WINDOW,
         NodeSizePolicy::default(),
         Arc::new(NoStructuralHints),
     );

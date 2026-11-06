@@ -199,6 +199,7 @@ impl Restructurer {
         mon: Monitor,
         key_state: KeyStateResolver,
         retry: RetryTiming,
+        batching_window: Duration,
         db_prefix: DbPrefix,
         policy: NodeSizePolicy,
         inline: InlinePolicy,
@@ -211,6 +212,7 @@ impl Restructurer {
             key_state.clone(),
             mon.clone(),
             retry,
+            batching_window,
             policy,
             Arc::new(parts.hints.clone()),
         );

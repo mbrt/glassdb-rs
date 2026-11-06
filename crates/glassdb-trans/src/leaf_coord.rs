@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker, rt};
@@ -48,6 +49,10 @@ use crate::retry_timing::RetryTiming;
 /// Maximum inner CAS retries on a single leaf/root before treating the
 /// operation as conflicted and restarting the transaction.
 pub(crate) const CAS_RETRIES: usize = 50;
+
+/// The default [batching window](LeafCoordinator::with_hinter) (ADR-087): the
+/// shortest wait that a live clock gives.
+pub(crate) const DEFAULT_BATCHING_WINDOW: Duration = Duration::from_millis(1);
 
 /// Counters for CAS activity across all coordinated leaf operations.
 #[derive(Default)]
@@ -483,6 +488,7 @@ struct CoordCore {
     nodes: NodeStore,
     key_state: KeyStateResolver,
     retry: RetryTiming,
+    batching_window: Duration,
     stats: Stats,
     // Where stored over-cap leaves are reported: the background
     // [`Restructurer`](crate::structural::Restructurer)'s queue when one is wired.
@@ -962,12 +968,18 @@ impl CasWorker {
     ) -> Result<(), TransError> {
         let path = &submitted.path;
         let mut requirement = submitted.requirement;
-        // A cache-served `Any` load may complete without yielding. Give peers
-        // already scheduled for this object one opportunity to join the round,
-        // so batching does not depend on backend I/O creating the collection
-        // window. The first load accepts any cached leaf, even for members
-        // that require bounded evidence before completion.
-        rt::yield_now().await;
+        // A cache-served `Any` load may complete without yielding, so batching
+        // cannot depend on backend I/O. The round waits for the batching
+        // window, so that the submissions for the leaf that arrive during it
+        // join the round (ADR-087). A zero window gives the peers already
+        // scheduled for this object one yield. The first load accepts any
+        // cached leaf, even for members that require bounded evidence before
+        // completion.
+        if self.core.batching_window.is_zero() {
+            rt::yield_now().await;
+        } else {
+            rt::sleep(self.core.batching_window).await;
+        }
         let mut contention = self.core.retry.contention.backoff();
         // A CAS that came back in-doubt can be a backend that throttles or
         // fails, so its retry waits longer.
@@ -1168,11 +1180,16 @@ impl LeafCoordinator {
     /// Creates a coordinator that reports capacity observations to `hinter` —
     /// normally the background [`Restructurer`](crate::structural::Restructurer)'s queue.
     /// `policy` governs the coordinator's hard node-size limit.
+    /// `batching_window` is the time that a round waits before its first leaf
+    /// load, so that other submissions for the leaf can join it (ADR-087).
+    /// Zero disables the wait.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_hinter(
         nodes: NodeStore,
         key_state: KeyStateResolver,
         tmon: Monitor,
         retry: RetryTiming,
+        batching_window: Duration,
         policy: NodeSizePolicy,
         hinter: Arc<dyn StructuralHinter>,
     ) -> Self {
@@ -1181,6 +1198,7 @@ impl LeafCoordinator {
             nodes,
             key_state,
             retry,
+            batching_window,
             stats: Stats::default(),
             policy,
             hinter,
@@ -1395,6 +1413,16 @@ mod tests {
         hinter: Arc<dyn StructuralHinter>,
         retry: RetryTiming,
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
+        coord_over_window(backend, policy, hinter, retry, DEFAULT_BATCHING_WINDOW).await
+    }
+
+    async fn coord_over_window(
+        backend: Arc<dyn Backend>,
+        policy: NodeSizePolicy,
+        hinter: Arc<dyn StructuralHinter>,
+        retry: RetryTiming,
+        batching_window: Duration,
+    ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
         let seed_timeline = Timeline::new();
         let seed_store = NodeStore::new(
             CachedStore::new(backend.clone(), 1 << 20, seed_timeline, None),
@@ -1418,8 +1446,15 @@ mod tests {
         let mon = foundation.monitor.clone();
         let nodes = foundation.nodes.clone();
         let key_state = KeyStateResolver::new(mon.clone());
-        let coord =
-            LeafCoordinator::with_hinter(nodes.clone(), key_state, mon, retry, policy, hinter);
+        let coord = LeafCoordinator::with_hinter(
+            nodes.clone(),
+            key_state,
+            mon,
+            retry,
+            batching_window,
+            policy,
+            hinter,
+        );
         (coord, nodes, timeline, bg)
     }
 
@@ -2668,6 +2703,92 @@ mod tests {
             "a current bound revalidates the cached leaf once"
         );
         coord.close().await;
+    }
+
+    // The batching window of these tests. It is longer than the paused clock's
+    // tick, so the offsets below stay exact.
+    const WINDOW: Duration = Duration::from_millis(10);
+
+    // Submits a recorder for `key` at once and returns when its round ends.
+    fn submit_recorder(
+        coord: &LeafCoordinator,
+        tx: TxId,
+        key: &[u8],
+    ) -> tokio::task::JoinHandle<rt::Instant> {
+        let coord = coord.clone();
+        let policy = Arc::new(Recorder {
+            key: key.to_vec(),
+            tx,
+            trace: Arc::new(Mutex::new(Vec::new())),
+        });
+        tokio::spawn(async move {
+            let outcome = coord
+                .submit_leaf(&leaf(), &tx, policy, Requirement::ANY)
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                Some(CoordinatedOutcome {
+                    outcome: MemberOutcome::Landed,
+                    ..
+                })
+            ));
+            rt::Instant::now()
+        })
+    }
+
+    // Submits one member at once and another at `offset`, and returns the
+    // coordinator rounds and the end of each member's round, from the first
+    // submission.
+    async fn rounds_with_window(window: Duration, offset: Duration) -> (u64, [Duration; 2]) {
+        let (coord, _nodes, _timeline, _bg) = coord_over_window(
+            Arc::new(MemoryBackend::new()),
+            NodeSizePolicy::default(),
+            Arc::new(NoStructuralHints),
+            RetryTiming::default(),
+            window,
+        )
+        .await;
+        coord.stats_and_reset();
+        let start = rt::Instant::now();
+        let first = submit_recorder(&coord, TxId::with_priority(1, b"first"), b"a");
+        rt::sleep(offset).await;
+        let second = submit_recorder(&coord, TxId::with_priority(2, b"second"), b"b");
+        let ends = [
+            first.await.unwrap().duration_since(start),
+            second.await.unwrap().duration_since(start),
+        ];
+        let rounds = coord.stats_and_reset().rounds;
+        coord.close().await;
+        (rounds, ends)
+    }
+
+    // ADR-087: a submission that arrives during the batching window joins the
+    // round, and the round loads at the end of the window.
+    #[tokio::test(start_paused = true)]
+    async fn submission_during_the_window_joins_the_round() {
+        let (rounds, ends) = rounds_with_window(WINDOW, Duration::from_millis(4)).await;
+        assert_eq!(rounds, 1);
+        assert_eq!(ends, [WINDOW, WINDOW]);
+    }
+
+    // ADR-087: a submission that arrives after the window needs its own round,
+    // which also waits for the window.
+    #[tokio::test(start_paused = true)]
+    async fn submission_after_the_window_takes_its_own_round() {
+        let late = WINDOW + Duration::from_millis(4);
+        let (rounds, ends) = rounds_with_window(WINDOW, late).await;
+        assert_eq!(rounds, 2);
+        assert_eq!(ends, [WINDOW, late + WINDOW]);
+    }
+
+    // ADR-087: a zero window gives a round only one yield.
+    #[tokio::test(start_paused = true)]
+    async fn zero_window_starts_a_round_at_once() {
+        let joins = Duration::from_millis(4);
+        let (rounds, ends) = rounds_with_window(Duration::ZERO, joins).await;
+        assert_eq!(rounds, 2);
+        assert_eq!(ends, [Duration::ZERO, joins]);
     }
 
     // ADR-028: two transactions contending the same leaf merge into one round —

@@ -302,6 +302,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         key_state,
         mon.clone(),
         RetryTiming::default(),
+        crate::leaf_coord::DEFAULT_BATCHING_WINDOW,
         glassdb_storage::NodeSizePolicy::default(),
         Arc::new(NoStructuralHints),
     );
@@ -1532,6 +1533,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
         KeyStateResolver::new(owner.monitor.clone()),
         owner.monitor.clone(),
         RetryTiming::default(),
+        crate::leaf_coord::DEFAULT_BATCHING_WINDOW,
         glassdb_storage::NodeSizePolicy::default(),
         Arc::new(NoStructuralHints),
     );

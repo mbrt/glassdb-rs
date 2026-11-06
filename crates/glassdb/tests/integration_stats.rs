@@ -324,7 +324,9 @@ async fn diagnostics_returns_typed_snapshot() {
 async fn warm_inline_updates_read_no_transaction_record() {
     const ITERATIONS: u64 = 30;
     // Keep one task runnable, so that the paused clock does not auto-advance
-    // to a GC deadline whose scan would add unrelated reads.
+    // to a GC deadline whose scan would add unrelated reads. The clock then
+    // stays still, so a batching window would never end, and the databases
+    // use none.
     let keep_time = tokio::spawn(async {
         loop {
             tokio::task::yield_now().await;
@@ -332,7 +334,9 @@ async fn warm_inline_updates_read_no_transaction_record() {
     });
     for keys in [1, 3] {
         let backend = mem();
-        let writer = Database::open("inlinereads", backend.clone())
+        let writer = Database::builder("inlinereads", backend.clone())
+            .batching_window(std::time::Duration::ZERO)
+            .open()
             .await
             .unwrap();
         let coll = writer
@@ -347,7 +351,11 @@ async fn warm_inline_updates_read_no_transaction_record() {
         }
         writer.shutdown().await;
 
-        let db = Database::open("inlinereads", backend).await.unwrap();
+        let db = Database::builder("inlinereads", backend)
+            .batching_window(std::time::Duration::ZERO)
+            .open()
+            .await
+            .unwrap();
         let coll = db.open_collection("c0").await.unwrap();
         let names: Vec<Vec<u8>> = (0..keys)
             .map(|key| format!("k{key:04}").into_bytes())

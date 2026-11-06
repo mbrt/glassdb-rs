@@ -359,6 +359,7 @@ fn restructurer_with_parts(
         key_state.clone(),
         mon.clone(),
         RetryTiming::default(),
+        crate::leaf_coord::DEFAULT_BATCHING_WINDOW,
         parts.sizes,
         Arc::new(parts.hints.clone()),
     );

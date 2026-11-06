@@ -331,7 +331,10 @@ read and one CAS ([ADR-017](adr/017-shard-object.md),
 [ADR-020](adr/020-commit-write-back-protocol.md)). Transactions that contend
 for the same leaf batch into one coordinator round instead of racing
 ([ADR-025](adr/025-dedup-shard-lock-acquisition.md),
-[ADR-026](adr/026-dedup-shard-release-write-back.md)).
+[ADR-026](adr/026-dedup-shard-release-write-back.md)). A round waits for the
+batching window before it loads the leaf, so that the operations that arrive
+during the window share its CAS
+([ADR-087](adr/087-coordinator-rounds-wait-for-a-batching-window.md)).
 
 The current state is absent, an external value, an inline value, or a
 tombstone ([ADR-051](adr/051-inline-latest-values.md)). A read of an inline value or a

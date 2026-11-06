@@ -4,6 +4,7 @@
 use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
@@ -94,6 +95,17 @@ impl DatabaseBuilder {
     /// other transactions. Defaults to [`RetryTiming::default`].
     pub fn retry_timing(mut self, timing: RetryTiming) -> Self {
         self.engine_config.set_retry_timing(timing);
+        self
+    }
+
+    /// Sets the batching window: how long a change of a leaf waits before it
+    /// loads the leaf. Changes of the same leaf that arrive during the window
+    /// share one write of the leaf: locks, commits, write-backs, and lock
+    /// releases. A longer window batches more changes, and it adds its length
+    /// to each of them. The window is local to each database instance. Zero
+    /// disables it. Defaults to 1 ms.
+    pub fn batching_window(mut self, window: Duration) -> Self {
+        self.engine_config.set_batching_window(window);
         self
     }
 

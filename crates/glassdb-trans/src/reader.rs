@@ -325,6 +325,7 @@ mod tests {
                         KeyStateResolver::new(local.monitor.clone()),
                         local.monitor.clone(),
                         RetryTiming::default(),
+                        crate::leaf_coord::DEFAULT_BATCHING_WINDOW,
                         glassdb_storage::NodeSizePolicy::default(),
                         Arc::new(NoStructuralHints),
                     );
