@@ -422,6 +422,10 @@ _Avoid_: Fold, fold plan
 A rejected leaf CAS of a coordinator round, because another CAS of the leaf landed first and changed only keys that the round does not access.
 _Avoid_: CAS conflict, lost CAS (alone)
 
+**Batching window**:
+The time that a coordinator round waits before its first leaf load, so that other operations on the leaf can join the round.
+_Avoid_: Batch delay, collection window
+
 ## Structural changes
 
 **Topology**:

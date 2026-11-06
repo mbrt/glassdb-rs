@@ -26,7 +26,9 @@ use crate::error::TransError;
 use crate::gc::{DEFAULT_GC_PARALLELISM, Gc, GcDiagnostics, GcHints, GcLimits, GcReport, GcStats};
 use crate::key_resolver::{KeyResolver, ScanResult};
 use crate::key_state_resolver::KeyStateResolver;
-use crate::leaf_coord::{CoordinatorStats, LeafCoordinator};
+use crate::leaf_coord::{
+    CoordinatorConfig, CoordinatorStats, DEFAULT_BATCHING_WINDOW, LeafCoordinator,
+};
 use crate::monitor::{Monitor, MonitorStats, ProtocolTiming};
 use crate::reader::{ReadOutcome, Reader};
 use crate::retry_timing::RetryTiming;
@@ -50,6 +52,7 @@ pub struct EngineConfig {
     cache_size: usize,
     persistent_cache: Option<PersistentCacheSetup>,
     retry: RetryTiming,
+    batching_window: Duration,
     node_size_policy: NodeSizePolicy,
     inline_policy: InlinePolicy,
     topology_policy: TopologyPolicy,
@@ -78,6 +81,12 @@ impl EngineConfig {
     /// Sets the retry schedules.
     pub fn set_retry_timing(&mut self, timing: RetryTiming) {
         self.retry = timing;
+    }
+
+    /// Sets the time that a coordinator round waits before its first leaf load
+    /// (ADR-087).
+    pub fn set_batching_window(&mut self, window: Duration) {
+        self.batching_window = window;
     }
 
     /// Sets the shared node size policy.
@@ -127,6 +136,7 @@ impl Default for EngineConfig {
             cache_size: DEFAULT_CACHE_SIZE,
             persistent_cache: None,
             retry: RetryTiming::default(),
+            batching_window: DEFAULT_BATCHING_WINDOW,
             node_size_policy: NodeSizePolicy::default(),
             inline_policy: InlinePolicy::default(),
             topology_policy: TopologyPolicy::default(),
@@ -530,6 +540,7 @@ impl DormantEngine {
     ) -> Self {
         let EngineConfig {
             retry,
+            batching_window,
             node_size_policy,
             inline_policy,
             topology_policy,
@@ -572,9 +583,12 @@ impl DormantEngine {
             timeline.clone(),
             monitor.clone(),
             key_state.clone(),
-            retry,
+            CoordinatorConfig {
+                retry,
+                batching_window,
+                node_size_policy,
+            },
             db_prefix,
-            node_size_policy,
             inline_policy,
             topology_policy,
             gc_hints.clone(),

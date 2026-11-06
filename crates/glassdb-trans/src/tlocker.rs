@@ -1454,7 +1454,7 @@ mod tests {
     use crate::collection_coordination::CollectionStateResolver;
     use crate::engine::{AssemblyFixture, EngineConfig};
     use crate::key_state_resolver::KeyStateResolver;
-    use crate::leaf_coord::StructuralHinter;
+    use crate::leaf_coord::{CoordinatorConfig, NoStructuralHints};
     use crate::monitor::ProtocolTiming;
     use futures::future::poll_fn;
     use glassdb_backend::middleware::{
@@ -1475,14 +1475,6 @@ mod tests {
     use std::task::Poll;
     use std::time::Duration;
     use tokio::sync::Notify;
-
-    struct NoStructuralHints;
-
-    impl StructuralHinter for NoStructuralHints {
-        fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
-
-        fn capacity_rejected(&self, _path: &ObjectPath) {}
-    }
 
     struct TlCtx {
         nodes: NodeStore,
@@ -1507,6 +1499,21 @@ mod tests {
         b: Arc<dyn Backend>,
         policy: NodeSizePolicy,
         parallelism: NonZeroUsize,
+    ) -> (Locker, TlCtx) {
+        new_test_locker_with_window(
+            b,
+            policy,
+            parallelism,
+            crate::leaf_coord::DEFAULT_BATCHING_WINDOW,
+        )
+        .await
+    }
+
+    async fn new_test_locker_with_window(
+        b: Arc<dyn Backend>,
+        policy: NodeSizePolicy,
+        parallelism: NonZeroUsize,
+        batching_window: Duration,
     ) -> (Locker, TlCtx) {
         let mut config = EngineConfig::default();
         config.set_cache_size(1 << 20);
@@ -1536,8 +1543,11 @@ mod tests {
             nodes.clone(),
             key_state,
             mon.clone(),
-            RetryTiming::default(),
-            policy,
+            CoordinatorConfig {
+                batching_window,
+                node_size_policy: policy,
+                ..CoordinatorConfig::default()
+            },
             Arc::new(NoStructuralHints),
         );
         let locker = Locker::new(
@@ -2871,8 +2881,17 @@ mod tests {
     async fn batch_gated_locker(parallelism: NonZeroUsize) -> (Locker, TlCtx, Arc<BatchGate>) {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let gate = BatchGate::install(&backend, GateKind::Write);
-        let (locker, ctx) =
-            new_test_locker_with_parallelism(backend, NodeSizePolicy::default(), parallelism).await;
+        // `operation_widths` counts the gated backend operations that run at
+        // once, and it takes a pause with none of them as the end of a wave.
+        // The rounds of one wave can end their batching windows on different
+        // ticks, so a window would split a wave.
+        let (locker, ctx) = new_test_locker_with_window(
+            backend,
+            NodeSizePolicy::default(),
+            parallelism,
+            Duration::ZERO,
+        )
+        .await;
         (locker, ctx, gate)
     }
 
@@ -3218,6 +3237,50 @@ mod tests {
                 .unwrap();
             assert!(leaf.entries().lookup(b"key").is_none());
         }
+    }
+
+    // ADR-087: the next lock of a client on the leaf of its previous commit
+    // shares the round of that commit's write-back, when the lock arrives
+    // during the batching window.
+    #[tokio::test(start_paused = true)]
+    async fn lock_during_a_write_back_window_shares_its_round() {
+        use glassdb_storage::transaction::{TxRecord, TxWrite};
+
+        let window = Duration::from_millis(10);
+        let (locker, ctx) = new_test_locker_with_window(
+            Arc::new(MemoryBackend::new()),
+            NodeSizePolicy::default(),
+            NonZeroUsize::MIN,
+            window,
+        )
+        .await;
+        let first = mk_tid(1, "first");
+        ctx.monitor.begin_tx(&first);
+        let groups = group_of(b"a", put_intent(b"a"));
+        let proofs = lock_ok(&locker, &first, &groups).await;
+        let locked = LockedTx::from_proofs(groups, proofs).unwrap();
+        let mut record = TxRecord::new(first, TxCommitStatus::Committed);
+        record.writes = vec![TxWrite {
+            key: logical_key(b"a"),
+            value: Arc::from(b"value".as_slice()),
+            deleted: false,
+        }];
+        ctx.monitor.commit_tx(record).await.unwrap();
+        ctx.coord.stats_and_reset();
+
+        // The write-back runs after the commit returns, and the next
+        // transaction locks the same leaf during its window.
+        let write_back = {
+            let locker = locker.clone();
+            tokio::spawn(async move { locker.keys().write_back(&first, &locked).await })
+        };
+        rt::sleep(window / 2).await;
+        let next = mk_tid(2, "next");
+        ctx.monitor.begin_tx(&next);
+        lock_ok(&locker, &next, &group_of(b"b", put_intent(b"b"))).await;
+
+        assert!(write_back.await.unwrap().is_empty());
+        assert_eq!(ctx.coord.stats_and_reset().rounds, 1);
     }
 
     #[tokio::test]
@@ -4154,7 +4217,14 @@ mod tests {
         let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let hooked = HookBackend::new(memory.clone());
         let gate = BatchGate::install(&hooked, GateKind::Read);
-        let (locker, ctx) = new_test_locker(hooked).await;
+        // See `batch_gated_locker` for the zero window.
+        let (locker, ctx) = new_test_locker_with_window(
+            hooked,
+            NodeSizePolicy::default(),
+            NonZeroUsize::MIN,
+            Duration::ZERO,
+        )
+        .await;
         let readers = reader_ids(40);
         seed_membership_readers(&ctx, memory, &readers, TxCommitStatus::Wounded).await;
         let writer = mk_tid(1, "writer");

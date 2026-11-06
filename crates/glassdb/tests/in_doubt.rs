@@ -695,6 +695,9 @@ async fn locked_commit_lost_ack_recovers_transparently() {
 #[tokio::test(start_paused = true)]
 async fn locked_commit_recovery_deadline_bounds_status_reads() {
     let horizon = Duration::from_secs(1);
+    // The lock round before the commit waits for one batching window
+    // (ADR-087), and the recovery deadline starts after it.
+    let window = Duration::from_millis(1);
     for (ack_delay, status_delay) in [
         (Duration::ZERO, None),
         (horizon / 2, None),
@@ -705,6 +708,7 @@ async fn locked_commit_recovery_deadline_bounds_status_reads() {
         let db = Database::builder("deadline", backend.clone())
             .inline_policy(InlinePolicy::none())
             .protocol_timing(ProtocolTiming::new(horizon, Duration::from_secs(30)))
+            .batching_window(window)
             .open()
             .await
             .unwrap();
@@ -754,7 +758,11 @@ async fn locked_commit_recovery_deadline_bounds_status_reads() {
             .await
             .expect("a stalled status read exceeded the commit recovery deadline");
         assert!(matches!(result, Err(Error::InDoubt(_))), "{result:?}");
-        assert_eq!(started.elapsed(), horizon, "ack_delay={ack_delay:?}");
+        assert_eq!(
+            started.elapsed(),
+            window + horizon,
+            "ack_delay={ack_delay:?}"
+        );
         assert_eq!(commit_writes.load(Ordering::SeqCst), 1);
         assert_eq!(
             status_reads.load(Ordering::SeqCst),

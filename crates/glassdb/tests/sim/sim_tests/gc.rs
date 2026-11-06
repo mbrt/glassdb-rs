@@ -142,9 +142,14 @@ fn gc_preserves_wounded_preparations_and_the_replayed_collection() {
 #[test]
 fn a_hint_survives_the_safety_horizon_without_successful_gc_scans() {
     exec::block_on(async {
+        // The write-back of a commit waits for the batching window (ADR-087),
+        // so the checks wait for it after each commit.
+        let window = Duration::from_millis(1);
+        let after_write_back = window + Duration::from_millis(1);
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let db = Database::builder("gc", backend.clone())
             .protocol_timing(ProtocolTiming::simulation())
+            .batching_window(window)
             .open()
             .await
             .unwrap();
@@ -157,7 +162,7 @@ fn a_hint_survives_the_safety_horizon_without_successful_gc_scans() {
         })
         .await
         .unwrap();
-        rt::sleep(Duration::from_millis(1)).await;
+        rt::sleep(after_write_back).await;
         let listed = backend
             .list("gc/_t/", None, ListLimit::new(1000).unwrap())
             .await
@@ -182,7 +187,7 @@ fn a_hint_survives_the_safety_horizon_without_successful_gc_scans() {
         })
         .await
         .unwrap();
-        rt::sleep(Duration::from_millis(1)).await;
+        rt::sleep(after_write_back).await;
         let gc = db.diagnostics().gc;
         assert!(gc.deferred > 0, "{gc:?}");
         assert!(backend.read(&old_path).await.is_ok());

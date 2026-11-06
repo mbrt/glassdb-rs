@@ -3,7 +3,7 @@ use crate::collection_coordination::{CollectionLocker, CollectionStateResolver};
 use crate::collections::TopologySettler;
 use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::key_state_resolver::KeyStateResolver;
-use crate::leaf_coord::{LeafCoordinator, StructuralHinter};
+use crate::leaf_coord::{LeafCoordinator, NoStructuralHints};
 use crate::monitor::Monitor;
 use crate::retry_timing::RetryTiming;
 use crate::tlocker::LockOutcome;
@@ -28,14 +28,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 struct UnexpectedTopologySettler;
-
-struct NoStructuralHints;
-
-impl StructuralHinter for NoStructuralHints {
-    fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
-
-    fn capacity_rejected(&self, _path: &ObjectPath) {}
-}
 
 #[async_trait]
 impl TopologySettler for UnexpectedTopologySettler {
@@ -301,8 +293,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         nodes.clone(),
         key_state,
         mon.clone(),
-        RetryTiming::default(),
-        glassdb_storage::NodeSizePolicy::default(),
+        crate::leaf_coord::CoordinatorConfig::default(),
         Arc::new(NoStructuralHints),
     );
     let router = TreeRouter::new(nodes.clone(), std::num::NonZeroUsize::MIN);
@@ -1531,8 +1522,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
         owner.nodes.clone(),
         KeyStateResolver::new(owner.monitor.clone()),
         owner.monitor.clone(),
-        RetryTiming::default(),
-        glassdb_storage::NodeSizePolicy::default(),
+        crate::leaf_coord::CoordinatorConfig::default(),
         Arc::new(NoStructuralHints),
     );
     let router = TreeRouter::new(owner.nodes.clone(), std::num::NonZeroUsize::MIN);

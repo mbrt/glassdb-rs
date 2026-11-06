@@ -30,9 +30,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{AddAssign, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use glassdb_concurr::{BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker, rt};
+use glassdb_concurr::{
+    Backoff, BatchHandle, Dedup, DedupError, DedupKeySnapshot, MergeRequest, Worker, rt,
+};
 use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{
     CasReceipt, CasResult, CurrentnessBarrier, LeafBody, LeafEdit, LeafEntry, LeafObservation,
@@ -48,6 +51,32 @@ use crate::retry_timing::RetryTiming;
 /// Maximum inner CAS retries on a single leaf/root before treating the
 /// operation as conflicted and restarting the transaction.
 pub(crate) const CAS_RETRIES: usize = 50;
+
+/// The default [batching window](CoordinatorConfig::batching_window)
+/// (ADR-087): the shortest wait that a live clock gives.
+pub(crate) const DEFAULT_BATCHING_WINDOW: Duration = Duration::from_millis(1);
+
+/// The settings of a [`LeafCoordinator`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatorConfig {
+    /// The waits between the CAS attempts of a round.
+    pub retry: RetryTiming,
+    /// The time that a round waits before its first leaf load, so that other
+    /// submissions for the leaf can join it (ADR-087). Zero gives one yield.
+    pub batching_window: Duration,
+    /// The hard size limit of a leaf.
+    pub node_size_policy: NodeSizePolicy,
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            retry: RetryTiming::default(),
+            batching_window: DEFAULT_BATCHING_WINDOW,
+            node_size_policy: NodeSizePolicy::default(),
+        }
+    }
+}
 
 /// Counters for CAS activity across all coordinated leaf operations.
 #[derive(Default)]
@@ -476,18 +505,28 @@ pub trait StructuralHinter: Send + Sync {
     fn lost_leaf_cas(&self, _path: &ObjectPath, _round_keys: &BTreeSet<Vec<u8>>) {}
 }
 
+/// A [`StructuralHinter`] that ignores all hints.
+#[cfg(test)]
+pub(crate) struct NoStructuralHints;
+
+#[cfg(test)]
+impl StructuralHinter for NoStructuralHints {
+    fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
+
+    fn capacity_rejected(&self, _path: &ObjectPath) {}
+}
+
 /// State shared by the [`LeafCoordinator`] and its dedup [`CasWorker`]: the
 /// storage handles, retry config, and stats.
 struct CoordCore {
     tmon: Monitor,
     nodes: NodeStore,
     key_state: KeyStateResolver,
-    retry: RetryTiming,
+    config: CoordinatorConfig,
     stats: Stats,
     // Where stored over-cap leaves are reported: the background
     // [`Restructurer`](crate::structural::Restructurer)'s queue when one is wired.
     hinter: Arc<dyn StructuralHinter>,
-    policy: NodeSizePolicy,
 }
 
 struct CoordState {
@@ -668,14 +707,6 @@ fn member_keys(member: &LeafMember) -> Vec<&[u8]> {
 }
 
 impl CasWorker {
-    /// Returns the members of the round, or none when the round has stopped.
-    fn round_members(&self, batch: &BatchHandle<CasReq, TransError>) -> BTreeMap<TxId, LeafMember> {
-        batch
-            .merged()
-            .map(|merged| merged.members)
-            .unwrap_or_default()
-    }
-
     /// Builds the ordered mutation plan for one loaded leaf attempt.
     async fn plan_mutation(
         &self,
@@ -868,13 +899,17 @@ impl CasWorker {
             _ => (false, false, true),
         };
         let create_full = (proposed.admission == StageAdmission::AddsKey || direct_adds_key)
-            && candidate_node.content_encoded_len() > self.core.policy.content_limit();
+            && candidate_node.content_encoded_len()
+                > self.core.config.node_size_policy.content_limit();
         let inline_entry_full = inline_publication
-            && proposed
-                .entries
-                .iter()
-                .any(|(_, entry)| !self.core.policy.entry_fits_split_budget(entry));
-        if candidate_node.encoded_len() <= self.core.policy.node_max_bytes()
+            && proposed.entries.iter().any(|(_, entry)| {
+                !self
+                    .core
+                    .config
+                    .node_size_policy
+                    .entry_fits_split_budget(entry)
+            });
+        if candidate_node.encoded_len() <= self.core.config.node_size_policy.node_max_bytes()
             && !create_full
             && !inline_entry_full
         {
@@ -960,186 +995,298 @@ impl CasWorker {
         submitted: &CasReq,
         batch: &BatchHandle<CasReq, TransError>,
     ) -> Result<(), TransError> {
-        let path = &submitted.path;
-        let mut requirement = submitted.requirement;
-        // A cache-served `Any` load may complete without yielding. Give peers
-        // already scheduled for this object one opportunity to join the round,
-        // so batching does not depend on backend I/O creating the collection
-        // window. The first load accepts any cached leaf, even for members
-        // that require bounded evidence before completion.
-        rt::yield_now().await;
-        let mut contention = self.core.retry.contention.backoff();
-        // A CAS that came back in-doubt can be a backend that throttles or
-        // fails, so its retry waits longer.
-        let mut failure = self.core.retry.wait.backoff();
-        let mut failed = false;
-        // Policies must distinguish the first attempt from recovery after a CAS
-        // failure or a stale transaction dependency.
-        let mut reloaded = false;
-        // The members whose changes rode a CAS that came back in-doubt. For them
-        // in-doubt is *sticky* across planning retries until their policy returns a
-        // reconciled, non-InDoubt decision: that write may have landed durably
-        // (and been help-forwarded to a peer), so a later rejected CAS must
-        // not downgrade the in-doubt outcome to a definitive loss. Commit-install
-        // would otherwise misclassify a landed-but-unacked lock as `Moved` and
-        // unsafely discard the body outcome and replay a commit a peer already
-        // observed.
-        //
-        // It is per member rather than per round: a member the in-doubt CAS did
-        // not carry — one skipped for a same-key direct reservation, or merged into
-        // the batch afterwards — definitively did not land, and inheriting the
-        // batch's in-doubt outcome would strand it over a write it never made.
-        //
-        // A member that stages again over a leaf that does not fence its
-        // in-doubt CAS also stays in doubt, until a CAS lands. So each member
-        // keeps the leaf state that its in-doubt CAS expected.
-        let mut in_doubt = InDoubtMembers::new();
-        let mut lost_cas: Option<LostCas> = None;
-        // Retain both submitted and policy-requested bounds across retries.
-        // ANY seeds need no preliminary check when a CAS confirms their state.
-        let mut load_requirement = Requirement::ANY;
+        self.wait_for_batching_window().await;
+        let mut round = RoundState::new(submitted.requirement, &self.core.config.retry);
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
-                let backoff = if failed {
-                    &mut failure
-                } else {
-                    &mut contention
-                };
-                rt::sleep(backoff.next_delay()).await;
-                failed = false;
+                round.wait_for_retry().await;
                 self.core.stats.n_retries.fetch_add(1, Ordering::Relaxed);
-                load_requirement = requirement;
             }
-            let loaded = self.core.nodes.load_leaf(path, load_requirement).await;
-            // Absence cannot supply a leaf CAS precondition or reach persist's
-            // no-change check. Preserve the submitted bound on this error path.
-            let loaded = match loaded {
-                Err(StorageError::NotFound) if load_requirement != requirement => {
-                    self.core.nodes.load_leaf(path, requirement).await
-                }
-                result => result,
-            };
-            let edit = match loaded {
-                Ok(loaded) => loaded.into_edit(),
-                // A root split can turn the routed root leaf into an index
-                // between grouping and this load. Deliver each policy's
-                // reroute outcome so its caller rebuilds the current leaf set.
-                Err(StorageError::Precondition) => {
-                    let members = self.round_members(batch);
-                    for (tx, member) in &members {
-                        *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
-                            outcome: member.policy.reroute_outcome(in_doubt.contains_key(tx)),
-                            evidence: None,
-                        });
-                    }
-                    return Ok(());
-                }
-                Err(e) => return Err(e.into()),
-            };
-            if let Some(lost) = lost_cas.take()
-                && lost.cause(edit.node()) == LostCasCause::OtherKeys
-            {
-                self.core.hinter.lost_leaf_cas(path, &lost.round_keys);
-            }
-            // Read the merged set *after* obtaining the leaf so this round
-            // absorbs every member that queued while the load I/O was in flight
-            // (ADR-025) — the window that turns N contenders' loads+CASes into
-            // one. Keep these members with their combined requirement: their
-            // dependent reads need that bound even when the leaf CAS can confirm
-            // an older seed without a preliminary check.
-            // A round whose every caller has gone away must stop here: nothing
-            // consumes its outcomes, and planning again would publish state on
-            // behalf of abandoned transactions — including, after a precondition
-            // miss proved the first CAS did not land, a brand-new direct
-            // publication over a newer writer.
-            let Some(merged) = batch.merged() else {
+            if let AttemptEnd::Done = self.attempt(&submitted.path, batch, &mut round).await? {
                 return Ok(());
-            };
-            requirement = requirement.stricter(merged.requirement);
-            let members = merged.members;
-            let mut plan = match self
-                .plan_mutation(path, &edit, &members, requirement, reloaded, &mut in_doubt)
-                .await
-            {
-                Ok(plan) => plan,
-                Err(TransError::ValidateRetry(fresh)) => {
-                    requirement = requirement.stricter(fresh);
-                    reloaded = true;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-
-            let loaded_observation = edit.observation().clone();
-            let persist_result = self.persist(path, edit, &mut plan, requirement).await?;
-            let (loaded_observation, applied) = match persist_result {
-                PersistResult::Applied(receipt) => (loaded_observation, Some(receipt)),
-                PersistResult::Unchanged(observed) => (observed, None),
-                // The CAS did not land, or the clean plan's loaded state
-                // changed. Neither resolves an earlier in-doubt mutation.
-                // Every topology policy receives the lost leaf CASes
-                // (ADR-085). A rejected CAS already cost a backend
-                // operation, so recording it costs little.
-                PersistResult::Rejected => {
-                    lost_cas = loaded_observation
-                        .value()
-                        .map(|expected| LostCas::new(expected.clone(), &members));
-                    reloaded = true;
-                    continue;
-                }
-                PersistResult::PreconditionMiss => {
-                    reloaded = true;
-                    continue;
-                }
-                // Rebuilding the plan from a reloaded leaf is idempotent. Only the
-                // members this in-doubt CAS actually carried inherit its doubt.
-                PersistResult::InDoubt(staged_ids) => {
-                    for id in staged_ids {
-                        in_doubt.insert(id, loaded_observation.clone());
-                    }
-                    reloaded = true;
-                    failed = true;
-                    continue;
-                }
-            };
-
-            // The CAS landed (or nothing needed staging): publish each member's
-            // outcome into its slot before returning, so the deposit
-            // happens-before the dedup delivers to the caller. Recording the held
-            // lock is the caller's job (the [`Locker`](crate::tlocker::Locker)), done when
-            // it observes its own `Locked` outcome.
-            for member in plan.members {
-                if let Some(m) = members.get(&member.id) {
-                    *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
-                        outcome: member.outcome,
-                        evidence: Some(match member.participation {
-                            Participation::Staged => {
-                                let receipt = applied.as_ref().ok_or_else(|| {
-                                    TransError::other("staged leaf member has no successful CAS")
-                                })?;
-                                CoordinationEvidence::Installed(receipt.clone())
-                            }
-                            Participation::Skipped => {
-                                CoordinationEvidence::Observed(loaded_observation.clone())
-                            }
-                        }),
-                    });
-                }
             }
-            return Ok(());
         }
         // Bounded CAS budget exhausted under churn: each member gets its
         // policy's exhaustion outcome. Acquirers conflict and release/re-lock;
         // write-backs re-descend and releases re-submit, because exhaustion does
         // not prove convergence.
-        for (tx, m) in &self.round_members(batch) {
-            *m.slot.lock().unwrap() = Some(CoordinatedOutcome {
-                outcome: m.policy.exhausted_outcome(in_doubt.contains_key(tx)),
-                evidence: None,
-            });
-        }
+        deliver_policy_outcomes(batch, &round.in_doubt, |policy, in_doubt| {
+            policy.exhausted_outcome(in_doubt)
+        });
         Ok(())
     }
+
+    /// Waits for the batching window before the first leaf load of a round.
+    ///
+    /// A cache-served `Any` load may complete without yielding, so batching
+    /// cannot depend on backend I/O. The round waits for the batching window,
+    /// so that the submissions for the leaf that arrive during it join the
+    /// round (ADR-087). A zero window gives the peers already scheduled for
+    /// this object one yield.
+    async fn wait_for_batching_window(&self) {
+        let window = self.core.config.batching_window;
+        if window.is_zero() {
+            rt::yield_now().await;
+        } else {
+            rt::sleep(window).await;
+        }
+    }
+
+    /// Runs one CAS attempt of a round: loads the leaf, plans the mutation of
+    /// the current members, persists it, and delivers their outcomes.
+    async fn attempt(
+        &self,
+        path: &ObjectPath,
+        batch: &BatchHandle<CasReq, TransError>,
+        round: &mut RoundState,
+    ) -> Result<AttemptEnd, TransError> {
+        let edit = match self.load_round_leaf(path, round).await {
+            Ok(edit) => edit,
+            // A root split can turn the routed root leaf into an index
+            // between grouping and this load. Deliver each policy's
+            // reroute outcome so its caller rebuilds the current leaf set.
+            Err(StorageError::Precondition) => {
+                deliver_policy_outcomes(batch, &round.in_doubt, |policy, in_doubt| {
+                    policy.reroute_outcome(in_doubt)
+                });
+                return Ok(AttemptEnd::Done);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(lost) = round.lost_cas.take()
+            && lost.cause(edit.node()) == LostCasCause::OtherKeys
+        {
+            self.core.hinter.lost_leaf_cas(path, &lost.round_keys);
+        }
+        // Read the merged set *after* obtaining the leaf so this round
+        // absorbs every member that queued while the load I/O was in flight
+        // (ADR-025) — the window that turns N contenders' loads+CASes into
+        // one. Keep these members with their combined requirement: their
+        // dependent reads need that bound even when the leaf CAS can confirm
+        // an older seed without a preliminary check.
+        // A round whose every caller has gone away must stop here: nothing
+        // consumes its outcomes, and planning again would publish state on
+        // behalf of abandoned transactions — including, after a precondition
+        // miss proved the first CAS did not land, a brand-new direct
+        // publication over a newer writer.
+        let Some(merged) = batch.merged() else {
+            return Ok(AttemptEnd::Done);
+        };
+        round.requirement = round.requirement.stricter(merged.requirement);
+        let members = merged.members;
+        let mut plan = match self
+            .plan_mutation(
+                path,
+                &edit,
+                &members,
+                round.requirement,
+                round.reloaded,
+                &mut round.in_doubt,
+            )
+            .await
+        {
+            Ok(plan) => plan,
+            Err(TransError::ValidateRetry(fresh)) => {
+                round.requirement = round.requirement.stricter(fresh);
+                return Ok(round.reload_and_retry());
+            }
+            Err(error) => return Err(error),
+        };
+
+        let loaded_observation = edit.observation().clone();
+        let persist_result = self
+            .persist(path, edit, &mut plan, round.requirement)
+            .await?;
+        let (observed, applied) = match persist_result {
+            PersistResult::Applied(receipt) => (loaded_observation, Some(receipt)),
+            PersistResult::Unchanged(observed) => (observed, None),
+            // The CAS did not land, or the clean plan's loaded state
+            // changed. Neither resolves an earlier in-doubt mutation.
+            // Every topology policy receives the lost leaf CASes
+            // (ADR-085). A rejected CAS already cost a backend
+            // operation, so recording it costs little.
+            PersistResult::Rejected => {
+                round.lost_cas = loaded_observation
+                    .value()
+                    .map(|expected| LostCas::new(expected.clone(), &members));
+                return Ok(round.reload_and_retry());
+            }
+            PersistResult::PreconditionMiss => return Ok(round.reload_and_retry()),
+            // Rebuilding the plan from a reloaded leaf is idempotent. Only the
+            // members this in-doubt CAS actually carried inherit its doubt.
+            PersistResult::InDoubt(staged_ids) => {
+                for id in staged_ids {
+                    round.in_doubt.insert(id, loaded_observation.clone());
+                }
+                round.failed = true;
+                return Ok(round.reload_and_retry());
+            }
+        };
+        deliver_plan(plan.members, &members, applied.as_ref(), &observed)?;
+        Ok(AttemptEnd::Done)
+    }
+
+    /// Loads the leaf with the load requirement of the round. If that load
+    /// finds no leaf, and the load requirement is weaker than the requirement
+    /// of the round, it loads again with the requirement of the round.
+    async fn load_round_leaf(
+        &self,
+        path: &ObjectPath,
+        round: &RoundState,
+    ) -> Result<LeafEdit, StorageError> {
+        let loaded = self
+            .core
+            .nodes
+            .load_leaf(path, round.load_requirement)
+            .await;
+        // Absence cannot supply a leaf CAS precondition or reach persist's
+        // no-change check. Preserve the submitted bound on this error path.
+        let loaded = match loaded {
+            Err(StorageError::NotFound) if round.load_requirement != round.requirement => {
+                self.core.nodes.load_leaf(path, round.requirement).await
+            }
+            result => result,
+        };
+        loaded.map(|loaded| loaded.into_edit())
+    }
+}
+
+/// How a CAS attempt of a round ends.
+enum AttemptEnd {
+    /// The round is over: it delivered the outcomes of its members, or it has
+    /// no members left.
+    Done,
+    /// The round needs another attempt.
+    Retry,
+}
+
+/// The state of a coordinator round that lasts across its CAS attempts.
+struct RoundState {
+    /// The combined bound of the submitted and the policy-requested
+    /// requirements. It only becomes stricter across attempts.
+    requirement: Requirement,
+    /// The bound of the next leaf load. The first load accepts any cached
+    /// leaf, even for members that require bounded evidence before completion:
+    /// `ANY` seeds need no preliminary check when a CAS confirms their state.
+    /// Retries load with `requirement`.
+    load_requirement: Requirement,
+    contention: Backoff,
+    /// A CAS that came back in-doubt can be a backend that throttles or
+    /// fails, so its retry waits longer.
+    failure: Backoff,
+    /// Whether the last CAS came back in doubt.
+    failed: bool,
+    /// Whether the round reloaded the leaf. Policies must distinguish the
+    /// first attempt from recovery after a CAS failure or a stale transaction
+    /// dependency.
+    reloaded: bool,
+    /// The members whose changes rode a CAS that came back in-doubt. For them
+    /// in-doubt is *sticky* across planning retries until their policy returns
+    /// a reconciled, non-InDoubt decision: that write may have landed durably
+    /// (and been help-forwarded to a peer), so a later rejected CAS must not
+    /// downgrade the in-doubt outcome to a definitive loss. Commit-install
+    /// would otherwise misclassify a landed-but-unacked lock as `Moved` and
+    /// unsafely discard the body outcome and replay a commit a peer already
+    /// observed.
+    ///
+    /// It is per member rather than per round: a member the in-doubt CAS did
+    /// not carry — one skipped for a same-key direct reservation, or merged
+    /// into the batch afterwards — definitively did not land, and inheriting
+    /// the batch's in-doubt outcome would strand it over a write it never
+    /// made.
+    ///
+    /// A member that stages again over a leaf that does not fence its
+    /// in-doubt CAS also stays in doubt, until a CAS lands. So each member
+    /// keeps the leaf state that its in-doubt CAS expected.
+    in_doubt: InDoubtMembers,
+    /// The last rejected CAS, until the next load shows what the peer changed.
+    lost_cas: Option<LostCas>,
+}
+
+impl RoundState {
+    fn new(requirement: Requirement, retry: &RetryTiming) -> Self {
+        Self {
+            requirement,
+            load_requirement: Requirement::ANY,
+            contention: retry.contention.backoff(),
+            failure: retry.wait.backoff(),
+            failed: false,
+            reloaded: false,
+            in_doubt: InDoubtMembers::new(),
+            lost_cas: None,
+        }
+    }
+
+    /// Waits for the backoff of the next attempt.
+    async fn wait_for_retry(&mut self) {
+        let backoff = if self.failed {
+            &mut self.failure
+        } else {
+            &mut self.contention
+        };
+        rt::sleep(backoff.next_delay()).await;
+        self.failed = false;
+        self.load_requirement = self.requirement;
+    }
+
+    /// Ends an attempt with a retry that plans again from a reloaded leaf.
+    fn reload_and_retry(&mut self) -> AttemptEnd {
+        self.reloaded = true;
+        AttemptEnd::Retry
+    }
+}
+
+/// Delivers to each member of the round the outcome that `outcome` gives for
+/// its policy and for whether the member is in doubt.
+fn deliver_policy_outcomes(
+    batch: &BatchHandle<CasReq, TransError>,
+    in_doubt: &InDoubtMembers,
+    outcome: impl Fn(&dyn MemberPolicy, bool) -> MemberOutcome,
+) {
+    let members = batch
+        .merged()
+        .map(|merged| merged.members)
+        .unwrap_or_default();
+    for (tx, member) in &members {
+        *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
+            outcome: outcome(member.policy.as_ref(), in_doubt.contains_key(tx)),
+            evidence: None,
+        });
+    }
+}
+
+/// Delivers the planned outcomes after the CAS landed, or after the plan
+/// needed no CAS. `applied` is the receipt of the CAS, and `observed` is the
+/// leaf state that the skipped members observed.
+///
+/// Each outcome goes into its slot before the round returns, so the deposit
+/// happens-before the dedup delivers to the caller. Recording the held lock is
+/// the caller's job (the [`Locker`](crate::tlocker::Locker)), done when it
+/// observes its own `Locked` outcome.
+fn deliver_plan(
+    planned: Vec<PlannedMember>,
+    members: &BTreeMap<TxId, LeafMember>,
+    applied: Option<&CasReceipt<Node>>,
+    observed: &LeafObservation,
+) -> Result<(), TransError> {
+    for planned in planned {
+        let Some(member) = members.get(&planned.id) else {
+            continue;
+        };
+        let evidence = match planned.participation {
+            Participation::Staged => {
+                let receipt = applied
+                    .ok_or_else(|| TransError::other("staged leaf member has no successful CAS"))?;
+                CoordinationEvidence::Installed(receipt.clone())
+            }
+            Participation::Skipped => CoordinationEvidence::Observed(observed.clone()),
+        };
+        *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
+            outcome: planned.outcome,
+            evidence: Some(evidence),
+        });
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -1167,22 +1314,19 @@ pub struct LeafCoordinator {
 impl LeafCoordinator {
     /// Creates a coordinator that reports capacity observations to `hinter` —
     /// normally the background [`Restructurer`](crate::structural::Restructurer)'s queue.
-    /// `policy` governs the coordinator's hard node-size limit.
     pub fn with_hinter(
         nodes: NodeStore,
         key_state: KeyStateResolver,
         tmon: Monitor,
-        retry: RetryTiming,
-        policy: NodeSizePolicy,
+        config: CoordinatorConfig,
         hinter: Arc<dyn StructuralHinter>,
     ) -> Self {
         let core = Arc::new(CoordCore {
             tmon,
             nodes,
             key_state,
-            retry,
+            config,
             stats: Stats::default(),
-            policy,
             hinter,
         });
         let dedup = Dedup::new(CasWorker { core: core.clone() });
@@ -1327,14 +1471,6 @@ mod tests {
         node_id(0)
     }
 
-    struct NoStructuralHints;
-
-    impl StructuralHinter for NoStructuralHints {
-        fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
-
-        fn capacity_rejected(&self, _path: &ObjectPath) {}
-    }
-
     // Every coordination round in these tests targets one leaf object. A
     // standalone node `_n/<node-id>` is the cleanest stand-in: it carries only key
     // entries (no collection metadata), exactly what leaf mutation planning operates on.
@@ -1369,7 +1505,11 @@ mod tests {
         policy: NodeSizePolicy,
         hinter: Arc<dyn StructuralHinter>,
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
-        coord_over_retry(backend, policy, hinter, RetryTiming::default()).await
+        let config = CoordinatorConfig {
+            node_size_policy: policy,
+            ..CoordinatorConfig::default()
+        };
+        coord_over_config(backend, config, hinter).await
     }
 
     // A coordinator with a near-zero CAS backoff, so an exhaustion regression
@@ -1377,23 +1517,23 @@ mod tests {
     async fn coord_over_fast(
         backend: Arc<dyn Backend>,
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
-        coord_over_retry(
-            backend,
-            NodeSizePolicy::default(),
-            Arc::new(NoStructuralHints),
-            RetryTiming::uniform(glassdb_concurr::RetrySchedule {
+        coord_over_config(backend, fast_retry(), Arc::new(NoStructuralHints)).await
+    }
+
+    fn fast_retry() -> CoordinatorConfig {
+        CoordinatorConfig {
+            retry: RetryTiming::uniform(glassdb_concurr::RetrySchedule {
                 initial_interval: Duration::from_nanos(1),
                 max_interval: Duration::from_nanos(1),
             }),
-        )
-        .await
+            ..CoordinatorConfig::default()
+        }
     }
 
-    async fn coord_over_retry(
+    async fn coord_over_config(
         backend: Arc<dyn Backend>,
-        policy: NodeSizePolicy,
+        config: CoordinatorConfig,
         hinter: Arc<dyn StructuralHinter>,
-        retry: RetryTiming,
     ) -> (LeafCoordinator, NodeStore, Timeline, Arc<Background>) {
         let seed_timeline = Timeline::new();
         let seed_store = NodeStore::new(
@@ -1410,16 +1550,16 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = EngineConfig::default();
-        config.set_cache_size(1 << 20);
-        let foundation = AssemblyFixture::new(backend, DbPrefix::try_from(COLL).unwrap(), &config);
+        let mut engine_config = EngineConfig::default();
+        engine_config.set_cache_size(1 << 20);
+        let foundation =
+            AssemblyFixture::new(backend, DbPrefix::try_from(COLL).unwrap(), &engine_config);
         let timeline = foundation.timeline.clone();
         let bg = foundation.background.clone();
         let mon = foundation.monitor.clone();
         let nodes = foundation.nodes.clone();
         let key_state = KeyStateResolver::new(mon.clone());
-        let coord =
-            LeafCoordinator::with_hinter(nodes.clone(), key_state, mon, retry, policy, hinter);
+        let coord = LeafCoordinator::with_hinter(nodes.clone(), key_state, mon, config, hinter);
         (coord, nodes, timeline, bg)
     }
 
@@ -2670,6 +2810,93 @@ mod tests {
         coord.close().await;
     }
 
+    // The batching window of these tests. It is longer than the paused clock's
+    // tick, so the offsets below stay exact.
+    const WINDOW: Duration = Duration::from_millis(10);
+
+    // Submits a recorder for `key` at once and returns when its round ends.
+    fn submit_recorder(
+        coord: &LeafCoordinator,
+        tx: TxId,
+        key: &[u8],
+    ) -> tokio::task::JoinHandle<rt::Instant> {
+        let coord = coord.clone();
+        let policy = Arc::new(Recorder {
+            key: key.to_vec(),
+            tx,
+            trace: Arc::new(Mutex::new(Vec::new())),
+        });
+        tokio::spawn(async move {
+            let outcome = coord
+                .submit_leaf(&leaf(), &tx, policy, Requirement::ANY)
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                Some(CoordinatedOutcome {
+                    outcome: MemberOutcome::Landed,
+                    ..
+                })
+            ));
+            rt::Instant::now()
+        })
+    }
+
+    // Submits one member at once and another at `offset`, and returns the
+    // coordinator rounds and the end of each member's round, from the first
+    // submission.
+    async fn rounds_with_window(window: Duration, offset: Duration) -> (u64, [Duration; 2]) {
+        let (coord, _nodes, _timeline, _bg) = coord_over_config(
+            Arc::new(MemoryBackend::new()),
+            CoordinatorConfig {
+                batching_window: window,
+                ..CoordinatorConfig::default()
+            },
+            Arc::new(NoStructuralHints),
+        )
+        .await;
+        coord.stats_and_reset();
+        let start = rt::Instant::now();
+        let first = submit_recorder(&coord, TxId::with_priority(1, b"first"), b"a");
+        rt::sleep(offset).await;
+        let second = submit_recorder(&coord, TxId::with_priority(2, b"second"), b"b");
+        let ends = [
+            first.await.unwrap().duration_since(start),
+            second.await.unwrap().duration_since(start),
+        ];
+        let rounds = coord.stats_and_reset().rounds;
+        coord.close().await;
+        (rounds, ends)
+    }
+
+    // ADR-087: a submission that arrives during the batching window joins the
+    // round, and the round loads at the end of the window.
+    #[tokio::test(start_paused = true)]
+    async fn submission_during_the_window_joins_the_round() {
+        let (rounds, ends) = rounds_with_window(WINDOW, Duration::from_millis(4)).await;
+        assert_eq!(rounds, 1);
+        assert_eq!(ends, [WINDOW, WINDOW]);
+    }
+
+    // ADR-087: a submission that arrives after the window needs its own round,
+    // which also waits for the window.
+    #[tokio::test(start_paused = true)]
+    async fn submission_after_the_window_takes_its_own_round() {
+        let late = WINDOW + Duration::from_millis(4);
+        let (rounds, ends) = rounds_with_window(WINDOW, late).await;
+        assert_eq!(rounds, 2);
+        assert_eq!(ends, [WINDOW, late + WINDOW]);
+    }
+
+    // ADR-087: a zero window gives a round only one yield.
+    #[tokio::test(start_paused = true)]
+    async fn zero_window_starts_a_round_at_once() {
+        let joins = Duration::from_millis(4);
+        let (rounds, ends) = rounds_with_window(Duration::ZERO, joins).await;
+        assert_eq!(rounds, 2);
+        assert_eq!(ends, [Duration::ZERO, joins]);
+    }
+
     // ADR-028: two transactions contending the same leaf merge into one round —
     // a single shared load and a single CAS — planned oldest-first, with the
     // younger member observing the older's staged entry (threading).
@@ -2888,16 +3115,8 @@ mod tests {
         let inner = slow_leaf_backend();
         store_leaf_entries(&cold_store(inner.clone()), &leaf(), entries).await;
         let (backend, peer_wins) = peer_wins_leaf_cas(inner, change);
-        let (coord, _nodes, _timeline, bg) = coord_over_retry(
-            backend,
-            NodeSizePolicy::default(),
-            hints.clone(),
-            RetryTiming::uniform(glassdb_concurr::RetrySchedule {
-                initial_interval: Duration::from_nanos(1),
-                max_interval: Duration::from_nanos(1),
-            }),
-        )
-        .await;
+        let (coord, _nodes, _timeline, bg) =
+            coord_over_config(backend, fast_retry(), hints.clone()).await;
         peer_wins.store(wins, Ordering::SeqCst);
         (coord, hints, bg)
     }
@@ -2953,11 +3172,10 @@ mod tests {
         )
         .await;
         let (backend, peer_wins) = peer_wins_leaf_cas(inner, |node| with_peer_writer(node, b"b"));
-        let (coord, _nodes, _timeline, _bg) = coord_over_retry(
+        let (coord, _nodes, _timeline, _bg) = coord_over_with(
             backend,
             NodeSizePolicy::default(),
             Arc::new(LostCasRecorder::default()),
-            RetryTiming::default(),
         )
         .await;
         peer_wins.store(LOSSES as usize, Ordering::SeqCst);
@@ -3476,11 +3694,10 @@ mod tests {
             vec![entry(b"a", LockType::None, None, Some(&seed))],
         )
         .await;
-        let (coord, _nodes, _timeline, _bg) = coord_over_retry(
+        let (coord, _nodes, _timeline, _bg) = coord_over_with(
             in_doubt_then_ok(inner),
             NodeSizePolicy::default(),
             Arc::new(LostCasRecorder::default()),
-            RetryTiming::default(),
         )
         .await;
 

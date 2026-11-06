@@ -10,7 +10,7 @@ use super::reconcile::{
 use super::recovery::ChangeKind;
 use super::split::{SplitNeed, SplitReason, SplitTarget};
 use crate::engine::{AssemblyFixture, EngineConfig};
-use crate::leaf_coord::StructuralHinter;
+use crate::leaf_coord::{CoordinatorConfig, NoStructuralHints, StructuralHinter};
 use crate::monitor::TxFinalStatus;
 use crate::node_locking::GateAcquisition;
 use crate::retry_timing::RetryTiming;
@@ -35,14 +35,6 @@ mod split_tests;
 mod topology_tests;
 
 const COLL: &str = "db/_c/0000000000000000000000";
-
-struct NoStructuralHints;
-
-impl StructuralHinter for NoStructuralHints {
-    fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {}
-
-    fn capacity_rejected(&self, _path: &ObjectPath) {}
-}
 
 fn collection() -> CollectionAddress {
     CollectionAddress::root("db")
@@ -358,8 +350,10 @@ fn restructurer_with_parts(
         store.nodes.clone(),
         key_state.clone(),
         mon.clone(),
-        RetryTiming::default(),
-        parts.sizes,
+        CoordinatorConfig {
+            node_size_policy: parts.sizes,
+            ..CoordinatorConfig::default()
+        },
         Arc::new(parts.hints.clone()),
     );
     Restructurer::with_parts(
