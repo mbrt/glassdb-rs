@@ -162,12 +162,26 @@ async fn keys_without_a_recent_writer_stay_with_the_contended_key() {
 // The local writer of k03 wrote k05 too, so a split at k04 divides its write
 // span. The split is at the other edge of the run.
 #[tokio::test]
-async fn the_split_divides_no_write_span() {
+async fn the_split_prefers_an_edge_that_divides_no_write_span() {
     let (contention, mon, _bg) = contention();
     let node = leaf(&mon, "FFFSFSFF");
 
     assert_eq!(
         contention.split_key(&node, &key(3), rt::system_now()),
+        Some(key(3))
+    );
+}
+
+// The local writer of k02 wrote k00 and k05 too, so both edges of the run
+// divide its write span. Contention comes before write spans (ADR-088), so the
+// split still moves away the side with more keys.
+#[tokio::test]
+async fn a_write_span_does_not_stop_the_split() {
+    let (contention, mon, _bg) = contention();
+    let node = leaf(&mon, "SFSFFS");
+
+    assert_eq!(
+        contention.split_key(&node, &key(2), rt::system_now()),
         Some(key(3))
     );
 }
@@ -228,14 +242,34 @@ async fn a_database_instance_that_writes_neither_leaf_does_not_merge_them() {
     assert!(contention.keeps_apart(&left, &right, rt::system_now()));
 }
 
-// A database instance that writes both leaves merges them, also when other
-// database instances write them too.
+// A database instance that writes both leaves alone merges them.
 #[tokio::test]
-async fn a_database_instance_that_writes_both_leaves_merges_them() {
+async fn a_database_instance_that_writes_both_leaves_alone_merges_them() {
+    let (contention, mon, _bg) = contention();
+    let (left, right) = pair(&mon, "L", "LoL");
+
+    assert!(!contention.keeps_apart(&left, &right, rt::system_now()));
+}
+
+// Regression: this database instance writes both leaves, but another database
+// instance writes the right leaf too. A merge would put the keys of the other
+// database instance back with the local key of the left leaf, so it waits
+// (ADR-088).
+#[tokio::test]
+async fn a_merge_into_a_leaf_that_another_database_instance_writes_too_waits() {
     let (contention, mon, _bg) = contention();
     let (left, right) = pair(&mon, "L", "FL");
 
-    assert!(!contention.keeps_apart(&left, &right, rt::system_now()));
+    assert!(contention.keeps_apart(&left, &right, rt::system_now()));
+}
+
+// The foreign writer can be in the left leaf too.
+#[tokio::test]
+async fn a_merge_of_a_leaf_that_another_database_instance_writes_too_waits() {
+    let (contention, mon, _bg) = contention();
+    let (left, right) = pair(&mon, "LF", "L");
+
+    assert!(contention.keeps_apart(&left, &right, rt::system_now()));
 }
 
 // A merge with a leaf that has no live value of a recent writer cannot put the

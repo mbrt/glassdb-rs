@@ -8,7 +8,10 @@ The policy that this ADR calls the size causes is now
 `TopologyPolicy::Writers`. `SizeCauses` now names the policy of the leaf sizes
 alone.
 
-Refined by [ADR-085](085-lost-leaf-cas-separates-the-keys-of-database-instances.md).
+Refined by [ADR-085](085-lost-leaf-cas-separates-the-keys-of-database-instances.md)
+and [ADR-088](088-contention-comes-before-write-spans-and-sizes.md), which
+stops its merges for write spans while another database instance writes one of
+the two leaves.
 
 Supersedes [ADR-075](075-avoidable-time-is-the-default-topology-policy.md).
 The rule of the avoidable time policy of

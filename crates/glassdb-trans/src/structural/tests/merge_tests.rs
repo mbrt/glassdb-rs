@@ -182,8 +182,8 @@ async fn underfull_leaf_does_not_merge_into_a_leaf_of_another_database_instance(
     assert!(stats.merges.kept_apart >= 1, "{stats:?}");
 }
 
-// ADR-085: this database instance writes both leaves, so the underfull merge
-// goes ahead, also when another database instance writes L1 too.
+// ADR-088: this database instance writes both leaves alone, so the underfull
+// merge goes ahead.
 #[tokio::test]
 async fn underfull_leaf_merges_into_a_leaf_that_its_database_instance_writes() {
     let s = store();
@@ -196,7 +196,7 @@ async fn underfull_leaf_merges_into_a_leaf_that_its_database_instance_writes() {
     ]));
     let right = Node::leaf(LeafBody::from_entries([
         written_by(b"m", &local_writer(&mon)),
-        written_by(b"n", &recent_writer()),
+        live(b"n"),
     ]));
     seed_leaves(&s, left, right).await;
 
@@ -1120,12 +1120,14 @@ async fn one_batch_splits_and_merges_under_one_parent() {
     assert_no_intents(&s).await;
 }
 
-// ADR-084: a recent transaction wrote "b" and "m" together, over the
-// boundary of L0 and L1, so the two leaves merge.
+// ADR-084: a recent transaction of this database instance wrote "b" and "m"
+// together, over the boundary of L0 and L1, so the two leaves merge.
 #[tokio::test]
 async fn leaves_merge_for_keys_committed_together_over_their_boundary() {
     let s = store();
-    let writer = recent_writer();
+    let bg = Arc::new(Background::new());
+    let (sp, mon) = restructurer_and_monitor(&s, &bg, mergeable());
+    let writer = local_writer(&mon);
     let left = Node::leaf(LeafBody::from_entries([
         live(b"a"),
         written_by(b"b", &writer),
@@ -1135,12 +1137,35 @@ async fn leaves_merge_for_keys_committed_together_over_their_boundary() {
         live(b"n"),
     ]));
     seed_leaves(&s, left, right).await;
-    let bg = Arc::new(Background::new());
-    let sp = restructurer(&s, &bg, mergeable());
 
     merge_now(&sp, "L0", MergeReason::WriteSpan).await.unwrap();
 
     assert_merged(&s).await;
+}
+
+// ADR-088: another database instance recently wrote "n", so the merge for the
+// write span of "b" and "m" waits. Contention comes before write spans.
+#[tokio::test]
+async fn leaves_that_another_database_instance_writes_do_not_merge_for_write_spans() {
+    let s = store();
+    let bg = Arc::new(Background::new());
+    let (sp, mon) = restructurer_and_monitor(&s, &bg, mergeable());
+    let writer = local_writer(&mon);
+    let left = Node::leaf(LeafBody::from_entries([
+        live(b"a"),
+        written_by(b"b", &writer),
+    ]));
+    let right = Node::leaf(LeafBody::from_entries([
+        written_by(b"m", &writer),
+        written_by(b"n", &recent_writer()),
+    ]));
+    seed_leaves(&s, left, right).await;
+
+    merge_now(&sp, "L0", MergeReason::WriteSpan).await.unwrap();
+
+    assert!(!current_node(&s, "L0").await.is_drained());
+    assert_eq!(sp.stats_and_reset().merges.kept_apart, 1);
+    assert_no_intents(&s).await;
 }
 
 // ADR-084: without keys committed together over the boundary, a merge for

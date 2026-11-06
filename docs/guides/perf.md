@@ -26,6 +26,51 @@ limit. Earlier entries that do not pass `--prefix-depth` used 2 segments, where
 all collections of a database share one limit. Pass `--prefix-depth=2` to
 measure them again.
 
+## ADR-088: contention comes before write spans and leaf sizes
+
+[ADR-088](../adr/088-contention-comes-before-write-spans-and-sizes.md) stops
+merges, also merges for write spans, while another database instance writes
+one of the two leaves. A contention split can divide a write span.
+
+### Setup
+
+- base: `15d82c940`; target: base with the change of ADR-088, both with the
+  engine defaults.
+- `--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
+  --drain-timeout=90s`, alternated. The base ran first, except in the rotated
+  runs.
+- ratio = target / base, of the throughput of all shapes
+
+### Results
+
+| Cell | Runs | Ratio | Writes/tx, base → target |
+| --- | ---: | --- | --- |
+| `false-sharing-spans` | 3, rotated | 1.086 | 0.33 → 0.69 |
+| `false-sharing` | 3 | 0.997 | 0.56 → 0.56 |
+| `load-shift`, `crossing` and low conflict | 3 | 0.979, 1.003 | 1.37 → 1.42, 1.18 → 1.19 |
+| `membership-churn` | 3 | 1.097 | 1.06 → 0.95 |
+| Random ranges, one and five instances | 1 | 1.002, 1.000 | 1.45 → 1.45, 3.01 → 2.96 |
+| Fixed ranges, one instance | 1 | 1.003 | 0.98 → 0.98 |
+| Fixed ranges, five instances | 3, and 3 rotated | 0.933, 0.962 | 1.49 → 1.96, 1.64 → 1.94 |
+| `workers`, 20/80/140/200 workers | 1/1/1/2 rotated | 0.999, 0.984, 1.011, 1.031 | 0.64 → 0.62 at 200 |
+
+- "Rotated" runs changed the order of the sides in each iteration. The other
+  runs ran the base first.
+- In `false-sharing-spans`, each hot writer commits about 7.7 tx/s, against
+  0.45 to 4.3 tx/s in the base, where the write span stops the contention
+  split. On average, the writer of the span commits fewer transactions,
+  because its commits are locked commits.
+- Fixed ranges with five instances lose 4 to 7%. Seed splits divide four of
+  the 16-key ranges and two of the 64-key ranges. Other instances write single
+  keys in the same leaves, so the merges for write spans of these ranges wait.
+- `workers` at 200 gave 0.947 in three pairs that ran the base first, and
+  0.993 in one pair that ran the target first. Both sides made the same
+  topology changes, and the rotated runs gave 1.031, so the lower values came
+  from the order of the runs.
+- `membership-churn` is noisy: 44 to 67 tx/s on both sides.
+- [`hack/perf/investigations.md`](../../hack/perf/investigations.md) has the
+  details in the entry of 2026-11-06.
+
 ## ADR-084: keys that transactions commit together
 
 The second change of

@@ -157,10 +157,9 @@ pub struct MergeStats {
     pub completed: u64,
     /// Retryable candidate attempts requeued for any cause.
     pub deferred: u64,
-    /// Checks of underfull merges that waited, because another database
-    /// instance writes one of the two leaves, and this one does not
-    /// (ADR-085). A merge is checked again at each write of its leaf, so one
-    /// merge can count many times.
+    /// Checks of merges that waited, because another database instance writes
+    /// one of the two leaves (ADR-088). A merge is checked again at each write
+    /// of its leaf, so one merge can count many times.
     pub kept_apart: u64,
 }
 

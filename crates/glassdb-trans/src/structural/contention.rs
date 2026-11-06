@@ -1,10 +1,11 @@
 //! The contended keys of a database instance, and the leaves that keep them
-//! apart from the keys of other database instances (ADR-085).
+//! apart from the keys of other database instances (ADR-085, ADR-088).
 //!
 //! A database instance that loses leaf CASes on a key to other database
 //! instances splits the key away from their keys, and merges only the leaves
-//! that it writes. The decisions read the writers of the leaf entries, and each
-//! database instance judges them with the identities of its own commits.
+//! that no other database instance writes. The decisions read the writers of
+//! the leaf entries, and each database instance judges them with the
+//! identities of its own commits.
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -101,11 +102,13 @@ impl Contention {
     /// `now`.
     ///
     /// The split key is at an edge of the run of keys around `key` that have
-    /// no live value of a recent foreign writer, and divides no write span. The edge
-    /// with more keys outside the run comes first, so that each split moves
-    /// most of the other keys away. `key` is in the run whoever wrote it last:
-    /// a database instance that loses every leaf CAS on it has not written
-    /// it yet. There is none when the run is the whole leaf.
+    /// no live value of a recent foreign writer. The edge with more keys
+    /// outside the run comes first, so that each split moves most of the other
+    /// keys away. An edge that divides no write span comes before the edges
+    /// that divide one, but a write span does not stop the split: contention
+    /// comes before write spans (ADR-088). `key` is in the run whoever wrote it
+    /// last: a database instance that loses every leaf CAS on it has not
+    /// written it yet. There is none when the run is the whole leaf.
     pub(super) fn split_key(&self, node: &Node, key: &[u8], now: SystemTime) -> Option<Vec<u8>> {
         let leaf = node.as_leaf()?;
         let writers = self.writers(node, now);
@@ -127,22 +130,29 @@ impl Contention {
             edges.push((writers.len() - end, writers[end].0));
         }
         edges.sort_by_key(|(outside, _)| std::cmp::Reverse(*outside));
-        edges
+        let edges: Vec<&[u8]> = edges
             .into_iter()
             .map(|(_, edge)| edge)
-            .find(|edge| leaf.divides_at(edge) && write_spans::divides_no_span(node, edge, now))
-            .map(<[u8]>::to_vec)
+            .filter(|edge| leaf.divides_at(edge))
+            .collect();
+        edges
+            .iter()
+            .find(|edge| write_spans::divides_no_span(node, edge, now))
+            .or(edges.first())
+            .map(|edge| edge.to_vec())
     }
 
-    /// Reports whether an underfull merge of the leaf `left` into its right
-    /// sibling `right` must wait, at `now`.
+    /// Reports whether a merge of the leaf `left` into its right sibling
+    /// `right` must wait, at `now` (ADR-088).
     ///
-    /// It waits when both leaves have live values of recent writers, and the
-    /// writers of one of them are all foreign. This database instance then
-    /// writes none of the keys of that leaf, so it cannot tell whether the
-    /// merge puts the keys of two database instances back together. The
-    /// writers of the leaf decide. A leaf without live values of recent
-    /// writers holds no key apart.
+    /// It waits when both leaves have live values of recent writers, and one
+    /// of these writers is foreign. The merge would then put the keys of a
+    /// foreign writer together with other keys that a recent writer still
+    /// writes, and contention comes before write spans and leaf sizes. When
+    /// all the recent writers are local, this database instance writes both
+    /// leaves alone, and they merge. When all of them are foreign, the writers
+    /// of the leaves decide. A leaf without live values of recent writers
+    /// holds no key apart.
     pub(super) fn keeps_apart(&self, left: &Node, right: &Node, now: SystemTime) -> bool {
         let writers = |node: &Node| -> (bool, bool) {
             let writers = self.writers(node, now);
@@ -151,7 +161,7 @@ impl Contention {
         };
         match (writers(left), writers(right)) {
             ((false, false), _) | (_, (false, false)) => false,
-            ((left_local, _), (right_local, _)) => !left_local || !right_local,
+            ((_, left_foreign), (_, right_foreign)) => left_foreign || right_foreign,
         }
     }
 

@@ -38,8 +38,8 @@ pub(super) enum MergeVeto {
     TooLarge,
     /// The reason does not apply to the nodes.
     NotNeeded,
-    /// Another database instance writes one of the two leaves, and this one
-    /// does not, so an underfull merge waits for the writers (ADR-085).
+    /// Another database instance writes one of the two leaves, so the merge
+    /// waits for its writers to stop being recent (ADR-088).
     KeptApart,
 }
 
@@ -354,7 +354,7 @@ impl Merger {
         }
     }
 
-    /// Counts each underfull merge that waits for the writers of its leaves.
+    /// Counts each merge that waits for the writers of its leaves.
     fn count_veto(&self, veto: MergeVeto) {
         if veto == MergeVeto::KeptApart {
             self.stats.record_kept_apart();

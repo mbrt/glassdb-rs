@@ -4,6 +4,10 @@
 
 Accepted — implemented.
 
+Refined by [ADR-088](088-contention-comes-before-write-spans-and-sizes.md),
+which replaces its merge condition and its rule that a contention split
+divides no write span.
+
 The policy that this ADR calls the size causes is now
 `TopologyPolicy::Writers`. `SizeCauses` now names the policy of the leaf sizes
 alone.

@@ -38,7 +38,9 @@ pub enum TopologyPolicy {
     /// The size causes decide, refined by the writers of the leaf entries:
     /// write spans move soft cap splits and cause merges (ADR-084), and the
     /// keys that several database instances write in one leaf split apart
-    /// (ADR-085). The default.
+    /// (ADR-085). Contention comes before write spans and leaf sizes, so no
+    /// merge puts the keys of two database instances back together (ADR-088).
+    /// The default.
     #[default]
     Writers,
 }
