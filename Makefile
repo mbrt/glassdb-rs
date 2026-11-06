@@ -118,7 +118,7 @@ fuzz:
 			echo "=== fuzzing $$t for $(FUZZ_TIME)s ==="; \
 			RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo +nightly fuzz run $$t -- \
 				-fork=$(FUZZ_JOBS) -max_total_time=$(FUZZ_TIME) \
-				-timeout=10 || exit $$?; \
+				-len_control=0 -timeout=10 || exit $$?; \
 		done
 
 # Minimize the fuzz corpora: drop inputs that add no coverage, keeping the

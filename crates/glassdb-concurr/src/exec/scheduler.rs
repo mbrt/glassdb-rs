@@ -26,26 +26,53 @@ pub trait Scheduler: Send {
 }
 
 /// Schedules by consuming a fuzzer-provided byte tape: at each decision the next
-/// byte selects which ready task runs. When the tape is exhausted it falls back
-/// to a fixed choice, so runs stay deterministic. This makes interleavings
-/// directly mutable by the coverage-guided fuzzer (see ADR-010/011).
+/// byte selects which ready task runs. This makes interleavings directly
+/// mutable by the coverage-guided fuzzer (see ADR-010/011). When the tape is
+/// exhausted, the scheduler selects the lowest ready task, or a random ready
+/// task from a seeded PRNG. Both fallbacks keep the run deterministic.
 pub struct TapeScheduler {
     tape: Vec<u8>,
     pos: usize,
+    fallback: Option<RandomScheduler>,
 }
 
 impl TapeScheduler {
+    /// Seed offset of the fallback PRNG. A run seeds other streams with the
+    /// same seed, so the offset keeps the scheduling draws independent of them.
+    const FALLBACK_STREAM: u64 = 0x7A9E_5C4E_D0FA_11BA;
+
     /// Builds a scheduler that replays `tape`, then selects the lowest ready task.
     pub fn new(tape: Vec<u8>) -> Self {
-        TapeScheduler { tape, pos: 0 }
+        TapeScheduler {
+            tape,
+            pos: 0,
+            fallback: None,
+        }
+    }
+
+    /// Builds a scheduler that replays `tape`, then selects a random ready task
+    /// with a PRNG seeded from `seed`. A fuzzer input can steer only the
+    /// decisions that its tape covers, and a fixed choice after the tape always
+    /// runs the lowest ready task, so it explores only one order. The random
+    /// choice keeps the later decisions varied.
+    pub fn with_random_fallback(tape: Vec<u8>, seed: u64) -> Self {
+        TapeScheduler {
+            tape,
+            pos: 0,
+            fallback: Some(RandomScheduler::new(seed ^ Self::FALLBACK_STREAM)),
+        }
     }
 }
 
 impl Scheduler for TapeScheduler {
     fn pick(&mut self, ready: &[TaskId]) -> usize {
-        let b = self.tape.get(self.pos).copied().unwrap_or(0);
-        self.pos = self.pos.wrapping_add(1);
-        (b as usize) % ready.len()
+        let byte = self.tape.get(self.pos).copied();
+        self.pos = self.pos.saturating_add(1);
+        match (byte, &mut self.fallback) {
+            (Some(b), _) => b as usize % ready.len(),
+            (None, Some(random)) => random.pick(ready),
+            (None, None) => 0,
+        }
     }
 }
 
@@ -188,6 +215,27 @@ mod sim_tests {
             scheduler.pick(&ready),
             0,
             "exhausted tapes fall back to the deterministic lowest-ready choice"
+        );
+    }
+
+    #[test]
+    fn exhausted_tape_falls_back_to_seeded_random_choices() {
+        let ready = [TaskId(10), TaskId(20), TaskId(30), TaskId(40)];
+        let picks = |seed| {
+            let mut scheduler = TapeScheduler::with_random_fallback(vec![5], seed);
+            (0..16).map(|_| scheduler.pick(&ready)).collect::<Vec<_>>()
+        };
+
+        let picks_7 = picks(7);
+        assert_eq!(
+            picks_7[0], 1,
+            "the tape decides first: 5 % 4 selects index 1"
+        );
+        assert_eq!(picks_7, picks(7), "the fallback replays from its seed");
+        assert_ne!(picks_7, picks(8), "other seeds give other fallback choices");
+        assert!(
+            picks_7[1..].iter().any(|&pick| pick != 0),
+            "the fallback does not always select the lowest ready task"
         );
     }
 

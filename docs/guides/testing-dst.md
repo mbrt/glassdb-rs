@@ -278,8 +278,11 @@ This is the current approach's clearest win, and the reason it exists.
   to interleaving). ADR-011's answer makes the **interleaving itself** a byte
   string libFuzzer mutates locally — `tape[pos] % ready.len()` chooses the next
   task — so a byte flip is a single, local scheduling perturbation (a real
-  gradient). A second **fault tape** extends the same gradient to the fault
-  schedule (which ops delay/drop/lose-ack, when instances crash, when outages open).
+  gradient). When the schedule tape of a fuzz input runs out, the run continues
+  with random choices seeded from the input, so a short input still explores
+  preemptions after its tape. A second **fault tape** extends the same gradient
+  to the fault schedule (which ops delay/drop/lose-ack, when instances crash,
+  when outages open).
   **PCT** complements it with a principled seed-breadth sweep that has a provable
   lower bound on catching depth-`d` bugs. All replay byte-for-byte.
 

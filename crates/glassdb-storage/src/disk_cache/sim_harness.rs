@@ -303,7 +303,7 @@ pub fn replay_disk_cache_input(data: &[u8]) {
 pub fn record_disk_cache_input(data: &[u8]) -> Vec<DiskCacheEvent> {
     let decoded = decode(data);
     exec::block_on_with(
-        exec::TapeScheduler::new(decoded.schedule_tape),
+        exec::TapeScheduler::with_random_fallback(decoded.schedule_tape, decoded.seed),
         decoded.seed,
         run(decoded.seed, decoded.commands, decoded.media_tape),
     )

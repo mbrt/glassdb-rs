@@ -46,8 +46,8 @@ pub use harness::{
 };
 #[cfg(sim)]
 pub use harness::{
-    PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep, record_input,
-    replay_input,
+    PCT_DEFAULT_DEPTH, PCT_DEFAULT_SEEDS, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep,
+    record_input, replay_input,
 };
 pub use history::{HistoryCollectionOp, HistoryInstruction, HistoryTransaction, HistoryWorkload};
 pub use membership::{MembOp, MembershipAcct, MembershipWorkload, MergingMembershipWorkload};

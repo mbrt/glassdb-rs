@@ -137,3 +137,17 @@ jobs:
         git fetch origin main
         git rebase --autostash origin/main
         git push origin HEAD:main
+
+    # PCT finds a race only on the seeds that it runs, and `make test` runs a
+    # small number of seeds per sweep. This step runs many more seeds in each
+    # sweep. A failure prints its seed, and `pct_assert` with that seed
+    # reproduces it. The corpus push can rebase onto a newer main, so the step
+    # prints the commit that it tests.
+    - name: Deep PCT seed sweep
+      if: steps.changes.outputs.run == 'true'
+      timeout-minutes: 90
+      env:
+        GLASSDB_PCT_SEEDS: 16384
+      run: |
+        echo "Sweeping commit $(git rev-parse HEAD)"
+        make test-sim

@@ -226,8 +226,8 @@ fn pct_seed_breadth_holds_membership() {
     // Seed-breadth sweep: many PCT schedules over the contended workload, with
     // and without faults. Any invariant violation panics inside the sweep.
     let workload = contended_membership();
-    pct_sweep(&workload, FaultConfig::failures(7), 0..32);
-    pct_sweep(&workload, FaultConfig::none(), 0..16);
+    pct_sweep(&workload, FaultConfig::failures(7));
+    pct_sweep(&workload, FaultConfig::none());
 }
 
 #[test]
@@ -264,6 +264,6 @@ fn membership_holds_while_nodes_merge_under_faults_and_restarts() {
 #[test]
 fn pct_seed_breadth_holds_membership_while_nodes_merge() {
     let workload = fill_then_shrink();
-    pct_sweep(&workload, FaultConfig::failures(7), 0..32);
-    pct_sweep(&workload, FaultConfig::none(), 0..16);
+    pct_sweep(&workload, FaultConfig::failures(7));
+    pct_sweep(&workload, FaultConfig::none());
 }
