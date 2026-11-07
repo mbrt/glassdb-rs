@@ -1,8 +1,11 @@
 //! Schedule selection and deterministic executor entry points.
 
+use std::cell::Cell;
 use std::env::VarError;
+use std::io::Write;
 use std::num::NonZeroU64;
-use std::panic::{self, AssertUnwindSafe};
+use std::panic;
+use std::sync::Once;
 
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::middleware::{OpLog, OpRecord};
@@ -135,9 +138,54 @@ pub fn record_input<W: SimWorkload + for<'a> Arbitrary<'a>>(data: &[u8]) -> Vec<
     recorded
 }
 
+thread_local! {
+    /// The seed and faults of the PCT run on this thread, if one runs.
+    static PCT_RUN: Cell<Option<(u64, FaultConfig)>> = const { Cell::new(None) };
+}
+
+/// Names the seed of a PCT run in the message of any panic on its thread.
+///
+/// The report comes from a panic hook, which runs before the panic unwinds. A
+/// later panic during the unwind, for example in a destructor, aborts the
+/// process, so a report after the unwind could be lost.
+struct PctRun;
+
+impl PctRun {
+    fn enter(seed: u64, faults: FaultConfig) -> Self {
+        static HOOK: Once = Once::new();
+        HOOK.call_once(|| {
+            let previous = panic::take_hook();
+            panic::set_hook(Box::new(move |info| {
+                previous(info);
+                // Report every panic of a run. A run can catch a panic, for
+                // example at a task boundary, and a later panic must still
+                // name the seed.
+                if let Some((seed, faults)) = PCT_RUN.get() {
+                    // Write to stderr directly. The test harness captures
+                    // `eprintln!`, and loses that output if the process aborts.
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "PCT run failed at seed {seed} with faults {faults:?}. \
+                         `pct_assert` reproduces it."
+                    );
+                }
+            }));
+        });
+        PCT_RUN.set(Some((seed, faults)));
+        PctRun
+    }
+}
+
+impl Drop for PctRun {
+    fn drop(&mut self) {
+        PCT_RUN.set(None);
+    }
+}
+
 /// Runs `workload` once under a PCT schedule seeded by `seed`, asserting its
-/// invariant. Panics on any violation.
+/// invariant. Panics on any violation, and names the seed on stderr.
 pub fn pct_assert<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) {
+    let _run = PctRun::enter(seed, faults);
     let w = workload.clone();
     exec::block_on_with(
         exec::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
@@ -148,8 +196,10 @@ pub fn pct_assert<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) 
 }
 
 /// Runs `workload` under a PCT schedule and returns the recorded backend op
-/// stream, for per-seed determinism comparison.
+/// stream, for per-seed determinism comparison. A panic names the seed on
+/// stderr.
 pub fn pct_record<W: SimWorkload>(workload: &W, faults: FaultConfig, seed: u64) -> OpLog {
+    let _run = PctRun::enter(seed, faults);
     let w = workload.clone();
     exec::block_on_with(
         exec::PctScheduler::new(seed, PCT_DEFAULT_DEPTH, PCT_DEFAULT_STEPS),
@@ -176,11 +226,7 @@ const PCT_SEEDS_VAR: &str = "GLASSDB_PCT_SEEDS";
 pub fn pct_sweep<W: SimWorkload>(workload: &W, faults: FaultConfig) {
     let seeds = pct_seed_count();
     for seed in 0..seeds.get() {
-        let run = panic::catch_unwind(AssertUnwindSafe(|| pct_assert(workload, faults, seed)));
-        if let Err(payload) = run {
-            eprintln!("PCT sweep failed at seed {seed} with faults {faults:?}");
-            panic::resume_unwind(payload);
-        }
+        pct_assert(workload, faults, seed);
     }
 }
 
