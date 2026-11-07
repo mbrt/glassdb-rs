@@ -63,11 +63,13 @@ impl DirectoryLocks {
     }
 }
 
-/// Whether a load of a collection record waits for a holder with no final
-/// status.
+/// What a load of a collection record does with a foreign holder, or a
+/// topology freeze, that has no final status yet.
 #[derive(Clone, Copy)]
-enum PendingHolders {
+pub(crate) enum PendingHolders {
+    /// Waits for the final status.
     Wait,
+    /// Returns the record with the pending holder still in it.
     Skip,
 }
 
@@ -197,7 +199,7 @@ impl CollectionLocker {
         loop {
             let (mut record, observed) = self
                 .state
-                .resolve_observed(parent, Some(id), requirement, PendingHolders::Wait)
+                .load_resolved(parent, Some(id), requirement, PendingHolders::Wait)
                 .await?;
             let lock = record.directory_lock();
             let already_held = lock.contains(id)
@@ -220,7 +222,7 @@ impl CollectionLocker {
                     TxFinalStatus::Committed => {
                         match self.state.help_committed_write_back(parent, &holder).await {
                             Ok(()) => {}
-                            // As in `resolve_observed`: GC can reclaim the log
+                            // As in `load_resolved`: GC can reclaim the log
                             // after another instance removed the holder.
                             Err(TransError::Storage(StorageError::NotFound)) => {
                                 requirement =
@@ -317,43 +319,9 @@ impl CollectionStateResolver {
         }
     }
 
-    /// Loads a collection record after resolving foreign lifecycle and
-    /// directory holders.
-    pub(crate) async fn resolve(
-        &self,
-        collection: &CollectionAddress,
-        own: Option<&TxId>,
-        requirement: Requirement,
-    ) -> Result<CollectionRecord, TransError> {
-        self.resolve_observed(collection, own, requirement, PendingHolders::Wait)
-            .await
-            .map(|(record, _)| record)
-    }
-
-    /// Loads a collection record for a transaction body of the identity `own`.
-    ///
-    /// The load resolves the foreign holders and the topology freeze that have
-    /// a final status, but it does not wait for a pending one. A pending writer
-    /// has not changed the record yet, so the record shows the bindings from
-    /// before its change. A pending drop has not removed the collection yet.
-    /// Validation checks the body's reads later (ADR-090).
-    pub(crate) async fn observe(
-        &self,
-        collection: &CollectionAddress,
-        own: &TxId,
-    ) -> Result<CollectionRecord, TransError> {
-        self.resolve_observed(
-            collection,
-            Some(own),
-            Requirement::ANY,
-            PendingHolders::Skip,
-        )
-        .await
-        .map(|(record, _)| record)
-    }
-
-    /// Loads a record and its CAS observation after resolving foreign holders.
-    async fn resolve_observed(
+    /// Loads a collection record and its CAS observation, and removes the
+    /// foreign holders and the topology freeze that have a final status.
+    pub(crate) async fn load_resolved(
         &self,
         parent: &CollectionAddress,
         own: Option<&TxId>,
@@ -716,9 +684,10 @@ mod tests {
             RetrySchedule::default(),
         );
         let resolved = resolver
-            .resolve(&parent, None, Requirement::ANY)
+            .load_resolved(&parent, None, Requirement::ANY, PendingHolders::Wait)
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         assert_eq!(resolved.child(&name), Some(child));
         assert!(!resolved.directory_lock().contains(&old));
     }
@@ -764,11 +733,14 @@ mod tests {
 
         let record = tokio::time::timeout(
             Duration::from_secs(5),
-            locker.state.resolve(&parent, None, Requirement::ANY),
+            locker
+                .state
+                .load_resolved(&parent, None, Requirement::ANY, PendingHolders::Wait),
         )
         .await
         .expect("the load waited for the pending reader")
-        .unwrap();
+        .unwrap()
+        .0;
 
         assert!(record.directory_lock().contains(&reader));
     }

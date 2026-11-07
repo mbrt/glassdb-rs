@@ -57,8 +57,8 @@ A live identity never releases a directory hold. It keeps its directory holds,
 like its key holds, for a body replay after a failed validation. The holds end
 at write-back after the commit, or after the identity has a final status.
 
-`Handle` keeps the directory locks that its identity holds. A pass that needs
-only these locks does not take them again.
+The transaction owner records the directory locks that its identity holds. A
+pass that needs only these locks does not take them again.
 
 ### Renew the identity for a new directory lock
 
@@ -93,7 +93,7 @@ its own overlay.
   the identity can change the bindings, and it changes them only in the
   write-back CAS that also removes the hold. So each record that lists the
   identity has the bindings that its committed pass validated, and the binding
-  checks of write-back are correct for records read with `ANY`.
+  checks of write-back are correct also for cached records.
 - **No wait cycle.** An identity waits for a directory lock holder only in its
   first locking pass, before it holds a key lock, and only for directories at
   higher addresses than the ones it holds. Body loads do not wait for directory

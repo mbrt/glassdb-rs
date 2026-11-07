@@ -7,7 +7,7 @@ use glassdb_storage::{
     CollectionRecord, CurrentnessBarrier, NodeSizePolicy, Requirement, StorageError,
 };
 
-use crate::collection_coordination::CollectionStateResolver;
+use crate::collection_coordination::{CollectionStateResolver, PendingHolders};
 use crate::collections::{
     CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind, DirectorySnapshot,
 };
@@ -28,10 +28,13 @@ impl CollectionCatalog {
     /// Loads a direct-child directory for a transaction body of the identity
     /// `own`.
     ///
-    /// The load does not wait for a pending holder, and it ignores the holds of
-    /// `own`. An identity keeps its directory locks for a body replay, so a wait
-    /// there could close a wait cycle (ADR-090). The pending changes of `own`
-    /// are not in the record either.
+    /// The load does not wait for a pending holder or a pending topology
+    /// freeze, and it ignores the holds of `own`. An identity keeps its
+    /// directory locks for a body replay, so a wait there could close a wait
+    /// cycle (ADR-090). A pending writer has not changed the record yet, so the
+    /// snapshot shows the bindings from before its change. A pending drop has
+    /// not removed the collection yet. The pending changes of `own` are not in
+    /// the record either.
     pub(crate) async fn snapshot(
         &self,
         parent: &CollectionAddress,
@@ -40,7 +43,10 @@ impl CollectionCatalog {
         // Callers retain directory reads and mutation preconditions as semantic
         // dependencies. Validation checks them after the body before accepting
         // its outcome, so this snapshot can use cached contents.
-        let record = self.state.observe(parent, own).await?;
+        let (record, _) = self
+            .state
+            .load_resolved(parent, Some(own), Requirement::ANY, PendingHolders::Skip)
+            .await?;
         Ok(DirectorySnapshot {
             children: record
                 .children()
@@ -69,10 +75,15 @@ impl CollectionCatalog {
             if !records.contains_key(parent) && !dropped.contains(parent) {
                 let record = match self
                     .state
-                    .resolve(parent, id, Requirement::after(barrier))
+                    .load_resolved(
+                        parent,
+                        id,
+                        Requirement::after(barrier),
+                        PendingHolders::Wait,
+                    )
                     .await
                 {
-                    Ok(record) => record,
+                    Ok((record, _)) => record,
                     // A removed name can invalidate this body even if a later
                     // directory read refers to the dropped collection. Check
                     // the surviving directories before returning that error.

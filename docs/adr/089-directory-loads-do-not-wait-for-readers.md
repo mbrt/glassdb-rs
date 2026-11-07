@@ -13,21 +13,20 @@ A transaction body that opens or lists a collection loads the collection record
 of the parent. Its locked commit then holds a read lock on that directory, and
 its validation loads the record again.
 
-Each of these loads went through `CollectionStateResolver::resolve_observed`.
-It waited for the final status of every directory holder of another
-transaction, also for holders of a read lock. A pending reader cannot change the
-child bindings or the directory generation, so the wait did not protect any
-result. But it made a directory read lock work like an exclusive lock for every
-other transaction that opened a child of the same parent.
+Each of these loads waited for the final status of every directory holder of
+another transaction, also for holders of a read lock. A pending reader cannot
+change the child bindings or the directory generation, so the wait did not
+protect any result. But it made a directory read lock work like an exclusive
+lock for every other transaction that opened a child of the same parent.
 
 The `open-in-body` perfbench experiment opens the collection in each
 read-modify-write body. The open made the throughput fall by orders of
 magnitude, and with five database instances the workers did not complete the
 cells. `docs/guides/perf.md` has the results.
 
-The wait also made the wound-wait branch of
-`CollectionLocker::lock_directory` unreachable: the load had already waited for
-all holders of other transactions, so the lock request never saw one.
+The wait also made wound-wait for directory lock requests unreachable. A lock
+request loads the record first, and the load had already waited for all holders
+of other transactions, so the request never found one.
 
 ## Decision
 
@@ -35,10 +34,10 @@ A load of a collection record does not resolve the holders of a directory read
 lock. It returns the record with its pending readers. Write holders and the
 topology freeze are resolved as before.
 
-A write lock request that finds readers uses wound-wait in `lock_directory`:
-an older requester wounds a younger reader, and a younger requester waits. When
-a reader has a final status, the requester removes it: it removes an aborted
-reader, and it completes the write-back of a committed reader.
+A write lock request that finds readers uses wound-wait: an older requester
+wounds a younger reader, and a younger requester waits. When a reader has a
+final status, the requester removes it: it removes an aborted reader, and it
+completes the write-back of a committed reader.
 
 This follows the principle that collection changes can be slow, but ordinary
 operations, such as reads of collections, must be fast.
