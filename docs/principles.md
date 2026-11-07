@@ -16,6 +16,9 @@ These are the principles from which GlassDB is founded:
   user code must transparently replay the body. The only exception is when user
   code panics.
 - Correctness over speed. We prefer to be correct and slow than fast and wrong.
+- Collection changes, such as a create or a drop, are rare. They can be slow,
+  but they must be correct. If a design must choose, it makes the ordinary
+  operations faster: reads of collections, scans, and reads and writes of keys.
 - When Backend calls can be done in parallel, they must be. One example is
   validating multiple leaves in a single transaction.
 - The user doesn't pay for what they don't use. Expensive background work should

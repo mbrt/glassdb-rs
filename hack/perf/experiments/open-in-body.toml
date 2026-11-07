@@ -1,0 +1,56 @@
+# Read-modify-write transactions that open their collection by name in the
+# body, on 1 and on 5 database instances. The open reads the directory of the
+# root collection, so every commit is a locked commit that also holds a read
+# lock on that directory. The size of the pool sets how often a read moves
+# before the commit locks it, which makes the body run again.
+tags = ["time/virtual", "area/contention"]
+
+[pools.sweep]
+keys = 1000
+
+[shapes.rw-1]
+kind = "read-modify-write"
+pool = "sweep"
+source = "pool"
+keys = 1
+open-in-body = true
+
+[shapes.rw-4]
+kind = "read-modify-write"
+pool = "sweep"
+source = "pool"
+keys = 4
+open-in-body = true
+
+[workloads.rw-1.groups.all]
+shapes = { rw-1 = "cell" }
+
+[workloads.rw-4.groups.all]
+shapes = { rw-4 = "cell" }
+
+[cell]
+workload = "rw-1"
+workers = 20
+# One pool for all instances, so that every worker can conflict with every other.
+collections = 1
+
+[cell.warm-up]
+timeout = "10s"
+
+[cell.measure]
+max-duration = "200s"
+
+[[axes]]
+name = "conflict"
+values = [
+  { label = "keys1-pool1000", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 1000 } },
+  { label = "keys1-pool100", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 100 } },
+  { label = "keys1-pool20", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 20 } },
+  { label = "keys1-pool5", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 5 } },
+  { label = "keys4-pool1000", set = { "cell.workload" = "rw-4", "pools.sweep.keys" = 1000 } },
+  { label = "keys4-pool100", set = { "cell.workload" = "rw-4", "pools.sweep.keys" = 100 } },
+]
+
+[[axes]]
+path = "cell.databases"
+values = [1, 5]

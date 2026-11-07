@@ -467,9 +467,11 @@ pruning durable, and a body replay against a change that was never stored would
 fail again. Cancellation before dispatch leaves no state. Cancellation after
 dispatch is equal to a crash.
 
-**Locked replay** keeps the key locks and membership locks of the transaction.
-Other transactions cannot write those keys, so sustained writes cannot cause
-body replays without limit.
+**Locked replay** keeps the key locks, membership locks, and directory locks of
+the transaction. Other transactions cannot write those keys, so sustained writes
+cannot cause body replays without limit. A replay that needs a directory lock
+that its identity does not hold renews the identity
+([ADR-090](adr/090-directory-holds-last-for-the-identity.md)).
 
 ### Transaction interruption
 
@@ -498,13 +500,21 @@ When a lock request conflicts with a holder
 - A **younger** requester waits and keeps the locks that it has
   (hold-and-wait).
 
-An older transaction never waits for a younger one, so no wait cycle can form.
-A wounded transaction renews its identity and replays its body. The new
+For key locks, an older transaction never waits for a younger one, so no wait
+cycle can form. A wounded transaction renews its identity and replays its body. The new
 identity keeps the original priority, so the transaction does not starve.
 
 Serial acquisition is a safety net. If the deadlock timeout fires, because of
 sustained contention or two transactions with equal priority, the transaction
 locks its leaves one at a time in ascending object path order. A total order cannot deadlock.
+
+Directory locks have no deadlock timeout, and a wait for a directory write
+holder does not wound it. Only the order of acquisition prevents a cycle: an
+identity takes all its directory locks, in address order, before its key locks,
+and a transaction that holds a key lock never waits for a directory lock
+holder. A directory load of a transaction body does not wait for a pending
+holder, as a key read does not
+([ADR-090](adr/090-directory-holds-last-for-the-identity.md)).
 
 Priority comes only from the timestamp, never from the random prefix. Identity
 renewal changes the prefix. If priority used the prefix, two transactions with
@@ -545,6 +555,12 @@ of child names to child IDs, and an `_r` tree root with only node state. The
 entry in the parent directory decides whether a collection exists, not the
 presence of its objects. The root collection is permanent, holds keys, and has
 a reserved ID outside the generated range.
+
+A load of a collection record does not wait for pending readers. A write lock
+request resolves them with wound-wait
+([ADR-089](adr/089-directory-loads-do-not-wait-for-readers.md)). Validation
+waits for a pending writer and a pending topology freeze, but a body load does
+not ([ADR-090](adr/090-directory-holds-last-for-the-identity.md)).
 
 A create prepares an unreachable record and root at a fresh ID, then publishes
 `name → ID` through the locked commit. Open, create, drop, and child listing all
