@@ -39,6 +39,7 @@ use crate::access::{AccessSet, LeafCoverage, ReadAccess, WriteOp};
 use crate::collection_commit::{
     CollectionCommit, CollectionHandleState, CollectionReservations, IdentityCollectionResources,
 };
+use crate::collection_coordination::DirectoryLocks;
 use crate::collections::CatalogAccesses;
 use crate::error::TransError;
 use crate::gc::GcHints;
@@ -219,6 +220,9 @@ pub struct Handle {
     /// use this schedule.
     backoff: Backoff,
     retirement: IdentityRetirementGuard,
+    /// The directory locks that this identity holds. The identity keeps them
+    /// until it commits or ends (ADR-090).
+    directory_locks: DirectoryLocks,
 }
 
 impl Handle {
@@ -274,6 +278,7 @@ impl Handle {
         let id = self.id.renew();
         self.collections.renew();
         self.state.renew();
+        self.directory_locks = DirectoryLocks::default();
         self.id = id;
         self.retirement.arm(id);
     }
@@ -291,7 +296,10 @@ pub enum BodyDecision {
 /// The non-error end of one commit pass.
 enum PassOutcome {
     Complete,
-    RenewForSerial {
+    /// The identity ends, and the transaction continues under a renewed
+    /// identity: for serial acquisition (ADR-065), or to keep the lock order
+    /// (ADR-090).
+    Renew {
         replay_body: bool,
         /// A cancelled lock-acquisition write may still land under the old
         /// identity. Its owner operation must remain unresolved so retirement
@@ -304,7 +312,7 @@ impl PassOutcome {
     fn has_pending_writes(&self) -> bool {
         matches!(
             self,
-            Self::RenewForSerial {
+            Self::Renew {
                 pending_writes: true,
                 ..
             }
@@ -470,6 +478,7 @@ impl Algo {
             retirement: IdentityRetirementGuard::new(self.retirement.clone(), id),
             id,
             backoff: self.acquisition_retry.backoff(),
+            directory_locks: DirectoryLocks::default(),
         }
     }
 
@@ -478,8 +487,8 @@ impl Algo {
         loop {
             match self.commit_pass(tx).await {
                 Ok(PassOutcome::Complete) => return Ok(BodyDecision::ReturnOutcome),
-                Ok(PassOutcome::RenewForSerial { replay_body, .. }) => {
-                    self.renew_for_serial(tx).await?;
+                Ok(PassOutcome::Renew { replay_body, .. }) => {
+                    self.end_and_renew(tx).await?;
                     if replay_body {
                         return Ok(BodyDecision::ReplayBody);
                     }
@@ -501,12 +510,12 @@ impl Algo {
         loop {
             match self.validation_pass(tx).await {
                 Ok(PassOutcome::Complete) => return Ok(BodyDecision::ReturnOutcome),
-                Ok(PassOutcome::RenewForSerial { replay_body, .. }) => {
+                Ok(PassOutcome::Renew { replay_body, .. }) => {
                     debug_assert!(
                         !replay_body,
                         "read-only validation cannot change collections"
                     );
-                    self.renew_for_serial(tx).await?;
+                    self.end_and_renew(tx).await?;
                 }
                 Err(TransError::Wounded) => {
                     self.renew_after_wound(tx).await;
@@ -653,7 +662,7 @@ impl Algo {
         Ok(())
     }
 
-    async fn renew_for_serial(&self, tx: &mut Handle) -> Result<(), TransError> {
+    async fn end_and_renew(&self, tx: &mut Handle) -> Result<(), TransError> {
         self.end(tx).await?;
         tx.renew();
         Ok(())
@@ -807,6 +816,18 @@ impl Algo {
     /// escalated to locked validation.
     async fn commit_locked(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         let is_new = tx.engage();
+        let directory_locks = DirectoryLocks::needed(
+            &tx.collections.accesses().reads,
+            &tx.collections.accesses().changes,
+        );
+        // A replay that needs a new directory lock would take it after its
+        // kept key locks. See `lock_directories`.
+        if !is_new && !tx.directory_locks.covers(&directory_locks) {
+            return Ok(PassOutcome::Renew {
+                replay_body: tx.collections.has_writes(),
+                pending_writes: false,
+            });
+        }
 
         self.collection_commit
             .reconcile_replay(&tx.id, &mut tx.collections)
@@ -827,15 +848,7 @@ impl Algo {
         }
 
         self.collection_commit.prepare(&mut tx.collections).await?;
-        let directory_locks = self
-            .locker
-            .collections()
-            .lock(
-                &tx.id,
-                &tx.collections.accesses().reads,
-                &tx.collections.accesses().changes,
-            )
-            .await?;
+        self.lock_directories(tx, directory_locks).await?;
 
         // Capture before lock acquisition so every successful lock CAS is
         // eligible to certify the reads it protects against this same bound.
@@ -846,7 +859,7 @@ impl Algo {
             // A higher-priority peer aborted us: renew the id and replay the body.
             Acquired::Wounded => return Err(TransError::Wounded),
             Acquired::RenewForSerial { pending_writes } => {
-                return Ok(PassOutcome::RenewForSerial {
+                return Ok(PassOutcome::Renew {
                     replay_body: tx.collections.has_writes(),
                     pending_writes,
                 });
@@ -860,7 +873,7 @@ impl Algo {
         // keys may under-record, which only defers those stale locks to lazy
         // reclaim, never a correctness loss.
         let mut locks = locked.locked_paths();
-        locks.extend(directory_locks.into_durable_locks());
+        locks.extend(tx.directory_locks.durable_locks());
         self.mon.record_tx_locks(&tx.id, locks.clone());
 
         // Validate point reads and scans after their entry/predicate locks are
@@ -881,10 +894,6 @@ impl Algo {
                 .validate(Some(&tx.id), &tx.collections, barrier)
                 .await?
         {
-            self.locker
-                .collections()
-                .release(&tx.id, &locks, Requirement::ANY)
-                .await?;
             return Err(TransError::Retry);
         }
 
@@ -931,30 +940,35 @@ impl Algo {
     /// does not commit the handle.
     async fn validate_locked_reads(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         self.validate_coordination_keys(&tx.accesses)?;
-        if tx.engage() {
+        let is_new = tx.engage();
+        let directory_locks = DirectoryLocks::needed(&tx.collections.accesses().reads, &[]);
+        // See `lock_directories`.
+        if !is_new && !tx.directory_locks.covers(&directory_locks) {
+            return Ok(PassOutcome::Renew {
+                replay_body: false,
+                pending_writes: false,
+            });
+        }
+        if is_new {
             self.mon.begin_tx(&tx.id);
         }
         // The escalated read-only path uses lock CASes as validation evidence,
         // so their shared lower bound must precede acquisition.
         let barrier = self.timeline.currentness_barrier();
         let requirement = Requirement::after(barrier);
-        let directory_locks = self
-            .locker
-            .collections()
-            .lock(&tx.id, &tx.collections.accesses().reads, &[])
-            .await?;
+        self.lock_directories(tx, directory_locks).await?;
         let locked = match self.acquire_locks(tx, requirement).await? {
             Acquired::Locked(locked) => locked,
             Acquired::Wounded => return Err(TransError::Wounded),
             Acquired::RenewForSerial { pending_writes } => {
-                return Ok(PassOutcome::RenewForSerial {
+                return Ok(PassOutcome::Renew {
                     replay_body: false,
                     pending_writes,
                 });
             }
         };
         let mut locks = locked.locked_paths();
-        locks.extend(directory_locks.into_durable_locks());
+        locks.extend(tx.directory_locks.durable_locks());
         self.mon.record_tx_locks(&tx.id, locks.clone());
         if self
             .validate(
@@ -973,11 +987,31 @@ impl Algo {
         {
             return Ok(PassOutcome::Complete);
         }
+        Err(TransError::Retry)
+    }
+
+    /// Takes the directory locks of a pass, unless the identity already holds
+    /// them.
+    ///
+    /// The identity keeps its directory and key locks for a body replay
+    /// (ADR-024, ADR-090). A pass whose identity can hold locks of an earlier
+    /// pass must therefore need no other directory lock: the caller renews the
+    /// identity instead. So the directory locks of an identity are always taken
+    /// before its key locks, and in address order.
+    async fn lock_directories(
+        &self,
+        tx: &mut Handle,
+        directory_locks: DirectoryLocks,
+    ) -> Result<(), TransError> {
+        if tx.directory_locks.covers(&directory_locks) {
+            return Ok(());
+        }
         self.locker
             .collections()
-            .release(&tx.id, &locks, Requirement::ANY)
+            .lock(&tx.id, &directory_locks)
             .await?;
-        Err(TransError::Retry)
+        tx.directory_locks = directory_locks;
+        Ok(())
     }
 
     /// Publishes the committed transaction's current states and releases its locks.
@@ -1339,7 +1373,7 @@ mod tests {
 
     use super::*;
     use crate::access::{ScanRange, WriteAccess};
-    use crate::collections::{CollectionChange, CollectionOp};
+    use crate::collections::{CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind};
     use crate::engine::{AssemblyFixture, Engine, EngineConfig, EngineFixture, engine_fixture};
     use crate::key_state_resolver::KeyStateResolver;
     use crate::monitor::{ProtocolTiming, TxRecoveryManifest};
@@ -1943,6 +1977,123 @@ mod tests {
         assert_eq!(e.lock_holders(), std::slice::from_ref(h.id()));
 
         tm.end(&mut h).await.unwrap();
+    }
+
+    fn directory_read(parent: CollectionAddress) -> DirectoryRead {
+        DirectoryRead {
+            parent,
+            kind: DirectoryReadKind::Entry {
+                name: CollectionName::new("child").unwrap(),
+                collection: None,
+            },
+        }
+    }
+
+    async fn directory_holders(tctx: &Tctx, parent: &CollectionAddress) -> Vec<TxId> {
+        let (record, _) = tctx
+            .records
+            .load_record(
+                parent,
+                Requirement::after(tctx.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        record.directory_lock().holders().to_vec()
+    }
+
+    // An identity never releases a directory hold while it can still commit
+    // (ADR-090). Otherwise a peer that cached the hold of an earlier pass takes
+    // it for the hold of the committed pass, and finds bindings that changed
+    // between the passes. So an invalidated read keeps the directory hold for
+    // the body replay, as it keeps the key holds.
+    #[tokio::test]
+    async fn an_invalidated_read_keeps_its_directory_locks() {
+        let (tm, tctx) = new_algo().await;
+        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
+        let key = logical_key(b"k");
+        commit_writes(&tm2, vec![wa(&key, b"v1")]).await;
+        let stale = do_read(&tctx, &key).await;
+        commit_writes(&tm2, vec![wa(&key, b"v2")]).await;
+        let catalog = || CatalogAccesses {
+            reads: vec![directory_read(test_collection())],
+            changes: Vec::new(),
+        };
+
+        let mut h = tm.begin(
+            AccessSet::new(vec![stale], vec![wa(&key, b"v3")], Vec::new()),
+            catalog(),
+        );
+        let id = *h.id();
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
+        assert_eq!(h.id(), &id);
+        assert_eq!(directory_holders(&tctx, &test_collection()).await, vec![id]);
+
+        let fresh = do_read(&tctx, &key).await;
+        tm.reset_with_collections(
+            &mut h,
+            AccessSet::new(vec![fresh], vec![wa(&key, b"v3")], Vec::new()),
+            catalog(),
+        );
+        assert_eq!(
+            tm.commit(&mut h).await.unwrap(),
+            BodyDecision::ReturnOutcome
+        );
+        assert_eq!(h.id(), &id);
+        assert!(
+            directory_holders(&tctx, &test_collection())
+                .await
+                .is_empty()
+        );
+    }
+
+    // A replay that needs a directory lock that its identity does not hold
+    // would take it after the kept key locks. Directory waits have no deadlock
+    // timeout, so that order could make a wait cycle. The replay renews its
+    // identity instead, and the renewed identity takes all its locks in order.
+    #[tokio::test]
+    async fn a_replay_that_needs_another_directory_renews_the_identity() {
+        let (tm, tctx) = new_algo().await;
+        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
+        let other = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([3; 16]));
+        assert!(
+            tctx.records
+                .create_record(&other, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        let key = logical_key(b"k");
+        commit_writes(&tm2, vec![wa(&key, b"v1")]).await;
+        let stale = do_read(&tctx, &key).await;
+        commit_writes(&tm2, vec![wa(&key, b"v2")]).await;
+
+        let mut h = tm.begin(
+            AccessSet::new(vec![stale], vec![wa(&key, b"v3")], Vec::new()),
+            CatalogAccesses {
+                reads: vec![directory_read(test_collection())],
+                changes: Vec::new(),
+            },
+        );
+        let first = *h.id();
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
+
+        let fresh = do_read(&tctx, &key).await;
+        tm.reset_with_collections(
+            &mut h,
+            AccessSet::new(vec![fresh], vec![wa(&key, b"v3")], Vec::new()),
+            CatalogAccesses {
+                reads: vec![
+                    directory_read(test_collection()),
+                    directory_read(other.clone()),
+                ],
+                changes: Vec::new(),
+            },
+        );
+        assert_eq!(
+            tm.commit(&mut h).await.unwrap(),
+            BodyDecision::ReturnOutcome
+        );
+        assert_ne!(h.id(), &first);
+        await_tx_status(&tctx, &first, TxCommitStatus::Aborted).await;
     }
 
     // A locked replay keeps the key locks and the membership lock of its

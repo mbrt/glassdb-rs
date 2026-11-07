@@ -1,5 +1,5 @@
 use super::*;
-use crate::collection_coordination::{CollectionLocker, CollectionStateResolver};
+use crate::collection_coordination::{CollectionLocker, CollectionStateResolver, DirectoryLocks};
 use crate::collections::TopologySettler;
 use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::key_state_resolver::KeyStateResolver;
@@ -74,7 +74,10 @@ async fn lock_directory(
         ),
         other => panic!("collections take no {other:?} lock"),
     };
-    locker.lock(id, &reads, &changes).await.unwrap();
+    locker
+        .lock(id, &DirectoryLocks::needed(&reads, &changes))
+        .await
+        .unwrap();
 }
 
 fn collection_name(name: impl AsRef<[u8]>) -> CollectionName {
@@ -2220,7 +2223,10 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         .await
         .unwrap();
     locker
-        .lock(&id, &[], std::slice::from_ref(&change))
+        .lock(
+            &id,
+            &DirectoryLocks::needed(&[], std::slice::from_ref(&change)),
+        )
         .await
         .unwrap();
     operation.complete();

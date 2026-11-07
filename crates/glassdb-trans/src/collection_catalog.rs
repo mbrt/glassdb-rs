@@ -25,15 +25,22 @@ impl CollectionCatalog {
         CollectionCatalog { state }
     }
 
-    /// Loads a direct-child directory after resolving transactions with a final status.
+    /// Loads a direct-child directory for a transaction body of the identity
+    /// `own`.
+    ///
+    /// The load does not wait for a pending holder, and it ignores the holds of
+    /// `own`. An identity keeps its directory locks for a body replay, so a wait
+    /// there could close a wait cycle (ADR-090). The pending changes of `own`
+    /// are not in the record either.
     pub(crate) async fn snapshot(
         &self,
         parent: &CollectionAddress,
+        own: &TxId,
     ) -> Result<DirectorySnapshot, TransError> {
         // Callers retain directory reads and mutation preconditions as semantic
         // dependencies. Validation checks them after the body before accepting
         // its outcome, so this snapshot can use cached contents.
-        let record = self.state.resolve(parent, None, Requirement::ANY).await?;
+        let record = self.state.observe(parent, own).await?;
         Ok(DirectorySnapshot {
             children: record
                 .children()
@@ -226,7 +233,10 @@ mod tests {
         });
         monitor.commit_tx(tx_record).await.unwrap();
 
-        let snapshot = catalog.snapshot(&parent).await.unwrap();
+        let snapshot = catalog
+            .snapshot(&parent, &TxId::with_priority(0, b"reader"))
+            .await
+            .unwrap();
 
         assert_eq!(snapshot.children, vec![(name, child.id())]);
         let (record, _) = records
@@ -234,6 +244,59 @@ mod tests {
             .await
             .unwrap();
         assert!(!record.directory_lock().contains(&id));
+    }
+
+    // A body load does not wait for a pending writer (ADR-090). The body can
+    // replay while its identity keeps locks, so a wait here could close a wait
+    // cycle with a writer that waits for those locks.
+    #[tokio::test]
+    async fn snapshot_does_not_wait_for_a_pending_directory_writer() {
+        let (catalog, records, monitor, _timeline, _background) = new_catalog();
+        let parent = CollectionAddress::root("db");
+        let child = CollectionAddress::new("db", CollectionId::from_bytes([1; 16]));
+        let name = CollectionName::new("child").unwrap();
+        let writer = TxId::with_priority(0, &[1]);
+        let mut record = CollectionRecord::new();
+        assert!(record.add_child(name.clone(), child.id()).unwrap());
+        record.set_directory_writer(writer);
+        assert!(records.create_record(&parent, &record).await.unwrap());
+        monitor.begin_tx(&writer);
+
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            catalog.snapshot(&parent, &TxId::with_priority(0, b"reader")),
+        )
+        .await
+        .expect("the snapshot waited for the pending writer")
+        .unwrap();
+
+        assert_eq!(snapshot.children, vec![(name, child.id())]);
+    }
+
+    // A body load does not wait for a pending drop either (ADR-090).
+    // Validation waits for it, and finds the drop if it commits.
+    #[tokio::test]
+    async fn snapshot_does_not_wait_for_a_pending_topology_freeze() {
+        let (catalog, records, monitor, _timeline, _background) = new_catalog();
+        let parent = CollectionAddress::new("db", CollectionId::from_bytes([3; 16]));
+        let child = CollectionAddress::new("db", CollectionId::from_bytes([1; 16]));
+        let name = CollectionName::new("child").unwrap();
+        let dropper = TxId::with_priority(0, &[1]);
+        let mut record = CollectionRecord::new();
+        assert!(record.add_child(name.clone(), child.id()).unwrap());
+        assert!(record.set_topology_freeze(dropper));
+        assert!(records.create_record(&parent, &record).await.unwrap());
+        monitor.begin_tx(&dropper);
+
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            catalog.snapshot(&parent, &TxId::with_priority(0, b"reader")),
+        )
+        .await
+        .expect("the snapshot waited for the pending drop")
+        .unwrap();
+
+        assert_eq!(snapshot.children, vec![(name, child.id())]);
     }
 
     /// Stores a parent whose record still binds `name` to `child` after a

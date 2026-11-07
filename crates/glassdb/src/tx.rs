@@ -15,7 +15,7 @@ mod catalog;
 
 use std::sync::{Arc, Mutex};
 
-use glassdb_data::{CollectionAddress, CollectionName, LogicalKey};
+use glassdb_data::{CollectionAddress, CollectionName, LogicalKey, TxId};
 use glassdb_trans::{AccessSet, CatalogAccesses, CollectionReservations};
 
 use self::access_overlay::{AccessOverlay, OverlayRead};
@@ -39,6 +39,8 @@ use crate::scan::{KeyPage, KeyScan};
 /// asynchronously.
 pub struct Transaction {
     db: Arc<DbInner>,
+    /// The engine identity that commits this body execution.
+    identity: TxId,
     inner: Arc<Mutex<TransactionInner>>,
 }
 
@@ -308,9 +310,14 @@ impl Transaction {
         Err(Error::Aborted)
     }
 
-    pub(crate) fn new(db: Arc<DbInner>, reservations: CollectionReservations) -> Self {
+    pub(crate) fn new(
+        db: Arc<DbInner>,
+        identity: TxId,
+        reservations: CollectionReservations,
+    ) -> Self {
         Transaction {
             db,
+            identity,
             inner: Arc::new(Mutex::new(TransactionInner {
                 accesses: AccessOverlay::default(),
                 catalog: CatalogOverlay::new(reservations),
@@ -326,6 +333,7 @@ impl Transaction {
     pub(crate) fn handle(&self) -> Transaction {
         Transaction {
             db: self.db.clone(),
+            identity: self.identity,
             inner: self.inner.clone(),
         }
     }
@@ -404,7 +412,7 @@ impl Transaction {
         let snapshot = self
             .db
             .engine
-            .collection_snapshot(parent)
+            .collection_snapshot(parent, &self.identity)
             .await
             .map_err(Error::from_read_trans)?;
         let mut inner = self.inner.lock().unwrap();

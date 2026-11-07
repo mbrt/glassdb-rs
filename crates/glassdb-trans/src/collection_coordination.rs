@@ -17,16 +17,58 @@ use crate::error::TransError;
 use crate::monitor::{Monitor, TxFinalStatus};
 use crate::wound_wait::resolve_tx_conflict;
 
-/// Durable directory locks acquired for one transaction.
-pub(crate) struct LockedDirectories {
-    locks: Vec<TxLock>,
+/// The directory locks of a transaction identity, with their lock types.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DirectoryLocks {
+    locks: BTreeMap<CollectionAddress, LockType>,
 }
 
-impl LockedDirectories {
-    /// Converts the acquired directory locks into durable lock records.
-    pub(crate) fn into_durable_locks(self) -> Vec<TxLock> {
-        self.locks
+impl DirectoryLocks {
+    /// Returns the directory locks that `reads` and `changes` need: a write
+    /// lock on each changed directory, and a read lock on each other read
+    /// directory.
+    pub(crate) fn needed(reads: &[DirectoryRead], changes: &[CollectionChange]) -> Self {
+        let mut locks = BTreeMap::new();
+        for read in reads {
+            locks.entry(read.parent.clone()).or_insert(LockType::Read);
+        }
+        for change in changes {
+            locks.insert(change.parent.clone(), LockType::Write);
+        }
+        Self { locks }
     }
+
+    /// Reports whether these locks include every lock of `other`. A write lock
+    /// includes a read lock.
+    pub(crate) fn covers(&self, other: &Self) -> bool {
+        other
+            .locks
+            .iter()
+            .all(|(parent, typ)| match self.locks.get(parent) {
+                Some(LockType::Write) => true,
+                Some(held) => held == typ,
+                None => false,
+            })
+    }
+
+    /// Returns the durable lock records of these locks.
+    pub(crate) fn durable_locks(&self) -> Vec<TxLock> {
+        self.locks
+            .iter()
+            .map(|(parent, typ)| TxLock::Directory {
+                collection: parent.clone(),
+                typ: *typ,
+            })
+            .collect()
+    }
+}
+
+/// Whether a load of a collection record waits for a holder with no final
+/// status.
+#[derive(Clone, Copy)]
+enum PendingHolders {
+    Wait,
+    Skip,
 }
 
 /// Resolves transaction-dependent state in collection records.
@@ -61,34 +103,18 @@ impl CollectionLocker {
         }
     }
 
-    /// Acquires directory locks in stable physical-address order.
-    pub(crate) async fn lock(
-        &self,
-        id: &TxId,
-        reads: &[DirectoryRead],
-        changes: &[CollectionChange],
-    ) -> Result<LockedDirectories, TransError> {
-        let mut desired = BTreeMap::<CollectionAddress, LockType>::new();
-        for read in reads {
-            desired.entry(read.parent.clone()).or_insert(LockType::Read);
+    /// Acquires `locks` in stable physical-address order.
+    ///
+    /// The caller must hold no key lock, and no directory lock at a higher
+    /// address. Equal-priority transactions wait for each other under
+    /// wound-wait, and directory locks have no deadlock timeout or serial
+    /// fallback. So only an order of all directory locks before all key locks,
+    /// each in address order, prevents a wait cycle.
+    pub(crate) async fn lock(&self, id: &TxId, locks: &DirectoryLocks) -> Result<(), TransError> {
+        for (parent, typ) in &locks.locks {
+            self.lock_directory(parent, id, *typ).await?;
         }
-        for change in changes {
-            desired.insert(change.parent.clone(), LockType::Write);
-        }
-
-        let mut locks = Vec::with_capacity(desired.len());
-        // Lock one directory at a time, in address order. Equal-priority
-        // transactions wait for each other under wound-wait, and directory locks
-        // have no deadlock timeout or serial fallback, so only this total order
-        // prevents a wait cycle.
-        for (parent, typ) in desired {
-            self.lock_directory(&parent, id, typ).await?;
-            locks.push(TxLock::Directory {
-                collection: parent,
-                typ,
-            });
-        }
-        Ok(LockedDirectories { locks })
+        Ok(())
     }
 
     /// Applies committed directory effects and releases their locks.
@@ -167,10 +193,11 @@ impl CollectionLocker {
         desired: LockType,
     ) -> Result<(), TransError> {
         let mut backoff = self.retry.backoff();
+        let mut requirement = Requirement::ANY;
         loop {
             let (mut record, observed) = self
                 .state
-                .resolve_observed(parent, Some(id), Requirement::ANY)
+                .resolve_observed(parent, Some(id), requirement, PendingHolders::Wait)
                 .await?;
             let lock = record.directory_lock();
             let already_held = lock.contains(id)
@@ -189,7 +216,26 @@ impl CollectionLocker {
             if conflicts
                 && let Some(holder) = lock.holders().iter().find(|holder| *holder != id).cloned()
             {
-                resolve_tx_conflict(&self.monitor, id, &holder).await?;
+                match resolve_tx_conflict(&self.monitor, id, &holder).await? {
+                    TxFinalStatus::Committed => {
+                        match self.state.help_committed_write_back(parent, &holder).await {
+                            Ok(()) => {}
+                            // As in `resolve_observed`: GC can reclaim the log
+                            // after another instance removed the holder.
+                            Err(TransError::Storage(StorageError::NotFound)) => {
+                                requirement =
+                                    Requirement::after(self.state.timeline.currentness_barrier());
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    TxFinalStatus::Aborted => {
+                        record.remove_directory_holder(&holder);
+                        if self.records.store_record(&record, &observed).await? {
+                            continue;
+                        }
+                    }
+                }
                 rt::sleep(backoff.next_delay()).await;
                 continue;
             }
@@ -279,9 +325,31 @@ impl CollectionStateResolver {
         own: Option<&TxId>,
         requirement: Requirement,
     ) -> Result<CollectionRecord, TransError> {
-        self.resolve_observed(collection, own, requirement)
+        self.resolve_observed(collection, own, requirement, PendingHolders::Wait)
             .await
             .map(|(record, _)| record)
+    }
+
+    /// Loads a collection record for a transaction body of the identity `own`.
+    ///
+    /// The load resolves the foreign holders and the topology freeze that have
+    /// a final status, but it does not wait for a pending one. A pending writer
+    /// has not changed the record yet, so the record shows the bindings from
+    /// before its change. A pending drop has not removed the collection yet.
+    /// Validation checks the body's reads later (ADR-090).
+    pub(crate) async fn observe(
+        &self,
+        collection: &CollectionAddress,
+        own: &TxId,
+    ) -> Result<CollectionRecord, TransError> {
+        self.resolve_observed(
+            collection,
+            Some(own),
+            Requirement::ANY,
+            PendingHolders::Skip,
+        )
+        .await
+        .map(|(record, _)| record)
     }
 
     /// Loads a record and its CAS observation after resolving foreign holders.
@@ -290,6 +358,7 @@ impl CollectionStateResolver {
         parent: &CollectionAddress,
         own: Option<&TxId>,
         requirement: Requirement,
+        pending: PendingHolders,
     ) -> Result<(CollectionRecord, Observation<CollectionRecord>), TransError> {
         let mut backoff = self.retry.backoff();
         let mut requirement = requirement;
@@ -302,7 +371,10 @@ impl CollectionStateResolver {
             if let Some(holder) = record.topology_freeze().cloned()
                 && Some(&holder) != own
             {
-                match self.monitor.await_tx_final(&holder).await? {
+                let Some(status) = self.holder_status(&holder, pending).await? else {
+                    return Ok((record, observed));
+                };
+                match status {
                     TxFinalStatus::Committed => return Err(TransError::StaleCollection),
                     TxFinalStatus::Aborted => {
                         record.remove_topology_freeze(&holder);
@@ -315,6 +387,12 @@ impl CollectionStateResolver {
                 continue;
             }
 
+            // Pending readers cannot change the bindings or the generation, so
+            // a load does not wait for them. A writer that needs the lock
+            // resolves them in `CollectionLocker::lock_directory` (ADR-089).
+            if record.directory_lock().lock_type() == LockType::Read {
+                return Ok((record, observed));
+            }
             let holder = record
                 .directory_lock()
                 .holders()
@@ -324,7 +402,10 @@ impl CollectionStateResolver {
             let Some(holder) = holder else {
                 return Ok((record, observed));
             };
-            match self.monitor.await_tx_final(&holder).await? {
+            let Some(status) = self.holder_status(&holder, pending).await? else {
+                return Ok((record, observed));
+            };
+            match status {
                 TxFinalStatus::Committed => {
                     match self.help_committed_write_back(parent, &holder).await {
                         Ok(()) => {}
@@ -344,6 +425,23 @@ impl CollectionStateResolver {
                     }
                 }
             }
+        }
+    }
+
+    /// Returns the final status of `holder`, or `None` if `pending` skips a
+    /// holder that has none yet.
+    async fn holder_status(
+        &self,
+        holder: &TxId,
+        pending: PendingHolders,
+    ) -> Result<Option<TxFinalStatus>, TransError> {
+        match pending {
+            PendingHolders::Wait => self.monitor.await_tx_final(holder).await.map(Some),
+            PendingHolders::Skip => Ok(match self.monitor.tx_status(holder).await? {
+                TxCommitStatus::Committed => Some(TxFinalStatus::Committed),
+                TxCommitStatus::Aborted | TxCommitStatus::Wounded => Some(TxFinalStatus::Aborted),
+                TxCommitStatus::Pending | TxCommitStatus::Unknown => None,
+            }),
         }
     }
 
@@ -474,9 +572,13 @@ mod tests {
     use glassdb_data::{CollectionId, CollectionName, DbPrefix};
     use glassdb_storage::{CachedStore, Timeline};
 
+    use std::time::Duration;
+
+    use glassdb_storage::transaction::TxRecord;
+
     use super::*;
     use crate::collections::DirectoryReadKind;
-    use crate::monitor::ProtocolTiming;
+    use crate::monitor::{OwnerAbortOutcome, ProtocolTiming};
 
     fn tx_id(prefix: &[u8]) -> TxId {
         TxId::with_priority(0, prefix)
@@ -537,8 +639,14 @@ mod tests {
             expected: None,
             op: CollectionOp::Create,
         };
-        locker.lock(&id, &[read], &[]).await.unwrap();
-        locker.lock(&id, &[], &[change]).await.unwrap();
+        locker
+            .lock(&id, &DirectoryLocks::needed(&[read], &[]))
+            .await
+            .unwrap();
+        locker
+            .lock(&id, &DirectoryLocks::needed(&[], &[change]))
+            .await
+            .unwrap();
 
         let (record, _) = records
             .load_record(&parent, Requirement::ANY)
@@ -613,5 +721,189 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.child(&name), Some(child));
         assert!(!resolved.directory_lock().contains(&old));
+    }
+
+    fn write_lock(parent: &CollectionAddress) -> DirectoryLocks {
+        DirectoryLocks::needed(
+            &[],
+            &[CollectionChange {
+                parent: parent.clone(),
+                name: CollectionName::new("child").unwrap(),
+                collection: CollectionAddress::new("db", CollectionId::from_bytes([2; 16])),
+                expected: None,
+                op: CollectionOp::Create,
+            }],
+        )
+    }
+
+    /// Creates the root record with `reader` as its pending directory reader.
+    async fn root_with_reader(
+        locker: &CollectionLocker,
+        records: &CollectionStore,
+        reader: &TxId,
+    ) -> CollectionAddress {
+        let parent = CollectionAddress::root("db");
+        let mut record = CollectionRecord::new();
+        record.add_directory_reader(*reader);
+        assert!(records.create_record(&parent, &record).await.unwrap());
+        locker.monitor.begin_tx(reader);
+        parent
+    }
+
+    async fn holders(records: &CollectionStore, parent: &CollectionAddress) -> Vec<TxId> {
+        let (record, _) = records.load_record(parent, Requirement::ANY).await.unwrap();
+        record.directory_lock().holders().to_vec()
+    }
+
+    // ADR-089: a reader cannot change the bindings, so a load does not wait.
+    #[tokio::test]
+    async fn a_load_does_not_wait_for_a_pending_reader() {
+        let (locker, records, _background) = new_locker();
+        let reader = tx_id(&[1]);
+        let parent = root_with_reader(&locker, &records, &reader).await;
+
+        let record = tokio::time::timeout(
+            Duration::from_secs(5),
+            locker.state.resolve(&parent, None, Requirement::ANY),
+        )
+        .await
+        .expect("the load waited for the pending reader")
+        .unwrap();
+
+        assert!(record.directory_lock().contains(&reader));
+    }
+
+    #[tokio::test]
+    async fn an_older_writer_wounds_a_younger_reader() {
+        let (locker, records, _background) = new_locker();
+        let reader = TxId::with_priority(2_000_000_000, b"younger");
+        let writer = TxId::with_priority(1_000_000_000, b"older");
+        let parent = root_with_reader(&locker, &records, &reader).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            locker.lock(&writer, &write_lock(&parent)),
+        )
+        .await
+        .expect("the older writer waited for the younger reader")
+        .unwrap();
+
+        assert_eq!(holders(&records, &parent).await, vec![writer]);
+        assert!(matches!(
+            locker.monitor.tx_status(&reader).await.unwrap(),
+            TxCommitStatus::Aborted | TxCommitStatus::Wounded
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_younger_writer_waits_for_an_older_reader() {
+        let (locker, records, _background) = new_locker();
+        let reader = TxId::with_priority(1_000_000_000, b"older");
+        let writer = TxId::with_priority(2_000_000_000, b"younger");
+        let parent = root_with_reader(&locker, &records, &reader).await;
+        let locks = write_lock(&parent);
+        let lock = locker.lock(&writer, &locks);
+        tokio::pin!(lock);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut lock)
+                .await
+                .is_err(),
+            "the younger writer did not wait"
+        );
+        assert_eq!(
+            locker.monitor.abort_owned_tx(&reader).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+        lock.await.unwrap();
+
+        assert_eq!(holders(&records, &parent).await, vec![writer]);
+    }
+
+    #[tokio::test]
+    async fn a_writer_removes_a_committed_reader() {
+        let (locker, records, _background) = new_locker();
+        let reader = tx_id(&[1]);
+        let writer = tx_id(&[2]);
+        let parent = root_with_reader(&locker, &records, &reader).await;
+        let mut record = TxRecord::new(reader, TxCommitStatus::Committed);
+        record.locks.push(TxLock::Directory {
+            collection: parent.clone(),
+            typ: LockType::Read,
+        });
+        locker.monitor.commit_tx(record).await.unwrap();
+
+        locker.lock(&writer, &write_lock(&parent)).await.unwrap();
+
+        assert_eq!(holders(&records, &parent).await, vec![writer]);
+    }
+
+    #[tokio::test]
+    async fn a_writer_removes_an_aborted_reader() {
+        let (locker, records, _background) = new_locker();
+        let reader = tx_id(&[1]);
+        let writer = tx_id(&[2]);
+        let parent = root_with_reader(&locker, &records, &reader).await;
+        locker.monitor.abort_owned_tx(&reader).await.unwrap();
+
+        locker.lock(&writer, &write_lock(&parent)).await.unwrap();
+
+        assert_eq!(holders(&records, &parent).await, vec![writer]);
+    }
+
+    // GC can reclaim the record of a committed reader after a peer removed its
+    // hold. A writer whose cache still shows the hold must load the record again.
+    #[tokio::test]
+    async fn a_writer_reloads_a_cached_reader_whose_record_was_reclaimed() {
+        use crate::engine::{AssemblyFixture, EngineConfig};
+
+        let backend = Arc::new(MemoryBackend::new());
+        let local = AssemblyFixture::new(
+            backend.clone(),
+            DbPrefix::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let peer = AssemblyFixture::new(
+            backend,
+            DbPrefix::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let parent = CollectionAddress::root("db");
+        let reader = tx_id(&[1]);
+        let writer = tx_id(&[2]);
+        let local_record = local
+            .tx_records
+            .set(&TxRecord::new(reader, TxCommitStatus::Committed))
+            .await
+            .unwrap();
+        assert_eq!(
+            local.monitor.tx_status(&reader).await.unwrap(),
+            TxCommitStatus::Committed
+        );
+        let mut record = CollectionRecord::new();
+        record.add_directory_reader(reader);
+        local.records.create_record(&parent, &record).await.unwrap();
+        let (mut record, observed) = peer
+            .records
+            .load_record(&parent, Requirement::ANY)
+            .await
+            .unwrap();
+        record.remove_directory_holder(&reader);
+        peer.records.store_record(&record, &observed).await.unwrap();
+        local.tx_records.delete(&local_record).await.unwrap();
+        let locker = CollectionLocker::new(
+            CollectionStateResolver::new(
+                local.records.clone(),
+                local.tx_records.clone(),
+                local.timeline.clone(),
+                local.monitor.clone(),
+                RetrySchedule::default(),
+            ),
+            NonZeroUsize::MIN,
+        );
+
+        locker.lock(&writer, &write_lock(&parent)).await.unwrap();
+
+        assert_eq!(holders(&local.records, &parent).await, vec![writer]);
     }
 }

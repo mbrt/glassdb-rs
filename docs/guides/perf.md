@@ -26,6 +26,49 @@ limit. Earlier entries that do not pass `--prefix-depth` used 2 segments, where
 all collections of a database share one limit. Pass `--prefix-depth=2` to
 measure them again.
 
+## ADR-089 and ADR-090: directory readers and kept directory holds
+
+[ADR-089](../adr/089-directory-loads-do-not-wait-for-readers.md) stops loads of
+a collection record from waiting for pending readers.
+[ADR-090](../adr/090-directory-holds-last-for-the-identity.md) keeps directory
+holds for a body replay.
+
+### Setup
+
+- base: `a4b5d1320` with the `open-in-body` parameter of the
+  `read-modify-write` kind; target: base with ADR-089 and ADR-090. A third side,
+  ADR-089 alone, ran the `open-in-body` cells. The target ran before body loads
+  stopped waiting for a pending directory writer. No cell has a directory
+  writer.
+- `--time=virtual`, one run of each cell, each cell alone with a timeout of 300 s
+- `open-in-body`: `--experiment=hack/perf/experiments/open-in-body.toml`. The
+  CI cells: `--experiment=hack/perf/experiments --tag=ci`.
+
+### Results
+
+`open-in-body`, tx/s:
+
+| Cell | Base, 1 instance | Target, 1 instance | Base, 5 instances | ADR-089, 5 instances | Target, 5 instances |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `keys1-pool1000` | 0.47 | 0.37 | none | 5.81 | 5.79 |
+| `keys1-pool100` | 0.46 | 0.37 | none | 5.25 | 5.52 |
+| `keys1-pool20` | 0.47 | 0.38 | none | 4.20 | 5.49 |
+| `keys1-pool5` | 0.47 | 0.38 | none | 2.47 | 5.35 |
+| `keys4-pool1000` | 0.47 | 0.36 | none | 4.95 | 5.78 |
+| `keys4-pool100` | 0.46 | 0.35 | none | 2.85 | 5.46 |
+
+- "None": the workers did not complete in the cell deadline, or in the
+  timeout. ADR-089 alone also did not complete `keys4-pool100` on one instance.
+- On one instance, the target loses about 20%. In `keys1-pool20`, the base
+  makes 39 writes for each transaction. Without the open, the base makes 0.08
+  writes for each transaction and commits 231 tx/s. Each read lock is a CAS on
+  the record of the root collection, and its release is another CAS. The
+  target makes 45 writes for each transaction. Its p90 latency is 97 s, against 217 s in the base.
+- The CI cells make the same writes for each transaction on both sides. The
+  three cells furthest from a ratio of 1 in one run gave 0.994
+  (`rmw-inline`), 0.993 (`read-warm-external`), and 1.008 (`rmw-shared-leaf`)
+  in three runs.
+
 ## ADR-088: contention comes before write spans and leaf sizes
 
 [ADR-088](../adr/088-contention-comes-before-write-spans-and-sizes.md) stops
