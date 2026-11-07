@@ -426,7 +426,11 @@ until the owner acknowledges it as `Aborted`
 transaction checks that every writer is still current and that no read key has
 a write lock. If the check passes, the transaction returns with no locks and no
 writes. Each key costs one leaf read, plus one record read if the value is not
-inline. If the check fails, the transaction uses the locked commit one time.
+inline. If the check fails, the transaction replays its body and checks again.
+After a few failed checks, its replays use the locked commit
+([ADR-091](adr/091-read-only-validation-locks-after-repeated-failures.md)).
+A near miss then leaves no read lock, so it cannot push the writers of a hot
+leaf from direct commits to locked commits.
 
 **Direct commit** applies when all point reads and point writes of a transaction
 route to one leaf. One leaf CAS validates every read and publishes every output,

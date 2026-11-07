@@ -6,9 +6,10 @@
 //! transactions validate their reads and install locks with one read-modify-write
 //! CAS per touched leaf, flip their transaction record to committed, then publish
 //! current states and release their locks. A read-only transaction
-//! starts with optimistic validation. If validation fails, later body replays
-//! use locked validation on their point reads and scan predicates so sustained
-//! churn cannot make them replay the body forever.
+//! starts with optimistic validation. After [`LOCKED_READS_AFTER`] failed
+//! validations, later body replays use locked validation on their point reads
+//! and scan predicates so sustained churn cannot make them replay the body
+//! forever.
 //!
 //! Concurrency control (ADR-002 / ADR-020 / ADR-021 / ADR-024): strict two-phase
 //! locking with wound-wait and leases for crash recovery. On a conflict it cannot
@@ -64,6 +65,16 @@ use handle_state::HandleState;
 /// different leaf first; serial acquisition, where first-CAS-wins on the lowest
 /// contended leaf, guarantees one of them makes progress.
 const SERIAL_FALLBACK_AFTER: usize = 3;
+
+/// Failed optimistic validations of the reads of a transaction before its body
+/// replays use locked validation (ADR-091). A read lock on a hot leaf makes the
+/// direct commits of its writers fall back to locked commits, and their locks
+/// make more validations fail, so one near miss can keep the leaf locked. A few
+/// optimistic replays absorb a near miss and leave no lock. Each one costs a
+/// body replay and its validation reads, so the bound stays small; it matches
+/// `SERIAL_FALLBACK_AFTER`, the other point where a transaction gives up on
+/// its optimistic path.
+pub const LOCKED_READS_AFTER: usize = 3;
 
 /// Upper bound on how long a transaction blocks acquiring its locks with the
 /// default parallel acquisition before suspecting a deadlock and escalating to
@@ -250,8 +261,8 @@ impl Handle {
         self.state.commit();
     }
 
-    fn force_locked_reads(&mut self) {
-        self.state.force_locked_reads();
+    fn fail_optimistic_validation(&mut self) {
+        self.state.fail_optimistic_validation();
     }
 
     fn force_serial_acquisition(&mut self) {
@@ -766,7 +777,7 @@ impl Algo {
         {
             return Ok(PassOutcome::Complete);
         }
-        tx.force_locked_reads();
+        tx.fail_optimistic_validation();
         Err(TransError::Retry)
     }
 
@@ -783,9 +794,9 @@ impl Algo {
     }
 
     /// Optimistic validation for read-only commit: re-resolve each read's
-    /// effective writer against the nodes and commit if none changed. The first
-    /// body execution takes no locks; a failed validation makes the next replay
-    /// use locked validation.
+    /// effective writer against the nodes and commit if none changed. The body
+    /// executions take no locks until [`LOCKED_READS_AFTER`] validations have
+    /// failed; the replays after that use locked validation.
     ///
     /// A failed validation does not back off before signalling [`Retry`]: the
     /// replay re-reads the authoritative values (the cache was just invalidated)
@@ -808,7 +819,7 @@ impl Algo {
             tx.commit();
             return Ok(PassOutcome::Complete);
         }
-        tx.force_locked_reads();
+        tx.fail_optimistic_validation();
         Err(TransError::Retry)
     }
 
@@ -3319,18 +3330,26 @@ mod tests {
         let rb = do_read(&tctx, &kb).await;
         commit_writes(&tm2, vec![wa(&ka, b"a2")]).await;
 
-        let mut h = begin_accesses(&tm, AccessSet::new(vec![ra, rb], Vec::new(), Vec::new()));
-        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
-        assert!(h.should_lock_reads());
-        for key in [b"a".as_slice(), b"b"] {
-            assert_eq!(
-                entry(&tctx, key).await.unwrap().lock_type(),
-                LockType::None,
-                "failed optimistic validation must not lock"
+        // Each failed optimistic validation leaves no lock. Only the last one
+        // of the bound escalates the replays to locked validation.
+        let mut h = begin_accesses(&tm, AccessSet::default());
+        for failures in 1..=LOCKED_READS_AFTER {
+            tm.reset(
+                &mut h,
+                AccessSet::new(vec![ra.clone(), rb.clone()], Vec::new(), Vec::new()),
             );
+            assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
+            assert_eq!(h.should_lock_reads(), failures == LOCKED_READS_AFTER);
+            for key in [b"a".as_slice(), b"b"] {
+                assert_eq!(
+                    entry(&tctx, key).await.unwrap().lock_type(),
+                    LockType::None,
+                    "failed optimistic validation must not lock"
+                );
+            }
         }
 
-        // The replay re-reads, then its second validation acquires locks for the
+        // The replay re-reads, then its locked validation acquires locks for the
         // complete fresh read set before deciding whether it can commit.
         let ra = do_read(&tctx, &ka).await;
         let rb = do_read(&tctx, &kb).await;
@@ -3519,15 +3538,19 @@ mod tests {
         // A create between the scan and (re-)validation bumps the covered leaf.
         commit_writes(&tm, vec![wa(&logical_key(b"b"), b"1")]).await;
 
-        let mut stale = begin_accesses(&tm, accesses);
-        assert_eq!(
-            tm.commit(&mut stale).await.unwrap(),
-            BodyDecision::ReplayBody
-        );
-        assert!(
-            stale.should_lock_reads(),
-            "scan body replay escalates to read locks"
-        );
+        let mut stale = begin_accesses(&tm, AccessSet::default());
+        for failures in 1..=LOCKED_READS_AFTER {
+            tm.reset(&mut stale, accesses.clone());
+            assert_eq!(
+                tm.commit(&mut stale).await.unwrap(),
+                BodyDecision::ReplayBody
+            );
+            assert_eq!(
+                stale.should_lock_reads(),
+                failures == LOCKED_READS_AFTER,
+                "scan body replays escalate to read locks at the bound"
+            );
+        }
 
         // The body replay computes a fresh page, then commits through locked commit.
         let (fresh, keys) = scan_accesses(&tctx).await;
