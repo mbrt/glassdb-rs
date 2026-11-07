@@ -583,7 +583,11 @@ impl DbInner {
         let mut driver = TransactionDriver::new(&self.engine);
 
         let result: Result<T, Error> = loop {
-            let tx = Transaction::new(self.clone(), driver.handle.collection_reservations());
+            let tx = Transaction::new(
+                self.clone(),
+                *driver.handle.id(),
+                driver.handle.collection_reservations(),
+            );
             let body_outcome = f(tx.handle()).await;
 
             // Collect the accesses produced by the transaction body.

@@ -86,6 +86,10 @@ struct ReadModifyWrite {
     value_bytes: Option<usize>,
     #[serde(default = "one")]
     collections: usize,
+    /// Open each collection by name in the transaction body, so that the
+    /// transaction also reads the directory of the root collection.
+    #[serde(default)]
+    open_in_body: bool,
 }
 
 /// A serializable read of `keys` keys.
@@ -142,8 +146,25 @@ impl Kind for ReadModifyWrite {
             .flat_map(|collection| op.keys.iter().map(move |key| (collection, key)))
             .collect();
         let members = &members;
+        let names: Vec<&[u8]> = if self.open_in_body {
+            op.collections
+                .iter()
+                .map(|collection| {
+                    collection.name().ok_or_else(|| {
+                        GError::InvalidInput("open-in-body needs named collections".into())
+                    })
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            Vec::new()
+        };
+        let names = &names;
         op.db
             .tx(|tx| async move {
+                let root = tx.root_collection();
+                for name in names {
+                    tx.open_collection(&root, name).await?;
+                }
                 let values = join_all(members.iter().map(|(c, key)| tx.read(c, key))).await;
                 for ((collection, key), value) in members.iter().zip(values) {
                     tx.write(collection, key, &next_value(value?, size))?;

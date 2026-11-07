@@ -266,8 +266,9 @@ impl Engine {
     pub async fn collection_snapshot(
         &self,
         parent: &CollectionAddress,
+        own: &TxId,
     ) -> Result<DirectorySnapshot, TransError> {
-        self.collection_catalog.snapshot(parent).await
+        self.collection_catalog.snapshot(parent, own).await
     }
 
     /// Starts a transaction from its collected logical accesses.

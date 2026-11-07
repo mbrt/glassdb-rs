@@ -177,6 +177,36 @@ impl Drop for CurrentGuard {
     }
 }
 
+/// Drops the background tasks of a run while the run's handle is still the
+/// `CURRENT` executor.
+///
+/// Some futures invoke `rt::spawn` from their `Drop` (e.g. `Dedup::DriverGuard`
+/// hands the rest of a batch off to a freshly-spawned owner), and that dispatch
+/// needs to see the simulation executor still installed. A guard does this on
+/// the normal return and while a panic unwinds: without `CURRENT`, that spawn
+/// would panic in a destructor and abort the process. Re-entrant spawns from a
+/// task's `Drop` would deadlock on the executor's `RefCell` if we held it across
+/// the drop, so we repeatedly snapshot-and-clear the task map until it stays
+/// empty. The tasks are dropped without running, so the scheduler does not need
+/// to learn about them.
+struct TaskDrain(Handle);
+
+impl Drop for TaskDrain {
+    fn drop(&mut self) {
+        loop {
+            let drained = {
+                let mut inner = self.0.inner.borrow_mut();
+                inner.pending_spawns.clear();
+                std::mem::take(&mut inner.tasks)
+            };
+            if drained.is_empty() {
+                break;
+            }
+            drop(drained);
+        }
+    }
+}
+
 /// Spawns `f` onto the running executor, returning a receiver for its result.
 pub(crate) fn det_spawn<F>(f: F) -> tokio::sync::oneshot::Receiver<F::Output>
 where
@@ -337,6 +367,8 @@ where
 
     let prev = CURRENT.with(|c| c.borrow_mut().replace(handle.clone()));
     let _guard = CurrentGuard(prev);
+    // Declared after `_guard`, so it drops first, while `CURRENT` is installed.
+    let _drain = TaskDrain(handle.clone());
 
     let out = Rc::new(RefCell::new(None));
     let o2 = out.clone();
@@ -358,28 +390,7 @@ where
         },
     )));
 
-    let result = out.borrow_mut().take().expect("root task did not complete");
-
-    // Drop background tasks BEFORE the `CurrentGuard` clears `CURRENT`. Some
-    // futures invoke `rt::spawn` from their `Drop` (e.g. `Dedup::DriverGuard`
-    // hands the rest of a batch off to a freshly-spawned owner), and that
-    // dispatch needs to see the simulation executor still installed. Re-entrant
-    // spawns from a task's `Drop` would deadlock on the executor's `RefCell`
-    // if we held it across the drop, so we repeatedly snapshot-and-clear the
-    // task map until it stays empty.
-    loop {
-        drain_spawn_notifications(&handle, &mut scheduler);
-        let drained: Vec<_> = std::mem::take(&mut handle.inner.borrow_mut().tasks)
-            .into_iter()
-            .collect();
-        if drained.is_empty() {
-            break;
-        }
-        drop(drained);
-    }
-    drop(handle);
-
-    result
+    out.borrow_mut().take().expect("root task did not complete")
 }
 
 fn run_loop<T>(
@@ -522,6 +533,29 @@ mod sim_tests {
             for _ in 0..10_000 {
                 DetYield::default().await;
             }
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "the root task failed")]
+    fn a_panicking_root_drops_tasks_that_spawn_from_drop() {
+        // A background task that spawns from its `Drop`, as `Dedup::DriverGuard`
+        // does, must still see the executor while a root panic unwinds. If it
+        // did not, the spawn would panic in a destructor and abort the process,
+        // and the original panic would be lost.
+        struct SpawnOnDrop;
+        impl Drop for SpawnOnDrop {
+            fn drop(&mut self) {
+                drop(det_spawn(async {}));
+            }
+        }
+        block_on_with(LowestFirst, 0, async {
+            let spawn = SpawnOnDrop;
+            drop(det_spawn(async move {
+                let _spawn = spawn;
+                std::future::pending::<()>().await;
+            }));
+            panic!("the root task failed");
         });
     }
 
