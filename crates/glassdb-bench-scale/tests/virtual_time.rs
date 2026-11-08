@@ -52,7 +52,16 @@ fn measured(report: &Value) -> Vec<Value> {
             !TIMESTAMPED_EXPERIMENTS.contains(&name)
         })
         .flat_map(|experiment| experiment["runs"][0]["cells"].as_array().unwrap())
-        .flat_map(|cell| cell["shapes"].as_array().unwrap())
+        .flat_map(measured_shapes)
+        .collect()
+}
+
+/// The numbers that a comparison reads of each shape of `cell`.
+fn measured_shapes(cell: &Value) -> Vec<Value> {
+    cell["shapes"]
+        .as_array()
+        .unwrap()
+        .iter()
         .map(|shape| {
             ["shape", "committed", "meanMs", "p50Ms", "p90Ms", "txPerSec"]
                 .map(|field| shape[field].clone())
@@ -79,6 +88,63 @@ fn virtual_runs_repeat_exactly() {
     assert_eq!(measured(&first), measured(&second));
 }
 
+// A parallel run must not change a result, so that the number of CPUs of the
+// host does not change it: the same runs, with the same cells in the same order.
+#[test]
+fn parallel_chains_give_the_results_of_one_job() {
+    let dir = std::env::temp_dir().join(format!("perfbench-chains-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Two chains of two cells: each affinity starts from the seed, and the
+    // second duration continues on the instances of the first.
+    let chains = dir.join("chains.toml");
+    std::fs::write(
+        &chains,
+        format!(
+            "include = [\"{EXPERIMENTS}/../configs/default.toml\"]\n\
+             [cell]\nworkload = \"diag-rmw-shared\"\n\
+             [[axes]]\npath = \"cell.affinity\"\nvalues = [0, 100]\n\
+             [[axes]]\npath = \"cell.measure.duration\"\nvalues = [\"4s\", \"6s\"]\n\
+             start = \"previous\"\n"
+        ),
+    )
+    .unwrap();
+    let experiment = format!("--experiment={}", chains.display());
+    let report = |jobs: &str| -> Value {
+        let arguments = [
+            &MEMORY_MODEL[..],
+            &["--time=virtual", "--runs=2", jobs, &experiment],
+        ]
+        .concat();
+        let output = perfbench(&arguments);
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    // The labels, the start, and the measured numbers of each cell of each run.
+    let cells = |report: &Value| -> Vec<Value> {
+        report["experiments"][0]["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|run| {
+                run["cells"].as_array().unwrap().iter().map(move |cell| {
+                    serde_json::json!([
+                        run["run"],
+                        cell["labels"],
+                        cell["start"],
+                        measured_shapes(cell)
+                    ])
+                })
+            })
+            .collect()
+    };
+    let one = cells(&report("--jobs=1"));
+    let four = cells(&report("--jobs=4"));
+
+    assert_eq!(one.len(), 8);
+    assert_eq!(one, four);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn virtual_time_rejects_what_it_cannot_skip() {
     let arguments = ["--backend=fakes3", "--time=virtual"];
@@ -90,7 +156,13 @@ fn virtual_time_rejects_what_it_cannot_skip() {
 
 #[test]
 fn a_failed_experiment_keeps_the_results_of_the_experiments_before_it() {
-    let dir = std::env::temp_dir().join(format!("perfbench-partial-{}", std::process::id()));
+    for jobs in ["--jobs=1", "--jobs=2"] {
+        failed_experiment_keeps_the_experiments_before_it(jobs);
+    }
+}
+
+fn failed_experiment_keeps_the_experiments_before_it(jobs: &str) {
+    let dir = std::env::temp_dir().join(format!("perfbench-partial-{}{jobs}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let first = format!("--experiment={EXPERIMENTS}/read-warm.toml");
     // A pass condition needs a sequence source, and the runner finds out only
@@ -110,6 +182,7 @@ fn a_failed_experiment_keeps_the_results_of_the_experiments_before_it() {
             &MEMORY_MODEL[..],
             &[
                 "--time=virtual",
+                jobs,
                 &first,
                 &format!("--experiment={}", failing.display()),
                 &format!("--output={}", output.display()),
@@ -121,7 +194,13 @@ fn a_failed_experiment_keeps_the_results_of_the_experiments_before_it() {
     assert!(!result.status.success());
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("no_passes: the end condition needs passes"),
+        stderr.contains("Error: \"no_passes: the end condition needs passes"),
+        "{stderr}"
+    );
+    // A process of a chain does not print the error that the parent prints.
+    assert_eq!(
+        stderr.matches("the end condition needs passes").count(),
+        1,
         "{stderr}"
     );
     let report: Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();

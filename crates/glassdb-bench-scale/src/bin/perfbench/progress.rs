@@ -120,6 +120,15 @@ pub(crate) fn finish_cell() {
     });
 }
 
+/// Marks the end of `count` cells that ran in other processes. The bar does
+/// not show the progress of a cell in another process, so it shows from here.
+pub(crate) fn finish_cells(count: usize) {
+    update(|state| {
+        state.done_cells += count;
+        state.visible = true;
+    });
+}
+
 /// Records the progress of `stage` now. The bar shows it at its next update.
 pub(crate) fn advance(stage: Stage) {
     if let Some(state) = lock().as_mut() {

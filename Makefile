@@ -57,7 +57,8 @@ bench:
 # Run all experiments one after the other, into one result in OUT. The default
 # is one run of each in real time, with the local S3 model of the canonical
 # plots (hack/perf/README.md). It takes hours and uses all CPUs: keep the host
-# idle. TIME=virtual runs all experiments in virtual time.
+# idle. TIME=virtual runs all experiments in virtual time, one chain of cells
+# on each CPU.
 bench-all:
 	mkdir -p $(dir $(BENCH_ALL_OUT))
 ifeq ($(TIME),virtual)

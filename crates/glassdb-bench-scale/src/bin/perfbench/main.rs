@@ -4,6 +4,7 @@
 //! of shared configuration; the README of this crate explains it.
 
 mod backend;
+mod parallel;
 mod progress;
 mod runner;
 mod scenarios;
@@ -73,6 +74,18 @@ struct Cli {
     /// Repeat the complete experiment.
     #[arg(long, default_value_t = 1)]
     runs: usize,
+    /// The chains of cells that run at the same time, each in its own
+    /// process. A chain is a cell that starts from a seed, and the cells that
+    /// continue from it. The default is the number of CPUs in virtual time,
+    /// and 1 in real time, where a cell that runs at the same time takes CPU
+    /// from a measurement.
+    #[arg(long)]
+    jobs: Option<usize>,
+    /// Run only this chain of all experiments, and write its cells as JSON to
+    /// stdout. A run with more than one job starts a process with it for each
+    /// chain.
+    #[arg(long, hide = true)]
+    chain: Option<usize>,
     /// Real wall time between repeated runs.
     #[arg(long, default_value = "0s", value_parser = glassdb_bench_scale::parse_duration)]
     run_cooldown: Duration,
@@ -148,14 +161,26 @@ fn main() -> Result<(), Box<dyn Error>> {
         exclude_tags: cli.exclude_tags.clone(),
     };
     let resolved = selection.resolve()?;
-    cli.time.install(&cli.backend)?;
-    let runtime = cli.time.runtime()?;
-    let factory = runtime.block_on(cli.backend.initialize())?;
     let execution = Execution {
         runs: cli.runs,
         run_cooldown: cli.run_cooldown,
         drain_timeout: cli.drain_timeout,
     };
+    let chains = parallel::chains(&resolved, cli.runs)?;
+    if let Some(index) = cli.chain {
+        return run_chain(&cli, &resolved, &chains, index, execution);
+    }
+    let jobs = match cli.jobs {
+        Some(0) => return Err("--jobs must be greater than zero".into()),
+        Some(jobs) => jobs,
+        None => match cli.time {
+            TimeMode::Real => 1,
+            TimeMode::Virtual => std::thread::available_parallelism()?.get(),
+        },
+    };
+    if jobs > 1 && !cli.run_cooldown.is_zero() {
+        return Err("--run-cooldown needs one job, because the runs overlap".into());
+    }
     let mut cells = 0;
     for experiment in &resolved {
         cells += runner::plan(experiment)?.0.len() * cli.runs;
@@ -164,7 +189,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         progress::enable(cells);
     }
     let mut experiments = Vec::with_capacity(resolved.len());
-    let outcome = run_all(&runtime, &factory, &resolved, execution, &mut experiments);
+    let outcome = if jobs > 1 {
+        // A check in each process of a chain would repeat the error.
+        cli.time.check(&cli.backend)?;
+        parallel::run_all(&resolved, &chains, jobs, cli.runs, &mut experiments)
+    } else {
+        cli.time.install(&cli.backend)?;
+        let runtime = cli.time.runtime()?;
+        let factory = runtime.block_on(cli.backend.initialize())?;
+        run_all(&runtime, &factory, &resolved, execution, &mut experiments)
+    };
     progress::finish();
     if outcome.is_err() {
         if experiments.is_empty() {
@@ -191,6 +225,45 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     write_json(cli.output, &serde_json::to_value(report)?)?;
     outcome
+}
+
+/// Runs chain `index` of `chains`, and writes its output as JSON to stdout:
+/// its cells, or its error with a failed exit status.
+fn run_chain(
+    cli: &Cli,
+    resolved: &[runner::config::Resolved],
+    chains: &[parallel::Job],
+    index: usize,
+    execution: Execution,
+) -> Result<(), Box<dyn Error>> {
+    let job = chains
+        .get(index)
+        .ok_or("--chain is not a chain of the plan")?;
+    let experiment = &resolved[job.experiment];
+    let output = match chain_cells(cli, experiment, &job.chain, index, execution) {
+        Ok(cells) => parallel::ChainOutput::Cells(cells),
+        Err(error) => parallel::ChainOutput::Error(format!("{}: {error}", experiment.name)),
+    };
+    let failed = matches!(output, parallel::ChainOutput::Error(_));
+    write_json(None, &serde_json::to_value(output)?)?;
+    if failed {
+        // The parent reports the error, so it is not printed here.
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn chain_cells(
+    cli: &Cli,
+    experiment: &runner::config::Resolved,
+    chain: &runner::Chain,
+    id: usize,
+    execution: Execution,
+) -> Result<Vec<runner::result::CellResult>, Box<dyn Error>> {
+    cli.time.install(&cli.backend)?;
+    let runtime = cli.time.runtime()?;
+    let factory = runtime.block_on(cli.backend.initialize())?;
+    runner::run_chain(&runtime, &factory, experiment, chain, id, execution)
 }
 
 /// Runs each experiment, and adds its description with its runs to

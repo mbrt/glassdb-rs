@@ -103,6 +103,17 @@ The options that are the same for all experiments are command-line options:
 `--progress[=auto|always|never]` controls a progress bar on stderr with the
 number of the cell and the estimated time left.
 
+`--jobs N` runs up to `N` chains of cells at the same time, each in its own
+process of perfbench. A chain is a cell that starts from a seed, and the cells
+that continue from it with `previous` or `previous-warm-up`. A chain seeds its
+own storage. The result has the same cells in the same order as a run with one
+job, and the log of a chain prints when the chain ends. The default is the
+number of CPUs in virtual time, where a cell does not depend on the host. In
+real time, the default is 1, because a cell that runs at the same time takes
+CPU from a measurement. `--run-cooldown` needs one job. After a chain fails, no
+new chain starts, and the result has the experiments before the one that
+failed.
+
 All experiments support `--backend=memory|fakes3|s3|gcs`. Real S3 and GCS use
 the bucket in `$BUCKET` and always run in real time. In real time, model time
 is wall time, so the ratio of CPU time to backend latency is the same as on a
@@ -469,7 +480,8 @@ the canonical plots and of the CI comparison reject them. Each entry has the `na
 
 All database instances use the production pending timeout and no clock skew
 allowance, because they read one clock. Full GCs after a seed or a warm-up
-stop after 600 s of wall time. Every cell runs on one multi-thread runtime.
+stop after 600 s of wall time. In real time, every cell runs on one
+multi-thread runtime.
 
 `hack/perf/perfbench_results.py` reads the result files for the
 comparison and plot tools.

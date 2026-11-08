@@ -15,6 +15,7 @@ pub(crate) mod until;
 pub(crate) mod workers;
 
 use std::error::Error;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -86,6 +87,34 @@ struct OpenInstance {
     collections: IndexMap<String, Arc<[Collection]>>,
 }
 
+/// The cells of one run that start from one seed: the first cell starts from
+/// the seed, and each cell after it continues from the cell before it. A
+/// chain runs in order; two chains do not depend on each other.
+#[derive(Debug, Clone)]
+pub(crate) struct Chain {
+    pub(crate) run: usize,
+    /// The indexes of the cells in the plan of the experiment.
+    pub(crate) cells: Range<usize>,
+}
+
+/// Returns the chains of `resolved` for each of `runs` runs, in the order
+/// that a run of all cells has them.
+pub(crate) fn chains(resolved: &Resolved, runs: usize) -> Result<Vec<Chain>, Box<dyn Error>> {
+    let (points, _) = plan(resolved)?;
+    let mut starts: Vec<usize> = (0..points.len())
+        .filter(|&index| index == 0 || points[index].start == Start::Seed)
+        .collect();
+    starts.push(points.len());
+    Ok((1..=runs)
+        .flat_map(|run| {
+            starts.windows(2).map(move |pair| Chain {
+                run,
+                cells: pair[0]..pair[1],
+            })
+        })
+        .collect())
+}
+
 /// Runs all cells of `resolved` for each run.
 pub(crate) fn run(
     runtime: &tokio::runtime::Runtime,
@@ -95,46 +124,94 @@ pub(crate) fn run(
 ) -> Result<Vec<RunResult>, Box<dyn Error>> {
     let (points, specs) = plan(resolved)?;
     let invocation = SystemTime::UNIX_EPOCH.elapsed()?.as_millis();
-    let mut runs = Vec::with_capacity(execution.runs);
+    let chains = chains(resolved, execution.runs)?;
+    let mut runs: Vec<RunResult> = Vec::with_capacity(execution.runs);
     for run in 1..=execution.runs {
         runtime.block_on(cooldown(execution, run));
-        // A database name has only letters and digits.
-        let name: String = resolved
-            .name
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .collect();
+        // The chains of a run share the cached seeds.
         let mut seeds = Seeds::new(
             factory,
-            format!("perfbench{name}{invocation}r{run}"),
+            seed_prefix(resolved, invocation, run),
             execution.drain_timeout,
         );
-        let mut carry: Option<Carry> = None;
         let mut cells = Vec::with_capacity(points.len());
-        for (index, (point, spec)) in points.iter().zip(&specs).enumerate() {
-            crate::progress::log!("{}: run={run} {}", resolved.name, describe(point));
-            let next_continues = points
-                .get(index + 1)
-                .is_some_and(|next| next.start == Start::Previous);
-            progress::start_cell();
-            let (cell, next) = runtime.block_on(run_cell(
-                &mut seeds,
-                carry.take(),
-                point,
-                spec,
-                next_continues,
-                execution,
-            ))?;
-            progress::finish_cell();
-            cells.push(cell);
-            carry = next;
-        }
-        if let Some(instances) = carry.and_then(|carry| carry.instances) {
-            runtime.block_on(close(instances, execution.drain_timeout))?;
+        for chain in chains.iter().filter(|chain| chain.run == run) {
+            cells.extend(run_cells(
+                runtime, &mut seeds, resolved, &points, &specs, chain, execution,
+            )?);
         }
         runs.push(RunResult { run, cells });
     }
     Ok(runs)
+}
+
+/// Runs the cells of one chain of `resolved` on their own seeds. `id` is
+/// unique among the chains of all experiments.
+pub(crate) fn run_chain(
+    runtime: &tokio::runtime::Runtime,
+    factory: &Factory,
+    resolved: &Resolved,
+    chain: &Chain,
+    id: usize,
+    execution: Execution,
+) -> Result<Vec<CellResult>, Box<dyn Error>> {
+    let (points, specs) = plan(resolved)?;
+    let invocation = SystemTime::UNIX_EPOCH.elapsed()?.as_millis();
+    // The processes of two chains can start in the same millisecond, and two
+    // experiment names can keep the same letters and digits, so the id keeps
+    // their databases apart.
+    let prefix = format!("{}c{id}", seed_prefix(resolved, invocation, chain.run));
+    let mut seeds = Seeds::new(factory, prefix, execution.drain_timeout);
+    run_cells(
+        runtime, &mut seeds, resolved, &points, &specs, chain, execution,
+    )
+}
+
+/// Returns the prefix of the database names of one run.
+fn seed_prefix(resolved: &Resolved, invocation: u128, run: usize) -> String {
+    // A database name has only letters and digits.
+    let name: String = resolved
+        .name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    format!("perfbench{name}{invocation}r{run}")
+}
+
+fn run_cells(
+    runtime: &tokio::runtime::Runtime,
+    seeds: &mut Seeds<'_>,
+    resolved: &Resolved,
+    points: &[CellPoint],
+    specs: &[CellSpec],
+    chain: &Chain,
+    execution: Execution,
+) -> Result<Vec<CellResult>, Box<dyn Error>> {
+    let run = chain.run;
+    let mut carry: Option<Carry> = None;
+    let mut cells = Vec::with_capacity(chain.cells.len());
+    for index in chain.cells.clone() {
+        let point = &points[index];
+        crate::progress::log!("{}: run={run} {}", resolved.name, describe(point));
+        let next_continues =
+            chain.cells.contains(&(index + 1)) && points[index + 1].start == Start::Previous;
+        progress::start_cell();
+        let (cell, next) = runtime.block_on(run_cell(
+            seeds,
+            carry.take(),
+            point,
+            &specs[index],
+            next_continues,
+            execution,
+        ))?;
+        progress::finish_cell();
+        cells.push(cell);
+        carry = next;
+    }
+    if let Some(instances) = carry.and_then(|carry| carry.instances) {
+        runtime.block_on(close(instances, execution.drain_timeout))?;
+    }
+    Ok(cells)
 }
 
 /// Returns the cells of `resolved`, with one seed for each chain of cells that

@@ -36,18 +36,20 @@ impl TimeMode {
     /// Real providers stay on live wall time, because their clocks cannot
     /// share this anchor.
     pub(crate) fn install(self, backend: &backend::Options) -> Result<(), Box<dyn Error>> {
+        self.check(backend)?;
         match self {
-            Self::Real => {
-                if backend.is_synthetic() {
-                    rt::set_model_time_speedup(1.0)?;
-                }
-                Ok(())
-            }
-            Self::Virtual => {
-                backend.check_virtual_time()?;
-                rt::set_paused_model_time()?;
-                Ok(())
-            }
+            Self::Real if backend.is_synthetic() => rt::set_model_time_speedup(1.0)?,
+            Self::Real => {}
+            Self::Virtual => rt::set_paused_model_time()?,
+        }
+        Ok(())
+    }
+
+    /// Checks that the mode can run with `backend`.
+    pub(crate) fn check(self, backend: &backend::Options) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::Real => Ok(()),
+            Self::Virtual => backend.check_virtual_time(),
         }
     }
 
