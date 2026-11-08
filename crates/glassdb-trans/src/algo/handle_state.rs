@@ -1,5 +1,7 @@
 //! Validated lifecycle transitions for one transaction handle.
 
+use super::LOCKED_READS_AFTER;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IdentityPhase {
     New,
@@ -25,6 +27,7 @@ pub(super) struct HandleState {
     validation_mode: ReadValidationMode,
     acquisition_mode: AcquisitionMode,
     renewals: usize,
+    failed_optimistic_validations: usize,
 }
 
 impl HandleState {
@@ -34,6 +37,7 @@ impl HandleState {
             validation_mode: ReadValidationMode::Optimistic,
             acquisition_mode: AcquisitionMode::Parallel,
             renewals: 0,
+            failed_optimistic_validations: 0,
         }
     }
 
@@ -61,11 +65,15 @@ impl HandleState {
         }
     }
 
-    /// Escalates subsequent read validation to locked validation.
-    pub(super) fn force_locked_reads(&mut self) {
+    /// Records a failed optimistic validation, and escalates later read
+    /// validation to locked validation after [`LOCKED_READS_AFTER`] of them.
+    pub(super) fn fail_optimistic_validation(&mut self) {
         match self.phase {
             IdentityPhase::New | IdentityPhase::Engaged => {
-                self.validation_mode = ReadValidationMode::Locked;
+                self.failed_optimistic_validations += 1;
+                if self.failed_optimistic_validations >= LOCKED_READS_AFTER {
+                    self.validation_mode = ReadValidationMode::Locked;
+                }
             }
             IdentityPhase::Committed => {
                 panic!("cannot change read validation for a committed transaction")
@@ -139,7 +147,11 @@ mod tests {
         assert_eq!(direct.acquisition_mode, AcquisitionMode::Parallel);
 
         let mut replayed = HandleState::new();
-        replayed.force_locked_reads();
+        for _ in 1..LOCKED_READS_AFTER {
+            replayed.fail_optimistic_validation();
+            assert_eq!(replayed.validation_mode, ReadValidationMode::Optimistic);
+        }
+        replayed.fail_optimistic_validation();
         assert_eq!(replayed.phase, IdentityPhase::New);
         assert_eq!(replayed.validation_mode, ReadValidationMode::Locked);
 

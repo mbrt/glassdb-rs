@@ -29,6 +29,10 @@ unchanged.
 inline-eligible value with one authoritative leaf CAS and no transaction record. The locked commit and write-back protocol remains the
 fallback.
 
+[ADR-091](091-read-only-validation-locks-after-repeated-failures.md) refines the
+read-only fast path: a read-only transaction escalates to read locks only after
+repeated invalidated reads, not after the first one.
+
 ## Context
 
 [ADR-017](017-shard-object.md), [ADR-018](018-collection-root-membership.md), and

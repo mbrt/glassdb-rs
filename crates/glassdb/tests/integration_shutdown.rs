@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::FutureExt;
 use glassdb::{Database, Error, InlinePolicy};
+use glassdb_trans::LOCKED_READS_AFTER;
 
 pub mod integration_support;
 
@@ -333,7 +334,13 @@ async fn failed_finalization_keeps_the_retirement_guard_armed() {
             let retirement = retirement.clone();
             async move {
                 tx.read(&coll, b"guard").await?;
-                if execution == 0 {
+                // Invalidate each optimistic execution, so that the last
+                // execution uses locked validation and engages its identity.
+                if execution + 1 < LOCKED_READS_AFTER {
+                    invalidator_coll
+                        .write(b"guard", format!("new{execution}").as_bytes())
+                        .await?;
+                } else if execution + 1 == LOCKED_READS_AFTER {
                     invalidator_coll.write(b"guard", b"new").await?;
                     invalidator.shutdown().await;
                 } else {
@@ -348,7 +355,7 @@ async fn failed_finalization_keeps_the_retirement_guard_armed() {
         result,
         Err(Error::InvalidInput(message)) if message == "body outcome"
     ));
-    assert_eq!(executions.load(Ordering::SeqCst), 2);
+    assert_eq!(executions.load(Ordering::SeqCst), LOCKED_READS_AFTER + 1);
     failed
         .await
         .expect("synchronous finalization did not reach the injected failure");
