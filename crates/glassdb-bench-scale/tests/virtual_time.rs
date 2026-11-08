@@ -109,7 +109,7 @@ fn parallel_chains_give_the_results_of_one_job() {
     )
     .unwrap();
     let experiment = format!("--experiment={}", chains.display());
-    let report = |jobs: &str| -> Value {
+    let report = |jobs: &str| -> (Value, String) {
         let arguments = [
             &MEMORY_MODEL[..],
             &["--time=virtual", "--runs=2", jobs, &experiment],
@@ -117,7 +117,10 @@ fn parallel_chains_give_the_results_of_one_job() {
         .concat();
         let output = perfbench(&arguments);
         assert!(output.status.success(), "{output:?}");
-        serde_json::from_slice(&output.stdout).unwrap()
+        (
+            serde_json::from_slice(&output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
     };
     // The labels, the start, and the measured numbers of each cell of each run.
     let cells = |report: &Value| -> Vec<Value> {
@@ -137,12 +140,63 @@ fn parallel_chains_give_the_results_of_one_job() {
             })
             .collect()
     };
-    let one = cells(&report("--jobs=1"));
-    let four = cells(&report("--jobs=4"));
+    let one = cells(&report("--jobs=1").0);
+    let (four, log) = report("--jobs=4");
 
     assert_eq!(one.len(), 8);
-    assert_eq!(one, four);
+    assert_eq!(one, cells(&four));
+    // The lines of each cell print together: a header, then its own lines.
+    let blocks: Vec<&str> = log.split("chains: run=").skip(1).collect();
+    assert_eq!(blocks.len(), 8, "{log}");
+    for block in blocks {
+        assert!(
+            block.lines().skip(1).all(|line| line.starts_with("  ")),
+            "{log}"
+        );
+        assert_eq!(block.matches("warm-up took").count(), 1, "{log}");
+    }
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Returns whether `types` is `log cellStart (log|progress)* cellEnd cells`.
+fn is_one_cell_stream(types: &[&str]) -> bool {
+    let n = types.len();
+    n >= 4
+        && types[..2] == ["log", "cellStart"]
+        && types[n - 2..] == ["cellEnd", "cells"]
+        && types[2..n - 2]
+            .iter()
+            .all(|t| *t == "log" || *t == "progress")
+}
+
+// The process of a chain writes only events to stdout, one JSON object on
+// each line, so that the parallel run can show its log and its progress.
+#[test]
+fn a_chain_writes_its_log_progress_and_cells_as_events() {
+    let experiment = format!("--experiment={EXPERIMENTS}/rmw-shared-leaf.toml");
+    let output = perfbench(
+        &[
+            &MEMORY_MODEL[..],
+            &["--time=virtual", &experiment, "--chain=0"],
+        ]
+        .concat(),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect();
+    // The header of the cell, then the events of the cell, then the cells.
+    let grammar = is_one_cell_stream(&types);
+    assert!(grammar, "{types:?}");
+    let cells = events.last().unwrap()["cells"].as_array().unwrap();
+    assert_eq!(cells.len(), 1);
+    assert_eq!(output.stderr, b"");
 }
 
 #[test]

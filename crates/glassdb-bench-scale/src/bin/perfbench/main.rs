@@ -227,8 +227,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     outcome
 }
 
-/// Runs chain `index` of `chains`, and writes its output as JSON to stdout:
-/// its cells, or its error with a failed exit status.
+/// Runs chain `index` of `chains`, and writes its events as JSON lines to
+/// stdout: its log and progress, and at the end its cells, or its error with
+/// a failed exit status.
 fn run_chain(
     cli: &Cli,
     resolved: &[runner::config::Resolved],
@@ -240,17 +241,20 @@ fn run_chain(
         .get(index)
         .ok_or("--chain is not a chain of the plan")?;
     let experiment = &resolved[job.experiment];
-    let output = match chain_cells(cli, experiment, &job.chain, index, execution) {
-        Ok(cells) => parallel::ChainOutput::Cells(cells),
-        Err(error) => parallel::ChainOutput::Error(format!("{}: {error}", experiment.name)),
-    };
-    let failed = matches!(output, parallel::ChainOutput::Error(_));
-    write_json(None, &serde_json::to_value(output)?)?;
-    if failed {
-        // The parent reports the error, so it is not printed here.
-        std::process::exit(1);
+    progress::enable_events();
+    match chain_cells(cli, experiment, &job.chain, index, execution) {
+        Ok(cells) => {
+            // Without the cells, the parent reports the exit status.
+            parallel::emit(&parallel::Event::Cells { cells: &cells })?;
+            Ok(())
+        }
+        Err(error) => {
+            let message = format!("{}: {error}", experiment.name);
+            let _ = parallel::emit(&parallel::Event::Error { message: &message });
+            // The parent reports the error, so it is not printed here.
+            std::process::exit(1);
+        }
     }
-    Ok(())
 }
 
 fn chain_cells(

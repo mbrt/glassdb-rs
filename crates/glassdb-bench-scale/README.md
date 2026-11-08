@@ -107,11 +107,14 @@ number of the cell and the estimated time left.
 process of perfbench. A chain is a cell that starts from a seed, and the cells
 that continue from it with `previous`. A chain seeds its own storage. The
 result has the same cells in the same order as a run with one job, and the log
-of a chain prints when the chain ends. The default is the number of CPUs in
-virtual time, where a cell does not depend on the host. In real time, the
-default is 1, because a cell that runs at the same time takes CPU from a
-measurement. `--run-cooldown` needs one job. After a chain fails, no new chain
-starts, and the result has the experiments before the one that failed.
+of a cell prints when the cell ends. The process of a chain writes its log, its
+progress, and at the end its cells or its error to stdout, as JSON lines, and
+the progress bar adds the progress of the running cells. The default is the
+number of CPUs in virtual time, where a cell does not depend on the host. In
+real time, the default is 1, because a cell that runs at the same time takes
+CPU from a measurement. `--run-cooldown` needs one job. After a chain fails, no
+new chain starts, and the result has the experiments before the one that
+failed.
 
 All experiments support `--backend=memory|fakes3|s3|gcs`. Real S3 and GCS use
 the bucket in `$BUCKET` and always run in real time. In real time, model time
