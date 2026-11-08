@@ -105,14 +105,13 @@ number of the cell and the estimated time left.
 
 `--jobs N` runs up to `N` chains of cells at the same time, each in its own
 process of perfbench. A chain is a cell that starts from a seed, and the cells
-that continue from it with `previous` or `previous-warm-up`. A chain seeds its
-own storage. The result has the same cells in the same order as a run with one
-job, and the log of a chain prints when the chain ends. The default is the
-number of CPUs in virtual time, where a cell does not depend on the host. In
-real time, the default is 1, because a cell that runs at the same time takes
-CPU from a measurement. `--run-cooldown` needs one job. After a chain fails, no
-new chain starts, and the result has the experiments before the one that
-failed.
+that continue from it with `previous`. A chain seeds its own storage. The
+result has the same cells in the same order as a run with one job, and the log
+of a chain prints when the chain ends. The default is the number of CPUs in
+virtual time, where a cell does not depend on the host. In real time, the
+default is 1, because a cell that runs at the same time takes CPU from a
+measurement. `--run-cooldown` needs one job. After a chain fails, no new chain
+starts, and the result has the experiments before the one that failed.
 
 All experiments support `--backend=memory|fakes3|s3|gcs`. Real S3 and GCS use
 the bucket in `$BUCKET` and always run in real time. In real time, model time
@@ -391,11 +390,10 @@ values follow a rule that a plain list repeats many times.
 
 The values of `start`:
 
-| `start` | Where the cell starts | Storage |
-| --- | --- | --- |
-| `seed` (default) | A copy of the seed, with new database instances. | all |
-| `previous` | The storage and the database instances at the end of the cell before it. | all |
-| `previous-warm-up` | A copy of the storage after the warm-up of the cell before it, with new database instances. | `memory` only |
+| `start` | Where the cell starts |
+| --- | --- |
+| `seed` (default) | A copy of the seed, with new database instances. |
+| `previous` | The storage and the database instances at the end of the cell before it. |
 
 `previous` keeps the instances, so their caches and the state of their topology
 policy carry over. This is necessary for `load-shift` and `inline-pressure`. A
@@ -414,7 +412,7 @@ for run in 1..=runs:
         if this is the first cell, or axis.start is "seed":
             state = seed(seed parameters of the cell)
         else:
-            state = state at the end (or after the warm-up) of the cell before it
+            state = state at the end of the cell before it
         warm up, then measure
 ```
 
@@ -430,10 +428,9 @@ one seed, as today.
 The checks before the first seed:
 
 - An axis that sets a seed parameter, or that changes the instances or
-  `cell.database`, must have `start = "seed"`, or `"previous-warm-up"` for a
-  change of the instances.
-- An axis with `start = "previous"` or `"previous-warm-up"` must be inside all
-  axes with `start = "seed"`.
+  `cell.database`, must have `start = "seed"`.
+- An axis with `start = "previous"` must be inside all axes with
+  `start = "seed"`.
 - Each name that a parameter uses must exist.
 - Each shape must have the parameters of its kind and of its source, and no
   others.
@@ -509,9 +506,8 @@ unconverged. Its windows have fewer commits, so its throughput distribution is
 noisier. The commits of the transactions that finish after the measurement are
 not in a window.
 
-A chain of cells that continue each other shares one seed. The seed writes the
-collections of the largest cell of the chain, and each cell uses the first of
-them.
+A cell that continues the cell before it keeps its seed and its open
+instances, so it cannot change `cell.collections`.
 
 ## Experiments of the repository
 

@@ -119,19 +119,25 @@ fn a_pass_condition_ends_the_measurement_of_a_sequence() -> Result<(), Box<dyn E
 }
 
 #[test]
-fn a_chain_of_cells_shares_the_seed_of_its_largest_cell() -> Result<(), Box<dyn Error>> {
-    let mut set = SHORT.to_vec();
-    set.extend(["pools.wide.keys=20000", "cell.databases=3"]);
-    let resolved = resolve("workers", &set)?;
-    let (points, specs) = super::plan(&resolved)?;
-    assert_eq!(specs[0].collections, 1);
-    assert!(specs.iter().all(|spec| spec.seed_collections == 3));
-    assert!(
-        points
-            .iter()
-            .skip(1)
-            .all(|point| point.start != super::config::Start::Seed)
+fn a_continued_cell_cannot_change_the_collections() -> Result<(), Box<dyn Error>> {
+    // The open instances keep the collections of the first cell of the chain.
+    let text = format!(
+        "include = [\"{}/../configs/default.toml\"]\n\
+         [cell]\nworkload = \"diag-read\"\n\
+         [[axes]]\npath = \"cell.collections\"\nvalues = [1, 2]\nstart = \"previous\"\n",
+        super::config::REPOSITORY_EXPERIMENTS
     );
+    let dir = super::config::tests::write(&[("collections.toml", &text)]);
+    let resolved = Selection {
+        experiments: vec![dir.join("collections.toml")],
+        ..Selection::default()
+    }
+    .resolve()?;
+    let Err(error) = super::plan(&resolved[0]) else {
+        panic!("a continued cell changed the collections");
+    };
+    let error = error.to_string();
+    assert!(error.contains("changes the seed"), "{error}");
     Ok(())
 }
 

@@ -39,7 +39,7 @@ pub(crate) struct CellResult {
     /// of its shapes: `keys` and `shared` of an overlap source, and
     /// `sharedPct` of the stripes.
     pub(crate) parameters: serde_json::Map<String, serde_json::Value>,
-    /// Where the cell started: `seed`, `previous`, or `previous-warm-up`.
+    /// Where the cell started: `seed` or `previous`.
     pub(crate) start: &'static str,
     pub(crate) workload: String,
     pub(crate) affinity_pct: u8,

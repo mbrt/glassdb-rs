@@ -23,13 +23,9 @@ pub(crate) struct CellSpec {
     pub(crate) groups: Vec<GroupSpec>,
     pub(crate) seed: SeedSpec,
     pub(crate) params: CellParams,
-    /// The collections of each pool that the cell uses.
+    /// The collections of each pool that the cell uses, and that its seed
+    /// writes.
     pub(crate) collections: usize,
-    /// The collections of each pool that the seed writes. A chain of cells
-    /// that continue each other shares one seed, so the seed writes the
-    /// collections of the largest cell of the chain, and each cell uses the
-    /// first of them.
-    pub(crate) seed_collections: usize,
     /// Whether a group takes its instances from `cell.databases`.
     pub(crate) uses_cell_databases: bool,
     /// Whether a shape takes its workers from `cell.workers`.
@@ -296,7 +292,6 @@ impl CellSpec {
             seed,
             params,
             collections,
-            seed_collections: collections,
             uses_cell_databases,
             uses_cell_workers,
         };

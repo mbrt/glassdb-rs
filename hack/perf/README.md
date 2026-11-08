@@ -45,7 +45,7 @@ instance can miss the cell completion deadline, and the run then stops.
 | `split-merge-fight` | A stable load under which both a split and a merge of one leaf make sense. The default topology policy must settle at one leaf or at two leaves, from a start of either one. |
 | `membership-churn` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
 | `mixed` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
-| `workers` | The worker grid of the canonical plots: 1 to 200 workers per shape, each count after the warm-up of the count before it. |
+| `workers` | The worker grid of the canonical plots: 1 to 200 workers per shape. Each count starts from the seed. |
 | `affinity` | The affinity grid: 5 affinities × 1, 3, 5, and 7 database instances. It is not part of the canonical plots. |
 | `conflict-sweep` | The conflict grid of the canonical plots: 20 workers on 1 and on 5 database instances run read-modify-write transactions of 1 or 4 keys on one pool, from 5,000 keys down to 5 keys (1 key) or 100 keys (4 keys). A smaller pool gives more conflicts. |
 | `load-shift` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |

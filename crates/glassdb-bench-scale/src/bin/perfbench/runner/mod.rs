@@ -78,8 +78,6 @@ struct Carry {
     /// The open instances of the cell and their collections, for
     /// `previous`. Other cells shut their instances down.
     instances: Option<Vec<OpenInstance>>,
-    /// A copy of the storage after the warm-up, for `previous-warm-up`.
-    after_warm_up: Option<Storage>,
 }
 
 struct OpenInstance {
@@ -214,29 +212,13 @@ fn run_cells(
     Ok(cells)
 }
 
-/// Returns the cells of `resolved`, with one seed for each chain of cells that
-/// continue each other, and checks that the chains can continue.
+/// Returns the cells of `resolved`, and checks that the chains can continue.
 pub(crate) fn plan(resolved: &Resolved) -> Result<(Vec<CellPoint>, Vec<CellSpec>), Box<dyn Error>> {
     let points = resolved.points();
-    let mut specs: Vec<CellSpec> = points
+    let specs: Vec<CellSpec> = points
         .iter()
         .map(|point| CellSpec::from_table(&resolved.cell_table(point)?))
         .collect::<Result<_, _>>()?;
-    let mut first = 0;
-    for end in 1..=points.len() {
-        if end < points.len() && points[end].start != Start::Seed {
-            continue;
-        }
-        let largest = specs[first..end]
-            .iter()
-            .map(|spec| spec.collections)
-            .max()
-            .unwrap_or(1);
-        for spec in &mut specs[first..end] {
-            spec.seed_collections = largest;
-        }
-        first = end;
-    }
     check_continuations(&points, &specs)?;
     Ok((points, specs))
 }
@@ -262,9 +244,7 @@ fn check_continuations(points: &[CellPoint], specs: &[CellSpec]) -> Result<(), B
                 .map(|group| (group.name.clone(), group.instances))
                 .collect()
         };
-        if point.start == Start::Previous
-            && (layout(before) != layout(after) || before.params.database != after.params.database)
-        {
+        if layout(before) != layout(after) || before.params.database != after.params.database {
             return Err(format!(
                 "cell {}: `previous` keeps the open instances, so it cannot change the groups, \
                  their instances, or cell.database",
@@ -288,12 +268,6 @@ async fn run_cell(
 ) -> Result<(CellResult, Option<Carry>), Box<dyn Error>> {
     let (storage, instances) = match (point.start, carry) {
         (Start::Previous, Some(carry)) => (carry.storage, carry.instances),
-        (Start::PreviousWarmUp, Some(carry)) => {
-            let storage = carry
-                .after_warm_up
-                .ok_or("`previous-warm-up` needs storage that can fork")?;
-            (storage, None)
-        }
         (_, _) => (seeds.storage_for(spec).await?, None),
     };
     let instances = match instances {
@@ -479,7 +453,6 @@ async fn run_cell(
     } else {
         None
     };
-    let after_warm_up = storage.fork();
     let baselines: Vec<Stats> = databases.iter().map(Database::stats).collect();
     let breakdown_start = storage.breakdown.snapshot();
     let measure_start = Instant::now();
@@ -658,7 +631,6 @@ async fn run_cell(
         start: match point.start {
             Start::Seed => "seed",
             Start::Previous => "previous",
-            Start::PreviousWarmUp => "previous-warm-up",
         },
         workload: spec.params.workload.clone(),
         affinity_pct: spec.params.affinity,
@@ -690,7 +662,6 @@ async fn run_cell(
         Some(Carry {
             storage,
             instances: carried,
-            after_warm_up,
         }),
     ))
 }
