@@ -21,14 +21,19 @@ if [[ -n "${PERFBENCH_CONFIG:-}" ]]; then
   printf '%s\n' "$PERFBENCH_CONFIG" >perfbench.toml
   common+=(--config=perfbench.toml)
 fi
-mkdir -p perf
-base64 -d <<<"$EXPERIMENT_FILES" | tar -C perf -xz
+mkdir -p files
+base64 -d <<<"$EXPERIMENT_FILES" | tar -C files -xz
 
 IFS=',' read -r -a experiments <<<"$EXPERIMENTS"
 for experiment in "${experiments[@]}"; do
-  file="perf/experiments/$experiment.toml"
+  # An experiment of real S3 replaces the local one with the same name.
+  file="files/aws-bench/experiments/$experiment.toml"
   if [[ ! -f "$file" ]]; then
-    echo "no experiment $experiment in hack/perf/experiments" >&2
+    file="files/perf/experiments/$experiment.toml"
+  fi
+  if [[ ! -f "$file" ]]; then
+    echo "no experiment $experiment in hack/aws-bench/experiments" \
+      "or hack/perf/experiments" >&2
     exit 1
   fi
   extra=()

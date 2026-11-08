@@ -1,7 +1,7 @@
 # Transactions on ranges of 16 and 64 adjacent keys from random starts, on
 # fixed sets of 3 keys, and on single keys, for the write spans of ADR-084.
 # See the investigation of 2026-10-28 in investigations.md.
-tags = ["area/topology"]
+tags = ["extra", "area/topology"]
 
 [pools.wide]
 keys = 20000

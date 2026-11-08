@@ -3,7 +3,7 @@
 # root collection, so every commit is a locked commit that also holds a read
 # lock on that directory. The size of the pool sets how often a read moves
 # before the commit locks it, which makes the body run again.
-tags = ["area/contention"]
+tags = ["extra", "area/contention"]
 
 [pools.sweep]
 keys = 1000

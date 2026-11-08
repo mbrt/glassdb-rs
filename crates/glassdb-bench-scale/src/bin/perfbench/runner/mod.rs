@@ -76,8 +76,9 @@ impl Window {
 struct Carry {
     storage: Storage,
     /// The open instances of the cell and their collections, for
-    /// `previous`. Other cells shut their instances down.
-    instances: Option<Vec<OpenInstance>>,
+    /// `previous`, in one list for each group. Other cells shut their
+    /// instances down.
+    instances: Option<Vec<Vec<OpenInstance>>>,
 }
 
 struct OpenInstance {
@@ -207,7 +208,10 @@ fn run_cells(
         carry = next;
     }
     if let Some(instances) = carry.and_then(|carry| carry.instances) {
-        runtime.block_on(close(instances, execution.drain_timeout))?;
+        runtime.block_on(close(
+            instances.into_iter().flatten().collect(),
+            execution.drain_timeout,
+        ))?;
     }
     Ok(cells)
 }
@@ -224,7 +228,8 @@ pub(crate) fn plan(resolved: &Resolved) -> Result<(Vec<CellPoint>, Vec<CellSpec>
 }
 
 /// Rejects a `previous` cell that changes what its open instances cannot
-/// change: the instances of its groups, and their database options.
+/// change: its groups, the instances that they have open, and their database
+/// options. A group can get more instances.
 fn check_continuations(points: &[CellPoint], specs: &[CellSpec]) -> Result<(), Box<dyn Error>> {
     for (index, point) in points.iter().enumerate().skip(1) {
         let (before, after) = (&specs[index - 1], &specs[index]);
@@ -238,16 +243,21 @@ fn check_continuations(points: &[CellPoint], specs: &[CellSpec]) -> Result<(), B
             )
             .into());
         }
-        let layout = |spec: &CellSpec| -> Vec<(String, usize)> {
-            spec.groups
-                .iter()
-                .map(|group| (group.name.clone(), group.instances))
-                .collect()
+        let names = |spec: &CellSpec| -> Vec<String> {
+            spec.groups.iter().map(|group| group.name.clone()).collect()
         };
-        if layout(before) != layout(after) || before.params.database != after.params.database {
+        let removes = before
+            .groups
+            .iter()
+            .zip(&after.groups)
+            .any(|(before, after)| after.instances < before.instances);
+        if names(before) != names(after)
+            || removes
+            || before.params.database != after.params.database
+        {
             return Err(format!(
                 "cell {}: `previous` keeps the open instances, so it cannot change the groups, \
-                 their instances, or cell.database",
+                 remove instances, or change cell.database",
                 describe(point)
             )
             .into());
@@ -271,7 +281,7 @@ async fn run_cell(
         (_, _) => (seeds.storage_for(spec).await?, None),
     };
     let instances = match instances {
-        Some(instances) => instances,
+        Some(groups) => add_instances(&storage, spec, groups).await?,
         None => open_instances(&storage, spec).await?,
     };
     let databases: Vec<Database> = instances.iter().map(|i| i.db.clone()).collect();
@@ -517,7 +527,7 @@ async fn run_cell(
     // and their shutdown work is part of the cell, as the work that it drains
     // belongs to the measured transactions.
     let carried = if next_continues {
-        Some(instances)
+        Some(by_group(instances, spec))
     } else {
         close(instances, execution.drain_timeout).await?;
         None
@@ -672,11 +682,42 @@ async fn open_instances(
 ) -> Result<Vec<OpenInstance>, Box<dyn Error>> {
     let mut instances = Vec::with_capacity(spec.instances());
     for _ in 0..spec.instances() {
-        let db = storage.open(&spec.params.database).await?;
-        let collections = seed::open_collections(&db, spec).await?;
-        instances.push(OpenInstance { db, collections });
+        instances.push(open_instance(storage, spec).await?);
     }
     Ok(instances)
+}
+
+async fn open_instance(storage: &Storage, spec: &CellSpec) -> Result<OpenInstance, Box<dyn Error>> {
+    let db = storage.open(&spec.params.database).await?;
+    let collections = seed::open_collections(&db, spec).await?;
+    Ok(OpenInstance { db, collections })
+}
+
+/// Returns the open instances of the cell before, with new instances for the
+/// groups of `spec` that have more instances, in the order of the groups.
+async fn add_instances(
+    storage: &Storage,
+    spec: &CellSpec,
+    groups: Vec<Vec<OpenInstance>>,
+) -> Result<Vec<OpenInstance>, Box<dyn Error>> {
+    let mut instances = Vec::with_capacity(spec.instances());
+    for (group, mut open) in spec.groups.iter().zip(groups) {
+        while open.len() < group.instances {
+            open.push(open_instance(storage, spec).await?);
+        }
+        instances.extend(open);
+    }
+    Ok(instances)
+}
+
+/// Splits `instances`, in the order of the groups of `spec`, in one list for
+/// each group.
+fn by_group(instances: Vec<OpenInstance>, spec: &CellSpec) -> Vec<Vec<OpenInstance>> {
+    let mut instances = instances.into_iter();
+    spec.groups
+        .iter()
+        .map(|group| instances.by_ref().take(group.instances).collect())
+        .collect()
 }
 
 async fn close(

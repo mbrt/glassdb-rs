@@ -1,5 +1,5 @@
 # Both conflict levels at five collection affinities.
-tags = ["area/mixed"]
+tags = ["extra", "area/mixed"]
 include = ["../configs/common-workloads.toml"]
 
 [[axes]]

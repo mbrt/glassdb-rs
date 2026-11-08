@@ -1,0 +1,28 @@
+# The worker grid of the canonical plots, without its axis: the experiments
+# `workers` in hack/perf/experiments and in hack/aws-bench/experiments include
+# it, and each gives the axis of the worker counts with its own start.
+include = ["common-workloads.toml"]
+
+[pools.wide]
+keys = 20000
+
+[seed]
+quiet-period = "5s"
+
+# Five collections at each worker count, so that every count has the same
+# seed, and a count can continue from the count before it. Below 5 workers,
+# a shape has fewer instances, and at affinity 100 the other collections stay
+# unused.
+[cell]
+workload = "low-conflict"
+databases = 5
+collections = 5
+
+[cell.warm-up]
+quiet = "5s"
+timeout = "180s"
+
+# A single worker of the slowest shape needs about 160 s to commit the target
+# of the windows, so the default cap of 60 s ends that cell before it converges.
+[cell.measure]
+max-duration = "200s"

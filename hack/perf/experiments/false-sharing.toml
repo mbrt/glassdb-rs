@@ -5,7 +5,7 @@
 # The default topology policy must split the keys of the four instances apart
 # (ADR-085), and then keep them apart, while the keys of the background
 # instance stay in moderate leaves.
-tags = ["area/topology"]
+tags = ["extra", "area/topology"]
 
 [pools.false-sharing]
 keys = 4096

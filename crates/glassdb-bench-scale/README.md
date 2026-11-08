@@ -397,9 +397,12 @@ The values of `start`:
 
 `previous` keeps the instances, so their caches and the state of their topology
 policy carry over. This is necessary for `load-shift` and `inline-pressure`. A
-`previous` axis must then not change the groups or the instances of a group,
-nor `cell.database.*`, because the open instances cannot change. A change of
-the shapes and their workers is allowed.
+`previous` axis must then not change the groups, remove instances of a group,
+or change `cell.database.*`, because the open instances cannot change. A group
+can get more instances: the cell opens them on the storage of the cell before
+it, like new clients. A change of the shapes and their workers is allowed. The
+`workers` experiment of `hack/aws-bench/experiments` uses this: 1 worker opens
+1 instance, and 10 workers open 5.
 
 ## Loop
 

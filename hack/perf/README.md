@@ -27,10 +27,13 @@ repository uses these tags:
 | Tag | Meaning |
 | --- | --- |
 | `ci` | An experiment of the CI comparison and of `make bench`. These run in virtual time, so that two revisions compare with results that repeat. |
+| `extra` | An experiment that is too slow for CI, but that runs on one host. |
+| `cloud` | An experiment of real S3, in [`hack/aws-bench/experiments`](../aws-bench/README.md). It changes a local experiment of the same name for real S3. |
 | `canonical` | An input of the [canonical plots](#plotting-results). |
 | `area/<topic>` | The topic of the experiment: `read`, `inline`, `commit`, `contention`, `topology`, or `mixed` (the [mixed workloads](#mixed-workloads)). |
 
-The experiments run in both time modes. `make bench-all` runs all experiments
+Each experiment has one of the tags `ci`, `extra`, and `cloud`. The experiments
+of this directory run in both time modes. `make bench-all` runs all of them
 in real time, and `make bench-all TIME=virtual` runs all of them in virtual
 time. In virtual time, CPU takes no model time, so the absolute values differ
 from real time, and `workers` shows no CPU saturation (see `--time=virtual` in
@@ -59,6 +62,9 @@ The files in `hack/perf/configs` are not experiments:
 - `common-workloads.toml`: the pools, shapes, and workloads of the mixed
   workloads (`low-conflict`, `high-conflict`, and `crossing`).
 - `default.toml`: the settings and the parts of the CI experiments.
+- `workers.toml`: the `workers` grid without its axis. The `workers`
+  experiments of `hack/perf/experiments` and of `hack/aws-bench/experiments`
+  include it, so a change to it changes both.
 
 ### Mixed workloads
 

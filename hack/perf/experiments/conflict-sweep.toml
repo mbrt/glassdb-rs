@@ -6,7 +6,7 @@
 # A single instance batches the commits of its workers, so it conflicts less
 # than five instances with the same workers. Each pool size has its own seed,
 # and both instance counts share it.
-tags = ["canonical", "area/contention"]
+tags = ["extra", "canonical", "area/contention"]
 
 [pools.sweep]
 keys = 5000

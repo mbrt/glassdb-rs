@@ -1,7 +1,7 @@
 # A change of the load on one tree. Each cell continues on the database
 # instances of the cell before it, and its warm-up shows whether the topology
 # becomes quiet again.
-tags = ["area/topology"]
+tags = ["extra", "area/topology"]
 include = ["../configs/common-workloads.toml"]
 
 [pools.wide]

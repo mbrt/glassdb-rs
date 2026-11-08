@@ -39,9 +39,10 @@
 #   DRAIN_TIMEOUT    worker/shutdown deadline         (default: 90s)
 #
 # Experiments:
-#   EXPERIMENTS      names of the experiments in hack/perf/experiments to run,
-#                    comma-separated; each one writes out/<experiment>.json
-#                    (default: mixed,contention)
+#   EXPERIMENTS      names of the experiments to run, comma-separated; each
+#                    one writes out/<experiment>.json. A name is a file of
+#                    hack/aws-bench/experiments, or else of
+#                    hack/perf/experiments (default: mixed,contention)
 #   PERFBENCH_CONFIG path of a perfbench configuration file that changes all
 #                    experiments, after aws.toml (default: none). It cannot
 #                    include other files. See
@@ -93,8 +94,10 @@ check_experiments() {
   local name names
   IFS=',' read -r -a names <<<"$EXPERIMENTS"
   for name in "${names[@]}"; do
-    if [[ ! -f "$REPO_ROOT/hack/perf/experiments/$name.toml" ]]; then
-      echo "EXPERIMENTS: $name is not one file in hack/perf/experiments" >&2
+    if [[ ! -f "$REPO_ROOT/hack/aws-bench/experiments/$name.toml" &&
+      ! -f "$REPO_ROOT/hack/perf/experiments/$name.toml" ]]; then
+      echo "EXPERIMENTS: $name is not one file in hack/aws-bench/experiments" \
+        "or hack/perf/experiments" >&2
       return 1
     fi
   done
@@ -113,7 +116,8 @@ write_config() {
   printf 'PERFBENCH_CONFIG=%q\n' "$config" >>"$path"
   # The experiment files and the files that they include, with their layout,
   # so that the relative paths of `include` stay valid.
-  files="$(tar -C "$REPO_ROOT/hack/perf" -cz configs experiments | base64 -w0)"
+  files="$(tar -C "$REPO_ROOT/hack" -cz perf/configs perf/experiments \
+    aws-bench/experiments | base64 -w0)"
   printf 'EXPERIMENT_FILES=%q\n' "$files" >>"$path"
 }
 
