@@ -21,7 +21,10 @@ macro_rules! experiments {
 const EXPERIMENTS: &str = experiments!();
 
 /// The experiments that CI compares.
-const CI_EXPERIMENTS: [&str; 2] = [concat!("--experiment=", experiments!()), "--tag=ci"];
+const CI_EXPERIMENTS: [&str; 2] = [
+    concat!("--experiment=", experiments!()),
+    "--tag=ci/counters",
+];
 
 fn perfbench(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_perfbench"))
@@ -39,7 +42,7 @@ fn virtual_ci_report() -> Value {
 /// The experiments whose persisted records carry a timestamp. The anchor of the wall
 /// clock is the start time of the process, so the size of these records, and
 /// with it the delay of their writes, moves by under 1% between processes.
-const TIMESTAMPED_EXPERIMENTS: [&str; 2] = ["rmw-external", "rmw-five-leaves"];
+const TIMESTAMPED_EXPERIMENTS: [&str; 2] = ["rmw-external-counters", "rmw-five-leaves-counters"];
 
 /// The numbers that a comparison of two revisions reads.
 fn measured(report: &Value) -> Vec<Value> {
@@ -81,7 +84,7 @@ fn virtual_runs_repeat_exactly() {
     assert!(!experiments.is_empty());
     for experiment in experiments {
         let tags = experiment["tags"].as_array().unwrap();
-        assert!(tags.contains(&"ci".into()), "{experiment}");
+        assert!(tags.contains(&"ci/counters".into()), "{experiment}");
     }
     assert_eq!(first["timeMode"], "virtual");
     assert_eq!(first["modelTimeSpeedup"], 1.0);

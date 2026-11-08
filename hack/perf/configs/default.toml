@@ -1,12 +1,13 @@
-# The settings of the experiments with the tag `ci`, which CI compares between
-# two revisions: single transactions of one worker with warm caches, and four
-# shapes at the same time on one leaf. Each of these experiments includes this
-# file and selects one workload. The experiments are the cases of the former
-# Criterion suite.
+# The settings of the experiments with the tag `ci/counters`, whose counters CI
+# compares between two revisions: single transactions of one worker with warm
+# caches, and four shapes at the same time on one leaf. Each of these
+# experiments includes this file and selects one workload. The experiments are
+# the cases of the former Criterion suite.
 #
 # The window of 10 s ends before the first background pass of the garbage
 # collector, so the counters of a run do not depend on the random cadence of
-# that pass; a measurement of latency can use a longer window.
+# that pass. The experiments with the tag `ci/timing` measure the latency with
+# a longer window (`ci-timing.toml`).
 
 [seed]
 quiet-period = "6s"

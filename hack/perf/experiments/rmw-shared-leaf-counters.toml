@@ -1,0 +1,8 @@
+# Three workers that update their own key of one leaf.
+# The counters of `rmw-shared-leaf`: one run without latency jitter, in a
+# window of 10 s.
+tags = ["ci/counters", "area/commit"]
+include = ["../configs/default.toml"]
+
+[cell]
+workload = "diag-rmw-shared"

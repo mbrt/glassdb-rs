@@ -1,7 +1,8 @@
 # A read-modify-write of one key with a 1,024-byte value, at the default inline
 # limit.
-tags = ["ci", "area/inline"]
-include = ["../configs/default.toml"]
+# The CI comparison runs it 32 times with latency jitter.
+tags = ["ci/timing", "area/inline"]
+include = ["../configs/ci-timing.toml"]
 
 [cell]
 workload = "diag-rmw-inline"

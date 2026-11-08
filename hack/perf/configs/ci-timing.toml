@@ -1,0 +1,10 @@
+# The settings of the experiments with the tag `ci/timing`: the experiments of
+# `ci/counters`, with a window of 300 s. The CI comparison runs them with
+# latency jitter, so that their percentiles are realistic, in 32 runs. In one
+# run, the spread of a p90 is at most about 0.9% at 300 s, and it falls with
+# the square root of the window.
+include = ["default.toml"]
+
+[cell.measure]
+duration = "300s"
+max-duration = "300s"

@@ -1,0 +1,8 @@
+# A read of one key with a 256-byte value.
+# The counters of `read-warm`: one run without latency jitter, in a window of
+# 10 s.
+tags = ["ci/counters", "area/read"]
+include = ["../configs/default.toml"]
+
+[cell]
+workload = "diag-read"

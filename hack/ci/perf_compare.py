@@ -20,27 +20,25 @@ if __package__:
 else:
     import perf_report
 
-# Planned checks bound the cost of repeated statistical decisions. Each count is
-# even so both revisions run first equally often at every possible stopping point.
-CHECKPOINTS = [8, 16, 32]
-# A process runs all experiments on virtual time and takes a few seconds.
-# Guard each process against hangs, such as a CPU livelock that virtual time
-# cannot see.
-PROCESS_TIMEOUT = 120
-# Virtual time charges a long window only as CPU time. A long window averages
-# the jitter of the provider latency out of the percentile samples, so that
-# changes of a few percent remain visible.
-MEASURE_WINDOW = "300s"
+# The runs of the timing experiments. Each run is one independent sample of
+# the latency jitter, and the runs of a process run in parallel. With 32 runs
+# of 300 s, an A/A comparison gave simultaneous intervals of at most +-0.9%
+# (median +-0.5%) for all 36 timing metrics, so the report can tell an
+# unchanged metric from a change of 2%. With 8 runs, the p90 intervals reached
+# +-1.9%, and unchanged metrics were often inconclusive.
+TIMING_RUNS = 32
+# Each process runs on virtual time, and takes seconds. Guard it against hangs,
+# such as a CPU livelock that virtual time cannot see.
+PROCESS_TIMEOUT = 600
 # The experiments, and the shared files that they include. They are part of
-# the harness. All comparisons measure the experiments with the tag `ci`.
+# the harness.
 EXPERIMENTS = Path("hack/perf/experiments")
-SELECTION = "--tag=ci"
 CONFIGS = Path("hack/perf/configs")
 # The sources that the base revision takes from the harness. The crate must be
 # in the base revision; the experiment files can be new.
 HARNESS = (Path("crates/glassdb-bench-scale"), CONFIGS, EXPERIMENTS)
-# The options of every compared process. One process runs all experiments. The
-# driver adds the experiments, from the copy of the harness in the output.
+# The options of every compared process. The driver adds the experiments, from
+# the copy of the harness in the output.
 COMMON_ARGS = [
     "--backend=memory",
     "--delays=s3",
@@ -49,22 +47,17 @@ COMMON_ARGS = [
     # The delay profile is not part of the copied harness, so pin its prefix
     # partition depth on both sides.
     "--prefix-depth=3",
-    "--runs=1",
     "--drain-timeout=10s",
 ]
-# The latency comes from a process that keeps the jitter of the provider, so
-# that percentiles are realistic.
-LATENCY_JITTER = True
-TIMING_ARGS = [
-    *COMMON_ARGS,
-    f"--latency-jitter={str(LATENCY_JITTER).lower()}",
-    f'--set=cell.measure.duration="{MEASURE_WINDOW}"',
-    f'--set=cell.measure.max-duration="{MEASURE_WINDOW}"',
-]
-# Jitter moves the counts of background operations by one per process, so the
-# counters come from a second process without it. They repeat exactly, so the
-# default window is enough.
-COUNTER_ARGS = [*COMMON_ARGS, "--latency-jitter=false"]
+# The counters repeat exactly without latency jitter, so one run is enough.
+COUNTER_ARGS = [*COMMON_ARGS, "--latency-jitter=false", "--runs=1"]
+COUNTER_TAG = "--tag=ci/counters"
+# The latency keeps the jitter of the provider, so that percentiles are
+# realistic.
+TIMING_ARGS = [*COMMON_ARGS, "--latency-jitter=true", f"--runs={TIMING_RUNS}"]
+TIMING_TAG = "--tag=ci/timing"
+# The version of the manifest that the driver writes.
+MANIFEST_VERSION = 5
 
 
 def capture(command: list[str], cwd: Path) -> str:
@@ -175,10 +168,7 @@ def build(
 def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
     output.mkdir(parents=True, exist_ok=False)
     manifest: dict[str, Any] = {
-        "schemaVersion": perf_report.MANIFEST_VERSION,
-        "checkpoints": CHECKPOINTS,
-        "completedPairs": 0,
-        "latencyJitter": LATENCY_JITTER,
+        "schemaVersion": MANIFEST_VERSION,
         "timingArgs": list(TIMING_ARGS),
         "counterArgs": list(COUNTER_ARGS),
         "processTimeoutSeconds": PROCESS_TIMEOUT,
@@ -232,17 +222,64 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         for relative in (CONFIGS, EXPERIMENTS):
             if (snapshots / "pr" / relative).is_dir():
                 shutil.copytree(snapshots / "pr" / relative, harness / relative)
-        experiments = [f"--experiment={harness / EXPERIMENTS}", SELECTION]
-        manifest["timingArgs"].extend(experiments)
-        manifest["counterArgs"].extend(experiments)
+        experiments = f"--experiment={harness / EXPERIMENTS}"
+        manifest["timingArgs"] += [experiments, TIMING_TAG]
+        manifest["counterArgs"] += [experiments, COUNTER_TAG]
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return manifest
 
 
+def run_side(
+    perfbench: str,
+    directory: Path,
+    counter_args: list[str],
+    timing_args: list[str],
+    timeout: float,
+) -> None:
+    """Run the counter and the timing experiments of one revision into
+    `directory`, with a log of each process beside its result."""
+    directory.mkdir(parents=True)
+    for stem, arguments in (
+        (Path(perf_report.COUNTERS_FILE).stem, counter_args),
+        (Path(perf_report.TIMING_FILE).stem, timing_args),
+    ):
+        print(f"{directory.name}: {stem}", flush=True)
+        command = [
+            perfbench,
+            f"--output={directory / f'{stem}.json'}",
+            "--progress=never",
+            *arguments,
+        ]
+        with (directory / f"{stem}.log").open("w") as log:
+            subprocess.run(
+                command,
+                cwd=directory,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=True,
+            )
+
+
+def bench(repo: Path, perfbench: Path, output: Path) -> None:
+    """Run one side of the comparison for the experiments of `repo`, and
+    print the summary of its results."""
+    experiments = f"--experiment={repo / EXPERIMENTS}"
+    run_side(
+        str(perfbench.resolve()),
+        output,
+        [*COUNTER_ARGS, experiments, COUNTER_TAG],
+        [*TIMING_ARGS, experiments, TIMING_TAG],
+        PROCESS_TIMEOUT,
+    )
+    print(perf_report.summarize(output))
+    print(f"Results: {output}")
+
+
 def measure(output: Path, manifest: dict) -> None:
-    perf_report.validate_manifest(manifest)
-    if manifest["completedPairs"]:
-        raise ValueError("measurement requires a new checkpoint comparison")
+    """Run the counter and the timing experiments of each side, and report."""
+    if manifest.get("schemaVersion") != MANIFEST_VERSION:
+        raise ValueError("unsupported comparison manifest")
     process_timeout = perf_report.number(manifest.get("processTimeoutSeconds"))
     if process_timeout == 0:
         raise ValueError("process timeout must be positive")
@@ -264,75 +301,37 @@ def measure(output: Path, manifest: dict) -> None:
             ),
             manifest["cpuModel"],
         )
-
-    def run_experiments(side, repetition):
-        """Run the experiments for the latency, and then for the counters."""
-        directory = output / side / f"{repetition:02d}"
-        directory.mkdir(parents=True, exist_ok=True)
-        for stem, arguments in (
-            ("timing", manifest["timingArgs"]),
-            ("counters", manifest["counterArgs"]),
-        ):
-            print(f"{side} repetition {repetition}: {stem}", flush=True)
-            command = [
-                manifest[side]["perfbench"],
-                f"--output={directory / f'{stem}.json'}",
-                *arguments,
-            ]
-            with (directory / f"{stem}.log").open("w") as log:
-                subprocess.run(
-                    command,
-                    cwd=directory,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    timeout=process_timeout,
-                    check=True,
-                )
-        return directory
-
     try:
-        for checkpoint in manifest["checkpoints"]:
-            for repetition in range(manifest["completedPairs"] + 1, checkpoint + 1):
-                # Adjacent pairs limit host drift.
-                sides = ("main", "pr") if repetition % 2 else ("pr", "main")
-                for side in sides:
-                    directory = run_experiments(side, repetition)
-                    _, warnings = perf_report.read_measurement(
-                        directory, latency_jitter=manifest["latencyJitter"]
-                    )
-                    if warnings:
-                        raise perf_report.ReportError("; ".join(warnings))
-                # A timeout during either side leaves this pair uncounted.
-                manifest["completedPairs"] = repetition
-            result = perf_report.analyze(output, manifest)
-            if result.warnings:
-                raise perf_report.ReportError("; ".join(result.warnings))
-            state = (
-                "resolved"
-                if result.resolved
-                else f"inconclusive: {len(result.unresolved)} metrics"
+        for side in ("main", "pr"):
+            run_side(
+                manifest[side]["perfbench"],
+                output / side,
+                manifest["counterArgs"],
+                manifest["timingArgs"],
+                process_timeout,
             )
-            print(f"{checkpoint} pairs, {state}", flush=True)
-            (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
-            if result.resolved:
-                break
     except subprocess.TimeoutExpired as error:
         manifest["warnings"].append(
-            f"Benchmark process timed out after {error.timeout:g} seconds; "
-            "results use each benchmark's last completed checkpoint. "
+            f"Benchmark process timed out after {error.timeout:g} seconds. "
             f"Command: {error.cmd}"
         )
         raise
-    except (subprocess.SubprocessError, perf_report.ReportError) as error:
+    except subprocess.SubprocessError as error:
         manifest["warnings"].append(
-            f"Measurement failed: {error}. See the per-run logs."
+            f"Measurement failed: {error}. See the logs of each side."
         )
         raise
     finally:
         manifest["runtimeSeconds"] = time.monotonic() - start
         (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
         (output / "report.md").write_text(
-            perf_report.render_report(output, manifest["base"], manifest["candidate"])
+            perf_report.render_report(
+                output / "main",
+                output / "pr",
+                manifest["base"],
+                manifest["candidate"],
+                manifest["warnings"],
+            )
         )
 
 
@@ -344,10 +343,19 @@ def main() -> int:
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--build-only", action="store_true")
     modes.add_argument("--run-only", action="store_true")
+    modes.add_argument(
+        "--bench",
+        type=Path,
+        metavar="PERFBENCH",
+        help="run one side with this binary and the current experiments, and print a summary",
+    )
     args = parser.parse_args()
     repo = Path(capture(["git", "rev-parse", "--show-toplevel"], Path.cwd()).strip())
     output = args.output.resolve()
     try:
+        if args.bench:
+            bench(repo, args.bench, output)
+            return 0
         manifest = (
             json.loads((output / "manifest.json").read_text())
             if args.run_only

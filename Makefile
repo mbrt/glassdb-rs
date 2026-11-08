@@ -42,17 +42,26 @@ format:
 
 EXPERIMENTS_DIR = hack/perf/experiments
 BENCH_ALL_OUT = $(or $(OUT),target/performance/bench-all-$(or $(TIME),real).json)
+BENCH_OUT = $(or $(OUT),/tmp/glassdb-bench-$(shell date -u +%Y%m%dT%H%M%SZ))
 
-# Run perfbench experiments on virtual time, with the latency jitter of the
-# provider. The default runs the experiments of the CI comparison: the ones with
-# the tag `ci`. Select other experiment files or directories with EXPERIMENT,
-# for example `make bench EXPERIMENT=hack/perf/experiments/contention.toml`.
-# Virtual time is fast, but it does not show CPU saturation: use real time for
-# the canonical plots (crates/glassdb-bench-scale/README.md explains the
+# Run the experiments of the CI comparison for the current tree, as CI runs
+# them for one revision: the counters once without latency jitter, and the
+# latency in 32 runs with it. The results go to OUT (default: a new directory
+# in /tmp), and a summary of the main metrics prints at the end. EXPERIMENT
+# runs other experiment files or directories instead, for example
+# `make bench EXPERIMENT=hack/perf/experiments/contention.toml`. Virtual time
+# is fast, but it does not show CPU saturation: use real time for the
+# canonical plots (crates/glassdb-bench-scale/README.md explains the
 # experiments and the time modes).
 bench:
+ifdef EXPERIMENT
 	cargo run --release -p glassdb-bench-scale --bin perfbench -- \
-		--time=virtual $(if $(EXPERIMENT),--experiment=$(EXPERIMENT),--experiment=$(EXPERIMENTS_DIR) --tag=ci)
+		--time=virtual --experiment=$(EXPERIMENT)
+else
+	cargo build --release -p glassdb-bench-scale --bin perfbench
+	python3 hack/ci/perf_compare.py --bench target/release/perfbench \
+		--output $(BENCH_OUT)
+endif
 
 # Run all experiments one after the other, into one result in OUT. The default
 # is one run of each in real time, with the local S3 model of the canonical

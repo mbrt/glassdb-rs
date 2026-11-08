@@ -1,0 +1,17 @@
+# The body of the `shapes-shared-leaf` experiments: four shapes at the same
+# time on one leaf, with `low-conflict` keys.
+include = ["common-workloads.toml"]
+
+[pools.wide]
+keys = 128
+
+[seed.database]
+leaf-max-entries = 256
+
+[cell]
+workload = "low-conflict"
+databases = 1
+workers = 1
+
+[cell.database]
+leaf-max-entries = 256

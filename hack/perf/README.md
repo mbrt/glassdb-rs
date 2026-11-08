@@ -26,19 +26,21 @@ repository uses these tags:
 
 | Tag | Meaning |
 | --- | --- |
-| `ci` | An experiment of the CI comparison and of `make bench`. These run in virtual time, so that two revisions compare with results that repeat. |
+| `ci/counters` | An experiment whose counters the CI comparison and `make bench` compare. It runs once in virtual time without latency jitter, so its counters repeat exactly. |
+| `ci/timing` | An experiment whose latency the CI comparison and `make bench` compare. It runs 32 times in virtual time with latency jitter. |
 | `extra` | An experiment that is too slow for CI, but that runs on one host. |
 | `cloud` | An experiment of real S3, in [`hack/aws-bench/experiments`](../aws-bench/README.md). It changes a local experiment of the same name for real S3. |
 | `canonical` | An input of the [canonical plots](#plotting-results). |
 | `area/<topic>` | The topic of the experiment: `read`, `inline`, `commit`, `contention`, `topology`, or `mixed` (the [mixed workloads](#mixed-workloads)). |
 
-Each experiment has one of the tags `ci`, `extra`, and `cloud`. The experiments
-of this directory run in both time modes. `make bench-all` runs all of them
-in real time, and `make bench-all TIME=virtual` runs all of them in virtual
-time. In virtual time, CPU takes no model time, so the absolute values differ
-from real time, and `workers` shows no CPU saturation (see `--time=virtual` in
-the crate README). In real time, a cell of `open-in-body` with one database
-instance can miss the cell completion deadline, and the run then stops.
+Each experiment has one of the tags `ci/counters`, `ci/timing`, `extra`, and
+`cloud`. The experiments of this directory run in both time modes. `make
+bench-all` runs all of them in real time, and `make bench-all TIME=virtual` runs
+all of them in virtual time. In virtual time, CPU takes no model time, so the
+absolute values differ from real time, and `workers` shows no CPU saturation
+(see `--time=virtual` in the crate README). In real time, a cell of
+`open-in-body` with one database instance can miss the cell completion deadline,
+and the run then stops.
 
 | Experiment | What it measures |
 | --- | --- |
@@ -76,12 +78,16 @@ pool.
 
 ### CI experiments
 
-The experiments with the tag `ci` replace the Criterion suite
-of `glassdb`. Each one is a case of the CI comparison. Except for the last one,
-each case runs one worker on one instance with warm caches. A case warms up for
-1250 ms and measures for 10 s of model time. The cases include
-`hack/perf/configs/default.toml`, which has their settings and their parts.
-Most cases use built-in parts:
+The experiments with the tags `ci/counters` and `ci/timing` replace the
+Criterion suite of `glassdb`. Each case of the CI comparison has two files:
+`<case>.toml` with the tag `ci/timing`, and `<case>-counters.toml` with the tag
+`ci/counters`. Except for the last one, each case runs one worker on one
+instance with warm caches. A case warms up for 1250 ms. The counter file
+measures for 10 s of model time, which ends before the first pass of the garbage
+collector. The timing file measures for 300 s. The counter files include
+`hack/perf/configs/default.toml`, which has their settings and their parts, and
+the timing files include `hack/perf/configs/ci-timing.toml`, which changes the
+window. Most cases use built-in parts:
 
 | Case | Shape |
 | --- | --- |
@@ -95,14 +101,39 @@ Most cases use built-in parts:
 | `rmw-shared-leaf` | Three workers that update their own key of one leaf. |
 | `shapes-shared-leaf` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time on one leaf, with `low-conflict` keys. |
 
-The CI comparison reads all cells of the experiments with the tag `ci`. It
-compares the p50 latency, the p90 latency, and the throughput of each shape,
-and the `costs` of each cell. The name of a metric is the experiment, then the
-labels of the cell if the experiment has more than one cell, then the shape if
-the cell has more than one shape, for example `shapes-shared-leaf/rw-single:
-p50Ms`. To add an experiment to the comparison, give it the tag `ci`. Each
-comparison runs each cell in up to 32 pairs of processes, so keep these
-experiments small.
+The CI comparison runs four perfbench processes, two for each revision, and then
+compares their results:
+
+```text
+perfbench --tag=ci/counters --latency-jitter=false              # each revision
+perfbench --tag=ci/timing --latency-jitter=true --runs=32       # each revision
+hack/ci/perf_report.py --base main/ --candidate pr/ --output report.md
+```
+
+`make bench` runs the two perfbench processes of one revision for the current
+tree, with the same options as CI, and prints the main metrics: the median p50,
+p90, and throughput of each shape over the runs, with the spread of one run, and
+the backend operations and coordinator rounds per transaction of each case. The
+results go to `OUT`, by default a new directory in `/tmp`. To print the summary
+of a result directory again, run `hack/ci/perf_report.py --summary DIR`.
+
+The counter run compares the `costs` of each cell. They repeat exactly, so a
+change of any count shows, and a byte count shows when it changes by more than
+1%: the size of a record with a timestamp changes by a byte with the start time
+of the process. The timing runs compare the p50 latency, the p90 latency, and
+the throughput of each shape. Each run is an independent sample of the latency
+jitter, so the report compares the 32 runs of each side with a simultaneous 95%
+interval of the change, and shows a change of 2% or more whose interval excludes
+zero. With 32 runs of 300 s, a comparison of a revision with itself gave
+intervals of at most ±0.9% for all 36 timing metrics, so an unchanged metric
+does not stay inconclusive.
+
+The name of a metric is the experiment, then the labels of the cell if the
+experiment has more than one cell, then the shape if the cell has more than one
+shape, for example `shapes-shared-leaf/rw-single: p50Ms`. To add an experiment
+to the comparison, give it the tag `ci/counters` if its counters repeat exactly
+without latency jitter, the tag `ci/timing` if its latency matters, or one file
+for each tag.
 
 ## Plotting results
 
@@ -139,8 +170,9 @@ figures go to `hack/perf/out-sweeps/`.
 ### Plotting any result file
 
 `plot_results.py` also plots single result files, such as the ones in
-`hack/aws-bench/out/` from a real S3 run. It picks the figures from the experiment in each file and
-writes them beside the file unless `--out` says otherwise:
+`hack/aws-bench/out/` from a real S3 run. It picks the figures from the
+experiment in each file and writes them beside the file unless `--out` says
+otherwise:
 
 ```bash
 uv run hack/perf/plot_results.py hack/aws-bench/out/mixed.json \
@@ -165,8 +197,8 @@ tests.
 `compare_refs.sh` uses the same comparison driver as CI. It copies the
 candidate's `glassdb-bench-scale` crate into disposable snapshots of both
 revisions, then builds each against its own engine. Both sides run the
-experiments of the candidate that have the tag `ci`. The current
-source tree is not changed.
+experiments of the candidate that have the tags `ci/counters` and `ci/timing`.
+The current source tree is not changed.
 
 If the candidate's harness does not build against the base engine, for example
 because it uses an API that the base does not have, both sides use the harness
@@ -225,18 +257,18 @@ sample count per line).
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `EXPERIMENT` | the experiments with the tag `ci` | The perfbench experiment file or directory. |
-| `CASE` | all cases | One experiment with the tag `ci`, by name, in place of `EXPERIMENT`. |
-| `SECONDS_PER_CASE` | `10` | Measured wall time of each experiment with the tag `ci`. |
+| `EXPERIMENT` | the experiments with the tag `ci/timing` | The perfbench experiment file or directory. |
+| `CASE` | all cases | One experiment with the tag `ci/timing`, by name, in place of `EXPERIMENT`. |
+| `SECONDS_PER_CASE` | `10` | Measured wall time of each experiment with the tag `ci/timing`. |
 | `OUT` | `hack/perf` | Output directory for artifacts. |
 
 ### Target
 
-The script profiles perfbench experiments, by default the experiments with
-the tag `ci`: the single transactions of one worker with
-warm caches, and four shapes at the same time on one leaf. The seed and the
-warm-up appear in the profile; use the transaction stacks to inspect measured
-work. `CASE` selects one of these experiments.
+The script profiles perfbench experiments, by default the experiments with the
+tag `ci/timing`: the single transactions of one worker with warm caches, and
+four shapes at the same time on one leaf. The seed and the warm-up appear in the
+profile; use the transaction stacks to inspect measured work. `CASE` selects one
+of these experiments.
 
 ### The in-memory caveat
 

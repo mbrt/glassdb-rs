@@ -1,0 +1,9 @@
+# A read-modify-write of one key in each of five collections.
+# The counters of `rmw-five-leaves`: one run without latency jitter, in a
+# window of 10 s.
+tags = ["ci/counters", "area/commit"]
+include = ["../configs/default.toml"]
+
+[cell]
+workload = "diag-rmw-five"
+collections = 5

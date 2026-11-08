@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 from pathlib import Path
-import shutil
 import tempfile
 import unittest
-from typing import Any
 
 from hack.ci import perf_report
 
 SHARED_LEAF = "shapes-shared-leaf"
 SHARED_LEAF_SHAPES = ("rw-single", "rw-many", "ro-single", "ro-multi")
-PAIRS = 4
+# The runs of the timing experiments of each side.
+RUNS = 4
 COUNTER_KEYS = (
     "reads",
     "writes",
@@ -77,7 +77,7 @@ def shared_leaf_cell():
     }
 
 
-def result(latency_jitter):
+def result(latency_jitter, runs):
     return {
         "schemaVersion": 3,
         "backend": "memory",
@@ -85,8 +85,11 @@ def result(latency_jitter):
         "modelTimeSpeedup": 1,
         "latencyJitter": latency_jitter,
         "experiments": [
-            {"name": cell["labels"]["case"], "runs": [{"run": 1, "cells": [cell]}]}
-            for cell in (example_cell(), shared_leaf_cell())
+            {
+                "name": make()["labels"]["case"],
+                "runs": [{"run": run, "cells": [make()]} for run in range(1, runs + 1)],
+            }
+            for make in (example_cell, shared_leaf_cell)
         ],
     }
 
@@ -96,64 +99,47 @@ class PerfReportTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.manifest: dict[str, Any] = {
-            "schemaVersion": perf_report.MANIFEST_VERSION,
-            "checkpoints": [PAIRS],
-            "completedPairs": PAIRS,
-            "latencyJitter": True,
-        }
-        self.write_manifest()
         for side in ("main", "pr"):
-            for repetition in range(1, PAIRS + 1):
-                directory = self.directory(side, repetition)
-                # The counters come from a process without latency jitter.
-                self.write(directory / "timing.json", result(True))
-                self.write(directory / "counters.json", result(False))
-
-    def directory(self, side, repetition):
-        return self.root / side / f"{repetition:02d}"
+            # The counters come from one run without latency jitter.
+            self.write(self.root / side / "timing.json", result(True, RUNS))
+            self.write(self.root / side / "counters.json", result(False, 1))
 
     @staticmethod
     def write(path, value):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value))
 
-    def write_manifest(self, **changes):
-        self.manifest.update(changes)
-        self.write(self.root / "manifest.json", self.manifest)
-
-    def extend(self, pairs):
-        """Add repetitions that repeat the last one."""
-        for side in ("main", "pr"):
-            for repetition in range(PAIRS + 1, pairs + 1):
-                shutil.copytree(
-                    self.directory(side, PAIRS), self.directory(side, repetition)
-                )
-
-    def update(self, kind, change, *, sides=("pr",), repetitions=None):
-        """Change the result file `kind` of repetitions, by default all of them."""
+    def update(self, kind, change, *, sides=("pr",)):
+        """Change the result file `kind` of `sides`."""
         for side in sides:
-            for repetition in repetitions or range(1, PAIRS + 1):
-                path = self.directory(side, repetition) / f"{kind}.json"
-                value = json.loads(path.read_text())
-                change(value)
-                self.write(path, value)
+            path = self.root / side / f"{kind}.json"
+            value = json.loads(path.read_text())
+            change(value)
+            self.write(path, value)
 
-    def update_cell(self, kind, case, change, **options):
+    def update_cell(self, kind, case, change, *, runs=None, **options):
+        """Change the cell of `case` in `runs`, by default in all of them."""
+
         def apply(value):
             (experiment,) = [e for e in value["experiments"] if e["name"] == case]
-            change(experiment["runs"][0]["cells"][0])
+            for run in experiment["runs"]:
+                if runs is None or run["run"] in runs:
+                    change(run["cells"][0])
 
         self.update(kind, apply, **options)
 
-    def remove_cell(self, kind, case, **options):
+    def remove_cell(self, kind, case, *, runs, **options):
+        """Remove the cell of `case` from `runs`."""
+
         def apply(value):
-            experiments = value["experiments"]
-            value["experiments"] = [e for e in experiments if e["name"] != case]
+            (experiment,) = [e for e in value["experiments"] if e["name"] == case]
+            for run in experiment["runs"]:
+                if run["run"] in runs:
+                    run["cells"] = []
 
         self.update(kind, apply, **options)
 
-    def set_latency(self, repetition, before, after):
+    def set_latency(self, run, before, after):
         for side, latency in (("main", before), ("pr", after)):
             self.update_cell(
                 "timing",
@@ -161,22 +147,24 @@ class PerfReportTest(unittest.TestCase):
                 lambda cell, latency=latency: cell.update(
                     shapes=example_cell(latency)["shapes"]
                 ),
+                runs=[run],
                 sides=(side,),
-                repetitions=[repetition],
             )
 
     def set_latencies(self, after, before=100):
-        for repetition, value in enumerate(after, 1):
-            self.set_latency(repetition, before, value)
+        for run, value in enumerate(after, 1):
+            self.set_latency(run, before, value)
 
     def report(self):
-        return perf_report.render_report(self.root, "base", "candidate")
+        return perf_report.render_report(
+            self.root / "main", self.root / "pr", "base", "candidate"
+        )
 
     def row(self, report, prefix):
         return next(r for r in report.splitlines() if r.startswith(prefix))
 
-    def test_process_variation_prevents_a_regression_claim(self):
-        # Every pair is slower, but variation between pairs leaves the
+    def test_run_variation_prevents_a_regression_claim(self):
+        # Every run is slower, but the variation between runs leaves the
         # direction unresolved.
         self.set_latencies((101, 112, 109, 104))
         report = self.report()
@@ -208,39 +196,28 @@ class PerfReportTest(unittest.TestCase):
         self.assertIn("No meaningful changes detected", report)
         self.assertNotIn("regressed", report)
 
-    def test_process_noise_control_retains_sensitivity_in_both_directions(self):
-        # Paired log changes (%) from 32 unchanged warm-external-read runs.
-        # Keep the observed process noise when adding known 3% effects.
+    def test_eight_runs_resolve_a_3_percent_change_at_the_noise_of_a_p90(self):
+        # Log changes (%) from unchanged processes, scaled to a spread of 0.9%
+        # in one run: the p90 of `rmw-shared-leaf` in one run of 300 s, the
+        # noisiest metric of the CI experiments.
         noise = (
             -0.413, -0.332, 0.237, -0.763, 0.440, -0.267, -0.573, -1.435,
             -0.066, 0.013, -0.254, 2.728, 0.252, -1.897, -0.230, 1.276,
-            -1.344, -0.727, 1.832, -1.678, 1.344, -0.332, -1.084, 0.019,
-            1.916, -1.892, 0.239, -0.314, 2.757, -1.035, 1.293, -1.925,
         )
+        scale = 0.9 / 1.043
         for effect in (0, -0.03, 0.03):
             with self.subTest(effect=effect):
                 base = perf_report.Metric("ns", "time")
                 candidate = perf_report.Metric("ns", "time")
-                for count, change in enumerate(noise, 1):
-                    base.add(100)
-                    candidate.add(100 * (1 + effect) * math.exp(change / 100))
-                    if count in (8, 16, 32):
-                        comparison = perf_report.compare(base, candidate, family_size=60)
-                        if not comparison.uncertain:
-                            break
-                self.assertFalse(comparison.uncertain)
+                for before, after in zip(noise[:8], noise[8:]):
+                    base.add(100 * math.exp(scale * before / 100))
+                    candidate.add(100 * (1 + effect) * math.exp(scale * after / 100))
+                # About 12 shapes with 3 metrics each.
+                comparison = perf_report.compare(base, candidate, family_size=36)
                 self.assertEqual(comparison.report, effect != 0)
                 if effect:
                     assert comparison.relative is not None
                     self.assertGreater(comparison.relative * effect, 0)
-
-    def test_paired_comparison_cancels_shared_host_drift(self):
-        for repetition, before in enumerate((100, 200, 400, 800), 1):
-            self.set_latency(repetition, before, before * 1.1)
-        report = self.report()
-        self.assertIn("+10.0%", report)
-        self.assertIn("regressed", report)
-        self.assertNotIn("inconclusive", report)
 
     def test_small_estimate_with_large_uncertainty_is_not_unchanged(self):
         self.set_latencies((99, 103, 106, 100))
@@ -262,10 +239,10 @@ class PerfReportTest(unittest.TestCase):
     def test_missing_metrics_do_not_reduce_multiple_comparison_correction(self):
         self.set_latencies((102.0, 102.1, 102.2, 102.1))
         before = self.row(self.report(), "| example: p50Ms")
-        self.remove_cell("timing", SHARED_LEAF, repetitions=[PAIRS])
+        self.remove_cell("timing", SHARED_LEAF, runs=[RUNS])
         report = self.report()
         self.assertEqual(self.row(report, "| example: p50Ms"), before)
-        self.assertIn("incomplete paired measurements", report)
+        self.assertIn("incomplete measurements", report)
 
     def test_student_t_critical_values_match_reference_values(self):
         # NIST's two-sided 95% values, independent of the CDF implementation.
@@ -288,60 +265,42 @@ class PerfReportTest(unittest.TestCase):
                 perf_report.t_critical(2, family_size), expected, places=8
             )
 
-    def test_planned_checks_protect_against_a_false_early_decision(self):
-        self.extend(8)
-        self.write_manifest(checkpoints=[8], completedPairs=8)
-        self.set_latencies((101.6, 105.6) * 4)
-        self.assertIn("regressed", self.report())
-        # Even unused future checks consume confidence. Reusing a fixed-sample
-        # interval here would let this first look stop the benchmark too early.
-        self.write_manifest(checkpoints=[8, 16, 32])
-        report = self.report()
-        self.assertNotIn("regressed", report)
-        self.assertIn("example: p50Ms: noisy or inconclusive", report)
-        self.assertFalse(perf_report.analyze(self.root, self.manifest).resolved)
+    def test_the_interval_of_many_runs_uses_their_degrees_of_freedom(self):
+        # 32 runs on each side give about 62 degrees of freedom, so a cap at
+        # 30 would make the interval about 2% wider than needed.
+        base = perf_report.Metric("ns", "time")
+        candidate = perf_report.Metric("ns", "time")
+        for run in range(32):
+            base.add(100 + run % 2)
+            candidate.add(103 + run % 2)
+        comparison = perf_report.compare(base, candidate)
+        a = [math.log(v) for v in base.values]
+        b = [math.log(v) for v in candidate.values]
+        standard_error = math.sqrt(
+            (statistics.variance(a) + statistics.variance(b)) / 32
+        )
+        mean = statistics.mean(b) - statistics.mean(a)
+        assert comparison.interval is not None
+        lower = math.expm1(mean - perf_report.t_critical(62, 1) * standard_error)
+        # The Welch degrees can truncate to 61; a cap at 30 moves the bound
+        # by about 5e-5.
+        self.assertAlmostEqual(comparison.interval[0], lower, delta=1e-5)
 
-    def test_samples_between_checkpoints_cannot_change_the_verdict(self):
-        self.write_manifest(checkpoints=[4, 8])
-        before = perf_report.analyze(self.root, self.manifest)
-        self.extend(6)
-        for repetition in (5, 6):
-            self.set_latency(repetition, 100, 1000)
-        self.write_manifest(completedPairs=6)
-        after = perf_report.analyze(self.root, self.manifest)
-        self.assertEqual(after.metrics, before.metrics)
-        self.assertEqual(after.pairs, 4)
-        report = self.report()
-        self.assertIn("using checkpoint at 4 pairs", report)
-        self.assertNotIn("regressed", report)
+    def test_one_run_of_a_timing_metric_is_inconclusive(self):
+        base = perf_report.Metric("ns", "time")
+        candidate = perf_report.Metric("ns", "time")
+        base.add(100)
+        candidate.add(150)
+        comparison = perf_report.compare(base, candidate)
+        self.assertFalse(comparison.report)
+        self.assertTrue(comparison.uncertain)
 
-    def test_missing_adaptive_measurements_do_not_reduce_the_correction(self):
-        self.write_manifest(checkpoints=[4, 8])
-        self.set_latencies((102, 102, 102, 102))
-        before = self.row(self.report(), "| example: p50Ms")
-        self.remove_cell("timing", SHARED_LEAF, repetitions=[PAIRS])
-        report = self.report()
-        self.assertEqual(self.row(report, "| example: p50Ms"), before)
-        self.assertIn("incomplete paired measurements", report)
+    def test_experiments_with_other_runs_are_invalid(self):
+        def drop(value):
+            value["experiments"][0]["runs"].pop()
 
-    def test_invalid_checkpoint_plans_are_rejected(self):
-        self.write_manifest(checkpoints=[4, 8])
-        for changes in (
-            {"checkpoints": []},
-            {"checkpoints": [3, 8]},
-            {"checkpoints": [4, 4]},
-            {"checkpoints": [8, 4]},
-            {"checkpoints": [False, 8]},
-            {"completedPairs": -1},
-            {"completedPairs": 9},
-            {"completedPairs": {"example": 4}},
-            {"latencyJitter": "yes"},
-            {"schemaVersion": 2},
-        ):
-            with self.subTest(changes=changes):
-                self.write(self.root / "manifest.json", {**self.manifest, **changes})
-                with self.assertRaises(perf_report.ReportError):
-                    self.report()
+        self.update("timing", drop)
+        self.assertIn("other runs than the other experiments", self.report())
 
     def test_unchanged_rows_are_hidden(self):
         report = self.report()
@@ -358,12 +317,12 @@ class PerfReportTest(unittest.TestCase):
         self.assertNotIn("meanMs", report)
 
     def test_more_transactions_do_not_hide_variation_between_shared_leaf_runs(self):
-        for repetition, p50 in enumerate((10.1, 11.2, 10.9, 10.4), 1):
+        for run, p50 in enumerate((10.1, 11.2, 10.9, 10.4), 1):
             self.update_cell(
                 "timing",
                 SHARED_LEAF,
                 lambda cell, p50=p50: cell["shapes"][0].update(p50Ms=p50),
-                repetitions=[repetition],
+                runs=[run],
             )
         before = self.report()
         self.assertIn(f"{SHARED_LEAF}/rw-single: p50Ms: noisy or inconclusive", before)
@@ -381,11 +340,11 @@ class PerfReportTest(unittest.TestCase):
         )
         report = self.report()
         self.assertIn("invalid latency measurements", report)
-        self.assertIn("incomplete paired measurements", report)
+        self.assertIn("incomplete measurements", report)
         self.assertNotIn("No meaningful changes detected", report)
 
     def test_every_case_is_compared_by_median_tail_and_throughput(self):
-        self.set_latencies((130,) * PAIRS)
+        self.set_latencies((130,) * RUNS)
         report = self.report()
         for metric in ("p50Ms", "p90Ms", "txPerSec"):
             self.assertIn("regressed", self.row(report, f"| example: {metric}"))
@@ -412,7 +371,7 @@ class PerfReportTest(unittest.TestCase):
         )
         self.assertNotIn("| Metric", self.report())
 
-    def test_repeatable_cost_change_from_zero_is_visible(self):
+    def test_cost_change_from_zero_is_visible(self):
         self.update_cell(
             "counters",
             "example",
@@ -422,51 +381,31 @@ class PerfReportTest(unittest.TestCase):
         self.assertIn("example/shutdown: writeBodyBytes", report)
         self.assertIn("new from zero", report)
 
-    def test_small_overlapping_cost_variation_is_not_a_warning(self):
-        base = perf_report.Metric("bytes/tx", "cost")
-        candidate = perf_report.Metric("bytes/tx", "cost")
-        for before, after in zip((1854.5, 1854.5, 1855.5), (1854.5, 1855.5, 1855.5)):
-            base.add(before)
-            candidate.add(after)
-        comparison = perf_report.compare(base, candidate)
-        self.assertFalse(comparison.report)
-        self.assertFalse(comparison.uncertain)
-
-    def test_small_repeatable_cost_change_remains_visible(self):
-        base = perf_report.Metric("bytes/tx", "cost")
-        candidate = perf_report.Metric("bytes/tx", "cost")
-        for _ in range(3):
-            base.add(1854.5)
-            candidate.add(1855.5)
+    def test_any_count_change_is_visible(self):
+        base = perf_report.Metric("count/tx", "cost")
+        candidate = perf_report.Metric("count/tx", "cost")
+        base.add(1.000)
+        candidate.add(1.001)
         comparison = perf_report.compare(base, candidate)
         self.assertTrue(comparison.report)
         self.assertFalse(comparison.uncertain)
 
-    def test_large_cost_variation_remains_inconclusive(self):
-        base = perf_report.Metric("count/tx", "cost")
-        candidate = perf_report.Metric("count/tx", "cost")
-        for before, after in zip((1, 2, 1), (2, 1, 2)):
-            base.add(before)
-            candidate.add(after)
-        comparison = perf_report.compare(base, candidate)
-        self.assertFalse(comparison.report)
-        self.assertTrue(comparison.uncertain)
-
-    def test_moderate_overlapping_cost_increase_remains_inconclusive(self):
-        base = perf_report.Metric("bytes/tx", "cost")
-        candidate = perf_report.Metric("bytes/tx", "cost")
-        for before, after in zip((100, 100, 109), (109, 109, 109)):
-            base.add(before)
-            candidate.add(after)
-        comparison = perf_report.compare(base, candidate)
-        self.assertFalse(comparison.report)
-        self.assertTrue(comparison.uncertain)
+    def test_a_byte_of_a_timestamp_is_not_a_byte_change(self):
+        for after, reported in ((1855.5, False), (1880.0, True)):
+            with self.subTest(after=after):
+                base = perf_report.Metric("bytes/tx", "cost")
+                candidate = perf_report.Metric("bytes/tx", "cost")
+                base.add(1854.5)
+                candidate.add(after)
+                comparison = perf_report.compare(base, candidate)
+                self.assertEqual(comparison.report, reported)
+                self.assertFalse(comparison.uncertain)
 
     def test_missing_run_is_not_reported_as_unchanged(self):
-        self.remove_cell("timing", SHARED_LEAF, repetitions=[PAIRS])
+        self.remove_cell("timing", SHARED_LEAF, runs=[RUNS])
         report = self.report()
         self.assertIn("Measurement warnings", report)
-        self.assertIn("incomplete paired measurements", report)
+        self.assertIn("incomplete measurements", report)
 
     def test_an_experiment_of_one_side_is_not_compared(self):
         def rename(value):
@@ -474,36 +413,39 @@ class PerfReportTest(unittest.TestCase):
 
         self.update("timing", rename)
         report = self.report()
-        self.assertIn("example: p50Ms: incomplete paired measurements", report)
-        self.assertIn("other: p50Ms: incomplete paired measurements", report)
+        self.assertIn("example: p50Ms: incomplete measurements", report)
+        self.assertIn("other: p50Ms: incomplete measurements", report)
 
     def test_a_cell_of_an_experiment_with_several_cells_is_named_by_its_labels(self):
         def split(value):
             (experiment,) = [e for e in value["experiments"] if e["name"] == "example"]
-            (cell,) = experiment["runs"][0]["cells"]
-            experiment["runs"][0]["cells"] = [
-                {**cell, "labels": {"size": size, "keys": "keys1"}}
-                for size in ("small", "large")
-            ]
+            for run in experiment["runs"]:
+                (cell,) = run["cells"]
+                run["cells"] = [
+                    {**cell, "labels": {"size": size, "keys": "keys1"}}
+                    for size in ("small", "large")
+                ]
 
         self.update("timing", split, sides=("main", "pr"))
         self.update("counters", split, sides=("main", "pr"))
-        self.update_cell(
+        self.update(
             "timing",
-            "example",
-            lambda cell: cell.update(shapes=example_cell(130)["shapes"]),
+            lambda value: [
+                run["cells"][0].update(shapes=example_cell(130)["shapes"])
+                for run in value["experiments"][0]["runs"]
+            ],
         )
         report = self.report()
         self.assertIn("regressed", self.row(report, "| example/small/keys1: p50Ms"))
         self.assertNotIn("| example/large/keys1: p50Ms", report)
-        metrics, _ = perf_report.read_measurement(self.directory("pr", 1), latency_jitter=True)
+        metrics, _ = perf_report.read_side(self.root / "pr")
         self.assertIn("example/large/keys1/workload: reads", metrics)
 
     def test_a_failed_cell_is_a_warning(self):
         self.update_cell("counters", SHARED_LEAF, lambda cell: cell.update(failures=1))
         report = self.report()
-        self.assertIn(f"{SHARED_LEAF}: cell failed", report)
-        self.assertIn("incomplete paired measurements", report)
+        self.assertIn(f"{SHARED_LEAF}/run 1: cell failed", report)
+        self.assertIn("incomplete measurements", report)
 
     def test_invalid_numbers_and_low_sample_counts_are_warnings(self):
         self.update_cell(
@@ -520,12 +462,12 @@ class PerfReportTest(unittest.TestCase):
     def test_missing_or_malformed_results_are_warnings(self):
         for contents in ("", "invalid JSON", "{}"):
             with self.subTest(contents=contents):
-                (self.directory("pr", PAIRS) / "timing.json").write_text(contents)
+                (self.root / "pr" / "timing.json").write_text(contents)
                 self.assertIn("invalid latency measurement", self.report())
 
     def test_models_must_match_before_latency_is_compared(self):
-        directory = self.directory("pr", 1)
-        metrics, warnings = perf_report.read_measurement(directory, latency_jitter=True)
+        directory = self.root / "pr"
+        metrics, warnings = perf_report.read_side(directory)
         self.assertFalse(warnings)
         self.assertIn("example: p50Ms", metrics)
         self.assertIn("example/workload: reads", metrics)
@@ -538,31 +480,39 @@ class PerfReportTest(unittest.TestCase):
             ("timeMode", None),
             ("schemaVersion", 1),
             ("schemaVersion", 2),
+            # The latency needs the jitter of the provider.
+            ("latencyJitter", False),
         ):
-            with self.subTest(key=key):
-                self.update("timing", lambda v: v.update({key: value}), repetitions=[1])
-                metrics, warnings = perf_report.read_measurement(
-                    directory, latency_jitter=True
-                )
+            with self.subTest(key=key, value=value):
+                self.update("timing", lambda v: v.update({key: value}))
+                metrics, warnings = perf_report.read_side(directory)
                 # The counters come from another file, and stay valid.
                 self.assertNotIn("example: p50Ms", metrics)
                 self.assertIn("example/workload: reads", metrics)
                 self.assertIn("invalid latency measurement", warnings[0])
-                self.write(directory / "timing.json", result(True))
-        metrics, warnings = perf_report.read_measurement(directory, latency_jitter=False)
-        self.assertNotIn("example: p50Ms", metrics)
-        self.assertIn("latency profile", warnings[0])
+                self.write(directory / "timing.json", result(True, RUNS))
 
     def test_counters_of_a_process_with_latency_jitter_are_not_compared(self):
-        self.update(
-            "counters", lambda v: v.update(latencyJitter=True), repetitions=[1]
-        )
-        metrics, warnings = perf_report.read_measurement(
-            self.directory("pr", 1), latency_jitter=True
-        )
+        self.update("counters", lambda v: v.update(latencyJitter=True))
+        metrics, warnings = perf_report.read_side(self.root / "pr")
         self.assertIn("example: p50Ms", metrics)
         self.assertNotIn("example/workload: reads", metrics)
         self.assertIn("invalid counter measurement", warnings[0])
+
+    def test_a_summary_shows_the_latency_and_the_counters_of_one_side(self):
+        self.set_latencies((100, 110, 120, 130))
+        self.update_cell(
+            "counters",
+            "example",
+            lambda cell: cell["costs"]["combined"].update(reads=2, coordinatorRounds=1),
+        )
+        summary = perf_report.summarize(self.root / "pr")
+        self.assertIn("median of 4 runs", summary)
+        # The median of the runs, and the spread of one run.
+        self.assertRegex(self.row(summary, "| example |"), r"\| 115\.00 ±\d+\.\d% \|")
+        self.assertIn(f"| {SHARED_LEAF}/rw-single | 10.00 ±0.0% |", summary)
+        self.assertIn("| example | 2.000 | 0.000 | 0.000 | 1.000 |", summary)
+        self.assertNotIn("Measurement warnings", summary)
 
     def test_model_mismatch_is_not_compared(self):
         self.update("timing", lambda value: value.update(modelTimeSpeedup=5))

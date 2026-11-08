@@ -1,18 +1,5 @@
 # Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time
 # on one leaf, with `low-conflict` keys.
-tags = ["ci", "area/mixed"]
-include = ["../configs/default.toml", "../configs/common-workloads.toml"]
-
-[pools.wide]
-keys = 128
-
-[seed.database]
-leaf-max-entries = 256
-
-[cell]
-workload = "low-conflict"
-databases = 1
-workers = 1
-
-[cell.database]
-leaf-max-entries = 256
+# The CI comparison runs it 32 times with latency jitter.
+tags = ["ci/timing", "area/mixed"]
+include = ["../configs/ci-timing.toml", "../configs/shapes-shared-leaf.toml"]

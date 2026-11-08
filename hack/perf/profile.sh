@@ -11,11 +11,12 @@
 #
 # Tunables (env):
 #   EXPERIMENT        perfbench experiment file or directory (default: the
-#                     experiments of hack/perf/experiments with the tag `ci`)
-#   CASE              one experiment of hack/perf/experiments with the tag `ci`,
-#                     in place of EXPERIMENT (default: all)
-#   SECONDS_PER_CASE  measured wall time of each experiment with the tag `ci`
-#                     (default 10)
+#                     experiments of hack/perf/experiments with the tag
+#                     `ci/timing`)
+#   CASE              one experiment of hack/perf/experiments with the tag
+#                     `ci/timing`, in place of EXPERIMENT (default: all)
+#   SECONDS_PER_CASE  measured wall time of each experiment with the tag
+#                     `ci/timing` (default 10)
 #   OUT               output directory for artifacts (default hack/perf)
 
 set -euo pipefail
@@ -28,12 +29,12 @@ CASE="${CASE:-}"
 # The CI experiments have a fixed length, which SECONDS_PER_CASE replaces.
 ci=false
 if [[ -n "$CASE" ]]; then
-	selection=(--experiment="$EXPERIMENTS/$CASE.toml" --tag=ci)
+	selection=(--experiment="$EXPERIMENTS/$CASE.toml" --tag=ci/timing)
 	ci=true
 elif [[ -n "$EXPERIMENT" ]]; then
 	selection=(--experiment="$EXPERIMENT")
 else
-	selection=(--experiment="$EXPERIMENTS" --tag=ci)
+	selection=(--experiment="$EXPERIMENTS" --tag=ci/timing)
 	ci=true
 fi
 SECONDS_PER_CASE="${SECONDS_PER_CASE:-10}"

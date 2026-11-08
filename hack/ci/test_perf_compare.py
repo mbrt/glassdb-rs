@@ -66,10 +66,11 @@ class HarnessTest(unittest.TestCase):
             output = Path(directory).resolve() / "out"
             manifest = perf_compare.prepare(Path(directory), output, "main", None)
             experiments = output / "harness" / perf_compare.EXPERIMENTS
-            for arguments in (manifest["timingArgs"], manifest["counterArgs"]):
-                self.assertEqual(
-                    arguments[-2:], [f"--experiment={experiments}", "--tag=ci"]
-                )
+            for arguments, tag in (
+                (manifest["timingArgs"], "--tag=ci/timing"),
+                (manifest["counterArgs"], "--tag=ci/counters"),
+            ):
+                self.assertEqual(arguments[-2:], [f"--experiment={experiments}", tag])
             experiment = (experiments / "read-warm.toml").read_text()
         return built, manifest, experiment
 
@@ -158,7 +159,7 @@ class MeasurementTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.fixture = self.root / "benchmark"
-        # A real subprocess exercises artifacts and pair order.
+        # A real subprocess exercises the artifacts and the order of the processes.
         self.fixture.write_text(f"#!{sys.executable}\n" + BENCHMARK_FIXTURE)
         self.fixture.chmod(0o755)
         self.configure()
@@ -166,46 +167,44 @@ class MeasurementTest(unittest.TestCase):
     def configure(self, **settings):
         (self.root / "settings.json").write_text(json.dumps(settings))
 
-    def manifest(self, cases=("a", "b"), checkpoints=(4, 8, 12)):
+    def manifest(self, cases=("a", "b")):
         (self.root / "cases.json").write_text(json.dumps(cases))
         return {
-            "schemaVersion": perf_compare.perf_report.MANIFEST_VERSION,
+            "schemaVersion": perf_compare.MANIFEST_VERSION,
             "base": "base",
             "candidate": "candidate",
-            "checkpoints": list(checkpoints),
-            "completedPairs": 0,
-            "latencyJitter": True,
             "processTimeoutSeconds": 30,
             "warnings": [],
-            "timingArgs": ["--experiment=default"],
-            "counterArgs": ["--latency-jitter=false", "--experiment=default"],
+            "timingArgs": ["--latency-jitter=true", "--runs=4", "--experiment=default"],
+            "counterArgs": ["--latency-jitter=false", "--runs=1", "--experiment=default"],
             **{side: {"perfbench": str(self.fixture)} for side in ("main", "pr")},
         }
 
-    def order(self, kind="timing"):
-        """Return the processes of one kind in the order they started."""
+    def order(self):
+        """Return the processes, as `[kind, side]`, in the order they started."""
         path = self.root / "order.jsonl"
         if not path.exists():
             return []
-        rows = [json.loads(line) for line in path.read_text().splitlines()]
-        return [row for row in rows if kind is None or row[1] == kind]
+        return [json.loads(line) for line in path.read_text().splitlines()]
 
-    def short_timeout_for(self, side, repetition):
+    def short_timeout_for(self, side, kind):
         original = subprocess.run
 
         def run(command, **kwargs):
             self.assertEqual(kwargs["timeout"], 30)
             # Keep normal subprocesses independent of host speed. Only the
             # selected stalled process gets the short timeout used by the test.
-            if kwargs["cwd"] == self.root / side / f"{repetition:02d}":
+            if kwargs["cwd"] == self.root / side and f"{kind}.json" in command[1]:
                 kwargs["timeout"] = 0.05
             return original(command, **kwargs)
 
         return mock.patch.object(perf_compare.subprocess, "run", side_effect=run)
 
-    def read(self, side, repetition, kind):
-        path = self.root / side / f"{repetition:02d}" / f"{kind}.json"
-        return json.loads(path.read_text())
+    def read(self, side, kind):
+        return json.loads((self.root / side / f"{kind}.json").read_text())
+
+    def report(self):
+        return (self.root / "report.md").read_text()
 
     def test_invalid_process_timeout_does_not_start_measurements(self):
         for timeout in (None, 0, -1, True, float("inf"), float("nan")):
@@ -218,167 +217,138 @@ class MeasurementTest(unittest.TestCase):
                     perf_compare.measure(self.root, manifest)
                 self.assertFalse((self.root / "main").exists())
                 self.assertFalse((self.root / "pr").exists())
-                self.assertFalse(self.order(kind=None))
+                self.assertFalse(self.order())
 
-    def test_fixed_latency_measurements_use_the_requested_profile(self):
+    def test_each_side_measures_counters_and_then_the_timing_runs(self):
         manifest = self.manifest(cases=("a",))
-        manifest.update(
-            timingArgs=["--latency-jitter=false", "--experiment=default"],
-            latencyJitter=False,
+        perf_compare.measure(self.root, manifest)
+        self.assertFalse(manifest["warnings"])
+        self.assertEqual(
+            self.order(),
+            [["counters", "main"], ["timing", "main"], ["counters", "pr"], ["timing", "pr"]],
         )
-        perf_compare.measure(self.root, manifest)
-        self.assertFalse(manifest["warnings"])
         for side in ("main", "pr"):
-            self.assertIs(self.read(side, 1, "timing")["latencyJitter"], False)
-
-    def test_each_side_measures_latency_and_then_counters_without_jitter(self):
-        manifest = self.manifest(cases=("a",))
-        perf_compare.measure(self.root, manifest)
-        self.assertFalse(manifest["warnings"])
-        for side in ("main", "pr"):
-            timing, counters = self.read(side, 1, "timing"), self.read(side, 1, "counters")
+            timing, counters = self.read(side, "timing"), self.read(side, "counters")
             self.assertIs(timing["latencyJitter"], True)
             self.assertIs(counters["latencyJitter"], False)
-            # One process measures every experiment.
-            for result in (timing, counters):
-                names = [experiment["name"] for experiment in result["experiments"]]
-                self.assertEqual(names, ["a", "shapes-shared-leaf"])
-        kinds = [row[1] for row in self.order(kind=None)[:4]]
-        self.assertEqual(kinds, ["timing", "counters"] * 2)
+            self.assertEqual(len(timing["experiments"][0]["runs"]), 4)
+            self.assertEqual(len(counters["experiments"][0]["runs"]), 1)
+        self.assertIn("No meaningful changes detected", self.report())
+        self.assertIn("cpuModel", manifest)
 
     def test_the_default_plan_measures_on_virtual_time(self):
         for arguments in (perf_compare.TIMING_ARGS, perf_compare.COUNTER_ARGS):
             self.assertIn("--time=virtual", arguments)
         self.assertIn("--latency-jitter=true", perf_compare.TIMING_ARGS)
+        self.assertIn(f"--runs={perf_compare.TIMING_RUNS}", perf_compare.TIMING_ARGS)
         self.assertIn("--latency-jitter=false", perf_compare.COUNTER_ARGS)
+        self.assertIn("--runs=1", perf_compare.COUNTER_ARGS)
+        self.assertEqual(perf_compare.TIMING_RUNS, 32)
 
-    def test_wrong_latency_profile_fails_before_counting_the_pair(self):
-        self.configure(latencyJitter=True)
-        manifest = self.manifest(cases=("a",))
-        manifest.update(
-            timingArgs=["--latency-jitter=false", "--experiment=default"],
-            latencyJitter=False,
-        )
-        with self.assertRaisesRegex(
-            perf_compare.perf_report.ReportError, "latency profile"
-        ):
-            perf_compare.measure(self.root, manifest)
-        self.assertEqual(manifest["completedPairs"], 0)
-
-    def test_every_benchmark_gets_the_pairs_that_the_least_resolved_one_needs(self):
-        self.configure(factors={"b": [1.028, 1.052], "shapes-shared-leaf": [1.028, 1.052]})
-        manifest = self.manifest()
-        perf_compare.measure(self.root, manifest)
-        self.assertEqual(manifest["completedPairs"], 8)
-        order = self.order()
-        self.assertEqual([row[0] for row in order[::2]], list(range(1, 9)))
-        # The sides alternate which one starts a pair.
-        for repetition in range(1, 9):
-            pair = [row for row in order if row[0] == repetition]
-            self.assertEqual(
-                [row[2] for row in pair],
-                ["main", "pr"] if repetition % 2 else ["pr", "main"],
-            )
-        report = (self.root / "report.md").read_text()
-        self.assertIn("regressed", report)
-        self.assertNotIn("Measurement warnings", report)
-        self.assertIn("cpuModel", manifest)
-        with self.assertRaises(ValueError):
-            perf_compare.measure(self.root, manifest)
-        self.assertEqual(self.order(), order)
-        with self.assertRaises(FileExistsError):
-            perf_compare.measure(self.root, self.manifest())
-
-    def test_clear_changes_and_small_effects_stop_at_the_first_checkpoint(self):
-        self.configure(factors={"a": [1.024], "b": [0.970]})
-        manifest = self.manifest()
-        perf_compare.measure(self.root, manifest)
-        self.assertEqual(manifest["completedPairs"], 4)
-        report = (self.root / "report.md").read_text()
+    def test_clear_changes_are_reported_in_both_directions(self):
+        self.configure(factors={"a": [1.10, 1.12], "b": [0.88, 0.90]})
+        perf_compare.measure(self.root, self.manifest())
+        report = self.report()
         self.assertIn("regressed", report)
         self.assertIn("improved", report)
         self.assertNotIn("Measurement warnings", report)
 
-    def test_unresolved_work_reaches_32_pairs_without_a_shared_deadline(self):
-        self.configure(factors={"a": [0.8, 1.2], "shapes-shared-leaf": [0.8, 1.2]})
-        manifest = self.manifest(cases=("a",), checkpoints=(8, 16, 32))
-        # Simulate a minute of total elapsed time per completed process. Each
-        # real subprocess still completes well within its own timeout.
-        with mock.patch.object(
-            perf_compare.time,
-            "monotonic",
-            side_effect=lambda: 60 * len(self.order(kind=None)),
-        ):
-            perf_compare.measure(self.root, manifest)
-        self.assertEqual(manifest["completedPairs"], 32)
-        self.assertGreater(manifest["runtimeSeconds"], 840)
-        self.assertFalse(manifest["warnings"])
-        report = (self.root / "report.md").read_text()
+    def test_variation_between_runs_is_inconclusive(self):
+        self.configure(factors={"a": [0.8, 1.2]})
+        perf_compare.measure(self.root, self.manifest(cases=("a",)))
+        report = self.report()
         self.assertIn("noisy or inconclusive", report)
-        self.assertNotIn("using checkpoint", report)
-        self.assertEqual(
-            perf_compare.perf_report.analyze(self.root, manifest).pairs, 32
-        )
-
-    def test_stalled_process_fails_and_preserves_the_last_checkpoint(self):
-        self.configure(factors={"a": [0.8, 1.2]}, hangAt=[6, "timing", "main"])
-        manifest = self.manifest(cases=("a",), checkpoints=(4, 8))
-        with self.short_timeout_for("main", 6):
-            with self.assertRaises(subprocess.TimeoutExpired):
-                perf_compare.measure(self.root, manifest)
-        self.assertEqual(manifest["completedPairs"], 5)
-        report = (self.root / "report.md").read_text()
-        self.assertIn("Benchmark process timed out", report)
-        self.assertIn("using checkpoint at 4 pairs", report)
-        self.assertIn("noisy or inconclusive", report)
-        self.assertNotIn("incomplete paired measurements", report)
-
-    def test_stalled_first_process_does_not_claim_no_change(self):
-        self.configure(hangAt=[1, "timing", "main"])
-        manifest = self.manifest(cases=("a",))
-        with self.short_timeout_for("main", 1):
-            with self.assertRaises(subprocess.TimeoutExpired):
-                perf_compare.measure(self.root, manifest)
-        self.assertEqual(manifest["completedPairs"], 0)
-        report = (self.root / "report.md").read_text()
-        self.assertIn("no completed checkpoint", report)
         self.assertNotIn("No meaningful changes detected", report)
 
-    def test_invalid_artifacts_between_checkpoints_fail_before_a_later_timeout(self):
-        self.configure(
-            factors={"a": [0.8, 1.2]},
-            badCostAt=[5, "a", "pr"],
-            hangAt=[6, "timing", "main"],
-        )
-        manifest = self.manifest(cases=("a",), checkpoints=(4, 8))
-        with self.short_timeout_for("main", 6):
-            with self.assertRaises(perf_compare.perf_report.ReportError):
-                perf_compare.measure(self.root, manifest)
-        self.assertEqual(manifest["completedPairs"], 4)
-        report = (self.root / "report.md").read_text()
-        self.assertIn("Measurement failed", report)
-        self.assertIn("invalid cost measurements", report)
-        self.assertNotIn("Benchmark process timed out", report)
+    def test_a_second_measurement_needs_a_new_directory(self):
+        perf_compare.measure(self.root, self.manifest(cases=("a",)))
+        order = self.order()
+        with self.assertRaises(FileExistsError):
+            perf_compare.measure(self.root, self.manifest(cases=("a",)))
+        self.assertEqual(self.order(), order)
 
-    def test_malformed_cost_records_preserve_a_failure_report(self):
-        self.configure(costRecord={})
-        manifest = self.manifest(cases=("a",))
-        with self.assertRaises(perf_compare.perf_report.ReportError):
+    def test_an_unknown_manifest_is_rejected(self):
+        manifest = self.manifest()
+        manifest["schemaVersion"] = 4
+        with self.assertRaises(ValueError):
             perf_compare.measure(self.root, manifest)
-        saved = json.loads((self.root / "manifest.json").read_text())
-        self.assertIn("Measurement failed", saved["warnings"][0])
-        self.assertIn("Measurement warnings", (self.root / "report.md").read_text())
+        self.assertFalse(self.order())
+
+    def test_stalled_process_fails_and_does_not_claim_no_change(self):
+        self.configure(hangAt=["timing", "main"])
+        manifest = self.manifest(cases=("a",))
+        with self.short_timeout_for("main", "timing"):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                perf_compare.measure(self.root, manifest)
+        report = self.report()
+        self.assertIn("Benchmark process timed out", report)
+        self.assertNotIn("No meaningful changes detected", report)
+
+    def test_counters_with_latency_jitter_are_not_compared(self):
+        self.configure(latencyJitter=True)
+        perf_compare.measure(self.root, self.manifest(cases=("a",)))
+        report = self.report()
+        self.assertIn("invalid counter measurement", report)
+        self.assertIn("latency profile", report)
+
+    def test_malformed_cost_records_are_warnings(self):
+        self.configure(costRecord={})
+        perf_compare.measure(self.root, self.manifest(cases=("a",)))
+        report = self.report()
+        self.assertIn("invalid cost measurements", report)
+        self.assertNotIn("No meaningful changes detected", report)
+
+    def test_bench_runs_one_side_and_prints_its_summary(self):
+        (self.root / "cases.json").write_text(json.dumps(["a"]))
+        with mock.patch("builtins.print") as printed:
+            perf_compare.bench(self.root, self.fixture, self.root / "bench")
+        self.assertEqual(self.order(), [["counters", "bench"], ["timing", "bench"]])
+        timing = self.read("bench", "timing")
+        self.assertEqual(len(timing["experiments"][0]["runs"]), perf_compare.TIMING_RUNS)
+        output = "\n".join(str(call.args[0]) for call in printed.call_args_list)
+        self.assertIn(f"median of {perf_compare.TIMING_RUNS} runs", output)
+        self.assertIn("| a | 100.00", output)
+        # The processes get the options of CI.
+        arguments = dict(
+            json.loads(line)
+            for line in (self.root / "arguments.jsonl").read_text().splitlines()
+        )
+        experiments = f"--experiment={self.root / perf_compare.EXPERIMENTS}"
+        self.assertEqual(
+            arguments["counters"][2:],
+            [*perf_compare.COUNTER_ARGS, experiments, perf_compare.COUNTER_TAG],
+        )
+        self.assertEqual(
+            arguments["timing"][2:],
+            [*perf_compare.TIMING_ARGS, experiments, perf_compare.TIMING_TAG],
+        )
+
+    def test_bench_without_usable_results_fails(self):
+        # The processes succeed, but every cell failed.
+        (self.root / "cases.json").write_text(json.dumps(["a"]))
+        self.configure(failedCells=True)
+        with mock.patch("builtins.print"):
+            with self.assertRaisesRegex(
+                perf_compare.perf_report.ReportError, "cell failed"
+            ):
+                perf_compare.bench(self.root, self.fixture, self.root / "bench")
+        # A summary of the same directory fails with a nonzero status.
+        arguments = ["perf_report.py", "--summary", str(self.root / "bench")]
+        with mock.patch.object(sys, "argv", arguments), mock.patch.object(
+            sys, "stderr"
+        ):
+            with self.assertRaises(SystemExit) as exit:
+                perf_compare.perf_report.main()
+        self.assertEqual(exit.exception.code, 1)
 
     def test_subprocess_failure_preserves_a_failure_report(self):
-        self.configure(failAt=[1, "timing", "pr"])
+        self.configure(failAt=["timing", "pr"])
         manifest = self.manifest(cases=("a",))
         with self.assertRaises(subprocess.CalledProcessError):
             perf_compare.measure(self.root, manifest)
-        self.assertEqual(manifest["completedPairs"], 0)
-        self.assertIn("Measurement failed", (self.root / "report.md").read_text())
-        self.assertNotIn(
-            "Benchmark process timed out", (self.root / "report.md").read_text()
-        )
+        report = self.report()
+        self.assertIn("Measurement failed", report)
+        self.assertNotIn("Benchmark process timed out", report)
 
 
 BENCHMARK_FIXTURE = r"""
@@ -387,45 +357,48 @@ from pathlib import Path
 root = Path(__file__).resolve().parent
 settings = json.loads((root / 'settings.json').read_text())
 cases = json.loads((root / 'cases.json').read_text())
-side = Path.cwd().parent.name
-repetition = int(Path.cwd().name)
+side = Path.cwd().name
 output = Path([arg for arg in sys.argv if arg.startswith('--output=')][0].split('=', 1)[1])
+runs = int([arg for arg in sys.argv if arg.startswith('--runs=')][0].split('=', 1)[1])
 kind = output.stem
 with (root / 'order.jsonl').open('a') as log:
-    log.write(json.dumps([repetition, kind, side]) + '\n')
-if settings.get('failAt') == [repetition, kind, side]:
+    log.write(json.dumps([kind, side]) + '\n')
+with (root / 'arguments.jsonl').open('a') as log:
+    log.write(json.dumps([kind, sys.argv[1:]]) + '\n')
+if settings.get('failAt') == [kind, side]:
     sys.exit(7)
-if settings.get('hangAt') == [repetition, kind, side]:
+if settings.get('hangAt') == [kind, side]:
     # Bound the fixture even if the driver's timeout is accidentally removed.
     time.sleep(5)
 jitter = settings.get('latencyJitter', '--latency-jitter=false' not in sys.argv)
 counters = {name: 0 for name in ('reads', 'writes', 'lists', 'readBodyBytes',
     'writeBodyBytes', 'coordinatorSubmissions', 'coordinatorRounds')}
-cells = []
+experiments = []
 for case in [*cases, 'shapes-shared-leaf']:
     factors = settings.get('factors', {}).get(case, [1])
-    factor = factors[(repetition - 1) % len(factors)] if side == 'pr' else 1
     costs = {'transactions': 30,
         **{window: counters for window in ('workload', 'shutdown', 'combined')}}
     costs = settings.get('costRecord', costs)
-    if settings.get('badCostAt') == [repetition, case, side] and kind == 'counters':
-        costs = {}
-    if case == 'shapes-shared-leaf':
-        shapes = [{'shape': name, 'committed': 200, 'converged': True,
-            'p50Ms': 10, 'p90Ms': 20, 'txPerSec': 100}
-            for name in ('rw-single', 'rw-many', 'ro-single', 'ro-multi')]
-        shapes[0]['p50Ms'] *= factor
-        cell = {'workload': 'low-conflict', 'affinityPct': 100, 'databases': 1,
-            'workersPerShape': 1, 'shapes': shapes}
-    else:
-        latency = 100 * factor
-        cell = {'shapes': [{'shape': case, 'committed': 200, 'converged': True,
-            'p50Ms': latency, 'p90Ms': 2 * latency, 'txPerSec': 1000 / latency}]}
-    cells.append({'name': case, 'runs': [{'run': 1,
-        'cells': [{**cell, 'failures': 0, 'costs': costs}]}]})
+    cells = []
+    for run in range(1, runs + 1):
+        factor = factors[(run - 1) % len(factors)] if side == 'pr' else 1
+        if case == 'shapes-shared-leaf':
+            shapes = [{'shape': name, 'committed': 200, 'converged': True,
+                'p50Ms': 10, 'p90Ms': 20, 'txPerSec': 100}
+                for name in ('rw-single', 'rw-many', 'ro-single', 'ro-multi')]
+            shapes[0]['p50Ms'] *= factor
+            cell = {'workload': 'low-conflict', 'affinityPct': 100, 'databases': 1,
+                'workersPerShape': 1, 'shapes': shapes}
+        else:
+            latency = 100 * factor
+            cell = {'shapes': [{'shape': case, 'committed': 200, 'converged': True,
+                'p50Ms': latency, 'p90Ms': 2 * latency, 'txPerSec': 1000 / latency}]}
+        failures = 1 if settings.get('failedCells') else 0
+        cells.append({'run': run, 'cells': [{**cell, 'failures': failures, 'costs': costs}]})
+    experiments.append({'name': case, 'runs': cells})
 result = {'schemaVersion': 3, 'backend': 'memory',
     'latencyJitter': jitter, 'timeMode': 'virtual', 'modelTimeSpeedup': 1,
-    'experiments': cells}
+    'experiments': experiments}
 output.write_text(json.dumps(result))
 """
 

@@ -952,9 +952,9 @@ pub(crate) mod tests {
             assert!(resolved.len() >= least, "{directory}: {}", resolved.len());
             for experiment in &resolved {
                 crate::runner::plan(experiment).map_err(|e| format!("{}: {e}", experiment.name))?;
-                // Each experiment is in one suite: the CI comparison, the
-                // slow local runs, or real S3.
-                let suites: Vec<_> = ["ci", "extra", "cloud"]
+                // Each experiment is in one suite: the counters or the latency
+                // of the CI comparison, the slow local runs, or real S3.
+                let suites: Vec<_> = ["ci/counters", "ci/timing", "extra", "cloud"]
                     .into_iter()
                     .filter(|tag| experiment.tags.iter().any(|t| t == tag))
                     .collect();

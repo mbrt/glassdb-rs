@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Report meaningful changes from the perfbench artifacts of two revisions."""
+"""Report meaningful changes between the perfbench results of two revisions.
+
+Each revision has a directory with two results. `counters.json` comes from the
+experiments with the tag `ci/counters`, in one run without latency jitter:
+their counters repeat exactly. `timing.json` comes from the experiments with
+the tag `ci/timing`, in several runs with latency jitter: each run is one
+independent sample of the latency.
+"""
 
 from __future__ import annotations
 
@@ -21,8 +28,6 @@ MODEL = {
 
 # The version of the perfbench results that the comparison reads.
 SCHEMA_VERSION = 3
-# The version of the manifest that the driver writes.
-MANIFEST_VERSION = 4
 TIMING_FILE = "timing.json"
 COUNTERS_FILE = "counters.json"
 
@@ -32,12 +37,12 @@ LATENCY_METRICS = (
     ("p90Ms", "model ms/tx", "time"),
     ("txPerSec", "tx/model s", "rate"),
 )
-# Unchanged-engine controls retain about 1–2% uncertainty after 32 pairs.
-# Keep the effect floor separate from the test for a repeatable direction.
+# The smallest timing change that the report shows. The test for a repeatable
+# direction is separate from this floor.
 TIMING_THRESHOLD = 0.02
-# Allow small object-size variation only when the complete cost range is tight.
-# This does not suppress changes between disjoint cost ranges.
-COST_NOISE_THRESHOLD = 0.01
+# The size of a record with a timestamp changes by a byte with the start time
+# of the process, so a byte count can move by this much with no change.
+BYTES_NOISE_THRESHOLD = 0.01
 
 
 class ReportError(ValueError):
@@ -46,7 +51,8 @@ class ReportError(ValueError):
 
 @dataclass
 class Metric:
-    """The values of one metric, one for each pair of processes."""
+    """The values of one metric: one for each run of the timing experiments,
+    or one for the counters."""
 
     unit: str
     kind: str
@@ -89,27 +95,32 @@ def read_report(path: Path) -> dict:
     return report
 
 
-def read_cells(path: Path, latency_jitter: bool) -> list[tuple[str, dict]]:
-    """Read the cells of all experiments of a perfbench result, with their names.
+def read_cells(path: Path, latency_jitter: bool) -> list[tuple[int, str, dict]]:
+    """Read the cells of all experiments of a perfbench result.
 
-    The result must have the latency profile of the comparison, and one run of
-    each experiment. The name of a cell is the name of its experiment, and the
-    labels of the cell if the experiment has more than one cell.
+    Returns `(run, name, cell)` for each cell of each run. The result must have
+    the latency profile `latency_jitter`, and the same runs of each experiment.
+    The name of a cell is the name of its experiment, and the labels of the
+    cell if the experiment has more than one cell.
     """
     report = read_report(path)
     if report.get("latencyJitter", True) is not latency_jitter:
         raise ReportError("latency profile differs from comparison settings")
     if not report["experiments"]:
         raise ReportError("no experiments")
-    cells = []
+    cells, runs = [], None
     for experiment in report["experiments"]:
-        name, runs = experiment["name"], experiment["runs"]
-        if len(runs) != 1:
-            raise ReportError(f"expected one run of {name}")
-        many = len(runs[0]["cells"]) > 1
-        for cell in runs[0]["cells"]:
-            labels = list(cell["labels"].values()) if many else []
-            cells.append(("/".join([name, *labels]), cell))
+        name = experiment["name"]
+        numbers = [run["run"] for run in experiment["runs"]]
+        if runs is None:
+            runs = numbers
+        if numbers != runs or not runs:
+            raise ReportError(f"{name} has other runs than the other experiments")
+        for run in experiment["runs"]:
+            many = len(run["cells"]) > 1
+            for cell in run["cells"]:
+                labels = list(cell["labels"].values()) if many else []
+                cells.append((run["run"], "/".join([name, *labels]), cell))
     return cells
 
 
@@ -121,30 +132,30 @@ def add(metrics: dict, name: str, unit: str, kind: str, value) -> None:
     metrics[name] = metric
 
 
-def read_measurement(directory: Path, *, latency_jitter: bool) -> tuple[dict, list[str]]:
-    """Read and validate the artifacts of all cells in a repetition.
+def read_side(directory: Path) -> tuple[dict, list[str]]:
+    """Read and validate the results of one revision.
 
-    The latency of a cell comes from the process with the latency profile of the
-    comparison. Its counters come from a process without jitter: jitter moves
-    the count of background operations, such as listings of the garbage
-    collector, by one per process, which the counters cannot tell from a change.
-    Without jitter, the counters repeat exactly.
+    The latency comes from the runs with latency jitter. The counters come from
+    a run without it: jitter moves the count of background operations, such as
+    listings of the garbage collector, and the path of some transactions, which
+    the counters cannot tell from a change. Without jitter, they repeat
+    exactly.
     """
     metrics, warnings = {}, []
-    side, repetition = directory.parent.name, directory.name
-    label = f"{side}/{repetition}"
+    side = directory.name
     for path, jitter, load, kind in (
-        (directory / TIMING_FILE, latency_jitter, load_latency, "latency"),
+        (directory / TIMING_FILE, True, load_latency, "latency"),
         (directory / COUNTERS_FILE, False, load_costs, "counter"),
     ):
         try:
-            for name, cell in read_cells(path, jitter):
+            for run, name, cell in read_cells(path, jitter):
+                label = f"{side}/{name}/run {run}"
                 if cell["failures"]:
-                    warnings.append(f"{label}/{name}: cell failed")
+                    warnings.append(f"{label}: cell failed")
                     continue
-                load(name, cell, metrics, warnings, f"{label}/{name}")
+                load(name, cell, metrics, warnings, label)
         except (ReportError, KeyError, TypeError, ValueError, IndexError) as error:
-            warnings.append(f"{label}: invalid {kind} measurement ({error})")
+            warnings.append(f"{side}: invalid {kind} measurement ({error})")
     return metrics, warnings
 
 
@@ -236,36 +247,29 @@ class Comparison:
 
 def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison:
     """Distinguish repeatable changes from effects the measurements cannot resolve."""
-    before, after = statistics.median(base.values), statistics.median(candidate.values)
     if base.kind == "cost":
-        separated = max(base.values) < min(candidate.values) or max(
-            candidate.values
-        ) < min(base.values)
-        spread = max(
-            max(base.values) - min(base.values),
-            max(candidate.values) - min(candidate.values),
-        )
-        noisy = spread > 0.1 * max(before, after) if max(before, after) else False
-        small = max(*base.values, *candidate.values) - min(
-            *base.values, *candidate.values
-        ) <= COST_NOISE_THRESHOLD * max(before, after)
-        # Small overlapping ranges are expected for variable-size objects.
-        # Unequal medians alone do not make their costs inconclusive.
-        return Comparison(
-            (after - before) / before if before else None,
-            None,
-            before != after and separated,
-            (before != after and not separated and not small) or noisy,
-        )
+        # The counters repeat exactly, so each side has one value.
+        before, after = base.values[0], candidate.values[0]
+        relative = (after - before) / before if before else None
+        noise = BYTES_NOISE_THRESHOLD * max(before, after) if base.unit == "bytes/tx" else 0
+        return Comparison(relative, None, abs(after - before) > noise, False)
 
-    # Each fresh process pair is one observation.
-    ratios = [
-        math.log(b / a) for a, b in zip(base.values, candidate.values, strict=True)
-    ]
-    mean = statistics.mean(ratios)
-    count = len(ratios)
-    variance = statistics.variance(ratios) / count
-    half = t_critical(min(count - 1, 30), family_size) * math.sqrt(variance)
+    # Each run is one independent sample, so the two sides are compared with
+    # an unpaired interval of the change of the log mean (Welch).
+    a = [math.log(value) for value in base.values]
+    b = [math.log(value) for value in candidate.values]
+    if len(a) < 2 or len(b) < 2:
+        return Comparison(None, None, False, True)
+    mean = statistics.mean(b) - statistics.mean(a)
+    va, vb = statistics.variance(a) / len(a), statistics.variance(b) / len(b)
+    variance = va + vb
+    if variance == 0:
+        degrees = len(a) + len(b) - 2
+    else:
+        degrees = int(
+            variance**2 / (va**2 / (len(a) - 1) + vb**2 / (len(b) - 1))
+        )
+    half = t_critical(max(1, degrees), family_size) * math.sqrt(variance)
     relative = math.expm1(mean)
     lower, upper = math.expm1(mean - half), math.expm1(mean + half)
     # Effect size and statistical significance answer different questions:
@@ -283,94 +287,51 @@ def escape(text: str) -> str:
     return str(text).replace("|", "\\|").replace("\n", " ").replace("`", "'")
 
 
-def validate_manifest(manifest: dict) -> None:
-    if (
-        manifest.get("schemaVersion") != MANIFEST_VERSION
-        or type(manifest.get("latencyJitter")) is not bool
-    ):
-        raise ReportError("unsupported comparison manifest")
-    checkpoints = manifest.get("checkpoints")
-    if (
-        not isinstance(checkpoints, list)
-        or not checkpoints
-        or any(type(n) is not int or n < 4 or n % 2 for n in checkpoints)
-        or checkpoints != sorted(set(checkpoints))
-        or type(manifest.get("completedPairs")) is not int
-        or not 0 <= manifest["completedPairs"] <= checkpoints[-1]
-    ):
-        raise ReportError("invalid checkpoint plan or completed pair count")
-
-
 @dataclass
 class Analysis:
-    pairs: int
     metrics: dict[str, tuple[Metric, Metric, Comparison]] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
-    @property
-    def unresolved(self) -> list[str]:
-        """Return the names of the timing metrics whose change is unclear."""
-        return [
-            name
-            for name, (base, _, comparison) in self.metrics.items()
-            if base.kind != "cost" and comparison.uncertain
-        ]
 
-    @property
-    def resolved(self) -> bool:
-        return bool(self.metrics) and not self.warnings and not self.unresolved
-
-
-def analyze(root: Path, manifest: dict) -> Analysis:
-    """Evaluate all cells at the last completed, planned checkpoint."""
-    completed = manifest["completedPairs"]
-    repetitions = max((n for n in manifest["checkpoints"] if n <= completed), default=0)
-    result = Analysis(repetitions)
-    if not repetitions:
-        result.warnings.append(f"no completed checkpoint ({completed} complete pairs)")
-        return result
-    if completed != repetitions:
-        result.warnings.append(
-            f"stopped after {completed} complete pairs; using checkpoint at {repetitions} pairs"
-        )
+def analyze(base_dir: Path, candidate_dir: Path) -> Analysis:
+    """Compare the results of two revisions."""
+    result = Analysis()
     sides = []
-    for side in ("main", "pr"):
-        metrics = {}
-        for repetition in range(1, repetitions + 1):
-            samples, warnings = read_measurement(
-                root / side / f"{repetition:02d}",
-                latency_jitter=manifest["latencyJitter"],
-            )
-            result.warnings.extend(warnings)
-            for key, sample in samples.items():
-                add(metrics, key, sample.unit, sample.kind, sample.values[0])
+    for directory in (base_dir, candidate_dir):
+        metrics, warnings = read_side(directory)
+        result.warnings.extend(warnings)
         sides.append(metrics)
     base, candidate = sides
-    # Include every comparison that any measurement has, even if the other
-    # measurements miss it. Both sides run the same experiments, so a metric
-    # that a repetition misses is still in the family. All checkpoints share the
-    # error budget; stopping early cannot narrow it.
+    # Include every timing comparison that either side has, even if the other
+    # side misses it: both sides run the same experiments, so a metric that a
+    # side misses is still in the family.
     timings = {name for side in sides for name, m in side.items() if m.kind != "cost"}
-    family_size = len(timings) * len(manifest["checkpoints"])
+    runs = {len(m.values) for side in sides for m in side.values() if m.kind != "cost"}
+    family_size = max(1, len(timings))
     for name in sorted(set(base) | set(candidate)):
+        a, b = base.get(name), candidate.get(name)
+        expected = 1 if (a or b).kind == "cost" else max(runs, default=0)
         if (
-            name not in base
-            or name not in candidate
-            or len(base[name].values) != repetitions
-            or len(candidate[name].values) != repetitions
+            a is None
+            or b is None
+            or len(a.values) != expected
+            or len(b.values) != expected
         ):
-            result.warnings.append(f"{name}: incomplete paired measurements")
+            result.warnings.append(f"{name}: incomplete measurements")
             continue
-        a, b = base[name], candidate[name]
         result.metrics[name] = (a, b, compare(a, b, family_size))
     return result
 
 
-def render_report(root: Path, base_label: str, candidate_label: str) -> str:
-    manifest = read_json(root / "manifest.json")
-    validate_manifest(manifest)
-    result = analyze(root, manifest)
-    warnings = [*manifest.get("warnings", []), *result.warnings]
+def render_report(
+    base_dir: Path,
+    candidate_dir: Path,
+    base_label: str,
+    candidate_label: str,
+    warnings: list[str] | None = None,
+) -> str:
+    result = analyze(base_dir, candidate_dir)
+    warnings = [*(warnings or []), *result.warnings]
     rows = []
     for name, (a, b, comparison) in sorted(result.metrics.items()):
         interval = (
@@ -439,15 +400,78 @@ def render_report(root: Path, base_label: str, candidate_label: str) -> str:
     return "\n".join(lines)
 
 
+def summarize(directory: Path) -> str:
+    """Return the main metrics of the results of one revision, as tables."""
+    metrics, warnings = read_side(directory)
+    if not metrics:
+        raise ReportError(f"no results in {directory}: {'; '.join(warnings)}")
+
+    def spread(values: list[float]) -> str:
+        if len(values) < 2:
+            return ""
+        return f" ±{statistics.stdev(values) / statistics.mean(values):.1%}"
+
+    latency = {}
+    for name, metric in metrics.items():
+        if metric.kind != "cost":
+            case, key = name.rsplit(": ", 1)
+            latency.setdefault(case, {})[key] = metric.values
+    runs = max((len(v) for row in latency.values() for v in row.values()), default=0)
+    lines = [
+        f"## Latency (median of {runs} runs, ± the spread of one run)",
+        "",
+        "| Case | p50 (model ms) | p90 (model ms) | Throughput (tx/model s) |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for case, row in sorted(latency.items()):
+        cells = [
+            f"{statistics.median(row[key]):,.2f}{spread(row[key])}" if key in row else "—"
+            for key, _, _ in LATENCY_METRICS
+        ]
+        lines.append(f"| {escape(case)} | {' | '.join(cells)} |")
+    counters = ("reads", "writes", "lists", "coordinatorRounds")
+    costs = {}
+    for name, metric in metrics.items():
+        window, _, counter = name.partition(": ")
+        if metric.kind == "cost" and window.endswith("/combined") and counter in counters:
+            # The counter experiment of a case has the name of the case and a
+            # suffix; the table names the case, as the latency table does.
+            case = window.removesuffix("/combined").removesuffix("-counters")
+            costs.setdefault(case, {})[counter] = metric.values[0]
+    lines += [
+        "",
+        "## Backend operations and coordinator rounds per transaction",
+        "",
+        "| Case | Reads | Writes | Lists | Coordinator rounds |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for case, row in sorted(costs.items()):
+        cells = [f"{row[c]:.3f}" if c in row else "—" for c in counters]
+        lines.append(f"| {escape(case)} | {' | '.join(cells)} |")
+    if warnings:
+        lines += ["", "## Measurement warnings", "", *[f"- {escape(w)}" for w in warnings]]
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--base-label", required=True)
-    parser.add_argument("--candidate-label", required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--summary", type=Path, metavar="DIR")
+    parser.add_argument("--base", type=Path)
+    parser.add_argument("--candidate", type=Path)
+    parser.add_argument("--base-label", default="base")
+    parser.add_argument("--candidate-label", default="candidate")
+    parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.summary:
+        try:
+            print(summarize(args.summary), end="")
+        except ReportError as error:
+            parser.exit(1, f"{error}\n")
+        return 0
+    if not (args.base and args.candidate and args.output):
+        parser.error("--base, --candidate, and --output are needed for a comparison")
     args.output.write_text(
-        render_report(args.input, args.base_label, args.candidate_label)
+        render_report(args.base, args.candidate, args.base_label, args.candidate_label)
     )
     return 0
 

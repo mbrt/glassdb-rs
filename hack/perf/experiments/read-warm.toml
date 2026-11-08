@@ -1,6 +1,7 @@
 # A read of one key with a 256-byte value.
-tags = ["ci", "area/read"]
-include = ["../configs/default.toml"]
+# The CI comparison runs it 32 times with latency jitter.
+tags = ["ci/timing", "area/read"]
+include = ["../configs/ci-timing.toml"]
 
 [cell]
 workload = "diag-read"

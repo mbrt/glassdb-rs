@@ -1,7 +1,8 @@
 # A read on a new database instance, which has no cache (the scenario kind
 # `fresh-client-read`). The open is not in the time.
-tags = ["ci", "area/read"]
-include = ["../configs/default.toml"]
+# The CI comparison runs it 32 times with latency jitter.
+tags = ["ci/timing", "area/read"]
+include = ["../configs/ci-timing.toml"]
 
 [cell]
 workload = "diag-fresh-read"

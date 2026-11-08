@@ -1,6 +1,7 @@
 # A read of a 1,025-byte value, which a transaction record stores.
-tags = ["ci", "area/read"]
-include = ["../configs/default.toml"]
+# The CI comparison runs it 32 times with latency jitter.
+tags = ["ci/timing", "area/read"]
+include = ["../configs/ci-timing.toml"]
 
 [cell]
 workload = "diag-read-external"
