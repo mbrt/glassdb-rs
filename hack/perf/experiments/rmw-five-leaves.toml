@@ -1,5 +1,5 @@
 # A read-modify-write of one key in each of five collections.
-tags = ["ci", "time/virtual", "area/commit"]
+tags = ["ci", "area/commit"]
 include = ["../configs/default.toml"]
 
 [cell]

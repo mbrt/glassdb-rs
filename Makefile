@@ -57,13 +57,13 @@ bench:
 # Run all experiments one after the other, into one result in OUT. The default
 # is one run of each in real time, with the local S3 model of the canonical
 # plots (hack/perf/README.md). It takes hours and uses all CPUs: keep the host
-# idle. TIME=virtual runs only the experiments with the tag `time/virtual`.
+# idle. TIME=virtual runs all experiments in virtual time.
 bench-all:
 	mkdir -p $(dir $(BENCH_ALL_OUT))
 ifeq ($(TIME),virtual)
 	cargo run --release -p glassdb-bench-scale --bin perfbench -- \
 		--time=virtual --output=$(BENCH_ALL_OUT) \
-		--experiment=$(EXPERIMENTS_DIR) --tag=time/virtual
+		--experiment=$(EXPERIMENTS_DIR)
 else
 	cargo run --release -p glassdb-bench-scale --bin perfbench -- \
 		--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3 \

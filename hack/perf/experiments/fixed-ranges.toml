@@ -1,7 +1,7 @@
 # Transactions on fixed ranges of 16 and 64 keys, with transactions on single
 # keys, for the write spans of ADR-084. See the investigation of 2026-10-28 in
 # investigations.md.
-tags = ["time/real", "area/topology"]
+tags = ["area/topology"]
 
 [pools.wide]
 keys = 20000

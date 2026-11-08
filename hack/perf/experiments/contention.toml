@@ -1,6 +1,6 @@
 # Five writers of `keys` keys each, of which `shared` are the same for all
 # writers.
-tags = ["time/virtual", "area/contention"]
+tags = ["area/contention"]
 
 [pools.contention]
 value-bytes = 1024

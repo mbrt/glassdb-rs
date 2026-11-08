@@ -1,5 +1,5 @@
 # A read of a 1,025-byte value, which a transaction record stores.
-tags = ["ci", "time/virtual", "area/read"]
+tags = ["ci", "area/read"]
 include = ["../configs/default.toml"]
 
 [cell]

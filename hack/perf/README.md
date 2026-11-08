@@ -27,33 +27,32 @@ repository uses these tags:
 | Tag | Meaning |
 | --- | --- |
 | `ci` | An experiment of the CI comparison and of `make bench`. These run in virtual time, so that two revisions compare with results that repeat. |
-| `time/virtual` | The experiment shows the behavior that it is for in virtual time. Its absolute values can differ from real time, because latencies in virtual time have no timer rounding. Some `ci` experiments do not give the results of real time, for example `rmw-shared-leaf` (see `--time=virtual` in the crate README). |
-| `time/real` | The experiment needs real time. In virtual time, CPU takes no model time, and identical workers batch better (see `--time=virtual` in the crate README), so it shows a different behavior. |
 | `canonical` | An input of the [canonical plots](#plotting-results). |
 | `area/<topic>` | The topic of the experiment: `read`, `inline`, `commit`, `contention`, `topology`, or `mixed` (the [mixed workloads](#mixed-workloads)). |
 
-Give each experiment one `time/` tag. Give a new experiment `time/virtual` when
-it shows the same behavior in virtual time, so that fast runs can use it.
+The experiments run in both time modes. `make bench-all` runs all experiments
+in real time, and `make bench-all TIME=virtual` runs all of them in virtual
+time. In virtual time, CPU takes no model time, so the absolute values differ
+from real time, and `workers` shows no CPU saturation (see `--time=virtual` in
+the crate README). In real time, a cell of `open-in-body` with one database
+instance can miss the cell completion deadline, and the run then stops.
 
-`make bench-all` runs all experiments in real time, and `make bench-all
-TIME=virtual` runs the experiments with the tag `time/virtual` in virtual time.
-
-| Experiment | Time | What it measures |
-| --- | --- | --- |
-| The cases of [CI experiments](#ci-experiments) | `time/virtual` | Single transactions of one worker with warm caches, and their backend costs, and four shapes at the same time on one leaf. Each case has a fixed length of 10 s. |
-| `inline-pressure` | `time/virtual` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
-| `contention` | `time/virtual` | Five writers whose transactions share some of their 1 to 6 keys. |
-| `split-merge-fight` | `time/real` | A stable load under which both a split and a merge of one leaf make sense. The default topology policy must settle at one leaf or at two leaves, from a start of either one. |
-| `membership-churn` | `time/real` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
-| `mixed` | `time/real` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
-| `workers` | `time/real` | The worker grid of the canonical plots: 1 to 200 workers per shape, each count after the warm-up of the count before it. |
-| `affinity` | `time/real` | The affinity grid: 5 affinities × 1, 3, 5, and 7 database instances. It is not part of the canonical plots. |
-| `conflict-sweep` | `time/real` | The conflict grid of the canonical plots: 20 workers on 1 and on 5 database instances run read-modify-write transactions of 1 or 4 keys on one pool, from 5,000 keys down to 5 keys (1 key) or 100 keys (4 keys). A smaller pool gives more conflicts. |
-| `load-shift` | `time/real` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
-| `false-sharing` | `time/real` | Four instances that each write one of four adjacent keys of one leaf, while one more instance reads and writes the keys around them (ADR-084). The default topology policy must split the keys of the four instances apart. |
-| `false-sharing-spans` | `time/real` | As `false-sharing`, but one more instance writes the two keys on both sides of the four contended keys in each transaction, so its write span crosses them (ADR-088). The default topology policy must still split the contended keys apart. |
-| `fixed-ranges` | `time/real` | Transactions on fixed ranges of 16 and 64 keys, with transactions on single keys (ADR-084). |
-| `random-ranges` | `time/real` | Transactions on ranges of 16 and 64 adjacent keys from random starts, on fixed sets of 3 keys, and on single keys (ADR-084). |
+| Experiment | What it measures |
+| --- | --- |
+| The cases of [CI experiments](#ci-experiments) | Single transactions of one worker with warm caches, and their backend costs, and four shapes at the same time on one leaf. Each case has a fixed length of 10 s. |
+| `inline-pressure` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
+| `contention` | Five writers whose transactions share some of their 1 to 6 keys. |
+| `split-merge-fight` | A stable load under which both a split and a merge of one leaf make sense. The default topology policy must settle at one leaf or at two leaves, from a start of either one. |
+| `membership-churn` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
+| `mixed` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
+| `workers` | The worker grid of the canonical plots: 1 to 200 workers per shape, each count after the warm-up of the count before it. |
+| `affinity` | The affinity grid: 5 affinities × 1, 3, 5, and 7 database instances. It is not part of the canonical plots. |
+| `conflict-sweep` | The conflict grid of the canonical plots: 20 workers on 1 and on 5 database instances run read-modify-write transactions of 1 or 4 keys on one pool, from 5,000 keys down to 5 keys (1 key) or 100 keys (4 keys). A smaller pool gives more conflicts. |
+| `load-shift` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
+| `false-sharing` | Four instances that each write one of four adjacent keys of one leaf, while one more instance reads and writes the keys around them (ADR-084). The default topology policy must split the keys of the four instances apart. |
+| `false-sharing-spans` | As `false-sharing`, but one more instance writes the two keys on both sides of the four contended keys in each transaction, so its write span crosses them (ADR-088). The default topology policy must still split the contended keys apart. |
+| `fixed-ranges` | Transactions on fixed ranges of 16 and 64 keys, with transactions on single keys (ADR-084). |
+| `random-ranges` | Transactions on ranges of 16 and 64 adjacent keys from random starts, on fixed sets of 3 keys, and on single keys (ADR-084). |
 
 The files in `hack/perf/configs` are not experiments:
 

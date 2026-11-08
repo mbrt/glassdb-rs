@@ -140,12 +140,6 @@ for the absolute value of a metric:
 
 - CPU and allocation costs take no model time, so a run shows no saturation of
   the host.
-- Identical concurrent workers never drift apart, so their transactions batch
-  better than in real time. In the diagnostics case with three transactions on
-  one leaf, they always share one coordinator round (0.33 operations per
-  transaction, against 0.63 in real time). `--latency-jitter` does not change
-  this: the transactions resubmit in the same instant that a round ends, and
-  only CPU time separates them in real time.
 - The watchdogs use virtual time, so only a wall-time limit on the process
   stops a CPU livelock.
 
@@ -335,7 +329,7 @@ has one cell.
 
 ```toml
 # An experiment of the mixed workloads at five affinities.
-tags = ["time/real", "area/mixed"]
+tags = ["area/mixed"]
 include = ["../configs/common-workloads.toml"]
 
 [cell]

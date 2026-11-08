@@ -9,6 +9,57 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-11-08: all experiments run in virtual time
+
+Status: with ADR-091, each experiment that ran in both time modes shows the
+same behavior in them, so the experiments have no `time/` tags. `workers` and
+`open-in-body` were not compared. The
+[2026-10-29 entry](#2026-10-29-experiments-that-need-real-time) found that
+`split-merge-fight` and `membership-churn` need real time. A near miss of a
+read-only validation caused the difference: CPU time in real time gives a gap
+between a read and its validation, and virtual time has no gap. The near miss
+then kept a hot leaf in locked commits in real time only. ADR-091 removes that
+path. In the diagnostics case with three transactions on one leaf, the three
+transactions now share one coordinator round in both modes (0.33 rounds per
+transaction). `workers` shows CPU saturation only in real time.
+
+Each mode ran each experiment once, at `c1e4fd732` (ADR-091),
+with `--backend=memory --delays=s3`, and `--delay-scale=0.2` in real time.
+Ratios are real time to virtual time, from the lowest cell to the highest
+cell:
+
+| Experiment | Cells | Throughput | Coordinator rounds per transaction | Backend operations per transaction |
+| --- | ---: | --- | --- | --- |
+| `affinity` | 20 | 0.80 to 0.86 | 0.97 to 1.05 | 0.95 to 1.06 |
+| `conflict-sweep` | 32 | 0.76 to 0.98 | 0.90 to 1.12 | 0.79 to 1.21 |
+| `contention` | 21 | 0.80 to 1.03 | 0.92 to 1.03 | 0.86 to 1.12 |
+| `false-sharing` | 1 | 0.84 | 1.07 | 1.11 |
+| `false-sharing-spans` | 1 | 0.84 | 1.03 | 1.08 |
+| `fixed-ranges` | 2 | 0.82 to 0.87 | 1.00 to 1.03 | 1.06 to 1.14 |
+| `inline-pressure` | 3 | 0.77 to 0.90 | 0.97 to 1.00 | 1.00 to 1.06 |
+| `load-shift` | 3 | 0.97 to 1.01 | 0.97 to 0.99 | 0.94 to 1.01 |
+| `membership-churn` | 1 | 0.78 | 1.08 | 1.17 |
+| `mixed` | 10 | 0.78 to 0.89 | 0.98 to 1.09 | 0.95 to 1.23 |
+| `random-ranges` | 2 | 0.86 | 1.00 to 1.01 | 1.01 to 1.02 |
+| `split-merge-fight` | 2 | 0.82 to 1.00 | 0.84 to 1.14 | 0.87 to 1.11 |
+| The CI experiments | 9 | 0.81 to 0.93 | 1.00, in the 5 that have rounds | 1.00 |
+
+- The throughput in real time is lower, because CPU time counts five times in
+  model time at `--delay-scale=0.2`.
+- The widest ranges of `conflict-sweep` are in cells that vary as much
+  between two runs in one mode.
+- The split and merge counts are the same in both modes, or differ by a few
+  splits in the cells where they also vary between runs. In `false-sharing`
+  and `false-sharing-spans`, each hot instance splits in the warm-up in both
+  modes, and no instance splits in the measurement.
+- `fixed-ranges` with one database instance converged in virtual time, but did
+  not converge in real time before `max-duration`.
+- `open-in-body` with one database instance is very slow in both modes, with
+  and without ADR-091: the mean latency of a transaction is about 45 s. In
+  real time, the cell `keys1-pool5` missed the cell completion deadline, and
+  the run stopped. So the table does not have `open-in-body`. Isolated reruns
+  of that cell completed.
+
 ## 2026-11-06: contention comes before write spans and leaf sizes
 
 Status: ADR-088 changed `false-sharing`, `load-shift`, and `random-ranges` by

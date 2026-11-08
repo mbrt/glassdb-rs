@@ -1,6 +1,6 @@
 # A read-modify-write of one key with a 1,025-byte value, above the default
 # inline limit.
-tags = ["ci", "time/virtual", "area/inline"]
+tags = ["ci", "area/inline"]
 include = ["../configs/default.toml"]
 
 [cell]
