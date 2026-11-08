@@ -10,9 +10,8 @@ use crate::backend;
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum TimeMode {
-    /// Model time follows wall time, compressed by `--delay-scale` for the
-    /// synthetic backends. Workers run on all cores, so the host CPU is part
-    /// of what a run measures.
+    /// Model time is wall time. Workers run on all cores, so the host CPU is
+    /// part of what a run measures.
     Real,
     /// Model time jumps over the waits of an idle process. Workers share one
     /// thread and CPU work takes no model time, so a run of the memory backend
@@ -29,23 +28,25 @@ impl TimeMode {
         }
     }
 
-    /// Installs the process-wide model time, and returns its speedup.
+    /// Installs the process-wide model time.
     ///
-    /// The speedup is 1 for virtual time: model time follows the paused clock
-    /// of the runtime, not wall time.
-    pub(crate) fn install(self, backend: &backend::Options) -> Result<f64, Box<dyn Error>> {
+    /// In real time, model time runs at the speed of wall time. For a
+    /// synthetic backend, the speedup of 1 also anchors wall timestamps to
+    /// the monotonic clock, so a step of the system clock does not move them.
+    /// Real providers stay on live wall time, because their clocks cannot
+    /// share this anchor.
+    pub(crate) fn install(self, backend: &backend::Options) -> Result<(), Box<dyn Error>> {
         match self {
             Self::Real => {
-                let speedup = backend.model_time_speedup()?;
-                if let Some(speedup) = speedup {
-                    rt::set_model_time_speedup(speedup)?;
+                if backend.is_synthetic() {
+                    rt::set_model_time_speedup(1.0)?;
                 }
-                Ok(speedup.unwrap_or(1.0))
+                Ok(())
             }
             Self::Virtual => {
                 backend.check_virtual_time()?;
                 rt::set_paused_model_time()?;
-                Ok(1.0)
+                Ok(())
             }
         }
     }

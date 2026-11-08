@@ -65,9 +65,9 @@ struct Cli {
     /// that has the axis.
     #[arg(long = "only")]
     only: Vec<String>,
-    /// How model time advances. `virtual` needs `--backend=memory` and no
-    /// `--delay-scale`, and the watchdogs `--drain-timeout` and the limit of
-    /// the full GCs then use virtual time too.
+    /// How model time advances. `virtual` needs `--backend=memory`, and the
+    /// watchdogs `--drain-timeout` and the limit of the full GCs then use
+    /// virtual time too.
     #[arg(long, value_enum, default_value = "real")]
     time: TimeMode,
     /// Repeat the complete experiment.
@@ -148,7 +148,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         exclude_tags: cli.exclude_tags.clone(),
     };
     let resolved = selection.resolve()?;
-    let model_time_speedup = cli.time.install(&cli.backend)?;
+    cli.time.install(&cli.backend)?;
     let runtime = cli.time.runtime()?;
     let factory = runtime.block_on(cli.backend.initialize())?;
     let execution = Execution {
@@ -181,9 +181,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         schema_version: SCHEMA_VERSION,
         backend: cli.backend.label().to_string(),
         time_mode: cli.time.label(),
-        model_time_speedup,
+        // Model time runs at the speed of wall time in real time, and the
+        // value is 1 by convention in virtual time. The readers reject other
+        // values, which come from older revisions with compressed real time.
+        model_time_speedup: 1.0,
         latency_jitter: cli.backend.latency_jitter,
-        options: cli.backend.describe(cli.time),
+        options: cli.backend.describe(),
         experiments,
     };
     write_json(cli.output, &serde_json::to_value(report)?)?;

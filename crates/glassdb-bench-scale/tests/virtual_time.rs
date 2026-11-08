@@ -81,21 +81,11 @@ fn virtual_runs_repeat_exactly() {
 
 #[test]
 fn virtual_time_rejects_what_it_cannot_skip() {
-    for (arguments, message) in [
-        (
-            ["--backend=fakes3", "--time=virtual"].as_slice(),
-            "needs --backend=memory",
-        ),
-        (
-            ["--time=virtual", "--delay-scale=0.2"].as_slice(),
-            "does not combine with --delay-scale",
-        ),
-    ] {
-        let output = perfbench(&[arguments, &CI_EXPERIMENTS].concat());
-        assert!(!output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains(message), "{stderr}");
-    }
+    let arguments = ["--backend=fakes3", "--time=virtual"];
+    let output = perfbench(&[arguments.as_slice(), &CI_EXPERIMENTS].concat());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("needs --backend=memory"), "{stderr}");
 }
 
 #[test]

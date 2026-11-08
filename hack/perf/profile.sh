@@ -50,12 +50,10 @@ run_args=(
 	--output="$OUT/profile.json"
 )
 if [[ "$ci" == true ]]; then
-	# perfbench durations are model time, and the default model clock runs five
-	# times as fast as wall time.
-	model_seconds=$((SECONDS_PER_CASE * 5))
+	# perfbench durations are model time, which is wall time in real time.
 	run_args+=(
-		--set="cell.measure.duration=\"${model_seconds}s\""
-		--set="cell.measure.max-duration=\"${model_seconds}s\""
+		--set="cell.measure.duration=\"${SECONDS_PER_CASE}s\""
+		--set="cell.measure.max-duration=\"${SECONDS_PER_CASE}s\""
 	)
 fi
 

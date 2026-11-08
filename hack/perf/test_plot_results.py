@@ -71,7 +71,7 @@ def report(runs: list[dict], name: str = "mixed") -> dict:
     return {
         "schemaVersion": 3,
         "backend": "memory",
-        "modelTimeSpeedup": 5.0,
+        "modelTimeSpeedup": 1.0,
         "experiments": [{"name": name, "runs": runs}],
     }
 
@@ -357,13 +357,30 @@ class MixedSweepPlotterTest(unittest.TestCase):
 
     def test_reports_must_use_the_same_backend_configuration(self) -> None:
         conflict = copy.deepcopy(conflict_report())
-        conflict["modelTimeSpeedup"] = 1.0
+        conflict["modelTimeSpeedup"] = 5.0
         with tempfile.TemporaryDirectory() as directory_name:
             directory = Path(directory_name)
             workers_path = self.write_report(directory, "workers.json", worker_report())
             conflict_path = self.write_report(directory, "conflict-sweep.json", conflict)
             with self.assertRaisesRegex(plotter.ReportError, "same backend"):
                 plotter.render(workers_path, conflict_path, directory / "plots")
+
+    def test_canonical_sweeps_need_real_time_at_the_speed_of_wall_time(self) -> None:
+        # Virtual time shows no CPU saturation, and an older compressed run
+        # makes CPU time count more than backend latency.
+        for change in ({"timeMode": "virtual"}, {"modelTimeSpeedup": 5.0}):
+            workers = copy.deepcopy(worker_report())
+            conflict = copy.deepcopy(conflict_report())
+            workers.update(change)
+            conflict.update(change)
+            with tempfile.TemporaryDirectory() as directory_name:
+                directory = Path(directory_name)
+                workers_path = self.write_report(directory, "workers.json", workers)
+                conflict_path = self.write_report(
+                    directory, "conflict-sweep.json", conflict
+                )
+                with self.assertRaisesRegex(plotter.ReportError, "in real time"):
+                    plotter.render(workers_path, conflict_path, directory / "plots")
 
 
 class GenericPlotterTest(unittest.TestCase):

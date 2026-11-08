@@ -249,9 +249,6 @@ class MeasurementTest(unittest.TestCase):
     def test_the_default_plan_measures_on_virtual_time(self):
         for arguments in (perf_compare.TIMING_ARGS, perf_compare.COUNTER_ARGS):
             self.assertIn("--time=virtual", arguments)
-            self.assertFalse(
-                [arg for arg in arguments if arg.startswith("--delay-scale")]
-            )
         self.assertIn("--latency-jitter=true", perf_compare.TIMING_ARGS)
         self.assertIn("--latency-jitter=false", perf_compare.COUNTER_ARGS)
 

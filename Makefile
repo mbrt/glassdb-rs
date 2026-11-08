@@ -66,7 +66,7 @@ ifeq ($(TIME),virtual)
 		--experiment=$(EXPERIMENTS_DIR)
 else
 	cargo run --release -p glassdb-bench-scale --bin perfbench -- \
-		--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3 \
+		--backend=memory --delays=s3 --prefix-depth=3 \
 		--drain-timeout=90s --output=$(BENCH_ALL_OUT) \
 		--experiment=$(EXPERIMENTS_DIR)
 endif

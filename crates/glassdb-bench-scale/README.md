@@ -97,26 +97,24 @@ it, and perfbench exits with the error. If the first experiment fails, there is
 no result.
 
 The options that are the same for all experiments are command-line options:
-`--backend`, `--delays`, `--delay-scale`, `--time`, `--prefix-depth`, `--latency-jitter`,
+`--backend`, `--delays`, `--time`, `--prefix-depth`, `--latency-jitter`,
 `--enable-throttling`, `--runs`, `--run-cooldown`, `--drain-timeout`,
 `--progress`, and `--output`. The result records them, except `--progress`.
 `--progress[=auto|always|never]` controls a progress bar on stderr with the
 number of the cell and the estimated time left.
 
 All experiments support `--backend=memory|fakes3|s3|gcs`. Real S3 and GCS use
-the bucket in `$BUCKET` and always run at real time. For `memory` and `fakes3`,
-`--delay-scale` selects the inverse process-wide model-time speedup: backend
-latency, rate limits, SDK and engine retries, leases, and background cadence
-advance coherently. The parts of an experiment that set what it measures also
-use model time: the seed and warm-up waits and timeouts, the measurement
-duration and its end conditions, and the timeline. So a run measures the same
-model time at each scale. Only the watchdogs (`--drain-timeout` and the limit
-of the full GCs) and `--run-cooldown` use wall time, because they protect the
-host. The `wallMs` fields of the result are wall time. The `0.2` default keeps
-S3-profile sleeps above timer granularity; smaller scales are useful only as
-explicitly approximate probes.
+the bucket in `$BUCKET` and always run in real time. In real time, model time
+is wall time, so the ratio of CPU time to backend latency is the same as on a
+cloud provider. Backend latency, rate limits, SDK and engine retries, leases,
+and background cadence all use model time. The parts of an experiment that set
+what it measures also use model time: the seed and warm-up waits and timeouts,
+the measurement duration and its end conditions, and the timeline. Only the
+watchdogs (`--drain-timeout` and the limit of the full GCs) and
+`--run-cooldown` use wall time, because they protect the host. The `wallMs`
+fields of the result are wall time.
 
-`--time=virtual` replaces the compression with virtual time. The process runs
+`--time=virtual` replaces wall time with virtual time. The process runs
 on one thread with a paused Tokio clock, and model time jumps over each wait of
 an idle process. The paused clock rounds each timer up to a whole millisecond,
 so `rt` runs model time 1000 times as slow as that clock: model waits are exact
@@ -126,13 +124,11 @@ runs of the same revision give nearly the same result: the engine randomizes
 the cadence of its background tasks, so a window that holds a pass of the
 garbage collector can count one listing more or less, and records with a
 timestamp can change their size by a byte with the start time of the process.
-This moves the latency of large writes by under 1%. It needs `--backend=memory`
-and does not combine with `--delay-scale`: a paused clock also jumps while a
-task waits for the operating system, as for the socket of `fakes3`. Latencies
-are 2–15% lower than at the 5× scale, so a comparison must use one mode on both
-sides. In real time, `rt` rounds each wait up to a whole millisecond of wall
-time, so each backend operation at the 5× scale takes about 5 ms of model time
-more. Short operations, such as reads, show the largest difference. The
+This moves the latency of large writes by under 1%. It needs `--backend=memory`:
+a paused clock also jumps while a task waits for the operating system, as for
+the socket of `fakes3`. Latencies are lower than in real time, where CPU work
+takes model time and each wait can end up to a millisecond late, so a
+comparison must use one mode on both sides. The
 comparison of two revisions in CI uses it, because both sides have the same
 effects and the results repeat. Use it also for fast checks and for a first look
 at the shape of a sweep. These effects make it unfit for the canonical plots and
@@ -437,8 +433,10 @@ The checks before the first seed:
 
 The result has `schemaVersion` 3. It has `backend`, `timeMode`,
 `modelTimeSpeedup`, `latencyJitter`, the command-line `options`, and
-`experiments`: one entry for each experiment, in the order that they ran. Each
-entry has the `name` of the experiment, its `tags`, its resolved
+`experiments`: one entry for each experiment, in the order that they ran.
+`modelTimeSpeedup` is always 1. Results of older revisions can have another
+value, for example 5 from the default compressed real time, and the readers of
+the canonical plots and of the CI comparison reject them. Each entry has the `name` of the experiment, its `tags`, its resolved
 `configuration`, its `axes`, and its `runs`. Each run has its cells. Each cell has:
 
 - `labels` (the label of each axis value), `parameters` (the paths that the

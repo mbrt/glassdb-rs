@@ -108,8 +108,8 @@ each collection its own simulated S3 request-rate limit:
 
 ```bash
 cargo build --release -p glassdb-bench-scale --bin perfbench
-common=(--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
-  --runs=3 --drain-timeout=90s)
+common=(--backend=memory --delays=s3 --prefix-depth=3 --runs=3
+  --drain-timeout=90s)
 e=hack/perf/experiments
 target/release/perfbench "${common[@]}" --experiment=$e/workers.toml \
   --output=hack/perf/out-sweeps/workers.json
@@ -234,8 +234,8 @@ work. `CASE` selects one of these experiments.
 
 ### The in-memory caveat
 
-The experiments use the memory backend with the S3 delay profile and a 5×
-model clock. A CPU profile explains local execution costs; it does not predict
+The experiments use the memory backend with the S3 delay profile in real time.
+A CPU profile explains local execution costs; it does not predict
 object-storage latency or waiting time. Use real-provider measurements for
 workload behavior.
 
