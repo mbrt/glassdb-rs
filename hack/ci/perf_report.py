@@ -460,6 +460,17 @@ def main() -> int:
     parser.add_argument("--candidate", type=Path)
     parser.add_argument("--base-label", default="base")
     parser.add_argument("--candidate-label", default="candidate")
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        help="the manifest of the build, for its labels and its warnings",
+    )
+    parser.add_argument(
+        "--warning",
+        action="append",
+        default=[],
+        help="a warning to add to the report; it can be given more than once",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.summary:
@@ -470,9 +481,12 @@ def main() -> int:
         return 0
     if not (args.base and args.candidate and args.output):
         parser.error("--base, --candidate, and --output are needed for a comparison")
-    args.output.write_text(
-        render_report(args.base, args.candidate, args.base_label, args.candidate_label)
-    )
+    labels, warnings = (args.base_label, args.candidate_label), list(args.warning)
+    if args.manifest:
+        manifest = read_json(args.manifest)
+        labels = (manifest.get("base", labels[0]), manifest.get("candidate", labels[1]))
+        warnings += manifest.get("warnings", [])
+    args.output.write_text(render_report(args.base, args.candidate, *labels, warnings))
     return 0
 
 

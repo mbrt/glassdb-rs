@@ -101,21 +101,30 @@ window. Most cases use built-in parts:
 | `rmw-shared-leaf` | Three workers that update their own key of one leaf. |
 | `shapes-shared-leaf` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time on one leaf, with `low-conflict` keys. |
 
-The CI comparison runs four perfbench processes, two for each revision, and then
-compares their results:
+The CI comparison builds perfbench for both revisions, runs `make bench` with
+each binary, and then compares the results:
 
 ```text
-perfbench --tag=ci/counters --latency-jitter=false              # each revision
-perfbench --tag=ci/timing --latency-jitter=true --runs=32       # each revision
-hack/ci/perf_report.py --base main/ --candidate pr/ --output report.md
+hack/ci/perf_compare.py --base <merge base> --candidate <head> --output R --build-only
+make bench PERFBENCH=R/bin/main-perfbench EXPERIMENTS_DIR=R/harness/hack/perf/experiments OUT=R/main
+make bench PERFBENCH=R/bin/pr-perfbench EXPERIMENTS_DIR=R/harness/hack/perf/experiments OUT=R/pr
+hack/ci/perf_report.py --manifest R/manifest.json --base R/main --candidate R/pr --output R/report.md
 ```
 
-`make bench` runs the two perfbench processes of one revision for the current
-tree, with the same options as CI, and prints the main metrics: the median p50,
-p90, and throughput of each shape over the runs, with the spread of one run, and
-the backend operations and coordinator rounds per transaction of each case. The
-results go to `OUT`, by default a new directory in `/tmp`. To print the summary
-of a result directory again, run `hack/ci/perf_report.py --summary DIR`.
+The build step copies the harness of the candidate into a snapshot of the base,
+so both binaries and both runs use the same benchmark code and experiments, and
+only the engine differs.
+
+`make bench` runs two perfbench processes: `--tag=ci/counters
+--latency-jitter=false --runs=1` and `--tag=ci/timing --latency-jitter=true
+--runs=32`. By default it builds perfbench and runs the experiments of the
+current tree; `PERFBENCH` and `EXPERIMENTS_DIR` change both, as in CI. It then
+prints the main metrics: the median p50, p90, and throughput of each shape over
+the runs, with the spread of one run, and the backend operations and
+coordinator rounds per transaction of each case. The results go to `OUT`, by
+default a new directory in `/tmp`, with a `host.json` of the host and the
+runtime. To print the summary of a result directory again, run
+`hack/ci/perf_report.py --summary DIR`.
 
 The counter run compares the `costs` of each cell. They repeat exactly, so a
 change of any count shows, and a byte count shows when it changes by more than

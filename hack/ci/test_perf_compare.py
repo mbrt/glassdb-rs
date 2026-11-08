@@ -234,7 +234,10 @@ class MeasurementTest(unittest.TestCase):
             self.assertEqual(len(timing["experiments"][0]["runs"]), 4)
             self.assertEqual(len(counters["experiments"][0]["runs"]), 1)
         self.assertIn("No meaningful changes detected", self.report())
-        self.assertIn("cpuModel", manifest)
+        for side in ("main", "pr"):
+            host = json.loads((self.root / side / "host.json").read_text())
+            self.assertIn("cpuModel", host)
+            self.assertGreaterEqual(host["runtimeSeconds"], 0)
 
     def test_the_default_plan_measures_on_virtual_time(self):
         for arguments in (perf_compare.TIMING_ARGS, perf_compare.COUNTER_ARGS):
@@ -301,7 +304,7 @@ class MeasurementTest(unittest.TestCase):
     def test_bench_runs_one_side_and_prints_its_summary(self):
         (self.root / "cases.json").write_text(json.dumps(["a"]))
         with mock.patch("builtins.print") as printed:
-            perf_compare.bench(self.root, self.fixture, self.root / "bench")
+            perf_compare.bench(self.root / perf_compare.EXPERIMENTS, self.fixture, self.root / "bench")
         self.assertEqual(self.order(), [["counters", "bench"], ["timing", "bench"]])
         timing = self.read("bench", "timing")
         self.assertEqual(len(timing["experiments"][0]["runs"]), perf_compare.TIMING_RUNS)
@@ -331,7 +334,9 @@ class MeasurementTest(unittest.TestCase):
             with self.assertRaisesRegex(
                 perf_compare.perf_report.ReportError, "cell failed"
             ):
-                perf_compare.bench(self.root, self.fixture, self.root / "bench")
+                perf_compare.bench(
+                    self.root / perf_compare.EXPERIMENTS, self.fixture, self.root / "bench"
+                )
         # A summary of the same directory fails with a nonzero status.
         arguments = ["perf_report.py", "--summary", str(self.root / "bench")]
         with mock.patch.object(sys, "argv", arguments), mock.patch.object(
@@ -349,6 +354,10 @@ class MeasurementTest(unittest.TestCase):
         report = self.report()
         self.assertIn("Measurement failed", report)
         self.assertNotIn("Benchmark process timed out", report)
+        # The side that failed still records its host and its time.
+        host = json.loads((self.root / "pr" / "host.json").read_text())
+        self.assertIs(host["completed"], False)
+        self.assertIn("cpuModel", host)
 
 
 BENCHMARK_FIXTURE = r"""

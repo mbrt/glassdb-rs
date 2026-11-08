@@ -43,6 +43,7 @@ jobs:
       run: make test-bench
 
     - name: Build harness
+      id: build
       env:
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -55,13 +56,33 @@ jobs:
           --candidate "$HEAD_SHA" --output "$PERF_RESULTS" --build-only
 
     - name: Measure workloads
+      id: measure
       timeout-minutes: 15
-      # Each revision runs the counter experiments once and the timing
-      # experiments 32 times, on virtual time, with the runs in parallel. On a
-      # host with 22 CPUs, the four processes take about 50 s; the time on a
-      # runner is not measured yet. This guards the driver; each benchmark
-      # process has its own timeout of ten minutes.
-      run: python3 hack/ci/perf_compare.py --output "$PERF_RESULTS" --run-only
+      # Each revision runs `make bench` with the binary and the experiments
+      # that the build step records in its manifest: the counter experiments
+      # once, and the timing experiments 32 times, on virtual time, with the
+      # runs in parallel. Each benchmark process has its own timeout of ten
+      # minutes.
+      run: |
+        manifest="$PERF_RESULTS/manifest.json"
+        for side in main pr; do
+          make bench PERFBENCH="$(jq -r ".$side.perfbench" "$manifest")" \
+            EXPERIMENTS_DIR="$(jq -r .experiments "$manifest")" \
+            OUT="$PERF_RESULTS/$side"
+        done
+
+    - name: Compare
+      if: ${{ always() && steps.build.outcome == 'success' }}
+      env:
+        MEASURE_OUTCOME: ${{ steps.measure.outcome }}
+      run: |
+        warnings=()
+        if [ "$MEASURE_OUTCOME" != success ]; then
+          warnings+=("--warning=The measurement step failed ($MEASURE_OUTCOME); see its log.")
+        fi
+        python3 hack/ci/perf_report.py --manifest "$PERF_RESULTS/manifest.json" \
+          --base "$PERF_RESULTS/main" --candidate "$PERF_RESULTS/pr" \
+          "${warnings[@]}" --output "$PERF_RESULTS/report.md"
 
     - name: Render job summary
       if: ${{ always() }}

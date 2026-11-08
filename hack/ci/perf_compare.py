@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -222,6 +223,7 @@ def prepare(repo: Path, output: Path, base: str, candidate: str | None) -> dict:
         for relative in (CONFIGS, EXPERIMENTS):
             if (snapshots / "pr" / relative).is_dir():
                 shutil.copytree(snapshots / "pr" / relative, harness / relative)
+        manifest["experiments"] = str(harness / EXPERIMENTS)
         experiments = f"--experiment={harness / EXPERIMENTS}"
         manifest["timingArgs"] += [experiments, TIMING_TAG]
         manifest["counterArgs"] += [experiments, COUNTER_TAG]
@@ -239,32 +241,60 @@ def run_side(
     """Run the counter and the timing experiments of one revision into
     `directory`, with a log of each process beside its result."""
     directory.mkdir(parents=True)
-    for stem, arguments in (
-        (Path(perf_report.COUNTERS_FILE).stem, counter_args),
-        (Path(perf_report.TIMING_FILE).stem, timing_args),
-    ):
-        print(f"{directory.name}: {stem}", flush=True)
-        command = [
-            perfbench,
-            f"--output={directory / f'{stem}.json'}",
-            "--progress=never",
-            *arguments,
-        ]
-        with (directory / f"{stem}.log").open("w") as log:
-            subprocess.run(
-                command,
-                cwd=directory,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                timeout=timeout,
-                check=True,
+    start = time.monotonic()
+    completed = False
+    try:
+        for stem, arguments in (
+            (Path(perf_report.COUNTERS_FILE).stem, counter_args),
+            (Path(perf_report.TIMING_FILE).stem, timing_args),
+        ):
+            print(f"{directory.name}: {stem}", flush=True)
+            command = [
+                perfbench,
+                f"--output={directory / f'{stem}.json'}",
+                "--progress=never",
+                *arguments,
+            ]
+            with (directory / f"{stem}.log").open("w") as log:
+                subprocess.run(
+                    command,
+                    cwd=directory,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    timeout=timeout,
+                    check=True,
+                )
+        completed = True
+    finally:
+        # The host and the time help to explain a slow or a stopped run; the
+        # results of virtual time do not depend on them.
+        (directory / "host.json").write_text(
+            json.dumps(
+                {
+                    "platform": platform.platform(),
+                    "cpuModel": cpu_model(),
+                    "cpus": os.cpu_count(),
+                    "runtimeSeconds": time.monotonic() - start,
+                    "completed": completed,
+                },
+                indent=2,
             )
+        )
 
 
-def bench(repo: Path, perfbench: Path, output: Path) -> None:
-    """Run one side of the comparison for the experiments of `repo`, and
-    print the summary of its results."""
-    experiments = f"--experiment={repo / EXPERIMENTS}"
+def cpu_model() -> str:
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.exists():
+        for line in cpuinfo.read_text().splitlines():
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    return platform.processor()
+
+
+def bench(experiments_dir: Path, perfbench: Path, output: Path) -> None:
+    """Run one side of the comparison for the experiments of `experiments_dir`,
+    and print the summary of its results."""
+    experiments = f"--experiment={experiments_dir.resolve()}"
     run_side(
         str(perfbench.resolve()),
         output,
@@ -289,18 +319,6 @@ def measure(output: Path, manifest: dict) -> None:
                 f"measurement directory already exists: {output / side}"
             )
     start = time.monotonic()
-    manifest["platform"] = platform.platform()
-    manifest["cpuModel"] = platform.processor()
-    cpuinfo = Path("/proc/cpuinfo")
-    if cpuinfo.exists():
-        manifest["cpuModel"] = next(
-            (
-                line.split(":", 1)[1].strip()
-                for line in cpuinfo.read_text().splitlines()
-                if line.startswith("model name")
-            ),
-            manifest["cpuModel"],
-        )
     try:
         for side in ("main", "pr"):
             run_side(
@@ -342,25 +360,27 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--build-only", action="store_true")
-    modes.add_argument("--run-only", action="store_true")
     modes.add_argument(
         "--bench",
         type=Path,
         metavar="PERFBENCH",
-        help="run one side with this binary and the current experiments, and print a summary",
+        help="run one side with this binary, and print a summary of its results",
+    )
+    parser.add_argument(
+        "--experiments",
+        type=Path,
+        help="the experiments of --bench (default: hack/perf/experiments)",
     )
     args = parser.parse_args()
+    if args.experiments and not args.bench:
+        parser.error("--experiments needs --bench")
     repo = Path(capture(["git", "rev-parse", "--show-toplevel"], Path.cwd()).strip())
     output = args.output.resolve()
     try:
         if args.bench:
-            bench(repo, args.bench, output)
+            bench(args.experiments or repo / EXPERIMENTS, args.bench, output)
             return 0
-        manifest = (
-            json.loads((output / "manifest.json").read_text())
-            if args.run_only
-            else prepare(repo, output, args.base, args.candidate)
-        )
+        manifest = prepare(repo, output, args.base, args.candidate)
         if not args.build_only:
             measure(output, manifest)
             print((output / "report.md").read_text())

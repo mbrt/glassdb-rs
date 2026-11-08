@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import math
 import statistics
+import sys
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from hack.ci import perf_report
 
@@ -513,6 +515,27 @@ class PerfReportTest(unittest.TestCase):
         self.assertIn(f"| {SHARED_LEAF}/rw-single | 10.00 ±0.0% |", summary)
         self.assertIn("| example | 2.000 | 0.000 | 0.000 | 1.000 |", summary)
         self.assertNotIn("Measurement warnings", summary)
+
+    def test_the_manifest_gives_the_labels_and_the_warnings_of_the_build(self):
+        self.write(
+            self.root / "manifest.json",
+            {"base": "abc", "candidate": "def", "warnings": ["used the base harness"]},
+        )
+        output = self.root / "report.md"
+        arguments = [
+            "perf_report.py",
+            f"--base={self.root / 'main'}",
+            f"--candidate={self.root / 'pr'}",
+            f"--manifest={self.root / 'manifest.json'}",
+            "--warning=the measurement step failed",
+            f"--output={output}",
+        ]
+        with mock.patch.object(sys, "argv", arguments):
+            self.assertEqual(perf_report.main(), 0)
+        report = output.read_text()
+        self.assertIn("Base: `abc`; candidate: `def`.", report)
+        self.assertIn("- used the base harness", report)
+        self.assertIn("- the measurement step failed", report)
 
     def test_model_mismatch_is_not_compared(self):
         self.update("timing", lambda value: value.update(modelTimeSpeedup=5))
