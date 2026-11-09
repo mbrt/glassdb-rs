@@ -288,6 +288,62 @@ class PerfReportTest(unittest.TestCase):
         # by about 5e-5.
         self.assertAlmostEqual(comparison.interval[0], lower, delta=1e-5)
 
+    def test_a_change_smaller_than_the_spread_of_one_run_is_not_reported(self):
+        # The runs of each side spread by about 5%, as the noisiest p90 of
+        # `contention` does. A change of 3.5% is repeatable, but a revision
+        # compared with itself can give a change of that size.
+        def compare(effect):
+            base = perf_report.Metric("ns", "time")
+            candidate = perf_report.Metric("ns", "time")
+            for run in range(32):
+                noise = math.exp(0.05 if run % 2 else -0.05)
+                base.add(100 * noise)
+                candidate.add(100 * (1 + effect) * noise)
+            return perf_report.compare(base, candidate)
+
+        small = compare(0.035)
+        assert small.interval is not None and small.floor is not None
+        self.assertGreater(small.interval[0], 0)
+        self.assertAlmostEqual(small.floor, math.expm1(0.05), delta=0.002)
+        self.assertFalse(small.report)
+        self.assertTrue(compare(0.10).report)
+
+    def test_the_floor_of_a_metric_with_a_small_spread_is_the_threshold(self):
+        base = perf_report.Metric("ns", "time")
+        candidate = perf_report.Metric("ns", "time")
+        for run in range(32):
+            base.add(100 + run % 2)
+            candidate.add(100 + run % 2)
+        comparison = perf_report.compare(base, candidate)
+        self.assertEqual(comparison.floor, perf_report.TIMING_THRESHOLD)
+        self.assertFalse(comparison.uncertain)
+
+    def test_a_reported_change_shows_its_floor(self):
+        self.set_latencies((102.8, 103.0, 103.2, 103.0))
+        self.assertIn("| ±2.0% |", self.row(self.report(), "| example: p50Ms |"))
+
+    def test_the_floor_is_explained_once_and_only_for_a_timing_change(self):
+        self.set_latencies((102.8, 103.0, 103.2, 103.0))
+        self.remove_cell("timing", SHARED_LEAF, runs=[RUNS])
+        report = self.report()
+        self.assertIn("incomplete measurements", report)
+        self.assertEqual(report.count(perf_report.FLOOR_NOTE), 1)
+        # The note explains the column of the table, so it comes before the
+        # warnings.
+        self.assertLess(
+            report.index(perf_report.FLOOR_NOTE), report.index("Measurement warnings")
+        )
+        self.set_latencies((100,) * RUNS)
+        self.assertNotIn(perf_report.FLOOR_NOTE, self.report())
+
+    def test_an_inconclusive_metric_shows_its_floor(self):
+        self.set_latencies((101, 112, 109, 104))
+        report = self.report()
+        self.assertRegex(
+            report, r"example: p50Ms: noisy or inconclusive .*\(floor ±\d+\.\d%\)"
+        )
+        self.assertIn(perf_report.FLOOR_NOTE, report)
+
     def test_one_run_of_a_timing_metric_is_inconclusive(self):
         base = perf_report.Metric("ns", "time")
         candidate = perf_report.Metric("ns", "time")

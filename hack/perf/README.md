@@ -132,10 +132,12 @@ change of any count shows, and a byte count shows when it changes by more than
 of the process. The timing runs compare the p50 latency, the p90 latency, and
 the throughput of each shape. Each run is an independent sample of the latency
 jitter, so the report compares the 32 runs of each side with a simultaneous 95%
-interval of the change, and shows a change of 2% or more whose interval excludes
-zero. With 32 runs of 300 s, a comparison of a revision with itself gave
-intervals of at most ±0.9% for all 36 timing metrics, so an unchanged metric
-does not stay inconclusive.
+interval of the change. It shows a change whose interval excludes zero and
+that is at least the floor of the metric: 2%, or the spread of one run if that
+is larger. A metric whose runs spread by 5% can change by 4% with no change of
+the engine, so the floor scales with the spread. With 32 runs of 300 s, a
+comparison of a revision with itself gave intervals of at most ±0.9% for all
+36 timing metrics, so an unchanged metric does not stay inconclusive.
 
 The name of a metric is the experiment, then the labels of the cell if the
 experiment has more than one cell, then the shape if the cell has more than one

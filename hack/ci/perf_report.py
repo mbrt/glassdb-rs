@@ -37,9 +37,16 @@ LATENCY_METRICS = (
     ("p90Ms", "model ms/tx", "time"),
     ("txPerSec", "tx/model s", "rate"),
 )
-# The smallest timing change that the report shows. The test for a repeatable
-# direction is separate from this floor.
+# The smallest timing change that the report shows. The floor of a metric is
+# also at least the spread of one of its runs: a smaller change is not
+# meaningful even if it is repeatable, because the runs of an unchanged
+# revision can differ by that much. The test for a repeatable direction is
+# separate from this floor.
 TIMING_THRESHOLD = 0.02
+FLOOR_NOTE = (
+    "A timing change shows when its interval excludes zero and it is at least"
+    f" its floor: {TIMING_THRESHOLD:.0%}, or the spread of one run if that is larger."
+)
 # The size of a record with a timestamp changes by a byte with the start time
 # of the process, so a byte count can move by this much with no change.
 BYTES_NOISE_THRESHOLD = 0.01
@@ -243,6 +250,8 @@ class Comparison:
     interval: tuple[float, float] | None
     report: bool
     uncertain: bool
+    # The smallest change that the report shows, for a timing metric.
+    floor: float | None = None
 
 
 def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison:
@@ -272,14 +281,20 @@ def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison
     half = t_critical(max(1, degrees), family_size) * math.sqrt(variance)
     relative = math.expm1(mean)
     lower, upper = math.expm1(mean - half), math.expm1(mean + half)
+    # The spread of one run, pooled over the two sides.
+    spread = math.sqrt(
+        (statistics.variance(a) * (len(a) - 1) + statistics.variance(b) * (len(b) - 1))
+        / (len(a) + len(b) - 2)
+    )
+    floor = max(TIMING_THRESHOLD, math.expm1(spread))
     # Effect size and statistical significance answer different questions:
     # a small repeatable change must not need an interval wholly beyond the floor.
-    increase = relative >= TIMING_THRESHOLD and lower > 0
-    decrease = relative <= -TIMING_THRESHOLD and upper < 0
+    increase = relative >= floor and lower > 0
+    decrease = relative <= -floor and upper < 0
     report = increase or decrease
-    resolved_small = lower >= -TIMING_THRESHOLD and upper <= TIMING_THRESHOLD
+    resolved_small = lower >= -floor and upper <= floor
     return Comparison(
-        relative, (lower, upper), report, not report and not resolved_small
+        relative, (lower, upper), report, not report and not resolved_small, floor
     )
 
 
@@ -339,8 +354,13 @@ def render_report(
             if comparison.interval is not None
             else "—"
         )
+        floor = (
+            f"±{comparison.floor:.1%}" if comparison.floor is not None else "—"
+        )
         if comparison.uncertain:
             detail = f" {interval}" if comparison.interval is not None else ""
+            if comparison.floor is not None:
+                detail += f" (floor {floor})"
             warnings.append(f"{name}: noisy or inconclusive{detail}")
         if not comparison.report:
             continue
@@ -362,8 +382,12 @@ def render_report(
             direction = "improved" if improved else "regressed"
         change = f"{delta:+,.3f} ({relative})" if a.kind == "cost" else relative
         rows.append(
-            f"| {escape(name)} | {before:,.3f} | {after:,.3f} | {change} | {interval} | {a.unit} | {direction} |"
+            f"| {escape(name)} | {before:,.3f} | {after:,.3f} | {change} | {interval} | {floor} | {a.unit} | {direction} |"
         )
+    floors = [FLOOR_NOTE, ""] if any(
+        c.floor is not None and (c.report or c.uncertain)
+        for *_, c in result.metrics.values()
+    ) else []
     lines = [
         "# Performance comparison",
         "",
@@ -372,11 +396,13 @@ def render_report(
     ]
     if rows:
         lines += [
-            "| Metric | Base median | Candidate median | Change | 95% simultaneous interval | Unit | Result |",
-            "| --- | ---: | ---: | ---: | --- | --- | --- |",
+            "| Metric | Base median | Candidate median | Change | 95% simultaneous interval | Floor | Unit | Result |",
+            "| --- | ---: | ---: | ---: | --- | ---: | --- | --- |",
             *rows,
             "",
+            *floors,
         ]
+        floors = []
     else:
         lines += [
             "No conclusive changes; some measurements remain unresolved."
@@ -392,6 +418,7 @@ def render_report(
             "",
             *[f"- {escape(warning)}" for warning in sorted(set(warnings))],
             "",
+            *floors,
         ]
     lines += [
         "Full results and logs are retained as artifacts.",
