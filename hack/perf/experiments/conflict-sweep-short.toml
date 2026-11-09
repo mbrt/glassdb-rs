@@ -1,6 +1,6 @@
 # The cells of `conflict-sweep` at three pool sizes of each transaction size,
 # for the CI comparison: few, some, and many conflicts.
-tags = ["ci/timing", "area/contention"]
+tags = ["ci/timing", "ci/extended", "area/contention"]
 include = ["../configs/conflict-sweep.toml"]
 
 [[axes]]

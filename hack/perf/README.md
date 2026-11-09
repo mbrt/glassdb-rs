@@ -28,6 +28,7 @@ repository uses these tags:
 | --- | --- |
 | `ci/counters` | An experiment whose counters the CI comparison and `make bench` compare. It runs once in virtual time without latency jitter, so its counters repeat exactly. |
 | `ci/timing` | An experiment whose latency the CI comparison and `make bench` compare. It runs 32 times in virtual time with latency jitter. |
+| `ci/extended` | An experiment of `ci/timing` that the CI comparison and `make bench` run only on request, because it is expensive. [Comparing revisions](#comparing-revisions) tells how to request it. |
 | `extra` | An experiment that is too slow for CI, but that runs on one host. |
 | `cloud` | An experiment of real S3, in [`hack/aws-bench/experiments`](../aws-bench/README.md). It changes a local experiment of the same name for real S3. |
 | `canonical` | An input of the [canonical plots](#plotting-results). |
@@ -123,7 +124,9 @@ only the engine differs.
 --latency-jitter=false --runs=1` and `--tag=ci/timing --latency-jitter=true
 --runs=32`. The Makefile is the only place that has their options. By default it
 builds perfbench and runs the experiments of the current tree; `PERFBENCH` and
-`EXPERIMENTS_DIR` change both, as in CI. It then prints the main metrics: the
+`EXPERIMENTS_DIR` change both, as in CI. The timing process excludes the
+experiments with the tag `ci/extended`, unless `EXTENDED=1`. They take about
+80% of its time. It then prints the main metrics: the
 median p50, p90, and throughput of each shape over the runs, with the spread of
 one run, and the backend operations and coordinator rounds per transaction of
 each case. While it runs, it prints the notes of perfbench about its cells, and
@@ -161,7 +164,8 @@ A metric whose spread grows by less than 3 times can be in that list.
 
 The experiments `contention`, `split-merge-fight`, `false-sharing`,
 `false-sharing-spans`, and the four shorter versions also have the tag
-`ci/timing`, with their own windows.
+`ci/timing`, with their own windows. The four shorter versions also have the
+tag `ci/extended`.
 Their metrics spread more, so their floors are larger. For most of them the
 spread of one run is at most about 6%. Some metrics spread much more: up to
 about 18% in `conflict-sweep-short`, 19% for the `span` shape of
@@ -245,6 +249,14 @@ binary, and `perf_report.py` writes the report. Both sides run the
 experiments of the candidate that have the tags `ci/counters` and `ci/timing`.
 The current source tree is not changed.
 
+CI excludes the experiments with the tag `ci/extended`, unless the PR has the
+label `perf` or `perf:extended`. A PR that changes performance has the label
+`perf`. To compare the extended experiments for another PR, add the label
+`perf:extended`. A new label starts no comparison: to compare with it, run the
+jobs of the last comparison again, or push a commit. The comparison takes about
+25 minutes, and about 1 hour with the extended experiments. For
+`compare_refs.sh`, set `EXTENDED=1` in the environment.
+
 If the candidate's harness does not build against the base engine, for example
 because it uses an API that the base does not have, both sides use the harness
 of the base, and the report says so.
@@ -259,6 +271,9 @@ hack/perf/compare_refs.sh --summary
 # explicit references
 BASE=main TARGET=my-branch OUT=/tmp/glassdb-comparison \
   hack/perf/compare_refs.sh
+
+# also the experiments with the tag ci/extended
+EXTENDED=1 hack/perf/compare_refs.sh
 ```
 
 ### Comparing result directories

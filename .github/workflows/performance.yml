@@ -55,14 +55,29 @@ jobs:
         python3 hack/ci/perf_compare.py --base "$MERGE_BASE" \
           --candidate "$HEAD_SHA" --output "$PERF_RESULTS"
 
+    # A PR that changes performance, or that asks for it, also compares the
+    # experiments with the tag ci/extended. The labels come from the API, not
+    # from the event, so that a run of the jobs again sees a new label. A new
+    # label starts no run, because a skipped run would replace the result of
+    # the last comparison on the PR.
+    - name: Select experiments
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        labels=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name')
+        if grep -qxE 'perf|perf:extended' <<<"$labels"; then
+          echo "EXTENDED=1" >> "$GITHUB_ENV"
+        fi
+
     - name: Measure workloads
       id: measure
       timeout-minutes: 90
       # Each revision runs `make bench` with the binary and the experiments
       # that the build step records in its manifest: the counter experiments
       # once, and the timing experiments 32 times, on virtual time, with the
-      # runs in parallel. By an estimate from a laptop, the timing process
-      # takes about 30 minutes on 4 vCPUs. The timeout of this step also stops
+      # runs in parallel. On 4 vCPUs, the timing process takes about 6 minutes,
+      # and about 25 minutes with EXTENDED. The timeout of this step also stops
       # a process that hangs, such as a CPU livelock that virtual time cannot
       # see.
       run: |

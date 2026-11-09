@@ -1,7 +1,7 @@
 # The cell of `fixed-ranges` on one database instance, for the CI comparison. It
 # measures for a fixed 20 s: the end condition `converged` waits for 1,000
 # commits of each shape, and the shapes of a single worker set its length.
-tags = ["ci/timing", "area/topology"]
+tags = ["ci/timing", "ci/extended", "area/topology"]
 include = ["../configs/fixed-ranges.toml"]
 
 [cell]
