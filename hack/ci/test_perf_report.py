@@ -173,8 +173,7 @@ class PerfReportTest(unittest.TestCase):
         self.assertNotIn("| Metric", report)
         self.assertRegex(
             report,
-            r"example: p50Ms: noisy or inconclusive\s*"
-            r"\[-\d+\.\d+%, \+\d+\.\d+%\]",
+            r"- example: p50Ms: \[-\d+\.\d+%, \+\d+\.\d+%\]",
         )
         self.assertIn("No conclusive changes", report)
         self.assertNotIn("No meaningful changes detected", report)
@@ -340,9 +339,93 @@ class PerfReportTest(unittest.TestCase):
         self.set_latencies((101, 112, 109, 104))
         report = self.report()
         self.assertRegex(
-            report, r"example: p50Ms: noisy or inconclusive .*\(floor ±\d+\.\d%\)"
+            report, r"- example: p50Ms: .*\(floor ±\d+\.\d%\)"
         )
         self.assertIn(perf_report.FLOOR_NOTE, report)
+
+    @staticmethod
+    def spread_metrics(base_spread, candidate_spread, runs=32):
+        """Return two metrics whose log values alternate around 100 by the
+        given spreads."""
+        base = perf_report.Metric("ns", "time")
+        candidate = perf_report.Metric("ns", "time")
+        for run in range(runs):
+            sign = 1 if run % 2 else -1
+            base.add(100 * math.exp(sign * base_spread))
+            candidate.add(100 * math.exp(sign * candidate_spread))
+        return base, candidate
+
+    def test_a_metric_that_becomes_less_stable_is_reported(self):
+        comparison = perf_report.compare(*self.spread_metrics(0.02, 0.06))
+        assert comparison.spread is not None
+        self.assertTrue(comparison.spread.report)
+        self.assertAlmostEqual(comparison.spread.ratio, 3, delta=0.01)
+        self.assertFalse(comparison.noisy)
+
+    def test_a_metric_that_becomes_more_stable_is_reported(self):
+        comparison = perf_report.compare(*self.spread_metrics(0.06, 0.02))
+        assert comparison.spread is not None
+        self.assertTrue(comparison.spread.report)
+        self.assertAlmostEqual(comparison.spread.ratio, 1 / 3, delta=0.01)
+
+    def test_the_spread_in_the_table_is_the_statistic_of_the_test(self):
+        # One outlier run moves the standard deviation much more than the mean
+        # distance from the median.
+        base, candidate = self.spread_metrics(0.02, 0.03)
+        base.values[0] = 100 * math.exp(0.4)
+        spread = perf_report.compare(base, candidate).spread
+        assert spread is not None
+        a = [math.log(v) for v in base.values]
+        distance = statistics.mean(abs(x - statistics.median(a)) for x in a)
+        self.assertAlmostEqual(
+            spread.before, math.expm1(math.sqrt(math.pi / 2) * distance)
+        )
+        self.assertAlmostEqual(
+            spread.ratio, math.log1p(spread.after) / math.log1p(spread.before)
+        )
+
+    def test_a_small_change_of_the_spread_is_not_reported(self):
+        # The distances from the median are equal on each side, so the change
+        # is certain, but below the threshold.
+        comparison = perf_report.compare(*self.spread_metrics(0.02, 0.025))
+        assert comparison.spread is not None
+        self.assertFalse(comparison.spread.report)
+
+    def test_the_same_spread_on_both_sides_is_not_a_change(self):
+        comparison = perf_report.compare(*self.spread_metrics(0.05, 0.05))
+        assert comparison.spread is not None
+        self.assertFalse(comparison.spread.report)
+        self.assertAlmostEqual(comparison.spread.ratio, 1)
+
+    def test_a_spread_change_shows_in_its_own_table(self):
+        # Each side has equal distances from its median, so the change of the
+        # spread is certain even with few runs.
+        for run, after in enumerate((60, 160, 60, 160), 1):
+            self.set_latency(run, 100 + run % 2, after)
+        report = self.report()
+        self.assertIn("## Spread changes", report)
+        row = self.row(report, "| example: p50Ms |")
+        self.assertIn("less stable", row)
+        # The reverse comparison is a spread that falls.
+        reverse = perf_report.render_report(
+            self.root / "pr", self.root / "main", "base", "candidate"
+        )
+        self.assertIn("more stable", self.row(reverse, "| example: p50Ms |"))
+        self.assertIn(perf_report.SPREAD_NOTE, report)
+
+    def test_noisy_metrics_do_not_hide_the_warnings(self):
+        # The same spread on both sides leaves the change unresolved.
+        for run, value in enumerate((101, 112, 109, 104), 1):
+            self.set_latency(run, value - 6, value)
+        self.update_cell("timing", SHARED_LEAF, lambda cell: cell.update(failures=1))
+        report = self.report()
+        warnings = report[report.index("## Measurement warnings") :]
+        self.assertIn("failed", warnings)
+        self.assertNotIn("example: p50Ms", warnings)
+        self.assertIn("Inconclusive metrics with no detected change of spread", report)
+        self.assertLess(
+            report.index("- example: p50Ms: ["), report.index("## Measurement warnings")
+        )
 
     def test_one_run_of_a_timing_metric_is_inconclusive(self):
         base = perf_report.Metric("ns", "time")
@@ -383,7 +466,7 @@ class PerfReportTest(unittest.TestCase):
                 runs=[run],
             )
         before = self.report()
-        self.assertIn(f"{SHARED_LEAF}/rw-single: p50Ms: noisy or inconclusive", before)
+        self.assertIn(f"- {SHARED_LEAF}/rw-single: p50Ms: [", before)
         self.assertNotIn("| Metric", before)
         self.update_cell(
             "timing",

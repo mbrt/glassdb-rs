@@ -140,13 +140,27 @@ comparison of a revision with itself gave intervals of at most ±0.9% for the
 36 timing metrics of the cases, so an unchanged metric of a case does not stay
 inconclusive.
 
+The report also compares the spread of one run of each timing metric, with the
+Brown-Forsythe test: a metric that becomes less stable is a change, even if
+its median does not move. The test and its table measure the spread as the
+mean distance of a run from the median, scaled to a standard deviation, so one
+outlier run moves it less than the standard deviation of the floor. A change of
+the spread shows when it is 1.5 times or more and the interval of the test
+excludes zero. With 32 runs, the spread
+changes less precisely than the median: a spread that grows by 3 times shows
+for most metrics, and one that grows by 2 times for some. The report lists an
+inconclusive metric with no detected change of spread in a collapsed list, not
+in the warnings, so that the noisy experiments do not hide the other warnings.
+A metric whose spread grows by less than 3 times can be in that list.
+
 The experiments `contention`, `split-merge-fight`, `false-sharing`, and
 `false-sharing-spans` also have the tag `ci/timing`, with their own windows.
 Their metrics spread by up to about 6% in one run, and the `span` shape of
 `false-sharing-spans` by up to about 19%, so their floors are larger. A
-comparison of a revision with itself gave no reports for them, and some of
-their metrics stay inconclusive. They have no counter file: their counters
-change between runs without latency jitter too.
+comparison of a revision with itself gave no reports for them, and about 40
+of their metrics stay inconclusive, with no detected change of their spread.
+They have no counter file: their counters change between runs without latency
+jitter too.
 
 The name of a metric is the experiment, then the labels of the cell if the
 experiment has more than one cell, then the shape if the cell has more than one

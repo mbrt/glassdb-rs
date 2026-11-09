@@ -47,6 +47,16 @@ FLOOR_NOTE = (
     "A timing change shows when its interval excludes zero and it is at least"
     f" its floor: {TIMING_THRESHOLD:.0%}, or the spread of one run if that is larger."
 )
+# The smallest change of the spread of one run that the report shows, as a
+# ratio. With 32 runs a side, a spread that grows by 3 times or more shows for
+# most metrics, and one that grows by 2 times for some of them.
+SPREAD_THRESHOLD = 1.5
+SPREAD_NOTE = (
+    "The spread in this table is the mean distance of a run from the median,"
+    " scaled to a standard deviation, which one outlier run moves less than the"
+    " standard deviation of the floor. A change of the spread shows when it is"
+    f" {SPREAD_THRESHOLD}× or more, and the runs show its direction."
+)
 # The size of a record with a timestamp changes by a byte with the start time
 # of the process, so a byte count can move by this much with no change.
 BYTES_NOISE_THRESHOLD = 0.01
@@ -245,6 +255,17 @@ def t_cdf(value: float, degrees: int) -> float:
 
 
 @dataclass(frozen=True)
+class Spread:
+    """The spread of one run on each side, as a relative change."""
+
+    before: float
+    after: float
+    # The change of the spread from the base to the candidate.
+    ratio: float
+    report: bool
+
+
+@dataclass(frozen=True)
 class Comparison:
     relative: float | None
     interval: tuple[float, float] | None
@@ -252,6 +273,54 @@ class Comparison:
     uncertain: bool
     # The smallest change that the report shows, for a timing metric.
     floor: float | None = None
+    spread: Spread | None = None
+
+    @property
+    def noisy(self) -> bool:
+        """The runs cannot resolve the change, and the spread test detects no
+        change of their spread. With 32 runs, the test detects a spread that
+        grows by 3 times for most metrics, but by 2 times only for some."""
+        return self.uncertain and self.spread is not None and not self.spread.report
+
+
+def welch(a: list[float], b: list[float], family_size: int) -> tuple[float, float]:
+    """Return the change of the mean from `a` to `b`, and the half-width of its
+    simultaneous 95% interval."""
+    va, vb = statistics.variance(a) / len(a), statistics.variance(b) / len(b)
+    variance = va + vb
+    if variance == 0:
+        degrees = len(a) + len(b) - 2
+    else:
+        degrees = int(
+            variance**2 / (va**2 / (len(a) - 1) + vb**2 / (len(b) - 1))
+        )
+    half = t_critical(max(1, degrees), family_size) * math.sqrt(variance)
+    return statistics.mean(b) - statistics.mean(a), half
+
+
+def compare_spread(a: list[float], b: list[float], family_size: int) -> Spread:
+    """Compare the spread of the log values of two sides."""
+    # Brown-Forsythe: the distances from the median of each side are compared
+    # as values, so a change of the spread is a change of their mean. It is
+    # robust to the skew of latency.
+    # https://www.itl.nist.gov/div898/handbook/eda/section3/eda35a.htm
+    distances = [
+        [abs(value - statistics.median(side)) for value in side] for side in (a, b)
+    ]
+    change, half = welch(*distances, family_size)
+    # The mean distance, scaled to the standard deviation of a normal
+    # distribution, so that the table shows the same statistic as the test.
+    before, after = (
+        math.sqrt(math.pi / 2) * statistics.mean(side) for side in distances
+    )
+    ratio = after / before if before else math.inf if after else 1.0
+    large = ratio >= SPREAD_THRESHOLD or ratio <= 1 / SPREAD_THRESHOLD
+    return Spread(
+        math.expm1(before),
+        math.expm1(after),
+        ratio,
+        large and (change - half > 0 or change + half < 0),
+    )
 
 
 def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison:
@@ -269,16 +338,7 @@ def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison
     b = [math.log(value) for value in candidate.values]
     if len(a) < 2 or len(b) < 2:
         return Comparison(None, None, False, True)
-    mean = statistics.mean(b) - statistics.mean(a)
-    va, vb = statistics.variance(a) / len(a), statistics.variance(b) / len(b)
-    variance = va + vb
-    if variance == 0:
-        degrees = len(a) + len(b) - 2
-    else:
-        degrees = int(
-            variance**2 / (va**2 / (len(a) - 1) + vb**2 / (len(b) - 1))
-        )
-    half = t_critical(max(1, degrees), family_size) * math.sqrt(variance)
+    mean, half = welch(a, b, family_size)
     relative = math.expm1(mean)
     lower, upper = math.expm1(mean - half), math.expm1(mean + half)
     # The spread of one run, pooled over the two sides.
@@ -294,7 +354,12 @@ def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison
     report = increase or decrease
     resolved_small = lower >= -floor and upper <= floor
     return Comparison(
-        relative, (lower, upper), report, not report and not resolved_small, floor
+        relative,
+        (lower, upper),
+        report,
+        not report and not resolved_small,
+        floor,
+        compare_spread(a, b, family_size),
     )
 
 
@@ -347,7 +412,7 @@ def render_report(
 ) -> str:
     result = analyze(base_dir, candidate_dir)
     warnings = [*(warnings or []), *result.warnings]
-    rows = []
+    rows, spreads, noisy = [], [], []
     for name, (a, b, comparison) in sorted(result.metrics.items()):
         interval = (
             f"[{comparison.interval[0]:+.1%}, {comparison.interval[1]:+.1%}]"
@@ -357,11 +422,20 @@ def render_report(
         floor = (
             f"±{comparison.floor:.1%}" if comparison.floor is not None else "—"
         )
+        spread = comparison.spread
+        if spread is not None and spread.report:
+            stability = "less stable" if spread.ratio > 1 else "more stable"
+            spreads.append(
+                f"| {escape(name)} | ±{spread.before:.1%} | ±{spread.after:.1%} | ×{spread.ratio:.2f} | {stability} |"
+            )
         if comparison.uncertain:
             detail = f" {interval}" if comparison.interval is not None else ""
             if comparison.floor is not None:
                 detail += f" (floor {floor})"
-            warnings.append(f"{name}: noisy or inconclusive{detail}")
+            if comparison.noisy:
+                noisy.append(f"{name}:{detail}")
+            else:
+                warnings.append(f"{name}: noisy or inconclusive{detail}")
         if not comparison.report:
             continue
         before, after = statistics.median(a.values), statistics.median(b.values)
@@ -403,11 +477,35 @@ def render_report(
             *floors,
         ]
         floors = []
-    else:
+    elif not spreads:
+        if warnings:
+            headline = "No conclusive changes; some measurements remain unresolved."
+        elif noisy:
+            headline = "No conclusive changes; some noisy metrics remain inconclusive."
+        else:
+            headline = "No meaningful changes detected in complete measurements."
+        lines += [headline, ""]
+    if spreads:
         lines += [
-            "No conclusive changes; some measurements remain unresolved."
-            if warnings
-            else "No meaningful changes detected in complete measurements.",
+            "## Spread changes",
+            "",
+            "| Metric | Base spread | Candidate spread | Change | Result |",
+            "| --- | ---: | ---: | ---: | --- |",
+            *spreads,
+            "",
+            SPREAD_NOTE,
+            "",
+        ]
+    if noisy:
+        # Inconclusive metrics with no detected change of spread are frequent,
+        # and a list of them in the warnings hides the other warnings.
+        lines += [
+            "<details>",
+            f"<summary>Inconclusive metrics with no detected change of spread: {len(noisy)}</summary>",
+            "",
+            *[f"- {escape(line)}" for line in noisy],
+            "",
+            "</details>",
             "",
         ]
     if warnings:
@@ -418,9 +516,9 @@ def render_report(
             "",
             *[f"- {escape(warning)}" for warning in sorted(set(warnings))],
             "",
-            *floors,
         ]
     lines += [
+        *floors,
         "Full results and logs are retained as artifacts.",
         "",
     ]
