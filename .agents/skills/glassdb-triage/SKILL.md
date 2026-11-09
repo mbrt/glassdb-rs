@@ -41,13 +41,6 @@ and the options. Then apply the fixes and the answers together.
 - Apply the [change standards](../../../docs/guides/change-standards.md) to
   the fix. A fix is code too.
 
-## Review the fix
-
-After you apply the fixes, run the `glassdb-review` skill again with the fix
-diff as the target, the same way as the first review. Do not run a third
-round for the same findings. If the second round finds new problems in the fix,
-report them to the user.
-
 ## Report
 
 Report to the user:
