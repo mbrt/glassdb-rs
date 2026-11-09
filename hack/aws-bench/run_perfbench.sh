@@ -13,6 +13,10 @@ common=(
   --run-cooldown="$RUN_COOLDOWN"
   --drain-timeout="$DRAIN_TIMEOUT"
   --config=aws.toml
+  # The bootstrap log is the only view of a run of hours, and it is not a
+  # terminal, so it has no progress bar. The details of each cell show its
+  # progress there.
+  --verbose
 )
 # The configuration and experiment files are in the environment, because the
 # stack fetches only the binary, this script, and its environment file.
@@ -21,14 +25,19 @@ if [[ -n "${PERFBENCH_CONFIG:-}" ]]; then
   printf '%s\n' "$PERFBENCH_CONFIG" >perfbench.toml
   common+=(--config=perfbench.toml)
 fi
-mkdir -p perf
-base64 -d <<<"$EXPERIMENT_FILES" | tar -C perf -xz
+mkdir -p files
+base64 -d <<<"$EXPERIMENT_FILES" | tar -C files -xz
 
 IFS=',' read -r -a experiments <<<"$EXPERIMENTS"
 for experiment in "${experiments[@]}"; do
-  file="perf/experiments/$experiment.toml"
+  # An experiment of real S3 replaces the local one with the same name.
+  file="files/aws-bench/experiments/$experiment.toml"
   if [[ ! -f "$file" ]]; then
-    echo "no experiment $experiment in hack/perf/experiments" >&2
+    file="files/perf/experiments/$experiment.toml"
+  fi
+  if [[ ! -f "$file" ]]; then
+    echo "no experiment $experiment in hack/aws-bench/experiments" \
+      "or hack/perf/experiments" >&2
     exit 1
   fi
   extra=()

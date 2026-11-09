@@ -1,0 +1,9 @@
+# A read on a new database instance, which has no cache (the scenario kind
+# `fresh-client-read`). The open is not in the time.
+# The counters of `read-fresh-client`: one run without latency jitter, in a
+# window of 10 s.
+tags = ["ci/counters", "area/read"]
+include = ["../configs/default.toml"]
+
+[cell]
+workload = "diag-fresh-read"

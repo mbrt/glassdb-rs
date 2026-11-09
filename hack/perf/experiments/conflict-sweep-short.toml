@@ -1,0 +1,19 @@
+# The cells of `conflict-sweep` at three pool sizes of each transaction size,
+# for the CI comparison: few, some, and many conflicts.
+tags = ["ci/timing", "area/contention"]
+include = ["../configs/conflict-sweep.toml"]
+
+[[axes]]
+name = "conflict"
+values = [
+  { label = "keys1-pool5000", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 5000 } },
+  { label = "keys1-pool50", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 50 } },
+  { label = "keys1-pool5", set = { "cell.workload" = "rw-1", "pools.sweep.keys" = 5 } },
+  { label = "keys4-pool5000", set = { "cell.workload" = "rw-4", "pools.sweep.keys" = 5000 } },
+  { label = "keys4-pool300", set = { "cell.workload" = "rw-4", "pools.sweep.keys" = 300 } },
+  { label = "keys4-pool100", set = { "cell.workload" = "rw-4", "pools.sweep.keys" = 100 } },
+]
+
+[[axes]]
+path = "cell.databases"
+values = [1, 5]

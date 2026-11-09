@@ -79,7 +79,7 @@ impl SeedKey {
     pub(crate) fn of(cell: &CellSpec) -> Self {
         Self {
             pools: cell.pools.clone(),
-            collections: cell.seed_collections,
+            collections: cell.collections,
             seed: cell.seed.clone(),
         }
     }
@@ -202,9 +202,9 @@ async fn seed(
         .pools
         .values()
         .filter(|pool| pool.seeded)
-        .map(|pool| pool.keys.unwrap_or(0) * cell.seed_collections)
+        .map(|pool| pool.keys.unwrap_or(0) * cell.collections)
         .sum();
-    crate::progress::log!("  seeding {keys} keys");
+    crate::progress::debug!("  seeding {keys} keys");
     let db = spec
         .database
         .apply(Database::builder(database, backend.clone()))?
@@ -241,7 +241,7 @@ async fn seed(
             let collected = collect_garbage(&db).await;
             match collected {
                 Ok(collected) => {
-                    crate::progress::log!(
+                    crate::progress::debug!(
                         "  full GC took {}ms: {} transaction records deleted",
                         collected.wall_ms,
                         collected.deleted
@@ -265,7 +265,7 @@ async fn seed(
         )
         .into());
     }
-    crate::progress::log!(
+    crate::progress::debug!(
         "  setup settled after {}ms: {} completed splits",
         report.settle_wall_ms,
         report.splits
@@ -276,7 +276,7 @@ async fn seed(
 async fn write_pools(db: &Database, cell: &CellSpec) -> Result<(), GError> {
     for (name, pool) in &cell.pools {
         let keys = pool.keys.unwrap_or(0);
-        for index in 0..cell.seed_collections {
+        for index in 0..cell.collections {
             let path = collection_path(name, index);
             let collection = db
                 .root_collection()

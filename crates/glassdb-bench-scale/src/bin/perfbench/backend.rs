@@ -9,10 +9,6 @@ use glassdb::middleware::{DelayBackend, DelayOptions, RateLimit, gcs_delays, s3_
 use glassdb::s3::{FakeS3, FakeS3Options, tuned_http_client};
 use glassdb_backend::Backend;
 
-use crate::time::TimeMode;
-
-const DEFAULT_DELAY_SCALE: f64 = 0.2;
-
 #[derive(Clone, Args)]
 pub(super) struct Options {
     /// Storage backend. The cloud backends use the bucket named by $BUCKET.
@@ -30,10 +26,6 @@ pub(super) struct Options {
     /// Override the simulated prefix partition depth; zero uses the profile.
     #[arg(long, default_value_t = 0)]
     prefix_depth: usize,
-    /// Compress process-wide model time for synthetic backends. The default is
-    /// 0.2. It does not combine with `--time=virtual`.
-    #[arg(long)]
-    delay_scale: Option<f64>,
     /// S3 connection-pool strategy. `churn` applies only to fakes3.
     #[arg(long, default_value = "tuned", value_parser = ["default", "tuned", "churn"])]
     http_pool: String,
@@ -82,44 +74,21 @@ impl Options {
         &self.backend
     }
 
-    /// Returns the options, for the result. Virtual time has no delay scale.
-    pub(super) fn describe(&self, time: TimeMode) -> serde_json::Value {
-        let delay_scale = match time {
-            TimeMode::Real => Some(self.delay_scale.unwrap_or(DEFAULT_DELAY_SCALE)),
-            TimeMode::Virtual => None,
-        };
+    /// Returns the options, for the result.
+    pub(super) fn describe(&self) -> serde_json::Value {
         serde_json::json!({
             "backend": self.backend,
             "delays": self.delays,
             "latencyJitter": self.latency_jitter,
             "enableThrottling": self.enable_throttling,
             "prefixDepth": self.prefix_depth,
-            "delayScale": delay_scale,
             "httpPool": self.http_pool,
         })
     }
 
-    /// Returns the model-time speedup for a synthetic backend. Real providers
-    /// stay on live wall time because their clocks cannot share this process's
-    /// model-time anchor.
-    pub(super) fn model_time_speedup(&self) -> Result<Option<f64>, Box<dyn Error>> {
-        match self.backend.as_str() {
-            "memory" | "fakes3" => {
-                let delay_scale = self.delay_scale.unwrap_or(DEFAULT_DELAY_SCALE);
-                if !(delay_scale > 0.0 && delay_scale.is_finite()) {
-                    return Err(format!("--delay-scale must be > 0, got {delay_scale}").into());
-                }
-                let speedup = 1.0 / delay_scale;
-                if !speedup.is_finite() {
-                    return Err(format!(
-                        "--delay-scale is too small to represent a model-time speedup: {delay_scale}"
-                    )
-                    .into());
-                }
-                Ok(Some(speedup))
-            }
-            _ => Ok(None),
-        }
+    /// Returns whether the backend runs in this process: `memory` or `fakes3`.
+    pub(super) fn is_synthetic(&self) -> bool {
+        matches!(self.backend.as_str(), "memory" | "fakes3")
     }
 
     /// Checks that the options can run on virtual time.
@@ -129,9 +98,6 @@ impl Options {
     pub(super) fn check_virtual_time(&self) -> Result<(), Box<dyn Error>> {
         if self.backend != "memory" {
             return Err("--time=virtual needs --backend=memory".into());
-        }
-        if self.delay_scale.is_some() {
-            return Err("--time=virtual does not combine with --delay-scale".into());
         }
         Ok(())
     }

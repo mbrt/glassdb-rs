@@ -1,0 +1,6 @@
+# Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time
+# on one leaf, with `low-conflict` keys.
+# The counters of `shapes-shared-leaf`: one run without latency jitter, in a
+# window of 10 s.
+tags = ["ci/counters", "area/mixed"]
+include = ["../configs/default.toml", "../configs/shapes-shared-leaf.toml"]

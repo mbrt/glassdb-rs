@@ -11,7 +11,7 @@ Manual experiments that use these tools are recorded in
 | --- | --- |
 | `plot_results.py` | Plots result files: the canonical sweeps, single files, and overlays. |
 | `compare.py` | Compares two directories of result files. |
-| `compare_refs.sh` | Compares two revisions with the CI comparison driver. |
+| `compare_refs.sh` | Compares two revisions with the steps of the CI comparison. |
 | `perfbench_results.py` | Reads the result files; the other tools use it. |
 | `profile.sh` | Records a CPU flamegraph of one experiment. |
 | `experiments/` | The experiment files, each for `--experiment`. [Experiments](#experiments) lists them and their tags. |
@@ -26,40 +26,51 @@ repository uses these tags:
 
 | Tag | Meaning |
 | --- | --- |
-| `ci` | An experiment of the CI comparison and of `make bench`. These run in virtual time, so that two revisions compare with results that repeat. |
-| `time/virtual` | The experiment shows the behavior that it is for in virtual time. Its absolute values can differ from real time, because latencies in virtual time have no timer rounding. Some `ci` experiments do not give the results of real time, for example `rmw-shared-leaf` (see `--time=virtual` in the crate README). |
-| `time/real` | The experiment needs real time. In virtual time, CPU takes no model time, and identical workers batch better (see `--time=virtual` in the crate README), so it shows a different behavior. |
+| `ci/counters` | An experiment whose counters the CI comparison and `make bench` compare. It runs once in virtual time without latency jitter, so its counters repeat exactly. |
+| `ci/timing` | An experiment whose latency the CI comparison and `make bench` compare. It runs 32 times in virtual time with latency jitter. |
+| `extra` | An experiment that is too slow for CI, but that runs on one host. |
+| `cloud` | An experiment of real S3, in [`hack/aws-bench/experiments`](../aws-bench/README.md). It changes a local experiment of the same name for real S3. |
 | `canonical` | An input of the [canonical plots](#plotting-results). |
 | `area/<topic>` | The topic of the experiment: `read`, `inline`, `commit`, `contention`, `topology`, or `mixed` (the [mixed workloads](#mixed-workloads)). |
 
-Give each experiment one `time/` tag. Give a new experiment `time/virtual` when
-it shows the same behavior in virtual time, so that fast runs can use it.
+Each experiment has one of the tags `ci/counters`, `ci/timing`, `extra`, and
+`cloud`. The experiments of this directory run in both time modes. `make
+bench-all` runs all of them in real time, and `make bench-all TIME=virtual` runs
+all of them in virtual time. In virtual time, CPU takes no model time, so the
+absolute values differ from real time, and `workers` shows no CPU saturation
+(see `--time=virtual` in the crate README). In real time, a cell of
+`open-in-body` with one database instance can miss the cell completion deadline,
+and the run then stops.
 
-`make bench-all` runs all experiments in real time, and `make bench-all
-TIME=virtual` runs the experiments with the tag `time/virtual` in virtual time.
-
-| Experiment | Time | What it measures |
-| --- | --- | --- |
-| The cases of [CI experiments](#ci-experiments) | `time/virtual` | Single transactions of one worker with warm caches, and their backend costs, and four shapes at the same time on one leaf. Each case has a fixed length of 10 s. |
-| `inline-pressure` | `time/virtual` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
-| `contention` | `time/virtual` | Five writers whose transactions share some of their 1 to 6 keys. |
-| `split-merge-fight` | `time/real` | A stable load under which both a split and a merge of one leaf make sense. The default topology policy must settle at one leaf or at two leaves, from a start of either one. |
-| `membership-churn` | `time/real` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
-| `mixed` | `time/real` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
-| `workers` | `time/real` | The worker grid of the canonical plots: 1 to 200 workers per shape, each count after the warm-up of the count before it. |
-| `affinity` | `time/real` | The affinity grid: 5 affinities × 1, 3, 5, and 7 database instances. It is not part of the canonical plots. |
-| `conflict-sweep` | `time/real` | The conflict grid of the canonical plots: 20 workers on 1 and on 5 database instances run read-modify-write transactions of 1 or 4 keys on one pool, from 5,000 keys down to 5 keys (1 key) or 100 keys (4 keys). A smaller pool gives more conflicts. |
-| `load-shift` | `time/real` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
-| `false-sharing` | `time/real` | Four instances that each write one of four adjacent keys of one leaf, while one more instance reads and writes the keys around them (ADR-084). The default topology policy must split the keys of the four instances apart. |
-| `false-sharing-spans` | `time/real` | As `false-sharing`, but one more instance writes the two keys on both sides of the four contended keys in each transaction, so its write span crosses them (ADR-088). The default topology policy must still split the contended keys apart. |
-| `fixed-ranges` | `time/real` | Transactions on fixed ranges of 16 and 64 keys, with transactions on single keys (ADR-084). |
-| `random-ranges` | `time/real` | Transactions on ranges of 16 and 64 adjacent keys from random starts, on fixed sets of 3 keys, and on single keys (ADR-084). |
+| Experiment | What it measures |
+| --- | --- |
+| The cases of [CI experiments](#ci-experiments) | Single transactions of one worker with warm caches, and their backend costs, and four shapes at the same time on one leaf. Each case has a fixed length of 10 s for its counters and of 300 s for its latency. |
+| `inline-pressure` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
+| `contention` | Five writers whose transactions share some of their 1 to 6 keys. |
+| `split-merge-fight` | A stable load under which both a split and a merge of one leaf make sense. The default topology policy must settle at one leaf or at two leaves, from a start of either one. |
+| `membership-churn` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
+| `mixed` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
+| `workers` | The worker grid of the canonical plots: 1 to 200 workers per shape. Each count starts from the seed. |
+| `affinity` | The affinity grid: 5 affinities × 1, 3, 5, and 7 database instances. It is not part of the canonical plots. |
+| `conflict-sweep` | The conflict grid of the canonical plots: 20 workers on 1 and on 5 database instances run read-modify-write transactions of 1 or 4 keys on one pool, from 5,000 keys down to 5 keys (1 key) or 100 keys (4 keys). A smaller pool gives more conflicts. |
+| `load-shift` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
+| `false-sharing` | Four instances that each write one of four adjacent keys of one leaf, while one more instance reads and writes the keys around them (ADR-084). The default topology policy must split the keys of the four instances apart. |
+| `false-sharing-spans` | As `false-sharing`, but one more instance writes the two keys on both sides of the four contended keys in each transaction, so its write span crosses them (ADR-088). The default topology policy must still split the contended keys apart. |
+| `fixed-ranges` | Transactions on fixed ranges of 16 and 64 keys, with transactions on single keys (ADR-084). |
+| `random-ranges` | Transactions on ranges of 16 and 64 adjacent keys from random starts, on fixed sets of 3 keys, and on single keys (ADR-084). |
+| `conflict-sweep-short`, `random-ranges-short`, `fixed-ranges-short`, `mixed-short` | Shorter versions of these experiments for the CI comparison: 6 of the 16 pools of `conflict-sweep`; the ranges on one instance for 20 s; `mixed` with low conflict at an affinity of 50 and with high conflict at an affinity of 100. |
 
 The files in `hack/perf/configs` are not experiments:
 
 - `common-workloads.toml`: the pools, shapes, and workloads of the mixed
   workloads (`low-conflict`, `high-conflict`, and `crossing`).
 - `default.toml`: the settings and the parts of the CI experiments.
+- `conflict-sweep.toml`, `random-ranges.toml`, and `fixed-ranges.toml`: these
+  experiments without their axes. The experiment of each name and its shorter
+  version include it.
+- `workers.toml`: the `workers` grid without its axis. The `workers`
+  experiments of `hack/perf/experiments` and of `hack/aws-bench/experiments`
+  include it, so a change to it changes both.
 
 ### Mixed workloads
 
@@ -71,12 +82,16 @@ pool.
 
 ### CI experiments
 
-The experiments with the tag `ci` replace the Criterion suite
-of `glassdb`. Each one is a case of the CI comparison. Except for the last one,
-each case runs one worker on one instance with warm caches. A case warms up for
-1250 ms and measures for 10 s of model time. The cases include
-`hack/perf/configs/default.toml`, which has their settings and their parts.
-Most cases use built-in parts:
+The experiments with the tags `ci/counters` and `ci/timing` replace the
+Criterion suite of `glassdb`. Each case of the CI comparison has two files:
+`<case>.toml` with the tag `ci/timing`, and `<case>-counters.toml` with the tag
+`ci/counters`. Except for the last one, each case runs one worker on one
+instance with warm caches. A case warms up for 1250 ms. The counter file
+measures for 10 s of model time, which ends before the first pass of the garbage
+collector. The timing file measures for 300 s. The counter files include
+`hack/perf/configs/default.toml`, which has their settings and their parts, and
+the timing files include `hack/perf/configs/ci-timing.toml`, which changes the
+window. Most cases use built-in parts:
 
 | Case | Shape |
 | --- | --- |
@@ -90,14 +105,79 @@ Most cases use built-in parts:
 | `rmw-shared-leaf` | Three workers that update their own key of one leaf. |
 | `shapes-shared-leaf` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time on one leaf, with `low-conflict` keys. |
 
-The CI comparison reads all cells of the experiments with the tag `ci`. It
-compares the p50 latency, the p90 latency, and the throughput of each shape,
-and the `costs` of each cell. The name of a metric is the experiment, then the
-labels of the cell if the experiment has more than one cell, then the shape if
-the cell has more than one shape, for example `shapes-shared-leaf/rw-single:
-p50Ms`. To add an experiment to the comparison, give it the tag `ci`. Each
-comparison runs each cell in up to 32 pairs of processes, so keep these
-experiments small.
+The CI comparison builds perfbench for both revisions, runs `make bench` with
+each binary, and then compares the results:
+
+```text
+hack/ci/perf_compare.py --base <merge base> --candidate <head> --output R
+make bench PERFBENCH=R/bin/main-perfbench EXPERIMENTS_DIR=R/harness/hack/perf/experiments OUT=R/main
+make bench PERFBENCH=R/bin/pr-perfbench EXPERIMENTS_DIR=R/harness/hack/perf/experiments OUT=R/pr
+hack/ci/perf_report.py --manifest R/manifest.json --base R/main --candidate R/pr --output R/report.md
+```
+
+The build step copies the harness of the candidate into a snapshot of the base,
+so both binaries and both runs use the same benchmark code and experiments, and
+only the engine differs.
+
+`make bench` runs two perfbench processes: `--tag=ci/counters
+--latency-jitter=false --runs=1` and `--tag=ci/timing --latency-jitter=true
+--runs=32`. The Makefile is the only place that has their options. By default it
+builds perfbench and runs the experiments of the current tree; `PERFBENCH` and
+`EXPERIMENTS_DIR` change both, as in CI. It then prints the main metrics: the
+median p50, p90, and throughput of each shape over the runs, with the spread of
+one run, and the backend operations and coordinator rounds per transaction of
+each case. While it runs, it prints the notes of perfbench about its cells, and
+on a terminal its progress bar. The results go to `OUT`, by default a new
+directory in `/tmp`. CI writes the output of each side to `<side>.log` beside
+its results. To print the summary of a result directory again, run
+`hack/ci/perf_report.py --summary DIR`.
+
+The counter run compares the `costs` of each cell. They repeat exactly, so a
+change of any count shows, and a byte count shows when it changes by more than
+1%: the size of a record with a timestamp changes by a byte with the start time
+of the process. The timing runs compare the p50 latency, the p90 latency, and
+the throughput of each shape. Each run is an independent sample of the latency
+jitter, so the report compares the 32 runs of each side with a simultaneous 95%
+interval of the change. It shows a change whose interval excludes zero and
+that is at least the floor of the metric: 2%, or the spread of one run if that
+is larger. A metric whose runs spread by 5% can change by 4% with no change of
+the engine, so the floor scales with the spread. With 32 runs of 300 s, a
+comparison of a revision with itself gave intervals of at most about ±1% for
+the 36 timing metrics of the cases, so an unchanged metric of a case does not stay
+inconclusive.
+
+The report also compares the spread of one run of each timing metric, with the
+Brown-Forsythe test: a metric that becomes less stable is a change, even if
+its median does not move. The test and its table measure the spread as the
+mean distance of a run from the median, scaled to a standard deviation, so one
+outlier run moves it less than the standard deviation of the floor. A change of
+the spread shows when it is 1.5 times or more and the interval of the test
+excludes zero. With 32 runs, the spread
+changes less precisely than the median: a spread that grows by 3 times shows
+for most metrics, and one that grows by 2 times for some. The report lists an
+inconclusive metric with no detected change of spread in a collapsed list, not
+in the warnings, so that the noisy experiments do not hide the other warnings.
+A metric whose spread grows by less than 3 times can be in that list.
+
+The experiments `contention`, `split-merge-fight`, `false-sharing`,
+`false-sharing-spans`, and the four shorter versions also have the tag
+`ci/timing`, with their own windows.
+Their metrics spread more, so their floors are larger. For most of them the
+spread of one run is at most about 6%. Some metrics spread much more: up to
+about 18% in `conflict-sweep-short`, 19% for the `span` shape of
+`false-sharing-spans`, and 70% for some shapes of one worker in
+`fixed-ranges-short`. A comparison of a
+revision with itself gave no reports and no spread changes for them, and about
+140 of their metrics stay inconclusive, with no detected change of their
+spread. They have no counter file: their counters change between runs without
+latency jitter too.
+
+The name of a metric is the experiment, then the labels of the cell if the
+experiment has more than one cell, then the shape if the cell has more than one
+shape, for example `shapes-shared-leaf/rw-single: p50Ms`. To add an experiment
+to the comparison, give it the tag `ci/counters` if its counters repeat exactly
+without latency jitter, the tag `ci/timing` if its latency matters, or one file
+for each tag.
 
 ## Plotting results
 
@@ -109,8 +189,8 @@ each collection its own simulated S3 request-rate limit:
 
 ```bash
 cargo build --release -p glassdb-bench-scale --bin perfbench
-common=(--backend=memory --delays=s3 --delay-scale=0.2 --prefix-depth=3
-  --runs=3 --drain-timeout=90s)
+common=(--backend=memory --delays=s3 --prefix-depth=3 --runs=3
+  --drain-timeout=90s)
 e=hack/perf/experiments
 target/release/perfbench "${common[@]}" --experiment=$e/workers.toml \
   --output=hack/perf/out-sweeps/workers.json
@@ -134,8 +214,9 @@ figures go to `hack/perf/out-sweeps/`.
 ### Plotting any result file
 
 `plot_results.py` also plots single result files, such as the ones in
-`hack/aws-bench/out/` from a real S3 run. It picks the figures from the experiment in each file and
-writes them beside the file unless `--out` says otherwise:
+`hack/aws-bench/out/` from a real S3 run. It picks the figures from the
+experiment in each file and writes them beside the file unless `--out` says
+otherwise:
 
 ```bash
 uv run hack/perf/plot_results.py hack/aws-bench/out/mixed.json \
@@ -157,11 +238,12 @@ tests.
 
 ## Comparing revisions
 
-`compare_refs.sh` uses the same comparison driver as CI. It copies the
+`compare_refs.sh` runs the same steps as CI. `perf_compare.py` copies the
 candidate's `glassdb-bench-scale` crate into disposable snapshots of both
-revisions, then builds each against its own engine. Both sides run the
-experiments of the candidate that have the tag `ci`. The current
-source tree is not changed.
+revisions, then builds each against its own engine. `make bench` runs each
+binary, and `perf_report.py` writes the report. Both sides run the
+experiments of the candidate that have the tags `ci/counters` and `ci/timing`.
+The current source tree is not changed.
 
 If the candidate's harness does not build against the base engine, for example
 because it uses an API that the base does not have, both sides use the harness
@@ -220,23 +302,24 @@ sample count per line).
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `EXPERIMENT` | the experiments with the tag `ci` | The perfbench experiment file or directory. |
-| `CASE` | all cases | One experiment with the tag `ci`, by name, in place of `EXPERIMENT`. |
-| `SECONDS_PER_CASE` | `10` | Measured wall time of each experiment with the tag `ci`. |
+| `EXPERIMENT` | the cases of the CI comparison | The perfbench experiment file or directory. |
+| `CASE` | all cases | One case of the CI comparison, by name, in place of `EXPERIMENT`. |
+| `SECONDS_PER_CASE` | `10` | Measured wall time of each case. |
 | `OUT` | `hack/perf` | Output directory for artifacts. |
 
 ### Target
 
-The script profiles perfbench experiments, by default the experiments with
-the tag `ci`: the single transactions of one worker with
-warm caches, and four shapes at the same time on one leaf. The seed and the
-warm-up appear in the profile; use the transaction stacks to inspect measured
-work. `CASE` selects one of these experiments.
+The script profiles perfbench experiments, by default the cases of the CI
+comparison, from their files with the tag `ci/counters`: the single
+transactions of one worker with warm caches, and four shapes at the same time
+on one leaf. The seed and the warm-up appear in the
+profile; use the transaction stacks to inspect measured work. `CASE` selects one
+of these experiments.
 
 ### The in-memory caveat
 
-The experiments use the memory backend with the S3 delay profile and a 5×
-model clock. A CPU profile explains local execution costs; it does not predict
+The experiments use the memory backend with the S3 delay profile in real time.
+A CPU profile explains local execution costs; it does not predict
 object-storage latency or waiting time. Use real-provider measurements for
 workload behavior.
 

@@ -97,26 +97,41 @@ it, and perfbench exits with the error. If the first experiment fails, there is
 no result.
 
 The options that are the same for all experiments are command-line options:
-`--backend`, `--delays`, `--delay-scale`, `--time`, `--prefix-depth`, `--latency-jitter`,
+`--backend`, `--delays`, `--time`, `--prefix-depth`, `--latency-jitter`,
 `--enable-throttling`, `--runs`, `--run-cooldown`, `--drain-timeout`,
-`--progress`, and `--output`. The result records them, except `--progress`.
-`--progress[=auto|always|never]` controls a progress bar on stderr with the
-number of the cell and the estimated time left.
+`--progress`, `--verbose`, and `--output`. The result records them, except
+`--progress` and `--verbose`. `--progress[=auto|always|never]` controls a
+progress bar on stderr with the number of the cell and the estimated time
+left. The log on stderr has only the notes about a cell, such as a
+measurement that reached its maximum duration, each after the line that names
+its cell. `--verbose` adds the details of each cell: its seed, its warm-up,
+and its garbage collection, which the result also has.
+
+`--jobs N` runs up to `N` chains of cells at the same time, each in its own
+process of perfbench. A chain is a cell that starts from a seed, and the cells
+that continue from it with `previous`. A chain seeds its own storage. The
+result has the same cells in the same order as a run with one job, and the log
+of a cell prints when the cell ends. The process of a chain writes its log, its
+progress, and at the end its cells or its error to stdout, as JSON lines, and
+the progress bar adds the progress of the running cells. The default is the
+number of CPUs in virtual time, where a cell does not depend on the host. In
+real time, the default is 1, because a cell that runs at the same time takes
+CPU from a measurement. `--run-cooldown` needs one job. After a chain fails, no
+new chain starts, and the result has the experiments before the one that
+failed.
 
 All experiments support `--backend=memory|fakes3|s3|gcs`. Real S3 and GCS use
-the bucket in `$BUCKET` and always run at real time. For `memory` and `fakes3`,
-`--delay-scale` selects the inverse process-wide model-time speedup: backend
-latency, rate limits, SDK and engine retries, leases, and background cadence
-advance coherently. The parts of an experiment that set what it measures also
-use model time: the seed and warm-up waits and timeouts, the measurement
-duration and its end conditions, and the timeline. So a run measures the same
-model time at each scale. Only the watchdogs (`--drain-timeout` and the limit
-of the full GCs) and `--run-cooldown` use wall time, because they protect the
-host. The `wallMs` fields of the result are wall time. The `0.2` default keeps
-S3-profile sleeps above timer granularity; smaller scales are useful only as
-explicitly approximate probes.
+the bucket in `$BUCKET` and always run in real time. In real time, model time
+is wall time, so the ratio of CPU time to backend latency is the same as on a
+cloud provider. Backend latency, rate limits, SDK and engine retries, leases,
+and background cadence all use model time. The parts of an experiment that set
+what it measures also use model time: the seed and warm-up waits and timeouts,
+the measurement duration and its end conditions, and the timeline. Only the
+watchdogs (`--drain-timeout` and the limit of the full GCs) and
+`--run-cooldown` use wall time, because they protect the host. The `wallMs`
+fields of the result are wall time.
 
-`--time=virtual` replaces the compression with virtual time. The process runs
+`--time=virtual` replaces wall time with virtual time. The process runs
 on one thread with a paused Tokio clock, and model time jumps over each wait of
 an idle process. The paused clock rounds each timer up to a whole millisecond,
 so `rt` runs model time 1000 times as slow as that clock: model waits are exact
@@ -126,13 +141,11 @@ runs of the same revision give nearly the same result: the engine randomizes
 the cadence of its background tasks, so a window that holds a pass of the
 garbage collector can count one listing more or less, and records with a
 timestamp can change their size by a byte with the start time of the process.
-This moves the latency of large writes by under 1%. It needs `--backend=memory`
-and does not combine with `--delay-scale`: a paused clock also jumps while a
-task waits for the operating system, as for the socket of `fakes3`. Latencies
-are 2–15% lower than at the 5× scale, so a comparison must use one mode on both
-sides. In real time, `rt` rounds each wait up to a whole millisecond of wall
-time, so each backend operation at the 5× scale takes about 5 ms of model time
-more. Short operations, such as reads, show the largest difference. The
+This moves the latency of large writes by under 1%. It needs `--backend=memory`:
+a paused clock also jumps while a task waits for the operating system, as for
+the socket of `fakes3`. Latencies are lower than in real time, where CPU work
+takes model time and each wait can end up to a millisecond late, so a
+comparison must use one mode on both sides. The
 comparison of two revisions in CI uses it, because both sides have the same
 effects and the results repeat. Use it also for fast checks and for a first look
 at the shape of a sweep. These effects make it unfit for the canonical plots and
@@ -140,12 +153,6 @@ for the absolute value of a metric:
 
 - CPU and allocation costs take no model time, so a run shows no saturation of
   the host.
-- Identical concurrent workers never drift apart, so their transactions batch
-  better than in real time. In the diagnostics case with three transactions on
-  one leaf, they always share one coordinator round (0.33 operations per
-  transaction, against 0.63 in real time). `--latency-jitter` does not change
-  this: the transactions resubmit in the same instant that a round ends, and
-  only CPU time separates them in real time.
 - The watchdogs use virtual time, so only a wall-time limit on the process
   stops a CPU livelock.
 
@@ -335,7 +342,7 @@ has one cell.
 
 ```toml
 # An experiment of the mixed workloads at five affinities.
-tags = ["time/real", "area/mixed"]
+tags = ["area/mixed"]
 include = ["../configs/common-workloads.toml"]
 
 [cell]
@@ -390,17 +397,19 @@ values follow a rule that a plain list repeats many times.
 
 The values of `start`:
 
-| `start` | Where the cell starts | Storage |
-| --- | --- | --- |
-| `seed` (default) | A copy of the seed, with new database instances. | all |
-| `previous` | The storage and the database instances at the end of the cell before it. | all |
-| `previous-warm-up` | A copy of the storage after the warm-up of the cell before it, with new database instances. | `memory` only |
+| `start` | Where the cell starts |
+| --- | --- |
+| `seed` (default) | A copy of the seed, with new database instances. |
+| `previous` | The storage and the database instances at the end of the cell before it. |
 
 `previous` keeps the instances, so their caches and the state of their topology
 policy carry over. This is necessary for `load-shift` and `inline-pressure`. A
-`previous` axis must then not change the groups or the instances of a group,
-nor `cell.database.*`, because the open instances cannot change. A change of
-the shapes and their workers is allowed.
+`previous` axis must then not change the groups, remove instances of a group,
+or change `cell.database.*`, because the open instances cannot change. A group
+can get more instances: the cell opens them on the storage of the cell before
+it, like new clients. A change of the shapes and their workers is allowed. The
+`workers` experiment of `hack/aws-bench/experiments` uses this: 1 worker opens
+1 instance, and 10 workers open 5.
 
 ## Loop
 
@@ -413,7 +422,7 @@ for run in 1..=runs:
         if this is the first cell, or axis.start is "seed":
             state = seed(seed parameters of the cell)
         else:
-            state = state at the end (or after the warm-up) of the cell before it
+            state = state at the end of the cell before it
         warm up, then measure
 ```
 
@@ -429,10 +438,9 @@ one seed, as today.
 The checks before the first seed:
 
 - An axis that sets a seed parameter, or that changes the instances or
-  `cell.database`, must have `start = "seed"`, or `"previous-warm-up"` for a
-  change of the instances.
-- An axis with `start = "previous"` or `"previous-warm-up"` must be inside all
-  axes with `start = "seed"`.
+  `cell.database`, must have `start = "seed"`.
+- An axis with `start = "previous"` must be inside all axes with
+  `start = "seed"`.
 - Each name that a parameter uses must exist.
 - Each shape must have the parameters of its kind and of its source, and no
   others.
@@ -443,8 +451,10 @@ The checks before the first seed:
 
 The result has `schemaVersion` 3. It has `backend`, `timeMode`,
 `modelTimeSpeedup`, `latencyJitter`, the command-line `options`, and
-`experiments`: one entry for each experiment, in the order that they ran. Each
-entry has the `name` of the experiment, its `tags`, its resolved
+`experiments`: one entry for each experiment, in the order that they ran.
+`modelTimeSpeedup` is always 1. Results of older revisions can have another
+value, for example 5 from the default compressed real time, and the readers of
+the canonical plots and of the CI comparison reject them. Each entry has the `name` of the experiment, its `tags`, its resolved
 `configuration`, its `axes`, and its `runs`. Each run has its cells. Each cell has:
 
 - `labels` (the label of each axis value), `parameters` (the paths that the
@@ -477,7 +487,8 @@ entry has the `name` of the experiment, its `tags`, its resolved
 
 All database instances use the production pending timeout and no clock skew
 allowance, because they read one clock. Full GCs after a seed or a warm-up
-stop after 600 s of wall time. Every cell runs on one multi-thread runtime.
+stop after 600 s of wall time. In real time, every cell runs on one
+multi-thread runtime.
 
 `hack/perf/perfbench_results.py` reads the result files for the
 comparison and plot tools.
@@ -505,9 +516,8 @@ unconverged. Its windows have fewer commits, so its throughput distribution is
 noisier. The commits of the transactions that finish after the measurement are
 not in a window.
 
-A chain of cells that continue each other shares one seed. The seed writes the
-collections of the largest cell of the chain, and each cell uses the first of
-them.
+A cell that continues the cell before it keeps its seed and its open
+instances, so it cannot change `cell.collections`.
 
 ## Experiments of the repository
 

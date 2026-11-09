@@ -1,0 +1,11 @@
+# The worker grid of the canonical plots on real S3. Real S3 cannot copy a
+# seed, so each worker count continues on the storage and the instances of
+# the count before it, and the grid seeds once.
+tags = ["cloud", "area/mixed"]
+include = ["../../perf/configs/workers.toml"]
+
+[[axes]]
+path = "cell.workers"
+values = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100,
+          110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
+start = "previous"

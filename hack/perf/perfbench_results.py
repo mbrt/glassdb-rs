@@ -46,6 +46,7 @@ class ReportError(ValueError):
 class ReportMetadata:
     scenario: str
     backend: str
+    time_mode: str
     model_time_speedup: float
 
 
@@ -114,6 +115,8 @@ def metadata(report: dict[str, Any], source: str) -> ReportMetadata:
     return ReportMetadata(
         scenario=report["scenario"],
         backend=backend,
+        # A result of an older harness has no time mode, and ran in real time.
+        time_mode=report.get("timeMode", "real"),
         model_time_speedup=_number(
             report.get("modelTimeSpeedup"), f"{source}: modelTimeSpeedup"
         ),

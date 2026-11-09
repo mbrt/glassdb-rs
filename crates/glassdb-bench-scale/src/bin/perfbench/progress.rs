@@ -4,13 +4,29 @@
 //! partly done while it runs, by the elapsed part of its expected model time.
 //! The expected time is an estimate, so the bar can move faster or slower than
 //! the clock, and the remaining time is only a guide.
+//!
+//! The process of a chain of a parallel run draws no bar. It writes its log
+//! and its progress as events, and the parallel run shows them in its own bar.
+//!
+//! The log has two levels. `log!` writes a line that the user must see, such
+//! as a note about a cell. `debug!` writes the details of a cell, which the
+//! result also has, only with `--verbose`. The first line of a cell names it.
+//! Without `--verbose`, it waits for the first line of `log!` in the cell, so
+//! that the line names its cell, and a cell with no such line prints nothing.
+//! The process of a chain always writes it, because a process that crashes
+//! writes no other line that names its cell. The parallel run drops a cell
+//! that ends with only that line.
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::io::Write as _;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use glassdb_concurr::rt;
+
+use crate::parallel::{self, Event};
 
 const BAR_WIDTH: usize = 30;
 
@@ -18,7 +34,20 @@ const BAR_WIDTH: usize = 30;
 /// the remaining time hard to read.
 const REDRAW_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The wall time between two progress events of a chain. In virtual time, a
+/// cell reports its progress much more often than a bar can show it.
+const EVENT_INTERVAL: Duration = Duration::from_millis(250);
+
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+/// The time of the last progress event, when this process writes events.
+static EVENTS: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Whether the log has the lines of `debug!`.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// The first line of the current cell, until a line of the cell prints.
+static HEADER: Mutex<Option<String>> = Mutex::new(None);
 
 struct State {
     started: Instant,
@@ -26,10 +55,13 @@ struct State {
     done_cells: usize,
     /// The part of the current cell that is done, from 0 to 1.
     cell_fraction: f64,
+    /// The part of the current cell of each running chain of a parallel run,
+    /// by the index of the chain.
+    chains: BTreeMap<usize, f64>,
     /// Whether the bar is on screen now.
     drawn: bool,
-    /// Whether the first stage of a cell started. The setup before it logs its
-    /// own lines, so the bar waits for that stage.
+    /// Whether the first stage of a cell started. The setup before it can log
+    /// its own lines, so the bar waits for that stage.
     visible: bool,
 }
 
@@ -91,6 +123,7 @@ pub(crate) fn enable(total_cells: usize) {
         total_cells,
         done_cells: 0,
         cell_fraction: 0.0,
+        chains: BTreeMap::new(),
         drawn: false,
         visible: false,
     });
@@ -107,13 +140,57 @@ pub(crate) fn enable(total_cells: usize) {
     });
 }
 
+/// Makes the log include the lines of `debug!`.
+pub(crate) fn set_verbose(verbose: bool) {
+    VERBOSE.store(verbose, Ordering::Relaxed);
+}
+
+/// Starts the log of a cell with the line that names it.
+pub(crate) fn header(text: fmt::Arguments<'_>) {
+    let mut header = HEADER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if VERBOSE.load(Ordering::Relaxed) || events().is_some() {
+        *header = None;
+        drop(header);
+        write(text);
+    } else {
+        // The header of a cell with no line replaces it.
+        *header = Some(text.to_string());
+    }
+}
+
+/// Writes a line of `debug!`.
+pub(crate) fn detail(text: fmt::Arguments<'_>) {
+    if VERBOSE.load(Ordering::Relaxed) {
+        message(text);
+    }
+}
+
+/// Makes this process write its log and progress as events, for the process
+/// of a parallel run that started it.
+pub(crate) fn enable_events() {
+    *events() = Some(Instant::now());
+}
+
 /// Marks the start of a cell.
 pub(crate) fn start_cell() {
+    if events().is_some() {
+        // A lost event only makes the bar of the parent less exact.
+        let _ = parallel::emit(&Event::CellStart);
+    }
     update(|state| state.cell_fraction = 0.0);
 }
 
 /// Marks the end of a cell.
 pub(crate) fn finish_cell() {
+    // A line after the cell does not belong to it.
+    *HEADER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    if events().is_some() {
+        let _ = parallel::emit(&Event::CellEnd);
+    }
     update(|state| {
         state.done_cells += 1;
         state.cell_fraction = 0.0;
@@ -122,14 +199,57 @@ pub(crate) fn finish_cell() {
 
 /// Records the progress of `stage` now. The bar shows it at its next update.
 pub(crate) fn advance(stage: Stage) {
+    if let Some(last) = events().as_mut() {
+        if last.elapsed() >= EVENT_INTERVAL {
+            *last = Instant::now();
+            let _ = parallel::emit(&Event::Progress {
+                fraction: stage.fraction(),
+            });
+        }
+        return;
+    }
     if let Some(state) = lock().as_mut() {
         state.cell_fraction = stage.fraction();
         state.visible = true;
     }
 }
 
+/// Marks the start of chain `chain` of a parallel run.
+pub(crate) fn chain_started(chain: usize) {
+    update(|state| {
+        state.chains.insert(chain, 0.0);
+        state.visible = true;
+    });
+}
+
+/// Records the part of the current cell of chain `chain` that is done.
+pub(crate) fn chain_progress(chain: usize, fraction: f64) {
+    if let Some(state) = lock().as_mut() {
+        state.chains.insert(chain, fraction.clamp(0.0, 1.0));
+    }
+}
+
+/// Marks the end of a cell of chain `chain`.
+pub(crate) fn chain_cell_done(chain: usize) {
+    update(|state| {
+        state.done_cells += 1;
+        state.chains.insert(chain, 0.0);
+    });
+}
+
+/// Marks the end of chain `chain`.
+pub(crate) fn chain_finished(chain: usize) {
+    update(|state| {
+        state.chains.remove(&chain);
+    });
+}
+
 /// Removes the bar from the screen.
 pub(crate) fn finish() {
+    // A line after the run does not belong to the last cell.
+    *HEADER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     let mut guard = lock();
     if let Some(state) = guard.as_mut() {
         clear(state);
@@ -137,8 +257,44 @@ pub(crate) fn finish() {
     *guard = None;
 }
 
-/// Prints a line on stderr above the bar.
+/// Prints `lines` on stderr above the bar, with no other line between them.
+pub(crate) fn lines(lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    let mut guard = lock();
+    if let Some(state) = guard.as_mut() {
+        clear(state);
+    }
+    for line in lines {
+        eprintln!("{line}");
+    }
+    if let Some(state) = guard.as_mut() {
+        draw(state);
+    }
+}
+
+/// Prints a line on stderr above the bar, after the header of its cell if
+/// that has not printed yet. A process of a chain writes it as an event.
 pub(crate) fn message(text: fmt::Arguments<'_>) {
+    let header = HEADER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(header) = header {
+        write(format_args!("{header}"));
+    }
+    write(text);
+}
+
+/// Prints a line on stderr above the bar, or writes it as an event.
+fn write(text: fmt::Arguments<'_>) {
+    if events().is_some() {
+        let _ = parallel::emit(&Event::Log {
+            text: &text.to_string(),
+        });
+        return;
+    }
     let mut guard = lock();
     if let Some(state) = guard.as_mut() {
         clear(state);
@@ -157,6 +313,14 @@ macro_rules! log {
 }
 pub(crate) use log;
 
+/// Prints a detail of a cell on stderr above the bar, only with `--verbose`.
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        $crate::progress::detail(format_args!($($arg)*))
+    };
+}
+pub(crate) use debug;
+
 fn update(change: impl FnOnce(&mut State)) {
     let mut guard = lock();
     if let Some(state) = guard.as_mut() {
@@ -167,6 +331,12 @@ fn update(change: impl FnOnce(&mut State)) {
 
 fn lock() -> std::sync::MutexGuard<'static, Option<State>> {
     STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn events() -> std::sync::MutexGuard<'static, Option<Instant>> {
+    EVENTS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -182,10 +352,11 @@ fn draw(state: &mut State) {
     if !state.visible {
         return;
     }
+    let running: f64 = state.cell_fraction + state.chains.values().sum::<f64>();
     let fraction = if state.total_cells == 0 {
         1.0
     } else {
-        ((state.done_cells as f64 + state.cell_fraction) / state.total_cells as f64).min(1.0)
+        ((state.done_cells as f64 + running) / state.total_cells as f64).min(1.0)
     };
     let elapsed = state.started.elapsed();
     let filled = (fraction * BAR_WIDTH as f64) as usize;
@@ -197,14 +368,26 @@ fn draw(state: &mut State) {
             _ => ' ',
         });
     }
-    let _ = write!(
-        line,
-        "] {:3.0}% cell {}/{} elapsed {}",
-        fraction * 100.0,
-        (state.done_cells + 1).min(state.total_cells),
-        state.total_cells,
-        format_duration(elapsed),
-    );
+    let _ = if state.chains.is_empty() {
+        write!(
+            line,
+            "] {:3.0}% cell {}/{} elapsed {}",
+            fraction * 100.0,
+            (state.done_cells + 1).min(state.total_cells),
+            state.total_cells,
+            format_duration(elapsed),
+        )
+    } else {
+        write!(
+            line,
+            "] {:3.0}% cells {}/{} done, {} running, elapsed {}",
+            fraction * 100.0,
+            state.done_cells,
+            state.total_cells,
+            state.chains.len(),
+            format_duration(elapsed),
+        )
+    };
     if fraction > 0.01 && fraction < 1.0 {
         let remaining = elapsed.mul_f64((1.0 - fraction) / fraction);
         let _ = write!(line, " eta {}", format_duration(remaining));

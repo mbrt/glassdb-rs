@@ -36,7 +36,11 @@ fn resolve(experiment: &str, set: &[&str]) -> Result<Resolved, Box<dyn Error>> {
 
 /// Runs `experiment` with the values of `set`, and returns its cells as JSON.
 fn run(experiment: &str, set: &[&str]) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
-    let resolved = resolve(experiment, set)?;
+    run_resolved(&resolve(experiment, set)?)
+}
+
+/// Runs `resolved`, and returns its cells as JSON.
+fn run_resolved(resolved: &Resolved) -> Result<Vec<serde_json::Value>, Box<dyn Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -45,7 +49,7 @@ fn run(experiment: &str, set: &[&str]) -> Result<Vec<serde_json::Value>, Box<dyn
         run_cooldown: Duration::ZERO,
         drain_timeout: Duration::from_secs(10),
     };
-    let runs: Vec<RunResult> = super::run(&runtime, &factory(), &resolved, execution)?;
+    let runs: Vec<RunResult> = super::run(&runtime, &factory(), resolved, execution)?;
     let json = serde_json::to_value(&runs)?;
     Ok(json[0]["cells"].as_array().cloned().unwrap_or_default())
 }
@@ -80,6 +84,62 @@ fn a_continued_cell_keeps_the_tree_and_the_instances_of_the_cell_before()
             assert!(shape["committed"].as_u64().unwrap() > 0, "{shape}");
         }
     }
+    Ok(())
+}
+
+#[test]
+fn a_continued_cell_opens_the_new_instances_of_its_groups() -> Result<(), Box<dyn Error>> {
+    // As `workers` of hack/aws-bench: 1 worker of each shape opens 1 instance,
+    // and 10 workers open the 5 of `cell.databases`.
+    let text = format!(
+        "include = [\"{}/../configs/workers.toml\"]\n\
+         [[axes]]\npath = \"cell.workers\"\nvalues = [1, 10]\nstart = \"previous\"\n",
+        super::config::REPOSITORY_EXPERIMENTS
+    );
+    let dir = super::config::tests::write(&[("grow.toml", &text)]);
+    let mut set = SHORT.to_vec();
+    set.push("pools.wide.keys=500");
+    let resolved = Selection {
+        experiments: vec![dir.join("grow.toml")],
+        set: set.iter().map(|s| s.to_string()).collect(),
+        ..Selection::default()
+    }
+    .resolve()?;
+    let cells = run_resolved(&resolved[0])?;
+
+    let starts: Vec<_> = cells.iter().map(|cell| cell["start"].clone()).collect();
+    assert_eq!(starts, ["seed", "previous"]);
+    let instances: Vec<_> = cells
+        .iter()
+        .map(|cell| cell["groups"][0]["instances"].as_array().unwrap().clone())
+        .collect();
+    assert_eq!(instances[0].len(), 1);
+    assert_eq!(instances[1].len(), 5);
+    for instance in &instances[1] {
+        assert!(instance["committed"].as_u64().unwrap() > 0, "{instance}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_continued_cell_cannot_remove_instances() -> Result<(), Box<dyn Error>> {
+    // 10 workers of each shape open 5 instances, and 1 worker opens 1.
+    let text = format!(
+        "include = [\"{}/../configs/workers.toml\"]\n\
+         [[axes]]\npath = \"cell.workers\"\nvalues = [10, 1]\nstart = \"previous\"\n",
+        super::config::REPOSITORY_EXPERIMENTS
+    );
+    let dir = super::config::tests::write(&[("shrink.toml", &text)]);
+    let resolved = Selection {
+        experiments: vec![dir.join("shrink.toml")],
+        ..Selection::default()
+    }
+    .resolve()?;
+    let Err(error) = super::plan(&resolved[0]) else {
+        panic!("a continued cell removed instances");
+    };
+    let error = error.to_string();
+    assert!(error.contains("remove instances"), "{error}");
     Ok(())
 }
 
@@ -119,19 +179,25 @@ fn a_pass_condition_ends_the_measurement_of_a_sequence() -> Result<(), Box<dyn E
 }
 
 #[test]
-fn a_chain_of_cells_shares_the_seed_of_its_largest_cell() -> Result<(), Box<dyn Error>> {
-    let mut set = SHORT.to_vec();
-    set.extend(["pools.wide.keys=20000", "cell.databases=3"]);
-    let resolved = resolve("workers", &set)?;
-    let (points, specs) = super::plan(&resolved)?;
-    assert_eq!(specs[0].collections, 1);
-    assert!(specs.iter().all(|spec| spec.seed_collections == 3));
-    assert!(
-        points
-            .iter()
-            .skip(1)
-            .all(|point| point.start != super::config::Start::Seed)
+fn a_continued_cell_cannot_change_the_collections() -> Result<(), Box<dyn Error>> {
+    // The open instances keep the collections of the first cell of the chain.
+    let text = format!(
+        "include = [\"{}/../configs/default.toml\"]\n\
+         [cell]\nworkload = \"diag-read\"\n\
+         [[axes]]\npath = \"cell.collections\"\nvalues = [1, 2]\nstart = \"previous\"\n",
+        super::config::REPOSITORY_EXPERIMENTS
     );
+    let dir = super::config::tests::write(&[("collections.toml", &text)]);
+    let resolved = Selection {
+        experiments: vec![dir.join("collections.toml")],
+        ..Selection::default()
+    }
+    .resolve()?;
+    let Err(error) = super::plan(&resolved[0]) else {
+        panic!("a continued cell changed the collections");
+    };
+    let error = error.to_string();
+    assert!(error.contains("changes the seed"), "{error}");
     Ok(())
 }
 

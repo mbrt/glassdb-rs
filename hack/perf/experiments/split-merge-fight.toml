@@ -6,7 +6,7 @@
 # The default topology policy must settle: after the warm-up, the collection
 # stays at one leaf or at two leaves, and the measurement shows no splits and
 # no merges. The axis `start` gives the shape that the cells start from.
-tags = ["time/real", "area/topology"]
+tags = ["ci/timing", "area/topology"]
 
 [pools.fight]
 keys = 2

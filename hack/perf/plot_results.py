@@ -608,13 +608,15 @@ def render(worker_path: Path, conflict_path: Path, out_dir: Path) -> list[Path]:
     )
     if _model(worker_metadata) != _model(conflict_metadata):
         raise ReportError(
-            "worker and conflict reports must use the same backend and model-time speedup"
+            "worker and conflict reports must use the same backend and time model"
         )
-    if worker_metadata.backend != "memory" or not math.isclose(
-        worker_metadata.model_time_speedup, 5.0
+    if (
+        worker_metadata.backend != "memory"
+        or worker_metadata.time_mode != "real"
+        or not math.isclose(worker_metadata.model_time_speedup, 1.0)
     ):
         raise ReportError(
-            "canonical sweeps require --backend=memory and --delay-scale=0.2"
+            "canonical sweeps require --backend=memory in real time, at the speed of wall time"
         )
     validate_worker_sweep(workers)
     validate_conflict_sweep(conflicts)
@@ -626,9 +628,9 @@ def render(worker_path: Path, conflict_path: Path, out_dir: Path) -> list[Path]:
     ]
 
 
-def _model(meta: perfbench_results.ReportMetadata) -> tuple[str, float]:
-    """Return the backend and the model-time speedup of a report."""
-    return meta.backend, meta.model_time_speedup
+def _model(meta: perfbench_results.ReportMetadata) -> tuple[str, str, float]:
+    """Return the backend, the time mode, and the model-time speedup of a report."""
+    return meta.backend, meta.time_mode, meta.model_time_speedup
 
 
 def main() -> int:

@@ -1,0 +1,9 @@
+# A read-modify-write of one key with a 1,025-byte value, above the default
+# inline limit.
+# The counters of `rmw-external`: one run without latency jitter, in a window
+# of 10 s.
+tags = ["ci/counters", "area/inline"]
+include = ["../configs/default.toml"]
+
+[cell]
+workload = "diag-rmw-external"

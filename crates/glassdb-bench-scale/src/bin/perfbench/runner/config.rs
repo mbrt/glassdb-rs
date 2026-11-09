@@ -60,9 +60,6 @@ pub(crate) enum Start {
     Seed,
     /// The storage and the database instances at the end of the cell before.
     Previous,
-    /// A copy of the storage after the warm-up of the cell before, with new
-    /// database instances.
-    PreviousWarmUp,
 }
 
 /// One value of each axis: the label of the cell, and the paths it sets.
@@ -376,7 +373,7 @@ fn check_axes(axes: &[Axis]) -> Result<(), Box<dyn Error>> {
                 .into());
             }
             Start::Seed => {}
-            Start::Previous | Start::PreviousWarmUp => seeds_done = true,
+            Start::Previous => seeds_done = true,
         }
     }
     Ok(())
@@ -608,11 +605,11 @@ pub(crate) fn repository_experiment(name: &str) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A temporary directory, removed when it is dropped.
-    struct Dir(PathBuf);
+    pub(crate) struct Dir(PathBuf);
 
     impl std::ops::Deref for Dir {
         type Target = Path;
@@ -629,7 +626,7 @@ mod tests {
     }
 
     /// Writes `files`, as `(PATH, TEXT)`, in a new directory, and returns it.
-    fn write(files: &[(&str, &str)]) -> Dir {
+    pub(crate) fn write(files: &[(&str, &str)]) -> Dir {
         let dir = Dir(std::env::temp_dir().join(format!(
             "perfbench-config-{}-{}",
             std::process::id(),
@@ -937,17 +934,43 @@ mod tests {
 
     #[test]
     fn every_repository_experiment_plans_its_cells_and_chains() -> Result<(), Box<dyn Error>> {
-        let experiments: Vec<_> = std::fs::read_dir(REPOSITORY_EXPERIMENTS)?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<_, _>>()?;
-        let resolved = Selection {
-            experiments,
-            ..Selection::default()
-        }
-        .resolve()?;
-        assert!(resolved.len() >= 20, "{}", resolved.len());
-        for experiment in &resolved {
-            crate::runner::plan(experiment).map_err(|e| format!("{}: {e}", experiment.name))?;
+        // The experiments of real S3 can have the names of local ones, so
+        // each directory is one selection.
+        let cloud = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../hack/aws-bench/experiments"
+        );
+        for (directory, suite, least) in [
+            (REPOSITORY_EXPERIMENTS, None, 20),
+            (cloud, Some("cloud"), 1),
+        ] {
+            let resolved = Selection {
+                experiments: vec![PathBuf::from(directory)],
+                ..Selection::default()
+            }
+            .resolve()?;
+            assert!(resolved.len() >= least, "{directory}: {}", resolved.len());
+            for experiment in &resolved {
+                crate::runner::plan(experiment).map_err(|e| format!("{}: {e}", experiment.name))?;
+                // Each experiment is in one suite: the counters or the latency
+                // of the CI comparison, the slow local runs, or real S3.
+                let suites: Vec<_> = ["ci/counters", "ci/timing", "extra", "cloud"]
+                    .into_iter()
+                    .filter(|tag| experiment.tags.iter().any(|t| t == tag))
+                    .collect();
+                assert_eq!(
+                    suites.len(),
+                    1,
+                    "{}: {:?}",
+                    experiment.name,
+                    experiment.tags
+                );
+                if let Some(suite) = suite {
+                    assert_eq!(suites, [suite], "{}", experiment.name);
+                } else {
+                    assert_ne!(suites, ["cloud"], "{}", experiment.name);
+                }
+            }
         }
         Ok(())
     }

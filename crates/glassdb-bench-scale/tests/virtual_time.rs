@@ -21,7 +21,10 @@ macro_rules! experiments {
 const EXPERIMENTS: &str = experiments!();
 
 /// The experiments that CI compares.
-const CI_EXPERIMENTS: [&str; 2] = [concat!("--experiment=", experiments!()), "--tag=ci"];
+const CI_EXPERIMENTS: [&str; 2] = [
+    concat!("--experiment=", experiments!()),
+    "--tag=ci/counters",
+];
 
 fn perfbench(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_perfbench"))
@@ -39,7 +42,7 @@ fn virtual_ci_report() -> Value {
 /// The experiments whose persisted records carry a timestamp. The anchor of the wall
 /// clock is the start time of the process, so the size of these records, and
 /// with it the delay of their writes, moves by under 1% between processes.
-const TIMESTAMPED_EXPERIMENTS: [&str; 2] = ["rmw-external", "rmw-five-leaves"];
+const TIMESTAMPED_EXPERIMENTS: [&str; 2] = ["rmw-external-counters", "rmw-five-leaves-counters"];
 
 /// The numbers that a comparison of two revisions reads.
 fn measured(report: &Value) -> Vec<Value> {
@@ -52,7 +55,16 @@ fn measured(report: &Value) -> Vec<Value> {
             !TIMESTAMPED_EXPERIMENTS.contains(&name)
         })
         .flat_map(|experiment| experiment["runs"][0]["cells"].as_array().unwrap())
-        .flat_map(|cell| cell["shapes"].as_array().unwrap())
+        .flat_map(measured_shapes)
+        .collect()
+}
+
+/// The numbers that a comparison reads of each shape of `cell`.
+fn measured_shapes(cell: &Value) -> Vec<Value> {
+    cell["shapes"]
+        .as_array()
+        .unwrap()
+        .iter()
         .map(|shape| {
             ["shape", "committed", "meanMs", "p50Ms", "p90Ms", "txPerSec"]
                 .map(|field| shape[field].clone())
@@ -72,35 +84,223 @@ fn virtual_runs_repeat_exactly() {
     assert!(!experiments.is_empty());
     for experiment in experiments {
         let tags = experiment["tags"].as_array().unwrap();
-        assert!(tags.contains(&"ci".into()), "{experiment}");
+        assert!(tags.contains(&"ci/counters".into()), "{experiment}");
     }
     assert_eq!(first["timeMode"], "virtual");
     assert_eq!(first["modelTimeSpeedup"], 1.0);
     assert_eq!(measured(&first), measured(&second));
 }
 
+// A parallel run must not change a result, so that the number of CPUs of the
+// host does not change it: the same runs, with the same cells in the same order.
 #[test]
-fn virtual_time_rejects_what_it_cannot_skip() {
-    for (arguments, message) in [
-        (
-            ["--backend=fakes3", "--time=virtual"].as_slice(),
-            "needs --backend=memory",
+fn parallel_chains_give_the_results_of_one_job() {
+    let dir = std::env::temp_dir().join(format!("perfbench-chains-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // Two chains of two cells: each affinity starts from the seed, and the
+    // second duration continues on the instances of the first.
+    let chains = dir.join("chains.toml");
+    std::fs::write(
+        &chains,
+        format!(
+            "include = [\"{EXPERIMENTS}/../configs/default.toml\"]\n\
+             [cell]\nworkload = \"diag-rmw-shared\"\n\
+             [[axes]]\npath = \"cell.affinity\"\nvalues = [0, 100]\n\
+             [[axes]]\npath = \"cell.measure.duration\"\nvalues = [\"4s\", \"6s\"]\n\
+             start = \"previous\"\n"
         ),
+    )
+    .unwrap();
+    let experiment = format!("--experiment={}", chains.display());
+    let report = |jobs: &str| -> (Value, String) {
+        let arguments = [
+            &MEMORY_MODEL[..],
+            &["--time=virtual", "--runs=2", "--verbose", jobs, &experiment],
+        ]
+        .concat();
+        let output = perfbench(&arguments);
+        assert!(output.status.success(), "{output:?}");
         (
-            ["--time=virtual", "--delay-scale=0.2"].as_slice(),
-            "does not combine with --delay-scale",
-        ),
-    ] {
-        let output = perfbench(&[arguments, &CI_EXPERIMENTS].concat());
-        assert!(!output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains(message), "{stderr}");
+            serde_json::from_slice(&output.stdout).unwrap(),
+            String::from_utf8(output.stderr).unwrap(),
+        )
+    };
+    // The labels, the start, and the measured numbers of each cell of each run.
+    let cells = |report: &Value| -> Vec<Value> {
+        report["experiments"][0]["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|run| {
+                run["cells"].as_array().unwrap().iter().map(move |cell| {
+                    serde_json::json!([
+                        run["run"],
+                        cell["labels"],
+                        cell["start"],
+                        measured_shapes(cell)
+                    ])
+                })
+            })
+            .collect()
+    };
+    let one = cells(&report("--jobs=1").0);
+    let (four, log) = report("--jobs=4");
+
+    assert_eq!(one.len(), 8);
+    assert_eq!(one, cells(&four));
+    // The lines of each cell print together: a header, then its own lines.
+    let blocks: Vec<&str> = log.split("chains: run=").skip(1).collect();
+    assert_eq!(blocks.len(), 8, "{log}");
+    for block in blocks {
+        assert!(
+            block.lines().skip(1).all(|line| line.starts_with("  ")),
+            "{log}"
+        );
+        assert_eq!(block.matches("warm-up took").count(), 1, "{log}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Returns whether `types` is `log cellStart (log|progress)* cellEnd cells`.
+fn is_one_cell_stream(types: &[&str]) -> bool {
+    let n = types.len();
+    n >= 4
+        && types[..2] == ["log", "cellStart"]
+        && types[n - 2..] == ["cellEnd", "cells"]
+        && types[2..n - 2]
+            .iter()
+            .all(|t| *t == "log" || *t == "progress")
+}
+
+// The process of a chain writes only events to stdout, one JSON object on
+// each line, so that the parallel run can show its log and its progress.
+#[test]
+fn a_chain_writes_its_log_progress_and_cells_as_events() {
+    let experiment = format!("--experiment={EXPERIMENTS}/rmw-shared-leaf.toml");
+    let output = perfbench(
+        &[
+            &MEMORY_MODEL[..],
+            &["--time=virtual", "--verbose", &experiment, "--chain=0"],
+        ]
+        .concat(),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect();
+    // The header of the cell, then the events of the cell, then the cells.
+    let grammar = is_one_cell_stream(&types);
+    assert!(grammar, "{types:?}");
+    let cells = events.last().unwrap()["cells"].as_array().unwrap();
+    assert_eq!(cells.len(), 1);
+    assert_eq!(output.stderr, b"");
+}
+
+// Without `--verbose`, the log has only the notes about a cell, each after
+// the line that names its cell.
+#[test]
+fn the_default_log_names_the_cell_of_each_note_and_nothing_else() {
+    let experiment = format!("--experiment={EXPERIMENTS}/rmw-shared-leaf.toml");
+    let arguments = |jobs, until| {
+        let until = format!("--set=cell.measure.until=\"{until}\"");
+        let output = perfbench(
+            &[
+                &MEMORY_MODEL[..],
+                &[
+                    "--time=virtual",
+                    "--runs=2",
+                    jobs,
+                    &experiment,
+                    &until,
+                    "--set=cell.measure.duration=\"1s\"",
+                    "--set=cell.measure.max-duration=\"1s\"",
+                ],
+            ]
+            .concat(),
+        );
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stderr).unwrap()
+    };
+    for jobs in ["--jobs=1", "--jobs=2"] {
+        // A fixed window ends on time, so there is no note.
+        assert_eq!(arguments(jobs, "duration"), "", "{jobs}");
+        // 1,000 commits of each shape do not fit in 1 s.
+        let log = arguments(jobs, "converged");
+        let mut lines: Vec<&str> = log.lines().collect();
+        lines.sort();
+        let note = "  note: the measurement reached its maximum duration before its end condition";
+        assert_eq!(
+            lines,
+            [
+                note,
+                note,
+                "rmw-shared-leaf: run=1 cell",
+                "rmw-shared-leaf: run=2 cell"
+            ],
+            "{jobs}: {log}"
+        );
+        for block in log.split("rmw-shared-leaf: run=").skip(1) {
+            assert_eq!(block.lines().nth(1), Some(note), "{jobs}: {log}");
+        }
+    }
+}
+
+// A cell that fails has no result, so its error names it at every level of
+// the log.
+#[test]
+fn the_error_of_a_cell_names_the_cell() {
+    let experiment = format!("--experiment={EXPERIMENTS}/split-merge-fight.toml");
+    for jobs in ["--jobs=1", "--jobs=2"] {
+        let output = perfbench(
+            &[
+                &MEMORY_MODEL[..],
+                &[
+                    "--time=virtual",
+                    jobs,
+                    &experiment,
+                    // No seed can stay quiet for longer than its timeout.
+                    "--set=seed.timeout=\"1s\"",
+                    "--set=seed.quiet-period=\"100s\"",
+                ],
+            ]
+            .concat(),
+        );
+        assert!(!output.status.success(), "{jobs}: {output:?}");
+        // The error is the only line: no other line names the cell again.
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(lines.len(), 1, "{jobs}: {stderr}");
+        assert!(
+            lines[0].starts_with("Error: \"split-merge-fight: run=1 start="),
+            "{jobs}: {stderr}"
+        );
     }
 }
 
 #[test]
+fn virtual_time_rejects_what_it_cannot_skip() {
+    let arguments = ["--backend=fakes3", "--time=virtual"];
+    let output = perfbench(&[arguments.as_slice(), &CI_EXPERIMENTS].concat());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("needs --backend=memory"), "{stderr}");
+}
+
+#[test]
 fn a_failed_experiment_keeps_the_results_of_the_experiments_before_it() {
-    let dir = std::env::temp_dir().join(format!("perfbench-partial-{}", std::process::id()));
+    for jobs in ["--jobs=1", "--jobs=2"] {
+        failed_experiment_keeps_the_experiments_before_it(jobs);
+    }
+}
+
+fn failed_experiment_keeps_the_experiments_before_it(jobs: &str) {
+    let dir = std::env::temp_dir().join(format!("perfbench-partial-{}{jobs}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let first = format!("--experiment={EXPERIMENTS}/read-warm.toml");
     // A pass condition needs a sequence source, and the runner finds out only
@@ -120,6 +320,7 @@ fn a_failed_experiment_keeps_the_results_of_the_experiments_before_it() {
             &MEMORY_MODEL[..],
             &[
                 "--time=virtual",
+                jobs,
                 &first,
                 &format!("--experiment={}", failing.display()),
                 &format!("--output={}", output.display()),
@@ -131,7 +332,13 @@ fn a_failed_experiment_keeps_the_results_of_the_experiments_before_it() {
     assert!(!result.status.success());
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("no_passes: the end condition needs passes"),
+        stderr.contains("Error: \"no_passes: run=1 cell: the end condition needs passes"),
+        "{stderr}"
+    );
+    // A process of a chain does not print the error that the parent prints.
+    assert_eq!(
+        stderr.matches("the end condition needs passes").count(),
+        1,
         "{stderr}"
     );
     let report: Value = serde_json::from_slice(&std::fs::read(&output).unwrap()).unwrap();

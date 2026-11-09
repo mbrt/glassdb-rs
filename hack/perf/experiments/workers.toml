@@ -1,29 +1,9 @@
-# The worker grid of the canonical plots. Each worker count continues from the
-# tree after the warm-up of the count before it.
-tags = ["time/real", "canonical", "area/mixed"]
-include = ["../configs/common-workloads.toml"]
-
-[pools.wide]
-keys = 20000
-
-[seed]
-quiet-period = "5s"
-
-[cell]
-workload = "low-conflict"
-databases = 5
-
-[cell.warm-up]
-quiet = "5s"
-timeout = "180s"
-
-# A single worker of the slowest shape needs about 160 s to commit the target
-# of the windows, so the default cap of 60 s ends that cell before it converges.
-[cell.measure]
-max-duration = "200s"
+# The worker grid of the canonical plots. Each worker count starts from the
+# seed, so the counts can run in parallel.
+tags = ["extra", "canonical", "area/mixed"]
+include = ["../configs/workers.toml"]
 
 [[axes]]
 path = "cell.workers"
 values = [1, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100,
           110, 120, 130, 140, 150, 160, 170, 180, 190, 200]
-start = "previous-warm-up"

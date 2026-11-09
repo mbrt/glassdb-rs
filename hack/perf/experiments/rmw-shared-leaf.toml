@@ -1,6 +1,7 @@
 # Three workers that update their own key of one leaf.
-tags = ["ci", "time/virtual", "area/commit"]
-include = ["../configs/default.toml"]
+# The CI comparison runs it 32 times with latency jitter.
+tags = ["ci/timing", "area/commit"]
+include = ["../configs/ci-timing.toml"]
 
 [cell]
 workload = "diag-rmw-shared"

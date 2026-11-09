@@ -15,6 +15,7 @@ pub(crate) mod until;
 pub(crate) mod workers;
 
 use std::error::Error;
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -75,15 +76,42 @@ impl Window {
 struct Carry {
     storage: Storage,
     /// The open instances of the cell and their collections, for
-    /// `previous`. Other cells shut their instances down.
-    instances: Option<Vec<OpenInstance>>,
-    /// A copy of the storage after the warm-up, for `previous-warm-up`.
-    after_warm_up: Option<Storage>,
+    /// `previous`, in one list for each group. Other cells shut their
+    /// instances down.
+    instances: Option<Vec<Vec<OpenInstance>>>,
 }
 
 struct OpenInstance {
     db: Database,
     collections: IndexMap<String, Arc<[Collection]>>,
+}
+
+/// The cells of one run that start from one seed: the first cell starts from
+/// the seed, and each cell after it continues from the cell before it. A
+/// chain runs in order; two chains do not depend on each other.
+#[derive(Debug, Clone)]
+pub(crate) struct Chain {
+    pub(crate) run: usize,
+    /// The indexes of the cells in the plan of the experiment.
+    pub(crate) cells: Range<usize>,
+}
+
+/// Returns the chains of `resolved` for each of `runs` runs, in the order
+/// that a run of all cells has them.
+pub(crate) fn chains(resolved: &Resolved, runs: usize) -> Result<Vec<Chain>, Box<dyn Error>> {
+    let (points, _) = plan(resolved)?;
+    let mut starts: Vec<usize> = (0..points.len())
+        .filter(|&index| index == 0 || points[index].start == Start::Seed)
+        .collect();
+    starts.push(points.len());
+    Ok((1..=runs)
+        .flat_map(|run| {
+            starts.windows(2).map(move |pair| Chain {
+                run,
+                cells: pair[0]..pair[1],
+            })
+        })
+        .collect())
 }
 
 /// Runs all cells of `resolved` for each run.
@@ -95,77 +123,120 @@ pub(crate) fn run(
 ) -> Result<Vec<RunResult>, Box<dyn Error>> {
     let (points, specs) = plan(resolved)?;
     let invocation = SystemTime::UNIX_EPOCH.elapsed()?.as_millis();
-    let mut runs = Vec::with_capacity(execution.runs);
+    let chains = chains(resolved, execution.runs)?;
+    let mut runs: Vec<RunResult> = Vec::with_capacity(execution.runs);
     for run in 1..=execution.runs {
         runtime.block_on(cooldown(execution, run));
-        // A database name has only letters and digits.
-        let name: String = resolved
-            .name
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .collect();
+        // The chains of a run share the cached seeds.
         let mut seeds = Seeds::new(
             factory,
-            format!("perfbench{name}{invocation}r{run}"),
+            seed_prefix(resolved, invocation, run),
             execution.drain_timeout,
         );
-        let mut carry: Option<Carry> = None;
         let mut cells = Vec::with_capacity(points.len());
-        for (index, (point, spec)) in points.iter().zip(&specs).enumerate() {
-            crate::progress::log!("{}: run={run} {}", resolved.name, describe(point));
-            let next_continues = points
-                .get(index + 1)
-                .is_some_and(|next| next.start == Start::Previous);
-            progress::start_cell();
-            let (cell, next) = runtime.block_on(run_cell(
-                &mut seeds,
-                carry.take(),
-                point,
-                spec,
-                next_continues,
-                execution,
-            ))?;
-            progress::finish_cell();
-            cells.push(cell);
-            carry = next;
-        }
-        if let Some(instances) = carry.and_then(|carry| carry.instances) {
-            runtime.block_on(close(instances, execution.drain_timeout))?;
+        for chain in chains.iter().filter(|chain| chain.run == run) {
+            cells.extend(run_cells(
+                runtime, &mut seeds, resolved, &points, &specs, chain, execution,
+            )?);
         }
         runs.push(RunResult { run, cells });
     }
     Ok(runs)
 }
 
-/// Returns the cells of `resolved`, with one seed for each chain of cells that
-/// continue each other, and checks that the chains can continue.
+/// Runs the cells of one chain of `resolved` on their own seeds. `id` is
+/// unique among the chains of all experiments.
+pub(crate) fn run_chain(
+    runtime: &tokio::runtime::Runtime,
+    factory: &Factory,
+    resolved: &Resolved,
+    chain: &Chain,
+    id: usize,
+    execution: Execution,
+) -> Result<Vec<CellResult>, Box<dyn Error>> {
+    let (points, specs) = plan(resolved)?;
+    let invocation = SystemTime::UNIX_EPOCH.elapsed()?.as_millis();
+    // The processes of two chains can start in the same millisecond, and two
+    // experiment names can keep the same letters and digits, so the id keeps
+    // their databases apart.
+    let prefix = format!("{}c{id}", seed_prefix(resolved, invocation, chain.run));
+    let mut seeds = Seeds::new(factory, prefix, execution.drain_timeout);
+    run_cells(
+        runtime, &mut seeds, resolved, &points, &specs, chain, execution,
+    )
+}
+
+/// Returns the prefix of the database names of one run.
+fn seed_prefix(resolved: &Resolved, invocation: u128, run: usize) -> String {
+    // A database name has only letters and digits.
+    let name: String = resolved
+        .name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    format!("perfbench{name}{invocation}r{run}")
+}
+
+fn run_cells(
+    runtime: &tokio::runtime::Runtime,
+    seeds: &mut Seeds<'_>,
+    resolved: &Resolved,
+    points: &[CellPoint],
+    specs: &[CellSpec],
+    chain: &Chain,
+    execution: Execution,
+) -> Result<Vec<CellResult>, Box<dyn Error>> {
+    let run = chain.run;
+    let mut carry: Option<Carry> = None;
+    let mut cells = Vec::with_capacity(chain.cells.len());
+    for index in chain.cells.clone() {
+        let point = &points[index];
+        progress::header(format_args!(
+            "{}: run={run} {}",
+            resolved.name,
+            describe(point)
+        ));
+        let next_continues =
+            chain.cells.contains(&(index + 1)) && points[index + 1].start == Start::Previous;
+        progress::start_cell();
+        // The log names a cell only before its notes, so the error names it.
+        let (cell, next) = runtime
+            .block_on(run_cell(
+                seeds,
+                carry.take(),
+                point,
+                &specs[index],
+                next_continues,
+                execution,
+            ))
+            .map_err(|e| format!("run={run} {}: {e}", describe(point)))?;
+        progress::finish_cell();
+        cells.push(cell);
+        carry = next;
+    }
+    if let Some(instances) = carry.and_then(|carry| carry.instances) {
+        runtime.block_on(close(
+            instances.into_iter().flatten().collect(),
+            execution.drain_timeout,
+        ))?;
+    }
+    Ok(cells)
+}
+
+/// Returns the cells of `resolved`, and checks that the chains can continue.
 pub(crate) fn plan(resolved: &Resolved) -> Result<(Vec<CellPoint>, Vec<CellSpec>), Box<dyn Error>> {
     let points = resolved.points();
-    let mut specs: Vec<CellSpec> = points
+    let specs: Vec<CellSpec> = points
         .iter()
         .map(|point| CellSpec::from_table(&resolved.cell_table(point)?))
         .collect::<Result<_, _>>()?;
-    let mut first = 0;
-    for end in 1..=points.len() {
-        if end < points.len() && points[end].start != Start::Seed {
-            continue;
-        }
-        let largest = specs[first..end]
-            .iter()
-            .map(|spec| spec.collections)
-            .max()
-            .unwrap_or(1);
-        for spec in &mut specs[first..end] {
-            spec.seed_collections = largest;
-        }
-        first = end;
-    }
     check_continuations(&points, &specs)?;
     Ok((points, specs))
 }
 
 /// Rejects a `previous` cell that changes what its open instances cannot
-/// change: the instances of its groups, and their database options.
+/// change: its groups, the instances that they have open, and their database
+/// options. A group can get more instances.
 fn check_continuations(points: &[CellPoint], specs: &[CellSpec]) -> Result<(), Box<dyn Error>> {
     for (index, point) in points.iter().enumerate().skip(1) {
         let (before, after) = (&specs[index - 1], &specs[index]);
@@ -179,18 +250,21 @@ fn check_continuations(points: &[CellPoint], specs: &[CellSpec]) -> Result<(), B
             )
             .into());
         }
-        let layout = |spec: &CellSpec| -> Vec<(String, usize)> {
-            spec.groups
-                .iter()
-                .map(|group| (group.name.clone(), group.instances))
-                .collect()
+        let names = |spec: &CellSpec| -> Vec<String> {
+            spec.groups.iter().map(|group| group.name.clone()).collect()
         };
-        if point.start == Start::Previous
-            && (layout(before) != layout(after) || before.params.database != after.params.database)
+        let removes = before
+            .groups
+            .iter()
+            .zip(&after.groups)
+            .any(|(before, after)| after.instances < before.instances);
+        if names(before) != names(after)
+            || removes
+            || before.params.database != after.params.database
         {
             return Err(format!(
                 "cell {}: `previous` keeps the open instances, so it cannot change the groups, \
-                 their instances, or cell.database",
+                 remove instances, or change cell.database",
                 describe(point)
             )
             .into());
@@ -211,16 +285,10 @@ async fn run_cell(
 ) -> Result<(CellResult, Option<Carry>), Box<dyn Error>> {
     let (storage, instances) = match (point.start, carry) {
         (Start::Previous, Some(carry)) => (carry.storage, carry.instances),
-        (Start::PreviousWarmUp, Some(carry)) => {
-            let storage = carry
-                .after_warm_up
-                .ok_or("`previous-warm-up` needs storage that can fork")?;
-            (storage, None)
-        }
         (_, _) => (seeds.storage_for(spec).await?, None),
     };
     let instances = match instances {
-        Some(instances) => instances,
+        Some(groups) => add_instances(&storage, spec, groups).await?,
         None => open_instances(&storage, spec).await?,
     };
     let databases: Vec<Database> = instances.iter().map(|i| i.db.clone()).collect();
@@ -368,7 +436,7 @@ async fn run_cell(
         change_rate,
         gc: (gc_stats(&databases) - gc_start).into(),
     };
-    crate::progress::log!(
+    crate::progress::debug!(
         "  warm-up took {}ms: {} splits and {} merges{}{}",
         warmup.wall_ms,
         warmup.split_completed,
@@ -387,7 +455,7 @@ async fn run_cell(
     let full_gc = if spec.params.gc {
         match seed::collect_garbage(&databases[0]).await {
             Ok(collected) => {
-                crate::progress::log!(
+                crate::progress::debug!(
                     "  full GC took {}ms: {} transaction records deleted",
                     collected.wall_ms,
                     collected.deleted
@@ -402,7 +470,6 @@ async fn run_cell(
     } else {
         None
     };
-    let after_warm_up = storage.fork();
     let baselines: Vec<Stats> = databases.iter().map(Database::stats).collect();
     let breakdown_start = storage.breakdown.snapshot();
     let measure_start = Instant::now();
@@ -467,7 +534,7 @@ async fn run_cell(
     // and their shutdown work is part of the cell, as the work that it drains
     // belongs to the measured transactions.
     let carried = if next_continues {
-        Some(instances)
+        Some(by_group(instances, spec))
     } else {
         close(instances, execution.drain_timeout).await?;
         None
@@ -581,7 +648,6 @@ async fn run_cell(
         start: match point.start {
             Start::Seed => "seed",
             Start::Previous => "previous",
-            Start::PreviousWarmUp => "previous-warm-up",
         },
         workload: spec.params.workload.clone(),
         affinity_pct: spec.params.affinity,
@@ -613,7 +679,6 @@ async fn run_cell(
         Some(Carry {
             storage,
             instances: carried,
-            after_warm_up,
         }),
     ))
 }
@@ -624,11 +689,42 @@ async fn open_instances(
 ) -> Result<Vec<OpenInstance>, Box<dyn Error>> {
     let mut instances = Vec::with_capacity(spec.instances());
     for _ in 0..spec.instances() {
-        let db = storage.open(&spec.params.database).await?;
-        let collections = seed::open_collections(&db, spec).await?;
-        instances.push(OpenInstance { db, collections });
+        instances.push(open_instance(storage, spec).await?);
     }
     Ok(instances)
+}
+
+async fn open_instance(storage: &Storage, spec: &CellSpec) -> Result<OpenInstance, Box<dyn Error>> {
+    let db = storage.open(&spec.params.database).await?;
+    let collections = seed::open_collections(&db, spec).await?;
+    Ok(OpenInstance { db, collections })
+}
+
+/// Returns the open instances of the cell before, with new instances for the
+/// groups of `spec` that have more instances, in the order of the groups.
+async fn add_instances(
+    storage: &Storage,
+    spec: &CellSpec,
+    groups: Vec<Vec<OpenInstance>>,
+) -> Result<Vec<OpenInstance>, Box<dyn Error>> {
+    let mut instances = Vec::with_capacity(spec.instances());
+    for (group, mut open) in spec.groups.iter().zip(groups) {
+        while open.len() < group.instances {
+            open.push(open_instance(storage, spec).await?);
+        }
+        instances.extend(open);
+    }
+    Ok(instances)
+}
+
+/// Splits `instances`, in the order of the groups of `spec`, in one list for
+/// each group.
+fn by_group(instances: Vec<OpenInstance>, spec: &CellSpec) -> Vec<Vec<OpenInstance>> {
+    let mut instances = instances.into_iter();
+    spec.groups
+        .iter()
+        .map(|group| instances.by_ref().take(group.instances).collect())
+        .collect()
 }
 
 async fn close(

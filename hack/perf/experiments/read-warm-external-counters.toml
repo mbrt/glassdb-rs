@@ -1,0 +1,8 @@
+# A read of a 1,025-byte value, which a transaction record stores.
+# The counters of `read-warm-external`: one run without latency jitter, in a
+# window of 10 s.
+tags = ["ci/counters", "area/read"]
+include = ["../configs/default.toml"]
+
+[cell]
+workload = "diag-read-external"
