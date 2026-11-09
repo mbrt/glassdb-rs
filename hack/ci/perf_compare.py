@@ -244,7 +244,8 @@ def run_side(
     timeout: float,
 ) -> None:
     """Run the counter and the timing experiments of one revision into
-    `directory`, with a log of each process beside its result."""
+    `directory`. The log and the progress bar of each process go to stderr;
+    perfbench draws the bar only on a terminal."""
     directory.mkdir(parents=True)
     start = time.monotonic()
     completed = False
@@ -254,21 +255,8 @@ def run_side(
             (Path(perf_report.TIMING_FILE).stem, timing_args),
         ):
             print(f"{directory.name}: {stem}", flush=True)
-            command = [
-                perfbench,
-                f"--output={directory / f'{stem}.json'}",
-                "--progress=never",
-                *arguments,
-            ]
-            with (directory / f"{stem}.log").open("w") as log:
-                subprocess.run(
-                    command,
-                    cwd=directory,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    timeout=timeout,
-                    check=True,
-                )
+            command = [perfbench, f"--output={directory / f'{stem}.json'}", *arguments]
+            subprocess.run(command, cwd=directory, timeout=timeout, check=True)
         completed = True
     finally:
         # The host and the time help to explain a slow or a stopped run; the
@@ -341,7 +329,7 @@ def measure(output: Path, manifest: dict) -> None:
         raise
     except subprocess.SubprocessError as error:
         manifest["warnings"].append(
-            f"Measurement failed: {error}. See the logs of each side."
+            f"Measurement failed: {error}. See the output of the measurement."
         )
         raise
     finally:

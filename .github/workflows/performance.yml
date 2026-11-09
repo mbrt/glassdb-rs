@@ -67,10 +67,14 @@ jobs:
       # process, not of this step.
       run: |
         manifest="$PERF_RESULTS/manifest.json"
+        # The log of each side goes to a file, which the artifact keeps, so
+        # that it does not fill the log of the job. A failed side shows the
+        # end of its log here.
         for side in main pr; do
+          log="$PERF_RESULTS/$side.log"
           make bench PERFBENCH="$(jq -r ".$side.perfbench" "$manifest")" \
             EXPERIMENTS_DIR="$(jq -r .experiments "$manifest")" \
-            OUT="$PERF_RESULTS/$side"
+            OUT="$PERF_RESULTS/$side" > "$log" 2>&1 || { tail -n 50 "$log"; exit 1; }
         done
 
     - name: Compare
@@ -80,7 +84,7 @@ jobs:
       run: |
         warnings=()
         if [ "$MEASURE_OUTCOME" != success ]; then
-          warnings+=("--warning=The measurement step failed ($MEASURE_OUTCOME); see its log.")
+          warnings+=("--warning=The measurement step failed ($MEASURE_OUTCOME); see the <side>.log files in the performance-results artifact.")
         fi
         python3 hack/ci/perf_report.py --manifest "$PERF_RESULTS/manifest.json" \
           --base "$PERF_RESULTS/main" --candidate "$PERF_RESULTS/pr" \

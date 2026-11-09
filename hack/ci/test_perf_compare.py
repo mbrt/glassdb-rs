@@ -317,12 +317,14 @@ class MeasurementTest(unittest.TestCase):
             for line in (self.root / "arguments.jsonl").read_text().splitlines()
         )
         experiments = f"--experiment={self.root / perf_compare.EXPERIMENTS}"
+        # Only the result file comes first: perfbench decides whether to draw
+        # its progress bar.
         self.assertEqual(
-            arguments["counters"][2:],
+            arguments["counters"][1:],
             [*perf_compare.COUNTER_ARGS, experiments, perf_compare.COUNTER_TAG],
         )
         self.assertEqual(
-            arguments["timing"][2:],
+            arguments["timing"][1:],
             [*perf_compare.TIMING_ARGS, experiments, perf_compare.TIMING_TAG],
         )
 
