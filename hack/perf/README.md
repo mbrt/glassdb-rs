@@ -11,7 +11,7 @@ Manual experiments that use these tools are recorded in
 | --- | --- |
 | `plot_results.py` | Plots result files: the canonical sweeps, single files, and overlays. |
 | `compare.py` | Compares two directories of result files. |
-| `compare_refs.sh` | Compares two revisions with the CI comparison driver. |
+| `compare_refs.sh` | Compares two revisions with the steps of the CI comparison. |
 | `perfbench_results.py` | Reads the result files; the other tools use it. |
 | `profile.sh` | Records a CPU flamegraph of one experiment. |
 | `experiments/` | The experiment files, each for `--experiment`. [Experiments](#experiments) lists them and their tags. |
@@ -109,7 +109,7 @@ The CI comparison builds perfbench for both revisions, runs `make bench` with
 each binary, and then compares the results:
 
 ```text
-hack/ci/perf_compare.py --base <merge base> --candidate <head> --output R --build-only
+hack/ci/perf_compare.py --base <merge base> --candidate <head> --output R
 make bench PERFBENCH=R/bin/main-perfbench EXPERIMENTS_DIR=R/harness/hack/perf/experiments OUT=R/main
 make bench PERFBENCH=R/bin/pr-perfbench EXPERIMENTS_DIR=R/harness/hack/perf/experiments OUT=R/pr
 hack/ci/perf_report.py --manifest R/manifest.json --base R/main --candidate R/pr --output R/report.md
@@ -121,16 +121,15 @@ only the engine differs.
 
 `make bench` runs two perfbench processes: `--tag=ci/counters
 --latency-jitter=false --runs=1` and `--tag=ci/timing --latency-jitter=true
---runs=32`. By default it builds perfbench and runs the experiments of the
-current tree; `PERFBENCH` and `EXPERIMENTS_DIR` change both, as in CI. It then
-prints the main metrics: the median p50, p90, and throughput of each shape over
-the runs, with the spread of one run, and the backend operations and
-coordinator rounds per transaction of each case. While it runs, it prints the
-notes of perfbench about its cells, and on a terminal its progress bar. The
-results go to `OUT`, by default a new directory in `/tmp`, with a `host.json`
-of the host and the runtime. CI writes the output of each side to
-`<side>.log` beside its results.
-To print the summary of a result directory again, run
+--runs=32`. The Makefile is the only place that has their options. By default it
+builds perfbench and runs the experiments of the current tree; `PERFBENCH` and
+`EXPERIMENTS_DIR` change both, as in CI. It then prints the main metrics: the
+median p50, p90, and throughput of each shape over the runs, with the spread of
+one run, and the backend operations and coordinator rounds per transaction of
+each case. While it runs, it prints the notes of perfbench about its cells, and
+on a terminal its progress bar. The results go to `OUT`, by default a new
+directory in `/tmp`. CI writes the output of each side to `<side>.log` beside
+its results. To print the summary of a result directory again, run
 `hack/ci/perf_report.py --summary DIR`.
 
 The counter run compares the `costs` of each cell. They repeat exactly, so a
@@ -239,9 +238,10 @@ tests.
 
 ## Comparing revisions
 
-`compare_refs.sh` uses the same comparison driver as CI. It copies the
+`compare_refs.sh` runs the same steps as CI. `perf_compare.py` copies the
 candidate's `glassdb-bench-scale` crate into disposable snapshots of both
-revisions, then builds each against its own engine. Both sides run the
+revisions, then builds each against its own engine. `make bench` runs each
+binary, and `perf_report.py` writes the report. Both sides run the
 experiments of the candidate that have the tags `ci/counters` and `ci/timing`.
 The current source tree is not changed.
 

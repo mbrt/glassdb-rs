@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from hack.ci import perf_compare
+from hack.ci import perf_compare, perf_report
 
 
 class HarnessTest(unittest.TestCase):
@@ -66,11 +66,7 @@ class HarnessTest(unittest.TestCase):
             output = Path(directory).resolve() / "out"
             manifest = perf_compare.prepare(Path(directory), output, "main", None)
             experiments = output / "harness" / perf_compare.EXPERIMENTS
-            for arguments, tag in (
-                (manifest["timingArgs"], "--tag=ci/timing"),
-                (manifest["counterArgs"], "--tag=ci/counters"),
-            ):
-                self.assertEqual(arguments[-2:], [f"--experiment={experiments}", tag])
+            self.assertEqual(manifest["experiments"], str(experiments))
             experiment = (experiments / "read-warm.toml").read_text()
         return built, manifest, experiment
 
@@ -153,7 +149,12 @@ class HarnessTest(unittest.TestCase):
                     self.assertGreater((root / copy / "file").stat().st_mtime, start)
 
 
-class MeasurementTest(unittest.TestCase):
+REPO = Path(__file__).resolve().parents[2]
+
+
+class BenchTest(unittest.TestCase):
+    """`make bench` runs one side of the comparison, with a fake perfbench."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -163,22 +164,32 @@ class MeasurementTest(unittest.TestCase):
         self.fixture.write_text(f"#!{sys.executable}\n" + BENCHMARK_FIXTURE)
         self.fixture.chmod(0o755)
         self.configure()
+        self.cases(("a", "b"))
 
     def configure(self, **settings):
         (self.root / "settings.json").write_text(json.dumps(settings))
 
-    def manifest(self, cases=("a", "b")):
-        (self.root / "cases.json").write_text(json.dumps(cases))
-        return {
-            "schemaVersion": perf_compare.MANIFEST_VERSION,
-            "base": "base",
-            "candidate": "candidate",
-            "processTimeoutSeconds": 30,
-            "warnings": [],
-            "timingArgs": ["--latency-jitter=true", "--runs=4", "--experiment=default"],
-            "counterArgs": ["--latency-jitter=false", "--runs=1", "--experiment=default"],
-            **{side: {"perfbench": str(self.fixture)} for side in ("main", "pr")},
-        }
+    def cases(self, cases):
+        (self.root / "cases.json").write_text(json.dumps(list(cases)))
+
+    def bench(self, side, check=True):
+        """Run `make bench` into the directory `side`, and return its output."""
+        result = subprocess.run(
+            [
+                "make",
+                "--no-print-directory",
+                "bench",
+                f"PERFBENCH={self.fixture}",
+                f"EXPERIMENTS_DIR={self.root / 'experiments'}",
+                f"OUT={self.root / side}",
+            ],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+        )
+        if check:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
 
     def order(self):
         """Return the processes, as `[kind, side]`, in the order they started."""
@@ -187,189 +198,103 @@ class MeasurementTest(unittest.TestCase):
             return []
         return [json.loads(line) for line in path.read_text().splitlines()]
 
-    def short_timeout_for(self, side, kind):
-        original = subprocess.run
-
-        def run(command, **kwargs):
-            self.assertEqual(kwargs["timeout"], 30)
-            # Keep normal subprocesses independent of host speed. Only the
-            # selected stalled process gets the short timeout used by the test.
-            if kwargs["cwd"] == self.root / side and f"{kind}.json" in command[1]:
-                kwargs["timeout"] = 0.05
-            return original(command, **kwargs)
-
-        return mock.patch.object(perf_compare.subprocess, "run", side_effect=run)
+    def arguments(self):
+        """Return the arguments of the processes, by kind."""
+        return dict(
+            json.loads(line)
+            for line in (self.root / "arguments.jsonl").read_text().splitlines()
+        )
 
     def read(self, side, kind):
         return json.loads((self.root / side / f"{kind}.json").read_text())
 
     def report(self):
-        return (self.root / "report.md").read_text()
-
-    def test_invalid_process_timeout_does_not_start_measurements(self):
-        for timeout in (None, 0, -1, True, float("inf"), float("nan")):
-            with self.subTest(timeout=timeout):
-                manifest = self.manifest()
-                manifest["processTimeoutSeconds"] = timeout
-                with self.assertRaises(
-                    (ValueError, perf_compare.perf_report.ReportError)
-                ):
-                    perf_compare.measure(self.root, manifest)
-                self.assertFalse((self.root / "main").exists())
-                self.assertFalse((self.root / "pr").exists())
-                self.assertFalse(self.order())
-
-    def test_each_side_measures_counters_and_then_the_timing_runs(self):
-        manifest = self.manifest(cases=("a",))
-        perf_compare.measure(self.root, manifest)
-        self.assertFalse(manifest["warnings"])
-        self.assertEqual(
-            self.order(),
-            [["counters", "main"], ["timing", "main"], ["counters", "pr"], ["timing", "pr"]],
+        return perf_report.render_report(
+            self.root / "main", self.root / "pr", "base", "candidate"
         )
-        for side in ("main", "pr"):
-            timing, counters = self.read(side, "timing"), self.read(side, "counters")
-            self.assertIs(timing["latencyJitter"], True)
-            self.assertIs(counters["latencyJitter"], False)
-            self.assertEqual(len(timing["experiments"][0]["runs"]), 4)
-            self.assertEqual(len(counters["experiments"][0]["runs"]), 1)
-        self.assertIn("No meaningful changes detected", self.report())
-        for side in ("main", "pr"):
-            host = json.loads((self.root / side / "host.json").read_text())
-            self.assertIn("cpuModel", host)
-            self.assertGreaterEqual(host["runtimeSeconds"], 0)
 
-    def test_the_default_plan_measures_on_virtual_time(self):
-        for arguments in (perf_compare.TIMING_ARGS, perf_compare.COUNTER_ARGS):
-            self.assertIn("--time=virtual", arguments)
-        self.assertIn("--latency-jitter=true", perf_compare.TIMING_ARGS)
-        self.assertIn(f"--runs={perf_compare.TIMING_RUNS}", perf_compare.TIMING_ARGS)
-        self.assertIn("--latency-jitter=false", perf_compare.COUNTER_ARGS)
-        self.assertIn("--runs=1", perf_compare.COUNTER_ARGS)
-        self.assertEqual(perf_compare.TIMING_RUNS, 32)
+    def test_the_counters_run_once_and_then_the_latency_in_32_runs(self):
+        output = self.bench("main").stdout
+        self.assertEqual(self.order(), [["counters", "main"], ["timing", "main"]])
+        timing, counters = self.read("main", "timing"), self.read("main", "counters")
+        self.assertIs(timing["latencyJitter"], True)
+        self.assertIs(counters["latencyJitter"], False)
+        self.assertEqual(len(timing["experiments"][0]["runs"]), 32)
+        self.assertEqual(len(counters["experiments"][0]["runs"]), 1)
+        # The summary of the main metrics prints at the end.
+        self.assertIn("median of 32 runs", output)
+        self.assertIn("| a | 100.00", output)
+        self.assertIn(f"Results: {self.root / 'main'}", output)
+
+    def test_both_processes_run_on_virtual_time_with_the_experiments_and_a_tag(self):
+        self.bench("main")
+        arguments = self.arguments()
+        experiments = f"--experiment={self.root / 'experiments'}"
+        for kind, tag, jitter, runs in (
+            ("counters", "--tag=ci/counters", "--latency-jitter=false", "--runs=1"),
+            ("timing", "--tag=ci/timing", "--latency-jitter=true", "--runs=32"),
+        ):
+            for argument in ("--time=virtual", "--backend=memory", experiments, tag, jitter, runs):
+                self.assertIn(argument, arguments[kind], kind)
+            # perfbench decides whether to draw its progress bar.
+            self.assertFalse(any(a.startswith("--progress") for a in arguments[kind]))
 
     def test_clear_changes_are_reported_in_both_directions(self):
+        self.bench("main")
         self.configure(factors={"a": [1.10, 1.12], "b": [0.88, 0.90]})
-        perf_compare.measure(self.root, self.manifest())
+        self.bench("pr")
         report = self.report()
         self.assertIn("regressed", report)
         self.assertIn("improved", report)
         self.assertNotIn("Measurement warnings", report)
 
-    def test_variation_between_runs_is_inconclusive(self):
-        self.configure(factors={"a": [0.8, 1.2]})
-        perf_compare.measure(self.root, self.manifest(cases=("a",)))
-        report = self.report()
-        self.assertIn("noisy or inconclusive", report)
-        self.assertNotIn("No meaningful changes detected", report)
-
-    def test_a_second_measurement_needs_a_new_directory(self):
-        perf_compare.measure(self.root, self.manifest(cases=("a",)))
+    def test_a_second_run_needs_a_new_directory(self):
+        self.bench("main")
         order = self.order()
-        with self.assertRaises(FileExistsError):
-            perf_compare.measure(self.root, self.manifest(cases=("a",)))
+        result = self.bench("main", check=False)
+        self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.order(), order)
 
-    def test_an_unknown_manifest_is_rejected(self):
-        manifest = self.manifest()
-        manifest["schemaVersion"] = 4
-        with self.assertRaises(ValueError):
-            perf_compare.measure(self.root, manifest)
-        self.assertFalse(self.order())
+    def test_a_failed_process_fails_and_stops_the_side(self):
+        self.configure(failAt=["counters", "main"])
+        result = self.bench("main", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.order(), [["counters", "main"]])
+        self.assertNotIn("Results:", result.stdout)
 
-    def test_stalled_process_fails_and_does_not_claim_no_change(self):
-        self.configure(hangAt=["timing", "main"])
-        manifest = self.manifest(cases=("a",))
-        with self.short_timeout_for("main", "timing"):
-            with self.assertRaises(subprocess.TimeoutExpired):
-                perf_compare.measure(self.root, manifest)
-        report = self.report()
-        self.assertIn("Benchmark process timed out", report)
-        self.assertNotIn("No meaningful changes detected", report)
+    def test_a_side_without_usable_results_fails(self):
+        # The processes succeed, but every cell failed.
+        self.cases(("a",))
+        self.configure(failedCells=True)
+        result = self.bench("main", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cell failed", result.stdout + result.stderr)
 
     def test_counters_with_latency_jitter_are_not_compared(self):
         self.configure(latencyJitter=True)
-        perf_compare.measure(self.root, self.manifest(cases=("a",)))
+        self.bench("main")
+        self.bench("pr")
         report = self.report()
         self.assertIn("invalid counter measurement", report)
         self.assertIn("latency profile", report)
 
     def test_malformed_cost_records_are_warnings(self):
         self.configure(costRecord={})
-        perf_compare.measure(self.root, self.manifest(cases=("a",)))
+        self.bench("main")
+        self.bench("pr")
         report = self.report()
         self.assertIn("invalid cost measurements", report)
         self.assertNotIn("No meaningful changes detected", report)
 
-    def test_bench_runs_one_side_and_prints_its_summary(self):
-        (self.root / "cases.json").write_text(json.dumps(["a"]))
-        with mock.patch("builtins.print") as printed:
-            perf_compare.bench(self.root / perf_compare.EXPERIMENTS, self.fixture, self.root / "bench")
-        self.assertEqual(self.order(), [["counters", "bench"], ["timing", "bench"]])
-        timing = self.read("bench", "timing")
-        self.assertEqual(len(timing["experiments"][0]["runs"]), perf_compare.TIMING_RUNS)
-        output = "\n".join(str(call.args[0]) for call in printed.call_args_list)
-        self.assertIn(f"median of {perf_compare.TIMING_RUNS} runs", output)
-        self.assertIn("| a | 100.00", output)
-        # The processes get the options of CI.
-        arguments = dict(
-            json.loads(line)
-            for line in (self.root / "arguments.jsonl").read_text().splitlines()
-        )
-        experiments = f"--experiment={self.root / perf_compare.EXPERIMENTS}"
-        # Only the result file comes first: perfbench decides whether to draw
-        # its progress bar.
-        self.assertEqual(
-            arguments["counters"][1:],
-            [*perf_compare.COUNTER_ARGS, experiments, perf_compare.COUNTER_TAG],
-        )
-        self.assertEqual(
-            arguments["timing"][1:],
-            [*perf_compare.TIMING_ARGS, experiments, perf_compare.TIMING_TAG],
-        )
-
-    def test_bench_without_usable_results_fails(self):
-        # The processes succeed, but every cell failed.
-        (self.root / "cases.json").write_text(json.dumps(["a"]))
-        self.configure(failedCells=True)
-        with mock.patch("builtins.print"):
-            with self.assertRaisesRegex(
-                perf_compare.perf_report.ReportError, "cell failed"
-            ):
-                perf_compare.bench(
-                    self.root / perf_compare.EXPERIMENTS, self.fixture, self.root / "bench"
-                )
-        # A summary of the same directory fails with a nonzero status.
-        arguments = ["perf_report.py", "--summary", str(self.root / "bench")]
-        with mock.patch.object(sys, "argv", arguments), mock.patch.object(
-            sys, "stderr"
-        ):
-            with self.assertRaises(SystemExit) as exit:
-                perf_compare.perf_report.main()
-        self.assertEqual(exit.exception.code, 1)
-
-    def test_subprocess_failure_preserves_a_failure_report(self):
-        self.configure(failAt=["timing", "pr"])
-        manifest = self.manifest(cases=("a",))
-        with self.assertRaises(subprocess.CalledProcessError):
-            perf_compare.measure(self.root, manifest)
-        report = self.report()
-        self.assertIn("Measurement failed", report)
-        self.assertNotIn("Benchmark process timed out", report)
-        # The side that failed still records its host and its time.
-        host = json.loads((self.root / "pr" / "host.json").read_text())
-        self.assertIs(host["completed"], False)
-        self.assertIn("cpuModel", host)
-
 
 BENCHMARK_FIXTURE = r"""
-import json, sys, time
+import json, sys
 from pathlib import Path
 root = Path(__file__).resolve().parent
 settings = json.loads((root / 'settings.json').read_text())
 cases = json.loads((root / 'cases.json').read_text())
-side = Path.cwd().name
 output = Path([arg for arg in sys.argv if arg.startswith('--output=')][0].split('=', 1)[1])
+side = output.parent.name
 runs = int([arg for arg in sys.argv if arg.startswith('--runs=')][0].split('=', 1)[1])
 kind = output.stem
 with (root / 'order.jsonl').open('a') as log:
@@ -378,9 +303,6 @@ with (root / 'arguments.jsonl').open('a') as log:
     log.write(json.dumps([kind, sys.argv[1:]]) + '\n')
 if settings.get('failAt') == [kind, side]:
     sys.exit(7)
-if settings.get('hangAt') == [kind, side]:
-    # Bound the fixture even if the driver's timeout is accidentally removed.
-    time.sleep(5)
 jitter = settings.get('latencyJitter', '--latency-jitter=false' not in sys.argv)
 counters = {name: 0 for name in ('reads', 'writes', 'lists', 'readBodyBytes',
     'writeBodyBytes', 'coordinatorSubmissions', 'coordinatorRounds')}

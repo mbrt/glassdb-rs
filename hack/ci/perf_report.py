@@ -43,10 +43,6 @@ LATENCY_METRICS = (
 # revision can differ by that much. The test for a repeatable direction is
 # separate from this floor.
 TIMING_THRESHOLD = 0.02
-FLOOR_NOTE = (
-    "A timing change shows when its interval excludes zero and it is at least"
-    f" its floor: {TIMING_THRESHOLD:.0%}, or the spread of one run if that is larger."
-)
 # The smallest change of the spread of one run that the report shows, as a
 # ratio. With 32 runs a side, a spread that grows by 3 times or more shows for
 # most metrics, and one that grows by 2 times for some of them.
@@ -458,10 +454,6 @@ def render_report(
         rows.append(
             f"| {escape(name)} | {before:,.3f} | {after:,.3f} | {change} | {interval} | {floor} | {a.unit} | {direction} |"
         )
-    floors = [FLOOR_NOTE, ""] if any(
-        c.floor is not None and (c.report or c.uncertain)
-        for *_, c in result.metrics.values()
-    ) else []
     lines = [
         "# Performance comparison",
         "",
@@ -474,9 +466,7 @@ def render_report(
             "| --- | ---: | ---: | ---: | --- | ---: | --- | --- |",
             *rows,
             "",
-            *floors,
         ]
-        floors = []
     elif not spreads:
         if warnings:
             headline = "No conclusive changes; some measurements remain unresolved."
@@ -518,7 +508,6 @@ def render_report(
             "",
         ]
     lines += [
-        *floors,
         "Full results and logs are retained as artifacts.",
         "",
     ]

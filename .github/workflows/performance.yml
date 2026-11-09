@@ -53,7 +53,7 @@ jobs:
       run: |
         MERGE_BASE=$(git merge-base "$HEAD_SHA" "$BASE_SHA")
         python3 hack/ci/perf_compare.py --base "$MERGE_BASE" \
-          --candidate "$HEAD_SHA" --output "$PERF_RESULTS" --build-only
+          --candidate "$HEAD_SHA" --output "$PERF_RESULTS"
 
     - name: Measure workloads
       id: measure
@@ -62,9 +62,9 @@ jobs:
       # that the build step records in its manifest: the counter experiments
       # once, and the timing experiments 32 times, on virtual time, with the
       # runs in parallel. By an estimate from a laptop, the timing process
-      # takes about 30 minutes on 4 vCPUs. Each benchmark process has its own
-      # timeout of 40 minutes, so that a hang shows as a timeout of its
-      # process, not of this step.
+      # takes about 30 minutes on 4 vCPUs. The timeout of this step also stops
+      # a process that hangs, such as a CPU livelock that virtual time cannot
+      # see.
       run: |
         manifest="$PERF_RESULTS/manifest.json"
         # The log of each side goes to a file, which the artifact keeps, so
