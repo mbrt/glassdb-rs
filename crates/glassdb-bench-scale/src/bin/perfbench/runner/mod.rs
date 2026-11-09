@@ -191,18 +191,25 @@ fn run_cells(
     let mut cells = Vec::with_capacity(chain.cells.len());
     for index in chain.cells.clone() {
         let point = &points[index];
-        crate::progress::log!("{}: run={run} {}", resolved.name, describe(point));
+        progress::header(format_args!(
+            "{}: run={run} {}",
+            resolved.name,
+            describe(point)
+        ));
         let next_continues =
             chain.cells.contains(&(index + 1)) && points[index + 1].start == Start::Previous;
         progress::start_cell();
-        let (cell, next) = runtime.block_on(run_cell(
-            seeds,
-            carry.take(),
-            point,
-            &specs[index],
-            next_continues,
-            execution,
-        ))?;
+        // The log names a cell only before its notes, so the error names it.
+        let (cell, next) = runtime
+            .block_on(run_cell(
+                seeds,
+                carry.take(),
+                point,
+                &specs[index],
+                next_continues,
+                execution,
+            ))
+            .map_err(|e| format!("run={run} {}: {e}", describe(point)))?;
         progress::finish_cell();
         cells.push(cell);
         carry = next;
@@ -429,7 +436,7 @@ async fn run_cell(
         change_rate,
         gc: (gc_stats(&databases) - gc_start).into(),
     };
-    crate::progress::log!(
+    crate::progress::debug!(
         "  warm-up took {}ms: {} splits and {} merges{}{}",
         warmup.wall_ms,
         warmup.split_completed,
@@ -448,7 +455,7 @@ async fn run_cell(
     let full_gc = if spec.params.gc {
         match seed::collect_garbage(&databases[0]).await {
             Ok(collected) => {
-                crate::progress::log!(
+                crate::progress::debug!(
                     "  full GC took {}ms: {} transaction records deleted",
                     collected.wall_ms,
                     collected.deleted

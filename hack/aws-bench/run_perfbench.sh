@@ -13,6 +13,10 @@ common=(
   --run-cooldown="$RUN_COOLDOWN"
   --drain-timeout="$DRAIN_TIMEOUT"
   --config=aws.toml
+  # The bootstrap log is the only view of a run of hours, and it is not a
+  # terminal, so it has no progress bar. The details of each cell show its
+  # progress there.
+  --verbose
 )
 # The configuration and experiment files are in the environment, because the
 # stack fetches only the binary, this script, and its environment file.

@@ -204,7 +204,7 @@ async fn seed(
         .filter(|pool| pool.seeded)
         .map(|pool| pool.keys.unwrap_or(0) * cell.collections)
         .sum();
-    crate::progress::log!("  seeding {keys} keys");
+    crate::progress::debug!("  seeding {keys} keys");
     let db = spec
         .database
         .apply(Database::builder(database, backend.clone()))?
@@ -241,7 +241,7 @@ async fn seed(
             let collected = collect_garbage(&db).await;
             match collected {
                 Ok(collected) => {
-                    crate::progress::log!(
+                    crate::progress::debug!(
                         "  full GC took {}ms: {} transaction records deleted",
                         collected.wall_ms,
                         collected.deleted
@@ -265,7 +265,7 @@ async fn seed(
         )
         .into());
     }
-    crate::progress::log!(
+    crate::progress::debug!(
         "  setup settled after {}ms: {} completed splits",
         report.settle_wall_ms,
         report.splits

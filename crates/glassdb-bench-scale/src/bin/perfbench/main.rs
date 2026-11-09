@@ -103,6 +103,11 @@ struct Cli {
         default_missing_value = "always"
     )]
     progress: ProgressMode,
+    /// Log the details of each cell: its seed, its warm-up, and its garbage
+    /// collection. The result has them too. By default, the log has only the
+    /// notes about a cell, after the line that names the cell.
+    #[arg(long, short)]
+    verbose: bool,
     /// Write JSON to this path instead of stdout.
     #[arg(long)]
     output: Option<PathBuf>,
@@ -167,6 +172,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         drain_timeout: cli.drain_timeout,
     };
     let chains = parallel::chains(&resolved, cli.runs)?;
+    // The process of a chain has the same arguments, so it filters its own log.
+    progress::set_verbose(cli.verbose);
     if let Some(index) = cli.chain {
         return run_chain(&cli, &resolved, &chains, index, execution);
     }

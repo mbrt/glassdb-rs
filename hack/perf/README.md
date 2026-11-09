@@ -126,9 +126,10 @@ current tree; `PERFBENCH` and `EXPERIMENTS_DIR` change both, as in CI. It then
 prints the main metrics: the median p50, p90, and throughput of each shape over
 the runs, with the spread of one run, and the backend operations and
 coordinator rounds per transaction of each case. While it runs, it prints the
-log of perfbench, and on a terminal its progress bar. The results go to `OUT`,
-by default a new directory in `/tmp`, with a `host.json` of the host and the
-runtime. CI writes the output of each side to `<side>.log` beside its results.
+notes of perfbench about its cells, and on a terminal its progress bar. The
+results go to `OUT`, by default a new directory in `/tmp`, with a `host.json`
+of the host and the runtime. CI writes the output of each side to
+`<side>.log` beside its results.
 To print the summary of a result directory again, run
 `hack/ci/perf_report.py --summary DIR`.
 

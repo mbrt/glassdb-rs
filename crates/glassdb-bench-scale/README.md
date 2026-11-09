@@ -99,9 +99,13 @@ no result.
 The options that are the same for all experiments are command-line options:
 `--backend`, `--delays`, `--time`, `--prefix-depth`, `--latency-jitter`,
 `--enable-throttling`, `--runs`, `--run-cooldown`, `--drain-timeout`,
-`--progress`, and `--output`. The result records them, except `--progress`.
-`--progress[=auto|always|never]` controls a progress bar on stderr with the
-number of the cell and the estimated time left.
+`--progress`, `--verbose`, and `--output`. The result records them, except
+`--progress` and `--verbose`. `--progress[=auto|always|never]` controls a
+progress bar on stderr with the number of the cell and the estimated time
+left. The log on stderr has only the notes about a cell, such as a
+measurement that reached its maximum duration, each after the line that names
+its cell. `--verbose` adds the details of each cell: its seed, its warm-up,
+and its garbage collection, which the result also has.
 
 `--jobs N` runs up to `N` chains of cells at the same time, each in its own
 process of perfbench. A chain is a cell that starts from a seed, and the cells

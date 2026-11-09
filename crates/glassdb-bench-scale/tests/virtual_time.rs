@@ -115,7 +115,7 @@ fn parallel_chains_give_the_results_of_one_job() {
     let report = |jobs: &str| -> (Value, String) {
         let arguments = [
             &MEMORY_MODEL[..],
-            &["--time=virtual", "--runs=2", jobs, &experiment],
+            &["--time=virtual", "--runs=2", "--verbose", jobs, &experiment],
         ]
         .concat();
         let output = perfbench(&arguments);
@@ -180,7 +180,7 @@ fn a_chain_writes_its_log_progress_and_cells_as_events() {
     let output = perfbench(
         &[
             &MEMORY_MODEL[..],
-            &["--time=virtual", &experiment, "--chain=0"],
+            &["--time=virtual", "--verbose", &experiment, "--chain=0"],
         ]
         .concat(),
     );
@@ -200,6 +200,87 @@ fn a_chain_writes_its_log_progress_and_cells_as_events() {
     let cells = events.last().unwrap()["cells"].as_array().unwrap();
     assert_eq!(cells.len(), 1);
     assert_eq!(output.stderr, b"");
+}
+
+// Without `--verbose`, the log has only the notes about a cell, each after
+// the line that names its cell.
+#[test]
+fn the_default_log_names_the_cell_of_each_note_and_nothing_else() {
+    let experiment = format!("--experiment={EXPERIMENTS}/rmw-shared-leaf.toml");
+    let arguments = |jobs, until| {
+        let until = format!("--set=cell.measure.until=\"{until}\"");
+        let output = perfbench(
+            &[
+                &MEMORY_MODEL[..],
+                &[
+                    "--time=virtual",
+                    "--runs=2",
+                    jobs,
+                    &experiment,
+                    &until,
+                    "--set=cell.measure.duration=\"1s\"",
+                    "--set=cell.measure.max-duration=\"1s\"",
+                ],
+            ]
+            .concat(),
+        );
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stderr).unwrap()
+    };
+    for jobs in ["--jobs=1", "--jobs=2"] {
+        // A fixed window ends on time, so there is no note.
+        assert_eq!(arguments(jobs, "duration"), "", "{jobs}");
+        // 1,000 commits of each shape do not fit in 1 s.
+        let log = arguments(jobs, "converged");
+        let mut lines: Vec<&str> = log.lines().collect();
+        lines.sort();
+        let note = "  note: the measurement reached its maximum duration before its end condition";
+        assert_eq!(
+            lines,
+            [
+                note,
+                note,
+                "rmw-shared-leaf: run=1 cell",
+                "rmw-shared-leaf: run=2 cell"
+            ],
+            "{jobs}: {log}"
+        );
+        for block in log.split("rmw-shared-leaf: run=").skip(1) {
+            assert_eq!(block.lines().nth(1), Some(note), "{jobs}: {log}");
+        }
+    }
+}
+
+// A cell that fails has no result, so its error names it at every level of
+// the log.
+#[test]
+fn the_error_of_a_cell_names_the_cell() {
+    let experiment = format!("--experiment={EXPERIMENTS}/split-merge-fight.toml");
+    for jobs in ["--jobs=1", "--jobs=2"] {
+        let output = perfbench(
+            &[
+                &MEMORY_MODEL[..],
+                &[
+                    "--time=virtual",
+                    jobs,
+                    &experiment,
+                    // No seed can stay quiet for longer than its timeout.
+                    "--set=seed.timeout=\"1s\"",
+                    "--set=seed.quiet-period=\"100s\"",
+                ],
+            ]
+            .concat(),
+        );
+        assert!(!output.status.success(), "{jobs}: {output:?}");
+        // The error is the only line: no other line names the cell again.
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(lines.len(), 1, "{jobs}: {stderr}");
+        assert!(
+            lines[0].starts_with("Error: \"split-merge-fight: run=1 start="),
+            "{jobs}: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -251,7 +332,7 @@ fn failed_experiment_keeps_the_experiments_before_it(jobs: &str) {
     assert!(!result.status.success());
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(
-        stderr.contains("Error: \"no_passes: the end condition needs passes"),
+        stderr.contains("Error: \"no_passes: run=1 cell: the end condition needs passes"),
         "{stderr}"
     );
     // A process of a chain does not print the error that the parent prints.

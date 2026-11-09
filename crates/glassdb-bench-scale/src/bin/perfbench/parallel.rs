@@ -185,7 +185,7 @@ fn run_job(index: usize) -> JobOutput {
             Ok(ReadEvent::CellStart) => progress::chain_progress(index, 0.0),
             Ok(ReadEvent::Progress { fraction }) => progress::chain_progress(index, fraction),
             Ok(ReadEvent::CellEnd) => {
-                progress::lines(&std::mem::take(&mut block));
+                show(&std::mem::take(&mut block), false);
                 progress::chain_cell_done(index);
             }
             Ok(ReadEvent::Cells { cells }) => output = Some(Ok(cells)),
@@ -206,12 +206,22 @@ fn run_job(index: usize) -> JobOutput {
             .lines()
             .map(str::to_string),
     );
-    progress::lines(&block);
+    // An error event names its cell, but a process that crashed wrote none.
+    show(&block, !matches!(output, Some(Err(_))));
     match output {
         Some(Ok(cells)) if status.success() => Ok(cells),
         Some(Err(message)) => Err(message),
         // A process that panics or is killed writes no last event.
         _ => Err(format!("the process of chain {index} failed: {status}")),
+    }
+}
+
+/// Shows the lines of a cell. The first line names the cell, so a cell with
+/// only that line has nothing to show at this level of the log, unless
+/// `keep_name`: no other line names the cell.
+fn show(lines: &[String], keep_name: bool) {
+    if lines.len() > 1 || keep_name {
+        progress::lines(lines);
     }
 }
 

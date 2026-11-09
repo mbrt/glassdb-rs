@@ -7,11 +7,21 @@
 //!
 //! The process of a chain of a parallel run draws no bar. It writes its log
 //! and its progress as events, and the parallel run shows them in its own bar.
+//!
+//! The log has two levels. `log!` writes a line that the user must see, such
+//! as a note about a cell. `debug!` writes the details of a cell, which the
+//! result also has, only with `--verbose`. The first line of a cell names it.
+//! Without `--verbose`, it waits for the first line of `log!` in the cell, so
+//! that the line names its cell, and a cell with no such line prints nothing.
+//! The process of a chain always writes it, because a process that crashes
+//! writes no other line that names its cell. The parallel run drops a cell
+//! that ends with only that line.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::io::Write as _;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use glassdb_concurr::rt;
@@ -33,6 +43,12 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// The time of the last progress event, when this process writes events.
 static EVENTS: Mutex<Option<Instant>> = Mutex::new(None);
 
+/// Whether the log has the lines of `debug!`.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// The first line of the current cell, until a line of the cell prints.
+static HEADER: Mutex<Option<String>> = Mutex::new(None);
+
 struct State {
     started: Instant,
     total_cells: usize,
@@ -44,8 +60,8 @@ struct State {
     chains: BTreeMap<usize, f64>,
     /// Whether the bar is on screen now.
     drawn: bool,
-    /// Whether the first stage of a cell started. The setup before it logs its
-    /// own lines, so the bar waits for that stage.
+    /// Whether the first stage of a cell started. The setup before it can log
+    /// its own lines, so the bar waits for that stage.
     visible: bool,
 }
 
@@ -124,6 +140,33 @@ pub(crate) fn enable(total_cells: usize) {
     });
 }
 
+/// Makes the log include the lines of `debug!`.
+pub(crate) fn set_verbose(verbose: bool) {
+    VERBOSE.store(verbose, Ordering::Relaxed);
+}
+
+/// Starts the log of a cell with the line that names it.
+pub(crate) fn header(text: fmt::Arguments<'_>) {
+    let mut header = HEADER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if VERBOSE.load(Ordering::Relaxed) || events().is_some() {
+        *header = None;
+        drop(header);
+        write(text);
+    } else {
+        // The header of a cell with no line replaces it.
+        *header = Some(text.to_string());
+    }
+}
+
+/// Writes a line of `debug!`.
+pub(crate) fn detail(text: fmt::Arguments<'_>) {
+    if VERBOSE.load(Ordering::Relaxed) {
+        message(text);
+    }
+}
+
 /// Makes this process write its log and progress as events, for the process
 /// of a parallel run that started it.
 pub(crate) fn enable_events() {
@@ -141,6 +184,10 @@ pub(crate) fn start_cell() {
 
 /// Marks the end of a cell.
 pub(crate) fn finish_cell() {
+    // A line after the cell does not belong to it.
+    *HEADER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     if events().is_some() {
         let _ = parallel::emit(&Event::CellEnd);
     }
@@ -199,6 +246,10 @@ pub(crate) fn chain_finished(chain: usize) {
 
 /// Removes the bar from the screen.
 pub(crate) fn finish() {
+    // A line after the run does not belong to the last cell.
+    *HEADER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     let mut guard = lock();
     if let Some(state) = guard.as_mut() {
         clear(state);
@@ -223,9 +274,21 @@ pub(crate) fn lines(lines: &[String]) {
     }
 }
 
-/// Prints a line on stderr above the bar. A process of a chain writes it as
-/// an event.
+/// Prints a line on stderr above the bar, after the header of its cell if
+/// that has not printed yet. A process of a chain writes it as an event.
 pub(crate) fn message(text: fmt::Arguments<'_>) {
+    let header = HEADER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(header) = header {
+        write(format_args!("{header}"));
+    }
+    write(text);
+}
+
+/// Prints a line on stderr above the bar, or writes it as an event.
+fn write(text: fmt::Arguments<'_>) {
     if events().is_some() {
         let _ = parallel::emit(&Event::Log {
             text: &text.to_string(),
@@ -249,6 +312,14 @@ macro_rules! log {
     };
 }
 pub(crate) use log;
+
+/// Prints a detail of a cell on stderr above the bar, only with `--verbose`.
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        $crate::progress::detail(format_args!($($arg)*))
+    };
+}
+pub(crate) use debug;
 
 fn update(change: impl FnOnce(&mut State)) {
     let mut guard = lock();
