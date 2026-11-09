@@ -265,19 +265,19 @@ impl CollectionCommit {
             .await
     }
 
-    /// Validates the handle's logical directory observations and mutations at
-    /// the supplied commit barrier.
+    /// Validates logical directory observations and mutations at the supplied
+    /// commit barrier.
     pub(crate) async fn validate(
         &self,
         id: Option<&TxId>,
-        handle: &CollectionHandleState,
+        accesses: &CatalogAccesses,
         barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
         self.catalog
             .validate(
                 id,
-                &handle.accesses.reads,
-                &handle.accesses.changes,
+                &accesses.reads,
+                &accesses.changes,
                 barrier,
                 &self.node_size_policy,
             )

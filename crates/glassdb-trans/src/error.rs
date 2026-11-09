@@ -3,6 +3,7 @@
 //! while wrapping storage/backend errors.
 
 use glassdb_backend::{BackendError, Cause};
+use glassdb_data::CollectionAddress;
 use glassdb_storage::{Requirement, StorageError};
 
 /// Errors produced by the transaction engine.
@@ -79,6 +80,18 @@ impl TransError {
             },
             TransError::InvalidInput(msg) => TransError::InvalidInput(format!("{ctx}: {msg}")),
             sentinel => sentinel,
+        }
+    }
+
+    /// Classifies physical absence while addressing a collection, as
+    /// [`StorageError::classify_collection_absence`] does.
+    #[must_use]
+    pub(crate) fn classify_collection_absence(self, collection: &CollectionAddress) -> Self {
+        match self {
+            TransError::Storage(error) => {
+                TransError::Storage(error.classify_collection_absence(collection))
+            }
+            other => other,
         }
     }
 }

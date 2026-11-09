@@ -725,9 +725,16 @@ impl Algo {
         // than failed (ADR-053).
         // An engaged identity holds locks and has a pending record, which only
         // a locked commit releases and finalizes.
+        // A direct commit validates no directory read, so every directory
+        // read must be a covered binding read (ADR-092).
         if !tx.needs_abort()
-            && tx.collections.accesses().reads.is_empty()
-            && tx.collections.accesses().changes.is_empty()
+            && !tx.collections.has_writes()
+            && tx
+                .collections
+                .accesses()
+                .without_covered_reads(&tx.accesses)
+                .reads
+                .is_empty()
         {
             match self
                 .direct_commit
@@ -772,7 +779,7 @@ impl Algo {
             .await?
             && self
                 .collection_commit
-                .validate(None, &tx.collections, barrier)
+                .validate(None, tx.collections.accesses(), barrier)
                 .await?
         {
             return Ok(PassOutcome::Complete);
@@ -813,7 +820,7 @@ impl Algo {
             .await?
             && self
                 .collection_commit
-                .validate(None, &tx.collections, barrier)
+                .validate(None, tx.collections.accesses(), barrier)
                 .await?
         {
             tx.commit();
@@ -827,10 +834,13 @@ impl Algo {
     /// escalated to locked validation.
     async fn commit_locked(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         let is_new = tx.engage();
-        let directory_locks = DirectoryLocks::needed(
-            &tx.collections.accesses().reads,
-            &tx.collections.accesses().changes,
-        );
+        // The key locks of this pass protect its covered binding reads until
+        // the commit point, so they need no directory lock (ADR-092).
+        let directory = tx
+            .collections
+            .accesses()
+            .without_covered_reads(&tx.accesses);
+        let directory_locks = DirectoryLocks::needed(&directory.reads, &directory.changes);
         // A replay that needs a new directory lock would take it after its
         // kept key locks. See `lock_directories`.
         if !is_new && !tx.directory_locks.covers(&directory_locks) {
@@ -902,7 +912,7 @@ impl Algo {
             .await?
             || !self
                 .collection_commit
-                .validate(Some(&tx.id), &tx.collections, barrier)
+                .validate(Some(&tx.id), &directory, barrier)
                 .await?
         {
             return Err(TransError::Retry);
@@ -952,7 +962,13 @@ impl Algo {
     async fn validate_locked_reads(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
         self.validate_coordination_keys(&tx.accesses)?;
         let is_new = tx.engage();
-        let directory_locks = DirectoryLocks::needed(&tx.collections.accesses().reads, &[]);
+        // As in `commit_locked`, the key locks protect the covered binding
+        // reads while the outcome is validated (ADR-092).
+        let directory = tx
+            .collections
+            .accesses()
+            .without_covered_reads(&tx.accesses);
+        let directory_locks = DirectoryLocks::needed(&directory.reads, &[]);
         // See `lock_directories`.
         if !is_new && !tx.directory_locks.covers(&directory_locks) {
             return Ok(PassOutcome::Renew {
@@ -993,7 +1009,7 @@ impl Algo {
             .await?
             && self
                 .collection_commit
-                .validate(Some(&tx.id), &tx.collections, barrier)
+                .validate(Some(&tx.id), &directory, barrier)
                 .await?
         {
             return Ok(PassOutcome::Complete);

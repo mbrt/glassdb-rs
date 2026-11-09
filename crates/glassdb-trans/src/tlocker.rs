@@ -1405,12 +1405,7 @@ impl KeyLocker {
                 .coord
                 .coordinate(operation)
                 .await
-                .map_err(|error| match error {
-                    TransError::Storage(error) => TransError::Storage(
-                        error.classify_collection_absence(group.leaf.collection()),
-                    ),
-                    other => other,
-                });
+                .map_err(|error| error.classify_collection_absence(group.leaf.collection()));
             match coordinated? {
                 AcquireOutcome::Locked(proof) => return Ok(LeafOutcome::Locked(proof)),
                 // Hold-and-wait (ADR-024): if the coordinated acquire reports
