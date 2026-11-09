@@ -165,6 +165,17 @@ class PerfReportTest(unittest.TestCase):
     def row(self, report, prefix):
         return next(r for r in report.splitlines() if r.startswith(prefix))
 
+    def test_the_title_says_whether_the_extended_experiments_ran(self):
+        self.assertTrue(self.report().startswith("# Performance comparison\n"))
+
+        def tag(value):
+            value["experiments"][0]["tags"] = ["ci/timing", "ci/extended"]
+
+        self.update("timing", tag, sides=("main", "pr"))
+        self.assertTrue(
+            self.report().startswith("# Performance comparison [extended]\n")
+        )
+
     def test_run_variation_prevents_a_regression_claim(self):
         # Every run is slower, but the variation between runs leaves the
         # direction unresolved.

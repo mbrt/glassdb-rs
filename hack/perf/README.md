@@ -253,8 +253,9 @@ CI excludes the experiments with the tag `ci/extended`, unless the PR has the
 label `perf` or `perf:extended`. A PR that changes performance has the label
 `perf`. To compare the extended experiments for another PR, add the label
 `perf:extended`. A new label starts no comparison: to compare with it, run the
-jobs of the last comparison again, or push a commit. The comparison takes about
-25 minutes, and about 1 hour with the extended experiments. For
+jobs of the last comparison again, or push a commit. The title of a report
+that compares them is `Performance comparison [extended]`. The comparison
+takes about 25 minutes, and about 1 hour with the extended experiments. For
 `compare_refs.sh`, set `EXTENDED=1` in the environment.
 
 If the candidate's harness does not build against the base engine, for example

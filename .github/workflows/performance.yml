@@ -68,6 +68,9 @@ jobs:
         labels=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name')
         if grep -qxE 'perf|perf:extended' <<<"$labels"; then
           echo "EXTENDED=1" >> "$GITHUB_ENV"
+          echo "The comparison includes the experiments with the tag ci/extended."
+        else
+          echo "The comparison excludes the experiments with the tag ci/extended."
         fi
 
     - name: Measure workloads
