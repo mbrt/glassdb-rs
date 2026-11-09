@@ -5,7 +5,7 @@
 # `false-sharing`.
 #
 # A split that separates the contended keys divides the write span (ADR-088).
-tags = ["extra", "area/topology"]
+tags = ["ci/timing", "area/topology"]
 
 [pools.false-sharing]
 keys = 4096

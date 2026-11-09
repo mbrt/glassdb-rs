@@ -44,7 +44,7 @@ and the run then stops.
 
 | Experiment | What it measures |
 | --- | --- |
-| The cases of [CI experiments](#ci-experiments) | Single transactions of one worker with warm caches, and their backend costs, and four shapes at the same time on one leaf. Each case has a fixed length of 10 s. |
+| The cases of [CI experiments](#ci-experiments) | Single transactions of one worker with warm caches, and their backend costs, and four shapes at the same time on one leaf. Each case has a fixed length of 10 s for its counters and of 300 s for its latency. |
 | `inline-pressure` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
 | `contention` | Five writers whose transactions share some of their 1 to 6 keys. |
 | `split-merge-fight` | A stable load under which both a split and a merge of one leaf make sense. The default topology policy must settle at one leaf or at two leaves, from a start of either one. |
@@ -136,8 +136,17 @@ interval of the change. It shows a change whose interval excludes zero and
 that is at least the floor of the metric: 2%, or the spread of one run if that
 is larger. A metric whose runs spread by 5% can change by 4% with no change of
 the engine, so the floor scales with the spread. With 32 runs of 300 s, a
-comparison of a revision with itself gave intervals of at most ±0.9% for all
-36 timing metrics, so an unchanged metric does not stay inconclusive.
+comparison of a revision with itself gave intervals of at most ±0.9% for the
+36 timing metrics of the cases, so an unchanged metric of a case does not stay
+inconclusive.
+
+The experiments `contention`, `split-merge-fight`, `false-sharing`, and
+`false-sharing-spans` also have the tag `ci/timing`, with their own windows.
+Their metrics spread by up to about 6% in one run, and the `span` shape of
+`false-sharing-spans` by up to about 19%, so their floors are larger. A
+comparison of a revision with itself gave no reports for them, and some of
+their metrics stay inconclusive. They have no counter file: their counters
+change between runs without latency jitter too.
 
 The name of a metric is the experiment, then the labels of the cell if the
 experiment has more than one cell, then the shape if the cell has more than one
@@ -268,16 +277,17 @@ sample count per line).
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `EXPERIMENT` | the experiments with the tag `ci/timing` | The perfbench experiment file or directory. |
-| `CASE` | all cases | One experiment with the tag `ci/timing`, by name, in place of `EXPERIMENT`. |
-| `SECONDS_PER_CASE` | `10` | Measured wall time of each experiment with the tag `ci/timing`. |
+| `EXPERIMENT` | the cases of the CI comparison | The perfbench experiment file or directory. |
+| `CASE` | all cases | One case of the CI comparison, by name, in place of `EXPERIMENT`. |
+| `SECONDS_PER_CASE` | `10` | Measured wall time of each case. |
 | `OUT` | `hack/perf` | Output directory for artifacts. |
 
 ### Target
 
-The script profiles perfbench experiments, by default the experiments with the
-tag `ci/timing`: the single transactions of one worker with warm caches, and
-four shapes at the same time on one leaf. The seed and the warm-up appear in the
+The script profiles perfbench experiments, by default the cases of the CI
+comparison, from their files with the tag `ci/counters`: the single
+transactions of one worker with warm caches, and four shapes at the same time
+on one leaf. The seed and the warm-up appear in the
 profile; use the transaction stacks to inspect measured work. `CASE` selects one
 of these experiments.
 

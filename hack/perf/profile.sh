@@ -11,12 +11,10 @@
 #
 # Tunables (env):
 #   EXPERIMENT        perfbench experiment file or directory (default: the
-#                     experiments of hack/perf/experiments with the tag
-#                     `ci/timing`)
-#   CASE              one experiment of hack/perf/experiments with the tag
-#                     `ci/timing`, in place of EXPERIMENT (default: all)
-#   SECONDS_PER_CASE  measured wall time of each experiment with the tag
-#                     `ci/timing` (default 10)
+#                     cases of the CI comparison)
+#   CASE              one case of the CI comparison, by name, in place of
+#                     EXPERIMENT (default: all)
+#   SECONDS_PER_CASE  measured wall time of each case (default 10)
 #   OUT               output directory for artifacts (default hack/perf)
 
 set -euo pipefail
@@ -26,15 +24,18 @@ cd "$(git rev-parse --show-toplevel)"
 EXPERIMENTS=hack/perf/experiments
 EXPERIMENT="${EXPERIMENT:-}"
 CASE="${CASE:-}"
-# The CI experiments have a fixed length, which SECONDS_PER_CASE replaces.
+# The cases of the CI comparison have a fixed length, which SECONDS_PER_CASE
+# replaces. Each case has one file with the tag `ci/counters`; the other
+# experiments with the tag `ci/timing` have warm-ups that would fill the
+# profile.
 ci=false
 if [[ -n "$CASE" ]]; then
-	selection=(--experiment="$EXPERIMENTS/$CASE.toml" --tag=ci/timing)
+	selection=(--experiment="$EXPERIMENTS/$CASE-counters.toml" --tag=ci/counters)
 	ci=true
 elif [[ -n "$EXPERIMENT" ]]; then
 	selection=(--experiment="$EXPERIMENT")
 else
-	selection=(--experiment="$EXPERIMENTS" --tag=ci/timing)
+	selection=(--experiment="$EXPERIMENTS" --tag=ci/counters)
 	ci=true
 fi
 SECONDS_PER_CASE="${SECONDS_PER_CASE:-10}"
