@@ -1051,6 +1051,15 @@ impl CasWorker {
                 });
                 return Ok(AttemptEnd::Done);
             }
+            // A leaf is missing only after a drop of its collection, which can
+            // also remove an in-doubt CAS that landed. So the missing leaf
+            // decides nothing about that CAS (ADR-081).
+            Err(StorageError::NotFound) if !round.in_doubt.is_empty() => {
+                deliver_policy_outcomes(batch, &round.in_doubt, |policy, in_doubt| {
+                    policy.exhausted_outcome(in_doubt)
+                });
+                return Ok(AttemptEnd::Done);
+            }
             Err(e) => return Err(e.into()),
         };
         if let Some(lost) = round.lost_cas.take()
@@ -4812,6 +4821,68 @@ mod tests {
         assert!(
             fences(&expected, &advanced),
             "the membership generation never decreases"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_leaf_after_an_in_doubt_cas_stays_in_doubt() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let seed = TxId::with_priority(1, b"seed");
+        store_leaf_entries(
+            &cold_store(mem.clone()),
+            &leaf(),
+            vec![entry(b"seed", LockType::None, None, Some(&seed))],
+        )
+        .await;
+        // The reply of the CAS is lost, and a drop removes the leaf before the
+        // round loads it again.
+        let backend = HookBackend::new(mem.clone());
+        backend.set_before(move |op| {
+            let removed = match op {
+                BackendOp::WriteIf { path, .. } if path.contains("/_n/") => Some(path.to_string()),
+                _ => None,
+            };
+            let mem = mem.clone();
+            let future: HookFuture = Box::pin(async move {
+                if let Some(path) = removed {
+                    let current = mem.read(&path).await.unwrap();
+                    mem.delete_if(&path, &current.revision).await.unwrap();
+                    return Err(glassdb_backend::BackendError::Unavailable(
+                        "simulated in-doubt leaf CAS".into(),
+                    ));
+                }
+                Ok(())
+            });
+            future
+        });
+        let (coord, _nodes, _timeline, _bg) = coord_over_fast(backend).await;
+        let tx = TxId::with_priority(2, b"in-doubt");
+        let seen_in_doubt = Arc::new(Mutex::new(None));
+
+        let outcome = coord
+            .submit_leaf(
+                &leaf(),
+                &tx,
+                Arc::new(StickyCommitProbe {
+                    key: b"in-doubt".to_vec(),
+                    tx,
+                    evaluations: std::sync::atomic::AtomicUsize::new(0),
+                    seen_in_doubt,
+                }),
+                Requirement::ANY,
+            )
+            .await;
+        coord.close().await;
+
+        assert!(
+            matches!(
+                outcome,
+                Ok(Some(CoordinatedOutcome {
+                    outcome: MemberOutcome::InDoubt(_),
+                    ..
+                }))
+            ),
+            "a missing leaf must not resolve an in-doubt CAS"
         );
     }
 

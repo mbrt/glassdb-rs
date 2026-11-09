@@ -2,7 +2,11 @@
 
 mod lifecycle;
 
+use std::collections::BTreeSet;
+
 use glassdb_data::{CollectionAddress, CollectionId, CollectionName};
+
+use crate::access::AccessSet;
 
 pub use lifecycle::{CollectionLifecycle, TopologySettler};
 
@@ -67,6 +71,62 @@ impl CatalogAccesses {
         self.changes.clear();
         self
     }
+
+    /// Returns these accesses without the covered binding reads of a commit
+    /// pass of `keys` (ADR-092). The pass must lock and validate the rest.
+    ///
+    /// Each point access of the pass locks a leaf of its collection, or is
+    /// part of the CAS of a direct commit on that leaf, so a drop of that
+    /// collection cannot commit before the pass. A covered binding of a child
+    /// also protects its parent, because a collection with a child cannot be
+    /// dropped. Range scans do not count: a scan of an empty range can hold no
+    /// leaf.
+    pub(crate) fn without_covered_reads(&self, keys: &AccessSet) -> Self {
+        let mut protected = keys
+            .points()
+            .map(|point| point.key.collection().clone())
+            .collect::<BTreeSet<_>>();
+        let mut covered = vec![false; self.reads.len()];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (read, covered) in self.reads.iter().zip(covered.iter_mut()) {
+                if !*covered && read.bound().is_some_and(|child| protected.contains(&child)) {
+                    *covered = true;
+                    changed |= protected.insert(read.parent.clone());
+                }
+            }
+        }
+        Self {
+            reads: self
+                .reads
+                .iter()
+                .zip(covered)
+                .filter(|(_, covered)| !covered)
+                .map(|(read, _)| read.clone())
+                .collect(),
+            changes: self.changes.clone(),
+        }
+    }
+}
+
+impl DirectoryRead {
+    /// Returns the collection that this read found bound, if any.
+    fn bound(&self) -> Option<CollectionAddress> {
+        match &self.kind {
+            DirectoryReadKind::Entry {
+                collection: Some(child),
+                ..
+            } => Some(CollectionAddress::from_db_prefix(
+                self.parent.db_prefix_component().clone(),
+                *child,
+            )),
+            DirectoryReadKind::Entry {
+                collection: None, ..
+            }
+            | DirectoryReadKind::Listing { .. } => None,
+        }
+    }
 }
 
 /// A resolved, transactionally clean view of one direct-child directory.
@@ -78,10 +138,73 @@ pub struct DirectorySnapshot {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use glassdb_data::LogicalKey;
+
     use super::*;
+    use crate::access::WriteAccess;
 
     fn address(byte: u8) -> CollectionAddress {
         CollectionAddress::new("db", CollectionId::from_bytes([byte; 16]))
+    }
+
+    fn entry(parent: &CollectionAddress, name: &str, child: Option<u8>) -> DirectoryRead {
+        DirectoryRead {
+            parent: parent.clone(),
+            kind: DirectoryReadKind::Entry {
+                name: CollectionName::new(name).unwrap(),
+                collection: child.map(|byte| CollectionId::from_bytes([byte; 16])),
+            },
+        }
+    }
+
+    fn names(accesses: &CatalogAccesses) -> Vec<&str> {
+        accesses
+            .reads
+            .iter()
+            .map(|read| match &read.kind {
+                DirectoryReadKind::Entry { name, .. } => {
+                    std::str::from_utf8(name.as_bytes()).unwrap()
+                }
+                DirectoryReadKind::Listing { .. } => "listing",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn key_accesses_cover_the_bindings_of_their_collections_and_ancestors() {
+        let root = CollectionAddress::root("db");
+        let accesses = CatalogAccesses {
+            reads: vec![
+                // Covered through `nested`, which binds a child of 1.
+                entry(&root, "parent", Some(1)),
+                entry(&address(1), "nested", Some(2)),
+                entry(&root, "untouched", Some(3)),
+                entry(&root, "missing", None),
+                DirectoryRead {
+                    parent: address(2),
+                    kind: DirectoryReadKind::Listing { generation: 0 },
+                },
+            ],
+            changes: Vec::new(),
+        };
+        let keys = AccessSet::new(
+            Vec::new(),
+            vec![WriteAccess::put(
+                LogicalKey::new(address(2), b"key"),
+                Arc::from(b"value".as_slice()),
+            )],
+            Vec::new(),
+        );
+
+        let uncovered = accesses.without_covered_reads(&keys);
+
+        assert_eq!(names(&uncovered), vec!["untouched", "missing", "listing"]);
+        assert_eq!(
+            names(&accesses.without_covered_reads(&AccessSet::default())),
+            names(&accesses)
+        );
     }
 
     #[test]

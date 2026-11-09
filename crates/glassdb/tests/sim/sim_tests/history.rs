@@ -201,6 +201,67 @@ fn shared_collection_history_holds_with_slow_mutations() {
     assert_slow_mutation_modes("shared collection history", &shared_collection_history());
 }
 
+/// Updates of a shared collection that open it by name and list nothing, so
+/// that only their key accesses protect the binding (ADR-092). Drops and
+/// creates of the same name race them. An update alone uses the direct commit,
+/// and an update with a write of another collection uses the locked commit.
+fn updated_collection_history() -> HistoryWorkload {
+    let actions = [
+        [
+            (C::Update(1), false),
+            (C::Update(2), true),
+            (C::Update(3), false),
+        ],
+        [(C::Drop, true), (C::Create, true), (C::Drop, true)],
+        [
+            (C::UpdateNested(4), false),
+            (C::UpdateNested(5), true),
+            (C::Update(6), false),
+        ],
+        [
+            (C::CreateNested, true),
+            (C::DropNested, true),
+            (C::CreateIfAbsent, true),
+        ],
+    ];
+    HistoryWorkload {
+        clients: actions
+            .into_iter()
+            .enumerate()
+            .map(|(client_id, actions)| {
+                actions
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (operation, other_write))| {
+                        let id = (client_id * 3 + index) as u8;
+                        let mut instructions = vec![I::Collection { slot: 0, operation }];
+                        if other_write {
+                            instructions.push(I::WriteLiteral {
+                                key: client_id as u8 % 3,
+                                value: id,
+                            });
+                        }
+                        transaction(id.into(), client_id, instructions)
+                    })
+                    .collect()
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn updated_collection_history_holds_under_contention_and_failures() {
+    let workload = updated_collection_history();
+    for faults in [FaultConfig::none(), FaultConfig::failures(7)] {
+        pct_sweep(&workload, faults);
+    }
+}
+
+#[test]
+fn updated_collection_history_holds_with_slow_mutations() {
+    assert_slow_mutation_modes("updated collection history", &updated_collection_history());
+}
+
 /// Splits the seeded leaf, deletes two of its three keys, and then scans. The
 /// write of client 0 finds the seeded leaf over its two-entry cap, and the
 /// split puts the keys in two leaves. Client 0 then deletes key 1 and then key

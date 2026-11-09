@@ -1,5 +1,6 @@
 //! Public collection operations and their independent sequential specification.
 
+use super::HistoryAction;
 use crate::{Collection, Error, Transaction};
 
 pub(super) const COLLECTION_SLOTS: usize = 2;
@@ -33,6 +34,12 @@ pub enum HistoryCollectionOp {
     WriteNested(u8),
     /// Drop the child, accepting NotFound as an observed result.
     DropNested,
+    /// Open the collection, read its value, and write a new one, with no
+    /// listing, so that only the key accesses protect the binding.
+    Update(u8),
+    /// Open the child through its parent, read its value, and write a new
+    /// one, with no listing.
+    UpdateNested(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +61,37 @@ pub(super) struct CollectionStep {
     pub(super) members_before: Vec<u8>,
     pub(super) members_after: Vec<u8>,
     pub(super) outcome: CollectionOutcome,
+}
+
+/// The observations of an update, which reads one value and lists nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CollectionUpdate {
+    pub(super) slot: u8,
+    pub(super) operation: HistoryCollectionOp,
+    /// The value that the update read, or `None` if it found no collection.
+    pub(super) before: Option<Option<u8>>,
+}
+
+impl CollectionUpdate {
+    pub(super) fn apply(&self, catalog: &mut Catalog) -> Result<(), String> {
+        let state = catalog
+            .get_mut(self.slot as usize)
+            .ok_or_else(|| format!("invalid collection slot {}", self.slot))?;
+        let current = match self.operation {
+            HistoryCollectionOp::UpdateNested(_) => {
+                state.as_ref().and_then(|collection| collection.child)
+            }
+            _ => state.as_ref().map(|collection| collection.value),
+        };
+        if current != self.before {
+            return Err(format!(
+                "collection {} update read {:?}, expected {current:?}",
+                self.slot, self.before
+            ));
+        }
+        self.operation.apply(state);
+        Ok(())
+    }
 }
 
 impl CollectionStep {
@@ -137,6 +175,20 @@ impl HistoryCollectionOp {
                 }
                 _ => O::NotFound,
             },
+            Self::Update(value) => match state {
+                Some(collection) => {
+                    collection.value = Some(value);
+                    O::Applied
+                }
+                None => O::NotFound,
+            },
+            Self::UpdateNested(value) => match state {
+                Some(parent) if parent.child.is_some() => {
+                    parent.child = Some(Some(value));
+                    O::Applied
+                }
+                _ => O::NotFound,
+            },
         }
     }
 }
@@ -161,7 +213,16 @@ pub(super) async fn execute(
     tx: &Transaction,
     slot: u8,
     operation: HistoryCollectionOp,
-) -> Result<CollectionStep, Error> {
+) -> Result<HistoryAction, Error> {
+    if let HistoryCollectionOp::Update(value) | HistoryCollectionOp::UpdateNested(value) = operation
+    {
+        let before = update(tx, slot, operation, value).await?;
+        return Ok(HistoryAction::CollectionUpdate(CollectionUpdate {
+            slot,
+            operation,
+            before,
+        }));
+    }
     let (before, members_before) = inspect(tx, slot).await?;
     let result = execute_operation(tx, slot, operation).await;
     let outcome = match result {
@@ -172,7 +233,7 @@ pub(super) async fn execute(
         Err(error) => return Err(error),
     };
     let (after, members_after) = inspect(tx, slot).await?;
-    Ok(CollectionStep {
+    Ok(HistoryAction::Collection(CollectionStep {
         slot,
         operation,
         before,
@@ -180,7 +241,33 @@ pub(super) async fn execute(
         members_before,
         members_after,
         outcome,
-    })
+    }))
+}
+
+/// Writes `value` to the collection of an update and returns the value that
+/// it replaced, or `None` if the collection does not exist.
+async fn update(
+    tx: &Transaction,
+    slot: u8,
+    operation: HistoryCollectionOp,
+    value: u8,
+) -> Result<Option<Option<u8>>, Error> {
+    let root = tx.root_collection();
+    let mut collection = match tx.open_collection(&root, collection_name(slot)).await {
+        Ok(collection) => collection,
+        Err(Error::NotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if matches!(operation, HistoryCollectionOp::UpdateNested(_)) {
+        collection = match tx.open_collection(&collection, CHILD_NAME).await {
+            Ok(child) => child,
+            Err(Error::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+    }
+    let before = read_value(tx, &collection).await?;
+    tx.write(&collection, VALUE_KEY, &[value])?;
+    Ok(Some(before))
 }
 
 fn collection_name(slot: u8) -> Vec<u8> {
@@ -259,6 +346,9 @@ async fn execute_operation(
     let name = collection_name(slot);
     match operation {
         C::Read => {}
+        C::Update(_) | C::UpdateNested(_) => {
+            return Err(Error::internal("an update is not a collection step"));
+        }
         C::Create => {
             tx.create_collection(&root, &name).await?;
         }

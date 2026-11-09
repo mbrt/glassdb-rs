@@ -22,7 +22,7 @@ use super::{CLIENT_COUNT, SimMedia, key_name, tiny_node_size_policy};
 mod collections;
 
 pub use collections::HistoryCollectionOp;
-use collections::{Catalog, CollectionStep};
+use collections::{Catalog, CollectionStep, CollectionUpdate};
 
 const HISTORY_COLLECTION: &[u8] = b"history";
 const HISTORY_KEY_COUNT: usize = 3;
@@ -43,6 +43,8 @@ struct AbstractState {
 enum HistoryAction {
     /// A shared collection operation and its public observations.
     Collection(CollectionStep),
+    /// An update of a shared collection, which observes no listing.
+    CollectionUpdate(CollectionUpdate),
     /// One transaction's complete shared collection catalog.
     CatalogRead(Catalog),
     /// A point read and its returned value (`None` means absent).
@@ -233,6 +235,7 @@ fn validate_trace(op_id: u64, trace: &BodyTrace) -> Result<(), CheckError> {
             | HistoryAction::ReadGroup { .. }
             | HistoryAction::Scan { .. }
             | HistoryAction::Collection(_)
+            | HistoryAction::CollectionUpdate(_)
             | HistoryAction::CatalogRead(_) => {}
             HistoryAction::Write { key, value } => {
                 derived.insert(*key, Some(*value));
@@ -288,6 +291,7 @@ fn apply_trace(state: &AbstractState, op: &LogicalOp<'_>) -> Result<AbstractStat
     for action in &op.trace.ordered_actions {
         match action {
             HistoryAction::Collection(step) => step.apply(&mut catalog)?,
+            HistoryAction::CollectionUpdate(update) => update.apply(&mut catalog)?,
             HistoryAction::CatalogRead(observed) if *observed != catalog => {
                 return Err(format!("catalog read {observed:?}, expected {catalog:?}"));
             }
@@ -717,7 +721,7 @@ fn arbitrary_program(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<HistoryI
         ],
         _ => {
             let slot = u.arbitrary::<u8>()? % collections::COLLECTION_SLOTS as u8;
-            let operation = match u.arbitrary::<u8>()? % 8 {
+            let operation = match u.arbitrary::<u8>()? % 10 {
                 0 => HistoryCollectionOp::Create,
                 1 => HistoryCollectionOp::CreateIfAbsent,
                 2 => HistoryCollectionOp::Write(u.arbitrary()?),
@@ -725,7 +729,9 @@ fn arbitrary_program(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<HistoryI
                 4 => HistoryCollectionOp::Drop,
                 5 => HistoryCollectionOp::CreateNested,
                 6 => HistoryCollectionOp::WriteNested(u.arbitrary()?),
-                _ => HistoryCollectionOp::DropNested,
+                7 => HistoryCollectionOp::DropNested,
+                8 => HistoryCollectionOp::Update(u.arbitrary()?),
+                _ => HistoryCollectionOp::UpdateNested(u.arbitrary()?),
             };
             let mut program = vec![HistoryInstruction::Collection { slot, operation }];
             // Couple lifecycle effects to a key in another collection so the
@@ -980,9 +986,7 @@ async fn interpret_body(
             HistoryInstruction::Collection { slot, operation } => {
                 collections::execute(&tx, *slot, *operation)
                     .await
-                    .map(|step| {
-                        actions.push(HistoryAction::Collection(step));
-                    })
+                    .map(|action| actions.push(action))
             }
             HistoryInstruction::Read { key, register } => {
                 match tx.read(collection, &key_name(*key as usize)).await {
@@ -1316,6 +1320,7 @@ mod sim_tests {
                 | HistoryAction::ReadGroup { .. }
                 | HistoryAction::Scan { .. }
                 | HistoryAction::Collection(_)
+                | HistoryAction::CollectionUpdate(_)
                 | HistoryAction::CatalogRead(_) => {}
                 HistoryAction::Write { key, value } => {
                     final_mutations.insert(*key, Some(*value));
@@ -2153,6 +2158,8 @@ mod sim_tests {
             HistoryCollectionOp::CreateNested,
             HistoryCollectionOp::WriteNested(55),
             HistoryCollectionOp::DropNested,
+            HistoryCollectionOp::Update(55),
+            HistoryCollectionOp::UpdateNested(55),
         ]
         .into_iter()
         .enumerate()
@@ -2164,7 +2171,10 @@ mod sim_tests {
                         data.extend([1, 0, 0, 8, slot, code as u8]);
                         if matches!(
                             operation,
-                            HistoryCollectionOp::Write(_) | HistoryCollectionOp::WriteNested(_)
+                            HistoryCollectionOp::Write(_)
+                                | HistoryCollectionOp::WriteNested(_)
+                                | HistoryCollectionOp::Update(_)
+                                | HistoryCollectionOp::UpdateNested(_)
                         ) {
                             data.push(55);
                         }

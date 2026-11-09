@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use glassdb_data::{LogicalKey, ObjectPath, TxId};
+use glassdb_data::{CollectionAddress, LogicalKey, ObjectPath, TxId};
 use glassdb_storage::{
     CurrentState, InlinePolicy, LeafEntry, NodeLocks, Requirement, StorageError, TreeRouter,
 };
@@ -142,7 +142,14 @@ impl DirectCommit {
                 self.inline_policy,
                 self.structural_hints.clone(),
             );
-            let outcome = self.coord.coordinate(operation).await?;
+            // A leaf is missing only after a drop of its collection. The round
+            // reports an in-doubt CAS as an outcome, so this error proves that
+            // nothing landed (ADR-092).
+            let outcome = self
+                .coord
+                .coordinate(operation)
+                .await
+                .map_err(|error| error.classify_collection_absence(member.collection()))?;
             match outcome {
                 DirectMutationOutcome::Landed(predecessors) => {
                     self.counters.completed.fetch_add(1, Ordering::Relaxed);
@@ -215,6 +222,12 @@ struct DirectMember {
 impl DirectMember {
     fn output_keys(&self) -> impl Iterator<Item = &DirectKey> {
         self.keys.iter().filter(|key| key.write.is_some())
+    }
+
+    /// Returns the collection of the leaf, which holds every key of the
+    /// member. A member has at least one write, so it has a key.
+    fn collection(&self) -> &CollectionAddress {
+        self.keys[0].key.collection()
     }
 }
 

@@ -902,3 +902,116 @@ async fn drop_rejects_invalid_targets_and_staged_data_writes() {
         Err(Error::InvalidInput(_))
     ));
 }
+
+#[tokio::test]
+async fn opening_in_the_body_costs_the_same_writes_as_opening_outside() {
+    let backend = Arc::new(MemoryBackend::new());
+    let setup = Database::open("example", backend.clone()).await.unwrap();
+    let parent = setup.create_collection("parent").await.unwrap();
+    parent.create_collection("child").await.unwrap();
+    setup.shutdown().await;
+    let path = CollectionPath::new(b"parent")
+        .unwrap()
+        .child(b"child")
+        .unwrap();
+
+    let recorder = Arc::new(RecordingBackend::new(backend));
+    let log = recorder.log();
+    let db = Database::open("example", recorder).await.unwrap();
+    let opened = db.open_collection(&path).await.unwrap();
+    let mut writes = Vec::new();
+    for open_in_body in [false, true, false, true] {
+        log.lock().unwrap().clear();
+        db.tx(|tx| {
+            let path = path.clone();
+            let opened = &opened;
+            async move {
+                let child = if open_in_body {
+                    tx.open_collection_path(path).await?
+                } else {
+                    opened.clone()
+                };
+                let value = tx.read(&child, b"k").await?.unwrap_or_default();
+                tx.write(&child, b"k", &[value, b"x".to_vec()].concat())?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter()
+                .all(|op| !op.op.starts_with("write") || !op.path.ends_with("/_i")),
+            "a body that uses the opened collection takes no directory lock: {log:?}"
+        );
+        writes.push(log.iter().filter(|op| op.op.starts_with("write")).count());
+    }
+    db.shutdown().await;
+
+    // The first two transactions warm the cache.
+    assert_eq!(writes[2], writes[3], "{writes:?}");
+}
+
+#[tokio::test]
+async fn a_drop_between_the_open_and_the_commit_replays_the_body() {
+    // A direct commit, a blind write, a locked commit, a nested path, and a
+    // binding that the key accesses do not cover.
+    for (read, root_write, nested, child_write) in [
+        (true, false, false, true),
+        (false, false, false, true),
+        (true, true, false, true),
+        (true, false, true, true),
+        (false, true, false, false),
+    ] {
+        let backend = Arc::new(MemoryBackend::new());
+        let db = Database::open("example", backend.clone()).await.unwrap();
+        let peer = Database::open("example", backend).await.unwrap();
+        let mut path = CollectionPath::new(b"child").unwrap();
+        if nested {
+            db.create_collection("parent").await.unwrap();
+            path = CollectionPath::new(b"parent")
+                .unwrap()
+                .child(b"child")
+                .unwrap();
+        }
+        db.create_collection(&path).await.unwrap();
+        let old = peer.open_collection(&path).await.unwrap();
+        let attempts = AtomicUsize::new(0);
+
+        db.tx(|tx| {
+            let (old, peer, path, attempts) = (&old, &peer, path.clone(), &attempts);
+            async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                let child = tx.open_collection_path(path.clone()).await?;
+                if read {
+                    tx.read(&child, b"k").await?;
+                }
+                if attempt == 0 {
+                    old.drop_collection().await?;
+                    peer.create_collection(&path).await?;
+                }
+                if child_write {
+                    tx.write(&child, b"k", format!("attempt {attempt}").as_bytes())?;
+                }
+                if root_write {
+                    tx.write(&tx.root_collection(), b"marker", b"m")?;
+                }
+                Ok(())
+            }
+        })
+        .await
+        .unwrap_or_else(|error| panic!("{:?}: {error:?}", (read, root_write, nested, child_write)));
+
+        let case = (read, root_write, nested, child_write);
+        let attempts = attempts.load(Ordering::SeqCst);
+        assert!(attempts >= 2, "{case:?}");
+        let current = db.open_collection(&path).await.unwrap();
+        assert_eq!(
+            current.read(b"k").await.unwrap(),
+            child_write.then(|| format!("attempt {}", attempts - 1).into_bytes()),
+            "{case:?}"
+        );
+        db.shutdown().await;
+        peer.shutdown().await;
+    }
+}

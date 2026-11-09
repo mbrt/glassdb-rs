@@ -437,9 +437,10 @@ route to one leaf. One leaf CAS validates every read and publishes every output,
 with no lock, transaction record, or write-back
 ([ADR-061](adr/061-atomic-logless-single-leaf-commits.md)). Every put becomes an
 inline value and every delete a tombstone. All values must fit the inline
-limits and the result must fit the leaf. Range scans, collection reads and
-changes, cross-leaf access, structural gates, drop intents, and live or unknown holders
-use the locked commit. A direct commit never waits for or wounds a holder. A
+limits and the result must fit the leaf. Range scans, collection changes,
+directory reads that are not covered binding reads, cross-leaf access,
+structural gates, drop intents, and live or unknown holders use the locked
+commit. A direct commit never waits for or wounds a holder. A
 failed multi-key direct commit does not request a split, because a split can
 make the transaction ineligible. A failed single-key direct commit still reports
 inline pressure.
@@ -565,6 +566,19 @@ request resolves them with wound-wait
 ([ADR-089](adr/089-directory-loads-do-not-wait-for-readers.md)). Validation
 waits for a pending writer and a pending topology freeze, but a body load does
 not ([ADR-090](adr/090-directory-holds-last-for-the-identity.md)).
+
+A binding of a collection can change only through a drop, and a drop cannot
+commit while a transaction holds a lock on a leaf of the collection, or before
+a direct commit on that leaf. So a commit pass takes no directory lock and does
+no directory validation for a covered binding read
+([ADR-092](adr/092-key-accesses-cover-the-binding-of-their-collection.md)). The
+point accesses of the pass decide the coverage, because each one locks a leaf
+of its collection. A covered binding of a child also covers the binding of its
+parent, because a collection with a child cannot be dropped. If the binding is
+stale, the access to the leaf reports `StaleCollection`, and the body replays
+after the directory reads are checked again. A missing leaf means that its
+collection was dropped, except after an in-doubt CAS on it, which stays in
+doubt.
 
 A create prepares an unreachable record and root at a fresh ID, then publishes
 `name → ID` through the locked commit. Open, create, drop, and child listing all

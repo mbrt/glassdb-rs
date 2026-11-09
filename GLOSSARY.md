@@ -273,6 +273,13 @@ _Avoid_: Membership hold
 **Directory lock**:
 A lock on the child bindings in one collection record.
 
+**Directory read**:
+An observation by a transaction body of the child bindings in one collection record: the binding of one name, the absence of that binding, or the list of all bindings.
+_Avoid_: Catalog read, collection read
+
+**Covered binding read**:
+A directory read that found a binding to a collection whose drop the same commit pass blocks through its key locks on, or its direct commit to, a leaf of that collection.
+
 **Serial acquisition**:
 Lock acquisition that locks the leaves of one transaction one at a time, in ascending order of their stored-object paths. This global order cannot deadlock. A transaction locks its leaves in parallel by default, and switches to serial acquisition under a renewed identity when parallel acquisition does not make progress.
 _Avoid_: Serial locking, serial validation, serial mode

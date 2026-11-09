@@ -26,6 +26,49 @@ limit. Earlier entries that do not pass `--prefix-depth` used 2 segments, where
 all collections of a database share one limit. Pass `--prefix-depth=2` to
 measure them again.
 
+## ADR-092: key accesses cover the binding of their collection
+
+[ADR-092](../adr/092-key-accesses-cover-the-binding-of-their-collection.md)
+removes the directory read lock and the directory validation of a binding read
+when the commit pass accesses keys of the bound collection. Such a transaction
+can then use the direct commit.
+
+### Setup
+
+- base: `312fccb30`; target: base with ADR-092. The third side is the target
+  with `open-in-body = false` for both shapes, so the transactions get the
+  collection handle from outside their body.
+- `--time=virtual`, one run of each cell
+- `open-in-body`: `--experiment=hack/perf/experiments/open-in-body.toml`. The
+  CI cells: `hack/perf/compare_refs.sh` with `BASE=main`.
+
+### Results
+
+`open-in-body`, tx/s, and writes for each transaction in parentheses:
+
+| Cell | Instances | Base | Target | Open outside the body |
+| --- | ---: | ---: | ---: | ---: |
+| `keys1-pool1000` | 1 | 0.39 (48.9) | 231.78 (0.98) | 230.89 (1.03) |
+| `keys1-pool100` | 1 | 0.38 (45.0) | 234.00 (0.30) | 230.00 (0.30) |
+| `keys1-pool20` | 1 | 0.36 (45.5) | 203.40 (0.09) | 212.84 (0.09) |
+| `keys1-pool5` | 1 | 0.37 (45.3) | 74.81 (0.23) | 80.80 (0.23) |
+| `keys4-pool1000` | 1 | 0.37 (54.5) | 70.88 (5.89) | 78.62 (5.81) |
+| `keys4-pool100` | 1 | 0.39 (46.2) | 15.05 (5.02) | 16.05 (5.01) |
+| `keys1-pool1000` | 5 | 5.73 (19.3) | 112.78 (2.04) | 116.57 (1.94) |
+| `keys1-pool100` | 5 | 5.58 (21.4) | 71.37 (1.54) | 72.21 (1.59) |
+| `keys1-pool20` | 5 | 5.52 (22.3) | 62.81 (0.79) | 63.49 (0.77) |
+| `keys1-pool5` | 5 | 5.32 (22.5) | 52.68 (1.10) | 52.79 (1.08) |
+| `keys4-pool1000` | 5 | 5.87 (28.6) | 24.39 (19.69) | 23.95 (19.92) |
+| `keys4-pool100` | 5 | 5.36 (27.0) | 7.04 (16.57) | 7.05 (16.80) |
+
+- In the base, most writes are failed CASes on the record of the root
+  collection. In one instance, `CachedStore` runs them one at a time, and each
+  failure waits for a backoff.
+- The target makes the same writes for each transaction as the cells with the
+  open outside the body. The `keys1` cells use the direct commit, as without
+  the open.
+- The CI comparison found no conclusive change.
+
 ## ADR-089 and ADR-090: directory readers and kept directory holds
 
 [ADR-089](../adr/089-directory-loads-do-not-wait-for-readers.md) stops loads of
