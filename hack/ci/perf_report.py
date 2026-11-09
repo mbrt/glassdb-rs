@@ -30,6 +30,8 @@ MODEL = {
 SCHEMA_VERSION = 3
 TIMING_FILE = "timing.json"
 COUNTERS_FILE = "counters.json"
+# The tag of the expensive timing experiments, which run only on request.
+EXTENDED_TAG = "ci/extended"
 
 # The latency metrics of every shape of every cell.
 LATENCY_METRICS = (
@@ -135,6 +137,16 @@ def read_cells(path: Path, latency_jitter: bool) -> list[tuple[int, str, dict]]:
                 labels = list(cell["labels"].values()) if many else []
                 cells.append((run["run"], "/".join([name, *labels]), cell))
     return cells
+
+
+def has_extended(directory: Path) -> bool:
+    """Return whether the timing result of `directory` has an experiment with
+    the tag `ci/extended`. An invalid result has none."""
+    try:
+        experiments = read_json(directory / TIMING_FILE)["experiments"]
+        return any(EXTENDED_TAG in e.get("tags", []) for e in experiments)
+    except (ReportError, KeyError, TypeError, AttributeError):
+        return False
 
 
 def add(metrics: dict, name: str, unit: str, kind: str, value) -> None:
@@ -454,8 +466,10 @@ def render_report(
         rows.append(
             f"| {escape(name)} | {before:,.3f} | {after:,.3f} | {change} | {interval} | {floor} | {a.unit} | {direction} |"
         )
+    # Both sides run the same experiments.
+    extended = " [extended]" if has_extended(candidate_dir) else ""
     lines = [
-        "# Performance comparison",
+        f"# Performance comparison{extended}",
         "",
         f"Base: `{escape(base_label)}`; candidate: `{escape(candidate_label)}`.",
         "",

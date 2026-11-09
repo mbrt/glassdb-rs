@@ -2,7 +2,7 @@
 # affinity of 50, and the high-conflict workload at an affinity of 100. Below
 # an affinity of 100, the `rw-many` shape of the high-conflict workload does not
 # converge, so the comparison would have no latency of it.
-tags = ["ci/timing", "area/mixed"]
+tags = ["ci/timing", "ci/extended", "area/mixed"]
 include = ["../configs/common-workloads.toml"]
 
 [[axes]]

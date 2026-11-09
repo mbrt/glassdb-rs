@@ -172,7 +172,7 @@ class BenchTest(unittest.TestCase):
     def cases(self, cases):
         (self.root / "cases.json").write_text(json.dumps(list(cases)))
 
-    def bench(self, side, check=True):
+    def bench(self, side, *variables, check=True):
         """Run `make bench` into the directory `side`, and return its output."""
         result = subprocess.run(
             [
@@ -182,6 +182,7 @@ class BenchTest(unittest.TestCase):
                 f"PERFBENCH={self.fixture}",
                 f"EXPERIMENTS_DIR={self.root / 'experiments'}",
                 f"OUT={self.root / side}",
+                *variables,
             ],
             cwd=REPO,
             capture_output=True,
@@ -238,6 +239,16 @@ class BenchTest(unittest.TestCase):
                 self.assertIn(argument, arguments[kind], kind)
             # perfbench decides whether to draw its progress bar.
             self.assertFalse(any(a.startswith("--progress") for a in arguments[kind]))
+
+    def test_the_extended_experiments_run_only_with_extended(self):
+        exclude = "--exclude-tag=ci/extended"
+        self.bench("main")
+        self.assertIn(exclude, self.arguments()["timing"])
+        self.assertNotIn(exclude, self.arguments()["counters"])
+        self.bench("pr", "EXTENDED=0")
+        self.assertIn(exclude, self.arguments()["timing"])
+        self.bench("third", "EXTENDED=1")
+        self.assertNotIn(exclude, self.arguments()["timing"])
 
     def test_clear_changes_are_reported_in_both_directions(self):
         self.bench("main")
