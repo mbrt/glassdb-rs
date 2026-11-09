@@ -23,14 +23,19 @@ else:
 
 # The runs of the timing experiments. Each run is one independent sample of
 # the latency jitter, and the runs of a process run in parallel. With 32 runs
-# of 300 s, an A/A comparison gave simultaneous intervals of at most +-0.9%
-# (median +-0.5%) for all 36 timing metrics, so the report can tell an
-# unchanged metric from a change of 2%. With 8 runs, the p90 intervals reached
-# +-1.9%, and unchanged metrics were often inconclusive.
+# of 300 s, an A/A comparison gave simultaneous intervals of at most about
+# +-1% for the 36 timing metrics of the cases, so the report can tell an
+# unchanged metric of a case from a change of 2%. With 8 runs, the p90
+# intervals of the cases reached +-1.9%, and unchanged metrics were often
+# inconclusive.
 TIMING_RUNS = 32
-# Each process runs on virtual time, and takes seconds. Guard it against hangs,
-# such as a CPU livelock that virtual time cannot see.
-PROCESS_TIMEOUT = 600
+# Each process runs on virtual time. On a laptop with 22 hardware threads, one
+# run of the timing experiments took about 80 CPU s alone, and about 220 CPU s
+# with all runs in parallel. By that estimate (32 runs x 220 CPU s / 4 vCPUs),
+# the timing process takes about 30 minutes on a CI runner. Guard it against
+# hangs, such as a CPU livelock that virtual time cannot see. The measure step
+# of the workflow allows two sides of this timeout.
+PROCESS_TIMEOUT = 2400
 # The experiments, and the shared files that they include. They are part of
 # the harness.
 EXPERIMENTS = Path("hack/perf/experiments")

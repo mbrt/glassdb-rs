@@ -7,41 +7,7 @@
 # than five instances with the same workers. Each pool size has its own seed,
 # and both instance counts share it.
 tags = ["extra", "canonical", "area/contention"]
-
-[pools.sweep]
-keys = 5000
-
-[shapes.rw-1]
-kind = "read-modify-write"
-pool = "sweep"
-source = "pool"
-keys = 1
-
-[shapes.rw-4]
-kind = "read-modify-write"
-pool = "sweep"
-source = "pool"
-keys = 4
-
-[workloads.rw-1.groups.all]
-shapes = { rw-1 = "cell" }
-
-[workloads.rw-4.groups.all]
-shapes = { rw-4 = "cell" }
-
-[cell]
-workload = "rw-1"
-workers = 20
-# One pool for all instances, so that every worker can conflict with every other.
-collections = 1
-
-[cell.warm-up]
-timeout = "10s"
-
-# A cell of four-key transactions on a small pool needs more than the default
-# 60 s to commit the target of the windows.
-[cell.measure]
-max-duration = "200s"
+include = ["../configs/conflict-sweep.toml"]
 
 # One cell for each pool size of each transaction size. A transaction of four keys
 # conflicts with a concurrent one with a chance above 99% in a pool of 50 keys or

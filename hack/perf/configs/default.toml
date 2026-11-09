@@ -6,8 +6,8 @@
 #
 # The window of 10 s ends before the first background pass of the garbage
 # collector, so the counters of a run do not depend on the random cadence of
-# that pass. The experiments with the tag `ci/timing` measure the latency with
-# a longer window (`ci-timing.toml`).
+# that pass. The timing file of each case measures the latency with a longer
+# window (`ci-timing.toml`).
 
 [seed]
 quiet-period = "6s"

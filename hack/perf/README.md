@@ -58,12 +58,16 @@ and the run then stops.
 | `false-sharing-spans` | As `false-sharing`, but one more instance writes the two keys on both sides of the four contended keys in each transaction, so its write span crosses them (ADR-088). The default topology policy must still split the contended keys apart. |
 | `fixed-ranges` | Transactions on fixed ranges of 16 and 64 keys, with transactions on single keys (ADR-084). |
 | `random-ranges` | Transactions on ranges of 16 and 64 adjacent keys from random starts, on fixed sets of 3 keys, and on single keys (ADR-084). |
+| `conflict-sweep-short`, `random-ranges-short`, `fixed-ranges-short`, `mixed-short` | Shorter versions of these experiments for the CI comparison: 6 of the 16 pools of `conflict-sweep`; the ranges on one instance for 20 s; `mixed` with low conflict at an affinity of 50 and with high conflict at an affinity of 100. |
 
 The files in `hack/perf/configs` are not experiments:
 
 - `common-workloads.toml`: the pools, shapes, and workloads of the mixed
   workloads (`low-conflict`, `high-conflict`, and `crossing`).
 - `default.toml`: the settings and the parts of the CI experiments.
+- `conflict-sweep.toml`, `random-ranges.toml`, and `fixed-ranges.toml`: these
+  experiments without their axes. The experiment of each name and its shorter
+  version include it.
 - `workers.toml`: the `workers` grid without its axis. The `workers`
   experiments of `hack/perf/experiments` and of `hack/aws-bench/experiments`
   include it, so a change to it changes both.
@@ -136,8 +140,8 @@ interval of the change. It shows a change whose interval excludes zero and
 that is at least the floor of the metric: 2%, or the spread of one run if that
 is larger. A metric whose runs spread by 5% can change by 4% with no change of
 the engine, so the floor scales with the spread. With 32 runs of 300 s, a
-comparison of a revision with itself gave intervals of at most ±0.9% for the
-36 timing metrics of the cases, so an unchanged metric of a case does not stay
+comparison of a revision with itself gave intervals of at most about ±1% for
+the 36 timing metrics of the cases, so an unchanged metric of a case does not stay
 inconclusive.
 
 The report also compares the spread of one run of each timing metric, with the
@@ -153,14 +157,18 @@ inconclusive metric with no detected change of spread in a collapsed list, not
 in the warnings, so that the noisy experiments do not hide the other warnings.
 A metric whose spread grows by less than 3 times can be in that list.
 
-The experiments `contention`, `split-merge-fight`, `false-sharing`, and
-`false-sharing-spans` also have the tag `ci/timing`, with their own windows.
-Their metrics spread by up to about 6% in one run, and the `span` shape of
-`false-sharing-spans` by up to about 19%, so their floors are larger. A
-comparison of a revision with itself gave no reports for them, and about 40
-of their metrics stay inconclusive, with no detected change of their spread.
-They have no counter file: their counters change between runs without latency
-jitter too.
+The experiments `contention`, `split-merge-fight`, `false-sharing`,
+`false-sharing-spans`, and the four shorter versions also have the tag
+`ci/timing`, with their own windows.
+Their metrics spread more, so their floors are larger. For most of them the
+spread of one run is at most about 6%. Some metrics spread much more: up to
+about 18% in `conflict-sweep-short`, 19% for the `span` shape of
+`false-sharing-spans`, and 70% for some shapes of one worker in
+`fixed-ranges-short`. A comparison of a
+revision with itself gave no reports and no spread changes for them, and about
+140 of their metrics stay inconclusive, with no detected change of their
+spread. They have no counter file: their counters change between runs without
+latency jitter too.
 
 The name of a metric is the experiment, then the labels of the cell if the
 experiment has more than one cell, then the shape if the cell has more than one
