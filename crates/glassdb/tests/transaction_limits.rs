@@ -575,36 +575,101 @@ async fn zero_collection_reservations_allows_existing_bindings() {
         .unwrap();
 }
 
-/// Writes `count` new keys of `key_len` bytes, all between `m` and `n`, in one
-/// transaction.
+/// Returns the key of index `i` with `len` bytes. All these keys are between
+/// `m` and `n`.
+fn bulk_key(i: usize, len: usize) -> Vec<u8> {
+    let mut key = format!("m{i:08}").into_bytes();
+    key.resize(len, b'x');
+    key
+}
+
+/// Writes `count` new keys of `key_len` bytes in one transaction.
 async fn create_keys(db: &Database, count: usize, key_len: usize) -> Result<(), Error> {
     let c = &db.root_collection();
     db.tx(|tx| async move {
         for i in 0..count {
-            let mut key = format!("m{i:08}").into_bytes();
-            key.resize(key_len, b'x');
-            tx.write(c, &key, b"v")?;
+            tx.write(c, &bulk_key(i, key_len), b"v")?;
         }
         Ok(())
     })
     .await
 }
 
+/// Writes keys around the range of the bulk keys. A split divides a leaf only
+/// at an existing key, so no split can divide the bulk keys.
+async fn write_keys_outside_the_bulk_range(db: &Database) {
+    for key in [b"a", b"b", b"z"] {
+        db.root_collection().write(key, b"v").await.unwrap();
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn creates_that_no_split_can_divide_fail_without_waiting_for_one() {
+async fn one_transaction_can_create_more_keys_than_an_ordinary_leaf_holds() {
     let db = Database::builder("limits", MemoryBackend::new())
         .open()
         .await
         .unwrap();
+    write_keys_outside_the_bulk_range(&db).await;
+
+    create_keys(&db, 2500, 400).await.unwrap();
+
     let c = db.root_collection();
-    // Splits divide a leaf only at existing keys. None of these is between the
-    // new keys, so the new keys stay in one leaf after every split.
-    for key in [b"a", b"b", b"z"] {
-        c.write(key, b"v").await.unwrap();
+    for i in [0, 2499] {
+        assert_eq!(
+            c.read(&bulk_key(i, 400)).await.unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_transaction_can_read_more_absent_keys_than_an_ordinary_leaf_holds() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .open()
+        .await
+        .unwrap();
+    let root = &db.root_collection();
+    // The write in another collection makes the transaction lock its reads.
+    let other = &root.create_collection_if_absent(b"other").await.unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        db.tx(|tx| async move {
+            for i in 0..2500 {
+                if tx.read(root, &bulk_key(i, 400)).await?.is_some() {
+                    return Err(Error::internal("the bulk key exists"));
+                }
+            }
+            tx.write(other, b"k", b"v")
+        }),
+    )
+    .await;
+
+    result.expect("the locked reads must fit the leaf").unwrap();
+    assert_eq!(other.read(b"k").await.unwrap().as_deref(), Some(&b"v"[..]));
+}
+
+/// Limits that allow a stage larger than the content limit of the default
+/// hard cap.
+fn limits_over_the_hard_cap() -> TransactionLimits {
+    TransactionLimits {
+        max_operations: 16_384,
+        max_key_access_bytes: 16 * 1024 * 1024,
+        ..TransactionLimits::default()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn creates_that_no_split_can_divide_fail_without_waiting_for_one() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(limits_over_the_hard_cap())
+        .open()
+        .await
+        .unwrap();
+    write_keys_outside_the_bulk_range(&db).await;
 
     let started = tokio::time::Instant::now();
-    let result = create_keys(&db, 4000, 400).await;
+    let result = create_keys(&db, 8000, 400).await;
     assert!(
         matches!(result, Err(Error::InvalidInput(_))),
         "got {result:?}"
@@ -614,22 +679,48 @@ async fn creates_that_no_split_can_divide_fail_without_waiting_for_one() {
         "the transaction waited {:?} for a split that cannot help",
         started.elapsed()
     );
-    let mut first = b"m00000000".to_vec();
-    first.resize(400, b'x');
-    assert_eq!(c.read(&first).await.unwrap(), None);
+    let c = db.root_collection();
+    assert_eq!(c.read(&bulk_key(0, 400)).await.unwrap(), None);
 }
 
 #[tokio::test(start_paused = true)]
 async fn creates_that_splits_can_divide_wait_for_the_splits() {
     let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(limits_over_the_hard_cap())
         .open()
         .await
         .unwrap();
     let c = db.root_collection();
     // Existing keys between the new keys let the splits divide them.
-    for i in (0..4000).step_by(100) {
-        c.write(format!("m{i:08}").as_bytes(), b"v").await.unwrap();
+    for i in (0..8000).step_by(100) {
+        c.write(&bulk_key(i, 9), b"v").await.unwrap();
     }
 
-    create_keys(&db, 4000, 400).await.unwrap();
+    create_keys(&db, 8000, 400).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn key_access_byte_limit_counts_reads_writes_and_deletes() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(TransactionLimits {
+            max_key_access_bytes: 6,
+            ..TransactionLimits::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let c = &db.root_collection();
+
+    let result = db
+        .tx(|tx| async move {
+            tx.read(c, b"ab").await?;
+            tx.write(c, b"cd", b"v")?;
+            tx.delete(c, b"ef")?;
+            expect_limit(tx.read(c, b"g").await, "transaction key access bytes", 6);
+            Ok(())
+        })
+        .await;
+
+    result.unwrap();
+    assert_eq!(c.read(b"cd").await.unwrap().as_deref(), Some(&b"v"[..]));
 }

@@ -365,13 +365,24 @@ them. A writer reads their transaction records in parallel, with a bound, and a
 new reader removes in its own CAS the holders whose final status its database
 instance already knows.
 
-A create that reaches the leaf content limit releases its partial locks and
-retries, so the restructurer can make room. The first capacity result starts one
-bounded wait. Leaf revisions, reroutes, and other full leaves do not reset it.
-Without that bound, a split that cannot happen or continuous churn would make
-the foreground wait forever. A split divides the new keys of a create only at an
-existing key between them. When the leaf has no such key and the new keys alone
-are over the content limit, the transaction fails at once with invalid input.
+A stage that adds leaf entries is a create, or a lock on an absent key. A leaf
+admits it only if the leaf content before the stage is within the create limit,
+and the content after it is within the content limit
+([ADR-093](adr/093-one-transaction-can-overfill-a-leaf.md)). Each database
+instance computes its create limit so that the leaf keeps room for the largest
+stage of its local transaction limits. The default hard cap has room for that
+stage. So one transaction can take a leaf over the create limit, and the leaf
+then admits no new entries until its splits make it smaller. The check after the
+stage uses only shared settings, so these stages never use the split headroom.
+
+A rejected stage gets `LeafFull`. The transaction keeps the holds that landed on
+other leaves and retries, so the restructurer can make room. The first capacity
+result starts one bounded wait. Leaf revisions, reroutes, and other full leaves
+do not reset it. Without that bound, a split that cannot happen or continuous
+churn would make the foreground wait forever. A split divides the new keys of a
+stage only at an existing key between them. When the leaf has no such key and
+the stage alone is over the content limit, the transaction fails at once with
+invalid input.
 
 ### Transaction records
 

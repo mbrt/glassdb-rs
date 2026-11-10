@@ -112,7 +112,7 @@ impl DatabaseBuilder {
     /// Sets local split and merge thresholds and proposes hard limits for a new
     /// database.
     /// Existing databases load their hard limits from metadata, ignoring the
-    /// proposed hard cap and reserved headroom. Soft thresholds remain local.
+    /// proposed hard cap and split headroom. Soft thresholds remain local.
     /// Creation fails if the hard limits cannot admit even an empty key.
     pub fn node_size_policy(mut self, policy: NodeSizePolicy) -> Self {
         self.node_size_policy = policy;
@@ -168,7 +168,11 @@ impl DatabaseBuilder {
         let metadata =
             check_or_create_db_meta(&backend, &name, node_size_policy, protocol_timing).await?;
         let database_id = metadata.id;
-        engine_config.set_node_size_policy(metadata.node_size_policy(node_size_policy)?);
+        engine_config.set_node_size_policy(
+            metadata
+                .node_size_policy(node_size_policy)?
+                .with_largest_stage(transaction_limits.largest_stage()),
+        );
         engine_config.set_protocol_timing(metadata.timing);
         let engine = Engine::open(&name, database_id, backend, engine_config)
             .await

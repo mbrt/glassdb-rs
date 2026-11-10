@@ -371,13 +371,16 @@ impl MemberPolicy for AcquireOperation {
         let mut entries = Vec::with_capacity(self.intents.len());
         for intent in self.intents.iter() {
             let cur = staged.get(&intent.raw_key).cloned();
+            // The lock of an absent key needs a new entry, also for a read or
+            // a delete (ADR-093).
+            let adds_entry = cur.as_ref().is_none_or(LeafEntry::is_vestigial);
             match resolve_and_lock(ctx, &self.id, intent, cur).await? {
                 EntryResolution::Locked(entry, changes_membership) => {
                     if changes_membership {
                         membership = LockType::Write;
-                        if intent.desired == Desired::Put {
-                            admission = StageAdmission::AddsKey;
-                        }
+                    }
+                    if adds_entry || (changes_membership && intent.desired == Desired::Put) {
+                        admission = StageAdmission::AddsEntries;
                     }
                     entries.push((intent.raw_key.clone(), entry));
                 }
@@ -950,9 +953,9 @@ pub(crate) enum LockOutcome {
     /// retries the complete access set. Sustained parallel contention requests
     /// owner-level renewal before sorted serial acquisition.
     Conflict,
-    /// A create reached a leaf's reserved content cap. The caller retains other
-    /// leaf holds, backs off without serial escalation, and retries after the
-    /// background split has had an opportunity to run.
+    /// A stage that adds leaf entries does not fit the leaf now. The caller
+    /// retains other leaf holds, backs off without serial escalation, and
+    /// retries after the background split has had an opportunity to run.
     LeafFull,
 }
 

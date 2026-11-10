@@ -49,6 +49,7 @@ struct TransactionInner {
     catalog: CatalogOverlay,
     operations: usize,
     write_bytes: usize,
+    key_access_bytes: usize,
 }
 
 impl Transaction {
@@ -60,6 +61,7 @@ impl Transaction {
     /// `futures::future::join_all`) to fetch keys in parallel.
     pub async fn read(&self, c: &Collection, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         self.admit_operation(c)?;
+        self.admit_key_access(key)?;
         let key = LogicalKey::new(c.address().clone(), key);
         // Brief lock to consult the per-transaction cache. The guard is dropped
         // before the backend read below so it is never held across `.await`.
@@ -142,6 +144,7 @@ impl Transaction {
     /// Stages a write of `value` to `key`.
     pub fn write(&self, c: &Collection, key: &[u8], value: &[u8]) -> Result<(), Error> {
         self.admit_operation(c)?;
+        self.admit_key_access(key)?;
         self.db.transaction_limits.check_write_key(key)?;
         self.db.transaction_limits.check_value(value)?;
         let mut inner = self.inner.lock().unwrap();
@@ -163,6 +166,7 @@ impl Transaction {
     /// Marks `key` for deletion within the transaction.
     pub fn delete(&self, c: &Collection, key: &[u8]) -> Result<(), Error> {
         self.admit_operation(c)?;
+        self.admit_key_access(key)?;
         let mut inner = self.inner.lock().unwrap();
         if inner.catalog.is_dropped(c.address()) {
             return Err(Error::InvalidInput(
@@ -323,6 +327,7 @@ impl Transaction {
                 catalog: CatalogOverlay::new(reservations),
                 operations: 0,
                 write_bytes: 0,
+                key_access_bytes: 0,
             })),
         }
     }
@@ -417,6 +422,20 @@ impl Transaction {
             .map_err(Error::from_read_trans)?;
         let mut inner = self.inner.lock().unwrap();
         inner.catalog.install_snapshot(parent.clone(), snapshot);
+        Ok(())
+    }
+
+    fn admit_key_access(&self, key: &[u8]) -> Result<(), Error> {
+        let limit = self.db.transaction_limits.max_key_access_bytes;
+        let mut inner = self.inner.lock().unwrap();
+        inner.key_access_bytes = inner
+            .key_access_bytes
+            .checked_add(key.len())
+            .filter(|&bytes| bytes <= limit)
+            .ok_or(Error::LimitExceeded {
+                resource: "transaction key access bytes",
+                limit,
+            })?;
         Ok(())
     }
 

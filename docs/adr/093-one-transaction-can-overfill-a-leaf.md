@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Accepted.
 
 Refines [ADR-032](032-node-locking-and-coordinated-splits.md). It changes when
 a leaf admits a stage that adds leaf entries, for locked commits and for direct
@@ -50,8 +50,10 @@ are true:
 
 The rule applies to every stage that adds entries. That includes the reads and
 the deletes of absent keys, and the direct commits that create a key. A stage
-that the rule rejects gets `LeafFull`, asks for a capacity split, and waits
-with the bounded wait for capacity, as a create does today.
+of a locked commit that the rule rejects gets `LeafFull`, asks for a capacity
+split, and waits with the bounded wait for capacity, as a create does today. A
+direct commit whose stage the rule rejects falls back to a locked commit
+(ADR-061), and that commit follows the same rule.
 
 The second condition is the check that ADR-032 already makes for creates. It
 uses only shared settings. So on every database instance, a stage that adds

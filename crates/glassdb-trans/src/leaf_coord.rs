@@ -138,7 +138,7 @@ pub(crate) enum MemberOutcome {
     /// not add a user key reached the absolute object limit. Release and
     /// re-lock while the hinted split makes progress.
     Conflict,
-    /// A create would exceed the leaf's reserved content limit. Nothing was
+    /// A stage that adds leaf entries does not fit the leaf now. Nothing was
     /// staged for this member; retry after the pending split relieves the leaf.
     LeafFull,
     /// A create can fit no leaf that a split of the current leaf can make.
@@ -249,24 +249,25 @@ type OutcomeSlot = Arc<Mutex<Option<CoordinatedOutcome>>>;
 /// How a staged mutation participates in leaf-capacity admission.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StageAdmission {
-    /// The stage does not add a user key, so it may consume reserved headroom
-    /// but must still fit under the absolute encoded-object limit.
+    /// The stage adds no leaf entry and no user key, so it may use the split
+    /// headroom but must still fit under the hard cap.
     ExistingKeys,
     /// The stage publishes an inline value. In addition to the absolute object
     /// limit, each published entry must retain the per-entry split budget so it
     /// cannot leave behind an intrinsically unsplittable singleton.
     InlinePublication {
         /// Whether the publication creates at least one live user key and must
-        /// therefore preserve the content headroom used by structural work.
+        /// therefore follow the admission of [`StageAdmission::AddsEntries`].
         adds_key: bool,
         /// Whether a rejected publication should notify the restructurer.
         /// ADR-061 suppresses this for multi-key direct members because
         /// splitting can destroy their eligibility.
         pressure_hint: bool,
     },
-    /// The stage adds at least one user key and must fit below the content limit
-    /// that reserves headroom for locks and the split's shrink CAS.
-    AddsKey,
+    /// The stage adds at least one leaf entry or user key. The leaf admits it
+    /// only while the leaf is within the create limit before the stage and
+    /// within the content limit after it (ADR-093).
+    AddsEntries,
 }
 
 /// One policy's proposed decision: either stage entry and node-lock changes
@@ -901,9 +902,11 @@ impl CasWorker {
             } => (true, adds_key, pressure_hint),
             _ => (false, false, true),
         };
-        let create_full = (proposed.admission == StageAdmission::AddsKey || direct_adds_key)
-            && candidate_node.content_encoded_len()
-                > self.core.config.node_size_policy.content_limit();
+        let create_full = (proposed.admission == StageAdmission::AddsEntries || direct_adds_key)
+            && (candidate_node.content_encoded_len()
+                > self.core.config.node_size_policy.content_limit()
+                || self.content_len(edit, entries)?
+                    > self.core.config.node_size_policy.create_limit());
         let inline_entry_full = inline_publication
             && proposed.entries.iter().any(|(_, entry)| {
                 !self
@@ -919,7 +922,7 @@ impl CasWorker {
             return Ok(CapacityDecision::Admitted(proposed));
         }
 
-        if proposed.admission == StageAdmission::AddsKey
+        if proposed.admission == StageAdmission::AddsEntries
             && create_full
             && self.never_fits(entries, &proposed)
         {
@@ -930,7 +933,7 @@ impl CasWorker {
         if pressure_hint && !inline_entry_full {
             self.core.hinter.capacity_rejected(path);
         }
-        let outcome = if proposed.admission == StageAdmission::AddsKey {
+        let outcome = if proposed.admission == StageAdmission::AddsEntries {
             MemberOutcome::LeafFull
         } else if in_doubt {
             policy.exhausted_outcome(true)
@@ -938,6 +941,22 @@ impl CasWorker {
             MemberOutcome::Conflict
         };
         Ok(CapacityDecision::Rejected(outcome))
+    }
+
+    /// Returns the content size of the leaf of `edit` with `entries`.
+    fn content_len(
+        &self,
+        edit: &LeafEdit,
+        entries: &BTreeMap<Vec<u8>, LeafEntry>,
+    ) -> Result<usize, TransError> {
+        let mut node = edit.node().clone();
+        node.set_leaf(LeafBody::from_entries(
+            entries
+                .values()
+                .filter(|entry| !entry.is_vestigial())
+                .cloned(),
+        ))?;
+        Ok(node.content_encoded_len())
     }
 
     /// Reports whether `proposed` stays over the content limit in every leaf
@@ -1714,7 +1733,7 @@ mod tests {
                 .get(&self.key)
                 .cloned()
                 .unwrap_or_else(|| entry(&self.key, LockType::None, None, None));
-            if self.admission == StageAdmission::AddsKey {
+            if self.admission == StageAdmission::AddsEntries {
                 e.replace_create_lock(self.tx);
             } else {
                 e.replace_write_lock(self.tx);
@@ -2460,6 +2479,62 @@ mod tests {
         fn observe_leaf(&self, _path: &ObjectPath, _leaf: &LeafBody) {
             self.calls.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// Stages one lock on `key` in a leaf that holds `committed` entries, with
+    /// a policy whose create limit is below its content limit. Returns whether
+    /// the leaf admitted the stage.
+    async fn stage_in_leaf_with(committed: usize, key: &[u8], admission: StageAdmission) -> bool {
+        let policy = NodeSizePolicy::builder()
+            .node_soft_max_bytes(256)
+            .node_max_bytes(4096)
+            .split_headroom_bytes(512)
+            .build()
+            .unwrap()
+            .with_largest_stage(2048);
+        assert!(policy.create_limit() < policy.content_limit());
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (coord, nodes, _timeline, _bg) =
+            coord_over_with(backend, policy, Arc::new(NoStructuralHints)).await;
+        let writer = TxId::with_priority(1, b"writer");
+        let entries: Vec<_> = (0..committed)
+            .map(|i| {
+                entry(
+                    format!("k{i:03}").as_bytes(),
+                    LockType::None,
+                    None,
+                    Some(&writer),
+                )
+            })
+            .collect();
+        let content = Node::leaf(LeafBody::from_entries(entries.clone())).content_encoded_len();
+        store_leaf_entries(&nodes, &leaf(), entries).await;
+        // The stage of one small key fits under the content limit in every case,
+        // so only the content before the stage decides.
+        assert!(content + 256 < policy.content_limit());
+
+        let admitted = coord
+            .coordinate(StageLock {
+                key: key.to_vec(),
+                tx: TxId::with_priority(2, b"t"),
+                admission,
+            })
+            .await
+            .unwrap();
+        coord.close().await;
+        admitted
+    }
+
+    // ADR-093: a leaf over the create limit admits no stage that adds entries,
+    // even when the stage fits under the content limit. Other stages still
+    // land.
+    #[tokio::test]
+    async fn a_leaf_over_the_create_limit_admits_no_new_entries() {
+        // About 40 bytes for each entry: 10 entries are under the create limit
+        // of 1536 bytes, and 50 entries are over it.
+        assert!(stage_in_leaf_with(10, b"new", StageAdmission::AddsEntries).await);
+        assert!(!stage_in_leaf_with(50, b"new", StageAdmission::AddsEntries).await);
+        assert!(stage_in_leaf_with(50, b"k000", StageAdmission::ExistingKeys).await);
     }
 
     // A typed operation drives one CAS and translates its exact precondition
@@ -4045,10 +4120,10 @@ mod tests {
         coord.close().await;
     }
 
-    // Capacity is a member-local result: a create that crosses the reserved
-    // content limit is rejected and re-hinted, while an overwrite already
-    // staged in the same merged round still lands. Existing-key mutations may
-    // consume the reserved headroom, but the absolute object limit still holds.
+    // Capacity is a member-local result: a create that crosses the content
+    // limit is rejected and re-hinted, while an overwrite already staged in the
+    // same merged round still lands. Existing-key mutations may use the split
+    // headroom, but the hard cap still holds.
     #[tokio::test(start_paused = true)]
     async fn leaf_full_create_does_not_poison_merged_overwrite() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
@@ -4111,7 +4186,7 @@ mod tests {
                 Arc::new(StageLock {
                     key: b"z".to_vec(),
                     tx: t2,
-                    admission: StageAdmission::AddsKey,
+                    admission: StageAdmission::AddsEntries,
                 }),
                 Requirement::ANY,
             )

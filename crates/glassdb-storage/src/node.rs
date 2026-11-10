@@ -188,7 +188,7 @@ impl IndexNode {
 /// Size admission limits and soft thresholds for coordination-node splits and
 /// merges.
 ///
-/// The hard cap and reserved headroom are shared database settings. Soft
+/// The hard cap and split headroom are shared database settings. Soft
 /// thresholds tune each database instance's background splits and merges
 /// (ADR-031, ADR-072, ADR-073).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +208,9 @@ pub struct NodeSizePolicy {
     node_max_bytes: usize,
     /// Bytes reserved for transient node-lock metadata at the hard cap.
     split_headroom_bytes: usize,
+    /// The most leaf content that one stage of the local transactions can
+    /// add. Leaves keep room for one such stage (ADR-093).
+    largest_stage: usize,
 }
 
 /// Builds a validated [`NodeSizePolicy`], starting from production defaults.
@@ -222,7 +225,7 @@ pub struct NodeSizePolicyBuilder {
     split_headroom_bytes: usize,
 }
 
-/// A node size policy whose reserved headroom exceeds its hard node cap.
+/// A node size policy whose split headroom exceeds its hard cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
     "split headroom ({split_headroom_bytes} bytes) exceeds the node hard cap ({node_max_bytes} bytes)"
@@ -277,6 +280,24 @@ impl NodeSizePolicy {
     /// headroom for transient locks and the split's shrink CAS.
     pub fn content_limit(&self) -> usize {
         self.node_max_bytes - self.split_headroom_bytes
+    }
+
+    /// Returns this policy with room for stages of up to `bytes` bytes. The
+    /// database computes the value from its transaction limits when it opens.
+    pub fn with_largest_stage(mut self, bytes: usize) -> Self {
+        self.largest_stage = bytes;
+        self
+    }
+
+    /// The leaf content above which a stage that adds leaf entries waits for a
+    /// split (ADR-093). It keeps room for one largest stage under the content
+    /// limit. It is never below the byte soft cap, so that ordinary leaves
+    /// keep their creates when the largest stage does not fit the hard cap.
+    pub fn create_limit(&self) -> usize {
+        self.content_limit()
+            .saturating_sub(self.largest_stage)
+            .max(self.node_soft_max_bytes)
+            .min(self.content_limit())
     }
 
     /// Reports whether one exact leaf entry fits the per-entry budget that
@@ -359,6 +380,8 @@ impl NodeSizePolicyBuilder {
             index_min_children: self.index_min_children,
             node_max_bytes: self.node_max_bytes,
             split_headroom_bytes: self.split_headroom_bytes,
+            // No room for a large stage until the database sets it.
+            largest_stage: 0,
         })
     }
 }
@@ -372,7 +395,11 @@ impl Default for NodeSizePolicyBuilder {
             index_max_children: 256,
             leaf_min_entries: 12,
             index_min_children: 64,
-            node_max_bytes: 1024 * 1024,
+            // With the default transaction limits, this leaves room for the
+            // largest stage above a create limit well over the byte soft cap
+            // (ADR-093). A leaf over the create limit exists only until its
+            // splits finish.
+            node_max_bytes: 2304 * 1024,
             split_headroom_bytes: 64 * 1024,
         }
     }
@@ -816,6 +843,15 @@ impl Node {
         let leaf_len =
             length_delimited_field(LEAF_ENTRIES_TAG, LeafEntry::worst_case_encoded_len(key_len));
         length_delimited_field(NODE_LEAF_TAG, leaf_len)
+    }
+
+    /// Returns an upper bound of the leaf content that one stage adds when it
+    /// accesses at most `entries` keys with at most `key_bytes` bytes in total.
+    pub fn worst_case_stage_len(entries: usize, key_bytes: usize) -> usize {
+        // The fixed part of an entry grows with its key length, so the
+        // longest possible key gives the bound for every entry.
+        let fixed = Node::worst_case_leaf_entry_len(key_bytes) - key_bytes;
+        key_bytes.saturating_add(entries.saturating_mul(fixed))
     }
 
     /// Returns the node-content size of the smallest parent that can contain a
