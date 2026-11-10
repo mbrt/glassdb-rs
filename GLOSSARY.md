@@ -411,6 +411,26 @@ _Avoid_: Leaf group, owning leaf group, point-leaf plan
 A logical key in a parent index node that bounds one child's range: keys at or above it route to that child. Parent reconciliation adds a separator after a child split, and removes one after a child merge.
 _Avoid_: Index key, boundary key
 
+**Hard cap**:
+The largest encoded size of one node. All database instances of a database use the same hard cap.
+_Avoid_: Node size limit, backend limit
+
+**Split headroom**:
+The part of the hard cap that stages that add no leaf entries, and splits, can use.
+_Avoid_: Reserved headroom
+
+**Content limit**:
+The hard cap minus the split headroom. A stage that adds leaf entries cannot take the content of a leaf over it.
+_Avoid_: Reserved content limit
+
+**Create limit**:
+The leaf content above which one database instance admits no stage that adds leaf entries, until a split makes the leaf smaller.
+_Avoid_: Admission threshold
+
+**Largest stage**:
+The most leaf content that one stage can add when its transaction is within the local transaction limits.
+_Avoid_: Stage budget
+
 ## Leaf coordination
 
 **Coordinator round**:
@@ -420,6 +440,10 @@ _Avoid_: Fold round, CAS (when referring to the whole round)
 **Round member**:
 One operation from one transaction identity in a coordinator round, with its own proposed leaf changes and outcome. A mutation plan includes all of its leaf changes or none of them.
 _Avoid_: Fold member
+
+**Stage**:
+The proposed leaf changes of one round member. It is different from the staged changes of a transaction, which a transaction body records.
+_Avoid_: Member changes
 
 **Mutation plan**:
 The proposed state of one leaf and the round members' outcomes, which at most one CAS publishes. A plan does not prove that its CAS took effect.
