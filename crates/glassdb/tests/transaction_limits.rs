@@ -574,3 +574,62 @@ async fn zero_collection_reservations_allows_existing_bindings() {
         .await
         .unwrap();
 }
+
+/// Writes `count` new keys of `key_len` bytes, all between `m` and `n`, in one
+/// transaction.
+async fn create_keys(db: &Database, count: usize, key_len: usize) -> Result<(), Error> {
+    let c = &db.root_collection();
+    db.tx(|tx| async move {
+        for i in 0..count {
+            let mut key = format!("m{i:08}").into_bytes();
+            key.resize(key_len, b'x');
+            tx.write(c, &key, b"v")?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn creates_that_no_split_can_divide_fail_without_waiting_for_one() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .open()
+        .await
+        .unwrap();
+    let c = db.root_collection();
+    // Splits divide a leaf only at existing keys. None of these is between the
+    // new keys, so the new keys stay in one leaf after every split.
+    for key in [b"a", b"b", b"z"] {
+        c.write(key, b"v").await.unwrap();
+    }
+
+    let started = tokio::time::Instant::now();
+    let result = create_keys(&db, 4000, 400).await;
+    assert!(
+        matches!(result, Err(Error::InvalidInput(_))),
+        "got {result:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the transaction waited {:?} for a split that cannot help",
+        started.elapsed()
+    );
+    let mut first = b"m00000000".to_vec();
+    first.resize(400, b'x');
+    assert_eq!(c.read(&first).await.unwrap(), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn creates_that_splits_can_divide_wait_for_the_splits() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .open()
+        .await
+        .unwrap();
+    let c = db.root_collection();
+    // Existing keys between the new keys let the splits divide them.
+    for i in (0..4000).step_by(100) {
+        c.write(format!("m{i:08}").as_bytes(), b"v").await.unwrap();
+    }
+
+    create_keys(&db, 4000, 400).await.unwrap();
+}

@@ -479,6 +479,9 @@ impl LeafOperation for AcquireOperation {
             }
             MemberOutcome::Wait(holder) => Ok(AcquireOutcome::Wait(holder)),
             MemberOutcome::LeafFull => Ok(AcquireOutcome::LeafFull),
+            MemberOutcome::Oversized => Err(TransError::InvalidInput(
+                "new keys in one leaf exceed the coordination node size limit".into(),
+            )),
             // A result from another operation kind is not proof that this lock
             // landed. The safe response is the ordinary release-and-relock path.
             MemberOutcome::Conflict

@@ -27,7 +27,7 @@
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::{AddAssign, Sub};
+use std::ops::{AddAssign, Bound, Sub};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -141,6 +141,9 @@ pub(crate) enum MemberOutcome {
     /// A create would exceed the leaf's reserved content limit. Nothing was
     /// staged for this member; retry after the pending split relieves the leaf.
     LeafFull,
+    /// A create can fit no leaf that a split of the current leaf can make.
+    /// Nothing was staged for this member.
+    Oversized,
     /// A release or write-back completed (ADR-026). The current node state
     /// proved that the holder was removed or the corresponding CAS landed.
     /// `superseded` carries the `current_writer` transaction identities a write-back
@@ -916,6 +919,12 @@ impl CasWorker {
             return Ok(CapacityDecision::Admitted(proposed));
         }
 
+        if proposed.admission == StageAdmission::AddsKey
+            && create_full
+            && self.never_fits(entries, &proposed)
+        {
+            return Ok(CapacityDecision::Rejected(MemberOutcome::Oversized));
+        }
         // Splitting cannot make an intrinsically oversized entry fit. The
         // direct publisher falls back to an external value instead.
         if pressure_hint && !inline_entry_full {
@@ -929,6 +938,35 @@ impl CasWorker {
             MemberOutcome::Conflict
         };
         Ok(CapacityDecision::Rejected(outcome))
+    }
+
+    /// Reports whether `proposed` stays over the content limit in every leaf
+    /// that splits can make from `entries`.
+    ///
+    /// A split moves the keys at or above an existing key to a new sibling, so
+    /// it divides the keys of the stage only at an existing key above the
+    /// smallest of them. When no such key is at or below the largest of them,
+    /// every leaf that holds the stage holds all of it.
+    fn never_fits(&self, entries: &BTreeMap<Vec<u8>, LeafEntry>, proposed: &ProposedStage) -> bool {
+        let staged = || proposed.entries.iter().map(|(key, _)| key.as_slice());
+        let (Some(low), Some(high)) = (staged().min(), staged().max()) else {
+            return false;
+        };
+        let divisible = entries
+            .range::<[u8], _>((Bound::Excluded(low), Bound::Included(high)))
+            .any(|(_, entry)| !entry.is_vestigial());
+        if divisible {
+            return false;
+        }
+        let stage = LeafBody::from_entries(
+            proposed
+                .entries
+                .iter()
+                .map(|(_, entry)| entry)
+                .filter(|entry| !entry.is_vestigial())
+                .cloned(),
+        );
+        Node::leaf(stage).content_encoded_len() > self.core.config.node_size_policy.content_limit()
     }
 
     /// Persists one mutation plan and classifies its storage result.

@@ -369,7 +369,9 @@ A create that reaches the leaf content limit releases its partial locks and
 retries, so the restructurer can make room. The first capacity result starts one
 bounded wait. Leaf revisions, reroutes, and other full leaves do not reset it.
 Without that bound, a split that cannot happen or continuous churn would make
-the foreground wait forever.
+the foreground wait forever. A split divides the new keys of a create only at an
+existing key between them. When the leaf has no such key and the new keys alone
+are over the content limit, the transaction fails at once with invalid input.
 
 ### Transaction records
 
