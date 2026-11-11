@@ -1,9 +1,12 @@
 //! Persistent-cache disk I/O and recovery mechanics.
 
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use glassdb_concurr::rt;
 use glassdb_data::DatabaseId;
 
 use crate::cache_stats::CacheMetrics;
@@ -16,6 +19,7 @@ use super::{CACHE_FILE, PersistentCacheConfig};
 
 const INDEX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const SYNC_BYTES: u64 = 64 * 1024 * 1024;
+const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(super) struct Disk {
     pub(super) file: Arc<dyn CacheFile>,
@@ -404,6 +408,36 @@ impl WriterState {
     }
 }
 
+/// Opens the cache file, waiting while another owner holds the lock.
+///
+/// The previous owner in this process can be a worker that a timed-out
+/// shutdown aborted. It releases the lock when its blocked I/O call returns.
+/// A live owner in another process keeps the lock, so the wait ends after
+/// `timeout` with `WouldBlock`.
+async fn open_exclusive_waiting(
+    media: &dyn CacheMedia,
+    directory: &Path,
+    timeout: Duration,
+) -> io::Result<Arc<dyn CacheFile>> {
+    let wait = async {
+        loop {
+            match media.open_exclusive(directory).await {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    rt::sleep(LOCK_POLL_INTERVAL).await;
+                }
+                result => return result,
+            }
+        }
+    };
+    match rt::timeout(timeout, wait).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("persistent-cache lock is still held after {timeout:?}"),
+        )),
+    }
+}
+
 pub(super) async fn open_disk(
     config: PersistentCacheConfig,
     database_name: &str,
@@ -413,7 +447,8 @@ pub(super) async fn open_disk(
     media: Arc<dyn CacheMedia>,
 ) -> io::Result<(Arc<Disk>, WriterState, Option<SequencePoint>)> {
     let format = CacheFormat::new(geometry, config.capacity_bytes, database_name, database_id)?;
-    let file = media.open_exclusive(&config.directory).await?;
+    let file =
+        open_exclusive_waiting(media.as_ref(), &config.directory, config.open_timeout).await?;
     let current_len = file.len().await?;
     let valid = current_len == format.capacity()
         && current_len != 0

@@ -787,7 +787,10 @@ transactions already hold.
 The optional L2 stores encoded bodies, revisions, and currentness points on
 disk. One bounded worker does all its file I/O instead of Tokio's blocking pool,
 so under overload GlassDB skips L2 instead of queuing blocking tasks without
-limit. Open and shutdown have deadlines and fail open.
+limit. Open and shutdown have deadlines and fail open. A shutdown that times
+out aborts the worker, but a worker blocked in a system call keeps the file
+lock until the call returns. Open therefore retries the lock until the open
+deadline, so a reopen of the same directory survives a slow shutdown.
 
 ### Evidence rules
 

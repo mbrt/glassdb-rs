@@ -364,6 +364,8 @@ fn config() -> PersistentCacheConfig {
     PersistentCacheConfig {
         directory: PathBuf::from("simulated-cache"),
         capacity_bytes: CAPACITY_BYTES,
+        open_timeout: PersistentCacheConfig::DEFAULT_OPEN_TIMEOUT,
+        shutdown_timeout: PersistentCacheConfig::DEFAULT_SHUTDOWN_TIMEOUT,
     }
 }
 
