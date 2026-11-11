@@ -2356,3 +2356,29 @@ fn split_target(path: &ObjectPath) -> SplitTarget<'_> {
         _ => SplitTarget::Root,
     }
 }
+
+// The structural gate of a split is no topology signal. Otherwise the gate on
+// an underfull leaf queues a merge, which joins the two leaves of the split
+// again before the transaction that asked for the split can use them.
+#[tokio::test]
+async fn a_capacity_split_of_an_underfull_leaf_queues_no_merge() {
+    let s = store();
+    seed_sibling_leaves(&s, 2).await;
+    let bg = Arc::new(Background::new());
+    // The leaves are within the default soft caps, and underfull.
+    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+
+    split_path(&sp, &node_path("L0"), &SplitReason::Capacity)
+        .await
+        .unwrap();
+
+    assert_eq!(leaf_keys(&s).await.len(), 3);
+    let merges: Vec<_> = sp
+        .candidates
+        .drain()
+        .into_iter()
+        .filter(|candidate| matches!(candidate.cause, CandidateCause::Merge(_)))
+        .map(|candidate| candidate.path)
+        .collect();
+    assert_eq!(merges, Vec::<ObjectPath>::new());
+}

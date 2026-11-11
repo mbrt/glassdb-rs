@@ -47,7 +47,7 @@ use crate::gc::GcHints;
 use crate::key_resolver::KeyResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::{Monitor, OwnerAbortOutcome};
-use crate::structural::StructuralHintSink;
+use crate::structural::{LandedSplits, StructuralHintSink};
 use crate::tlocker::{LockOutcome, LockedTx, Locker};
 
 mod direct_commit;
@@ -401,6 +401,7 @@ pub struct Algo {
     locker: Locker,
     direct_commit: DirectCommit,
     structural_hints: StructuralHintSink,
+    landed_splits: LandedSplits,
     mon: Monitor,
     gc_hints: GcHints,
     timeline: Timeline,
@@ -438,6 +439,7 @@ impl Algo {
         collection_reservation_limit: usize,
         inline_policy: InlinePolicy,
         structural_hints: StructuralHintSink,
+        landed_splits: LandedSplits,
     ) -> Self {
         let direct_commit = DirectCommit::new(
             router,
@@ -458,6 +460,7 @@ impl Algo {
             locker,
             direct_commit,
             structural_hints,
+            landed_splits,
             mon,
             gc_hints,
             timeline,
@@ -1085,6 +1088,9 @@ impl Algo {
         let serial = tx.should_acquire_serially();
         let mut conflicts: usize = 0;
         let mut leaf_full_since: Option<rt::Instant> = None;
+        // Made before the first pass, so that a split that lands after a
+        // `LeafFull` and before its wait still ends the wait.
+        let mut landed_splits = self.landed_splits.watch();
         loop {
             // A higher-priority peer may have aborted us; re-checked each
             // iteration so a wound landing during a long wait surfaces promptly
@@ -1120,7 +1126,10 @@ impl Algo {
                     rt::sleep(tx.backoff.next_delay()).await;
                 }
                 // Capacity is not lock contention. Retain other leaf holds and
-                // wait for the hinted split without serial escalation.
+                // wait for the hinted split without serial escalation. A split
+                // that lands ends the wait at once, so that the transaction
+                // uses the new leaves before other changes, such as a merge,
+                // can join them again.
                 Ok(LockOutcome::LeafFull) => {
                     let since = *leaf_full_since.get_or_insert_with(rt::Instant::now);
                     if since.elapsed() >= MAX_LEAF_FULL_WAIT {
@@ -1129,7 +1138,10 @@ impl Algo {
                             MAX_LEAF_FULL_WAIT.as_secs()
                         )));
                     }
-                    rt::sleep(tx.backoff.next_delay()).await;
+                    tokio::select! {
+                        _ = rt::sleep(tx.backoff.next_delay()) => {}
+                        _ = landed_splits.next() => {}
+                    }
                 }
                 // The dropped parallel acquisition can still publish. Leave its
                 // owner operation unresolved so end pins the old identity.

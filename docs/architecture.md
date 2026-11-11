@@ -376,7 +376,9 @@ then admits no new entries until its splits make it smaller. The check after the
 stage uses only shared settings, so these stages never use the split headroom.
 
 A rejected stage gets `LeafFull`. The transaction keeps the holds that landed on
-other leaves and retries, so the restructurer can make room. The first capacity
+other leaves and retries, so the restructurer can make room. It retries when its
+backoff ends, or at once when a split lands in its database instance, so that it
+uses the new leaves before a merge can join them again. The first capacity
 result starts one bounded wait. Leaf revisions, reroutes, and other full leaves
 do not reset it. Without that bound, a split that cannot happen or continuous
 churn would make the foreground wait forever. A split divides the new keys of a
@@ -691,9 +693,12 @@ policy. It gives the other signals to the policy, which ignores the ones that
 it does not use. `MaintenanceCandidates` is only the queue.
 
 Committed leaf writes, parent reconciliation, and capacity rejections queue
-candidates. With the default writers topology policy, the soft caps, the
-underfull threshold, and inline pressure decide, and the write spans that the
-writers of the leaf entries show move soft cap splits and cause merges
+candidates. The leaf write that only takes a structural gate queues none,
+because the structural change checks the node again itself, and a merge
+candidate of the gated leaf could undo its split. With the default writers
+topology policy, the soft caps, the underfull threshold, and inline pressure
+decide, and the write spans that the writers of the leaf entries show move soft
+cap splits and cause merges
 ([ADR-084](adr/084-size-causes-are-the-default-topology-policy.md)). A database
 instance that loses leaf CASes on a key to other database instances also splits
 the key away from their keys. It knows its own writers from the transaction

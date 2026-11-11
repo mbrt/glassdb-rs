@@ -56,6 +56,7 @@ use policy::{
 use reclamation::ReclamationReporter;
 use reconcile::ParentReconciler;
 use recovery::{RecoveryAction, RecoveryStep, StructuralRecovery};
+pub(crate) use split::LandedSplits;
 use split::{SplitReason, Splitter};
 use stats::Stats;
 
@@ -93,6 +94,7 @@ pub struct Restructurer {
     // producers receive.
     hints: StructuralHintSink,
     stats: Arc<Stats>,
+    landed_splits: LandedSplits,
     splitter: Splitter,
     merger: Merger,
     changes: ChangeLifecycle,
@@ -233,6 +235,11 @@ impl Restructurer {
         self.hints.clone()
     }
 
+    /// Returns the splits that land in this database instance.
+    pub(crate) fn landed_splits(&self) -> LandedSplits {
+        self.landed_splits.clone()
+    }
+
     /// Returns and resets the counters of background split and merge
     /// activity.
     pub fn stats_and_reset(&self) -> TopologyStats {
@@ -320,6 +327,7 @@ impl Restructurer {
             db_prefix,
         );
         let reclamation = ReclamationReporter::new(stats.clone(), gc_hints);
+        let landed_splits = LandedSplits::new();
         let splitter = Splitter::new(
             nodes.clone(),
             router.clone(),
@@ -329,6 +337,7 @@ impl Restructurer {
             decisions.clone(),
             stats.clone(),
             reclamation.clone(),
+            landed_splits.clone(),
         );
         let merger = Merger::new(
             nodes,
@@ -358,6 +367,7 @@ impl Restructurer {
             candidates,
             hints,
             stats,
+            landed_splits,
             splitter,
             merger,
             changes,

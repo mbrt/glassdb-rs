@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use glassdb::{Database, Error, KeyScan, TransactionLimits, memory::MemoryBackend};
+use glassdb::{Database, Error, KeyScan, RetryTiming, TransactionLimits, memory::MemoryBackend};
 
 fn expect_limit<T>(result: Result<T, Error>, resource: &'static str, limit: usize) {
     assert!(
@@ -723,4 +723,45 @@ async fn key_access_byte_limit_counts_reads_writes_and_deletes() {
 
     result.unwrap();
     assert_eq!(c.read(b"cd").await.unwrap().as_deref(), Some(&b"v"[..]));
+}
+
+// A capacity split that makes underfull leaves must not be undone by a merge
+// before the transaction that asked for it uses the new leaves.
+#[tokio::test(start_paused = true)]
+async fn creates_that_few_existing_keys_divide_wait_for_the_splits() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .transaction_limits(limits_over_the_hard_cap())
+        .open()
+        .await
+        .unwrap();
+    let c = db.root_collection();
+    // Each leaf that the splits make has too few live entries, and is a merge
+    // candidate.
+    for i in [0, 4000, 8000, 12000, 15999] {
+        c.write(&bulk_key(i, 9), b"v").await.unwrap();
+    }
+
+    create_keys(&db, 16_000, 400).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_create_in_a_full_leaf_retries_when_a_split_lands() {
+    let db = Database::builder("limits", MemoryBackend::new())
+        .open()
+        .await
+        .unwrap();
+    write_keys_outside_the_bulk_range(&db).await;
+    // The bulk keys take their leaf over the create limit.
+    create_keys(&db, 2500, 400).await.unwrap();
+
+    let started = tokio::time::Instant::now();
+    db.root_collection().write(b"m5", b"v").await.unwrap();
+
+    // The jitter of a backoff makes a delay at most half shorter.
+    let shortest_backoff = RetryTiming::default().wait.initial_interval / 2;
+    assert!(
+        started.elapsed() < shortest_backoff,
+        "the create waited {:?} for its backoff, after the split landed",
+        started.elapsed()
+    );
 }
