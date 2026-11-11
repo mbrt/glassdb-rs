@@ -51,6 +51,7 @@ use glassdb_storage::{
     IndexNode, LeafObservation, Node, NodeSizePolicy, NodeStore, Requirement, StorageError,
     Timeline, TreeRouter,
 };
+use tokio::sync::watch;
 
 use crate::error::TransError;
 
@@ -74,6 +75,50 @@ pub(super) struct Splitter {
     decisions: Arc<dyn TopologyDecisions>,
     stats: Arc<Stats>,
     reclamation: ReclamationReporter,
+    landed: LandedSplits,
+}
+
+/// The splits that land in one database instance. A transaction that waits
+/// for leaf capacity retries when one lands, and does not wait for its whole
+/// backoff.
+#[derive(Clone)]
+pub(crate) struct LandedSplits {
+    sender: Arc<watch::Sender<()>>,
+}
+
+/// Waits for the splits that land after it was made.
+pub(crate) struct SplitWatch {
+    receiver: watch::Receiver<()>,
+}
+
+impl LandedSplits {
+    pub(super) fn new() -> Self {
+        Self {
+            sender: Arc::new(watch::Sender::new(())),
+        }
+    }
+
+    /// Starts to watch for the splits that land from now on.
+    pub(crate) fn watch(&self) -> SplitWatch {
+        SplitWatch {
+            receiver: self.sender.subscribe(),
+        }
+    }
+
+    fn record(&self) {
+        self.sender.send_replace(());
+    }
+}
+
+impl SplitWatch {
+    /// Waits until a split lands that this watch did not return for yet.
+    pub(crate) async fn next(&mut self) {
+        // The sender closes only when every `LandedSplits` is dropped, and
+        // then no split can land any more.
+        if self.receiver.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// Why a node may need a split.
@@ -142,6 +187,7 @@ impl Splitter {
         decisions: Arc<dyn TopologyDecisions>,
         stats: Arc<Stats>,
         reclamation: ReclamationReporter,
+        landed: LandedSplits,
     ) -> Self {
         Self {
             nodes,
@@ -152,6 +198,7 @@ impl Splitter {
             decisions,
             stats,
             reclamation,
+            landed,
         }
     }
 
@@ -485,6 +532,7 @@ impl Splitter {
     ) {
         self.reclamation.record(reclaimed, false);
         self.stats.record_split(reason);
+        self.landed.record();
         for (id, node) in outputs {
             self.enqueue_if_over_soft_cap(collection, id, node);
         }

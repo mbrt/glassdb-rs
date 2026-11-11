@@ -646,6 +646,7 @@ impl DormantEngine {
             collection_reservation_limit,
             inline_policy,
             restructurer.hint_sink(),
+            restructurer.landed_splits(),
         );
         let engine = Engine {
             backend,

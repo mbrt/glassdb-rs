@@ -396,6 +396,11 @@ pub(crate) trait MemberPolicy: Send + Sync {
     fn direct_publication_keys(&self) -> Vec<&[u8]> {
         Vec::new()
     }
+
+    /// Whether a leaf write that stages this member is a topology signal.
+    fn signals_topology(&self) -> bool {
+        true
+    }
 }
 
 /// One complete operation submitted to the shared leaf-mutation engine.
@@ -560,6 +565,8 @@ struct MutationPlan {
     entries: BTreeMap<Vec<u8>, LeafEntry>,
     locks: NodeLocks,
     members: Vec<PlannedMember>,
+    // Whether a staged member makes the leaf write a topology signal.
+    signals_topology: bool,
 }
 
 impl MutationPlan {
@@ -730,6 +737,7 @@ impl CasWorker {
                 .collect(),
             locks: edit.locks().clone(),
             members: Vec::with_capacity(members.len()),
+            signals_topology: false,
         };
 
         // Oldest-first planning prevents backtracking: a later member cannot
@@ -836,6 +844,7 @@ impl CasWorker {
                                     .map(<[u8]>::to_vec),
                             );
                             plan.locks = proposed.locks;
+                            plan.signals_topology |= member.policy.signals_topology();
                             plan.members.push(PlannedMember {
                                 id: *tx,
                                 outcome: proposed.outcome,
@@ -1033,7 +1042,9 @@ impl CasWorker {
             // over the soft cap (ADR-031); the restructurer reloads and
             // re-checks, so a spurious hint only costs one load.
             Ok(CasResult::Applied(receipt)) => {
-                self.core.hinter.observe_leaf(path, &new_leaf);
+                if plan.signals_topology {
+                    self.core.hinter.observe_leaf(path, &new_leaf);
+                }
                 Ok(PersistResult::Applied(receipt))
             }
             Ok(CasResult::Rejected) => Ok(PersistResult::Rejected),

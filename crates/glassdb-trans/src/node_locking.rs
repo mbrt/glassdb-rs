@@ -585,6 +585,14 @@ impl MemberPolicy for StructuralGateOperation {
     fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
         MemberOutcome::Conflict
     }
+
+    /// The structural change that takes the gate checks the node again
+    /// itself. A signal from the gate would queue a change of the same node,
+    /// such as a merge that undoes the split that takes the gate. A member
+    /// that shares the CAS of the gate still makes the write a signal.
+    fn signals_topology(&self) -> bool {
+        false
+    }
 }
 
 impl LeafOperation for StructuralGateOperation {
