@@ -310,7 +310,7 @@ impl PersistentCache {
         let fallback_metrics = metrics.clone();
         let open_timeout = config.open_timeout;
         let (completion, result) = oneshot::channel();
-        let worker = match Self::spawn_worker(
+        let worker = Self::spawn_worker(
             config,
             database_name.to_owned(),
             database_id,
@@ -318,14 +318,7 @@ impl PersistentCache {
             metrics,
             media,
             completion,
-        ) {
-            Ok(worker) => worker,
-            Err(error) => {
-                fallback_metrics.l2_error();
-                tracing::warn!(%error, "persistent-cache worker failed to start");
-                return Self::disabled_open(fallback_metrics);
-            }
-        };
+        );
 
         match rt::timeout(open_timeout, result).await {
             Ok(Ok(opened)) => Self::attach_worker(opened, worker),
@@ -364,14 +357,6 @@ impl PersistentCache {
             media,
             completion,
         );
-        let worker = match worker {
-            Ok(worker) => worker,
-            Err(error) => {
-                fallback_metrics.l2_error();
-                tracing::warn!(%error, "persistent-cache worker failed to start");
-                return Self::disabled_open(fallback_metrics);
-            }
-        };
         match result.await {
             Ok(opened) => Self::attach_worker(opened, worker),
             Err(_) => {

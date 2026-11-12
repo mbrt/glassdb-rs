@@ -31,7 +31,7 @@ const PROMOTION_CAP_DIVISOR: u64 = 8;
 impl PersistentCache {
     pub(super) fn attach_worker(
         opened: OpenedPersistentCache,
-        worker: rt::DedicatedJoinHandle<()>,
+        worker: rt::JoinHandle<()>,
     ) -> OpenedPersistentCache {
         if let Some(inner) = &opened.cache.inner {
             inner.attach_worker(worker);
@@ -47,8 +47,8 @@ impl PersistentCache {
         metrics: Arc<CacheMetrics>,
         media: Arc<dyn CacheMedia>,
         completion: oneshot::Sender<OpenedPersistentCache>,
-    ) -> Result<rt::DedicatedJoinHandle<()>, rt::SpawnError> {
-        rt::spawn_dedicated("glassdb-l2", async move {
+    ) -> rt::JoinHandle<()> {
+        rt::spawn(async move {
             Self::run_opening_worker(
                 config,
                 database_name,
@@ -114,7 +114,7 @@ pub(super) struct CacheInner {
     shutdown_started: AtomicBool,
     pub(super) completion: Arc<Completion>,
     worker_joined: Completion,
-    worker: Mutex<Option<rt::DedicatedJoinHandle<()>>>,
+    worker: Mutex<Option<rt::JoinHandle<()>>>,
     pub(super) shutdown_timeout: Duration,
 }
 
@@ -223,7 +223,7 @@ impl CacheInner {
         )
     }
 
-    fn attach_worker(&self, worker: rt::DedicatedJoinHandle<()>) {
+    fn attach_worker(&self, worker: rt::JoinHandle<()>) {
         *self.worker.lock().unwrap() = Some(worker);
     }
 

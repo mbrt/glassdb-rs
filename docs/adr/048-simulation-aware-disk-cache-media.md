@@ -12,6 +12,9 @@ runtime seam from
 The native `spawn_dedicated` fallback in simulation builds is superseded by
 [ADR-069](069-deterministic-only-simulation-builds.md).
 
+The dedicated worker thread and the `rt::spawn_dedicated` primitive are
+superseded by [ADR-094](094-persistent-cache-worker-is-a-task-over-blocking-pool-calls.md).
+
 ## Context
 
 ADR-045 places blocking positioned file I/O on a dedicated worker thread. That
