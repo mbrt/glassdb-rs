@@ -20,7 +20,7 @@ use crate::sim_support::{assert_slow_mutation_modes, fault_tape, tape};
 use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{
     Covered, FaultConfig, MembOp, MembershipWorkload, MergingMembershipWorkload,
-    StructuralCoverage, pct_sweep, run_and_assert, run_and_assert_with_faults,
+    StructuralCoverage, run_and_assert, run_and_assert_with_faults,
 };
 
 const SPLITS: StructuralCoverage = StructuralCoverage {
@@ -91,10 +91,7 @@ fn contended_membership() -> Covered<MembershipWorkload> {
             ],
         ]),
     };
-    Covered {
-        workload,
-        requires: SPLITS,
-    }
+    Covered::new(workload, SPLITS)
 }
 
 /// A workload that fills the whole key universe: every client puts all of its
@@ -109,10 +106,7 @@ fn fill_all_keys() -> Covered<MembershipWorkload> {
             vec![MembOp::Put(2), MembOp::Put(5), MembOp::List],
         ]),
     };
-    Covered {
-        workload,
-        requires: SPLITS,
-    }
+    Covered::new(workload, SPLITS)
 }
 
 /// Fills the key universe, lets the fill split leaves, and then deletes all keys
@@ -148,13 +142,13 @@ fn fill_then_shrink() -> Covered<MergingMembershipWorkload> {
             .concat(),
         ],
     });
-    Covered {
+    Covered::new(
         workload,
-        requires: StructuralCoverage {
+        StructuralCoverage {
             splits: true,
             merges: true,
         },
-    }
+    )
 }
 
 #[test]
@@ -226,8 +220,8 @@ fn pct_seed_breadth_holds_membership() {
     // Seed-breadth sweep: many PCT schedules over the contended workload, with
     // and without faults. Any invariant violation panics inside the sweep.
     let workload = contended_membership();
-    pct_sweep(&workload, FaultConfig::failures(7));
-    pct_sweep(&workload, FaultConfig::none());
+    workload.pct_sweep(FaultConfig::failures(7));
+    workload.pct_sweep(FaultConfig::none());
 }
 
 #[test]
@@ -264,6 +258,6 @@ fn membership_holds_while_nodes_merge_under_faults_and_restarts() {
 #[test]
 fn pct_seed_breadth_holds_membership_while_nodes_merge() {
     let workload = fill_then_shrink();
-    pct_sweep(&workload, FaultConfig::failures(7));
-    pct_sweep(&workload, FaultConfig::none());
+    workload.pct_sweep(FaultConfig::failures(7));
+    workload.pct_sweep(FaultConfig::none());
 }

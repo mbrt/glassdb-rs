@@ -76,7 +76,10 @@ therefore adds a short latency to every request and reply, also in runs without
 faults, so that the timers of background work (restructurer sweeps,
 structural recovery, GC) elapse while the clients run. The fault tape and the
 seed select each latency. A workload that exists to exercise splits or merges
-uses `Covered`, which fails a run without faults that makes no such change.
+uses `Covered`, which fails a run without faults that makes no such change. A
+schedule can delay a change past the end of its run, so a PCT sweep of a
+`Covered` workload fails only when too few of its runs without faults that
+finish in time make the change. This catches a change that stops in most schedules.
 
 Each instance also bounds its foreground client work in virtual time. On expiry
 it interrupts the client tasks and leaves unfinished operations in doubt. The

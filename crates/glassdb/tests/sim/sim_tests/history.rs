@@ -313,13 +313,13 @@ fn shrinking_history() -> Covered<HistoryWorkload> {
             })
             .collect(),
     };
-    Covered {
+    Covered::new(
         workload,
-        requires: StructuralCoverage {
+        StructuralCoverage {
             splits: true,
             merges: true,
         },
-    }
+    )
 }
 
 #[test]
@@ -335,6 +335,6 @@ fn exact_history_holds_while_leaves_merge() {
 #[test]
 fn pct_seed_breadth_holds_exact_history_while_leaves_merge() {
     let workload = shrinking_history();
-    pct_sweep(&workload, FaultConfig::none());
-    pct_sweep(&workload, FaultConfig::failures(7));
+    workload.pct_sweep(FaultConfig::none());
+    workload.pct_sweep(FaultConfig::failures(7));
 }

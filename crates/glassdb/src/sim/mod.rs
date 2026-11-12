@@ -24,7 +24,8 @@
 //!   after admissible public errors while retaining in-doubt outcomes.
 //!
 //! [`Covered`] runs a workload and also requires splits or merges, so that
-//! hand-written runs cannot stop exercising structural changes unnoticed.
+//! hand-written runs cannot stop exercising structural changes unnoticed. A
+//! PCT sweep requires them only in a share of its runs.
 
 mod api;
 mod coverage;

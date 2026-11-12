@@ -223,6 +223,11 @@ const PCT_SEEDS_VAR: &str = "GLASSDB_PCT_SEEDS";
 /// The sweep runs N seeds, from 0 to N - 1. N is [`PCT_DEFAULT_SEEDS`], or the
 /// value of the `GLASSDB_PCT_SEEDS` environment variable. A failure names its
 /// seed, so [`pct_assert`] reproduces it.
+///
+/// Sweep a [`Covered`](crate::sim::Covered) workload with
+/// [`Covered::pct_sweep`](crate::sim::Covered::pct_sweep). This sweep makes
+/// each of its runs check the structural changes, and a schedule can delay a
+/// change past the end of its run.
 pub fn pct_sweep<W: SimWorkload>(workload: &W, faults: FaultConfig) {
     let seeds = pct_seed_count();
     for seed in 0..seeds.get() {
