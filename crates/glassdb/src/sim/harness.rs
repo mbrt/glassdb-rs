@@ -143,6 +143,8 @@ pub(crate) async fn open_det_db(
             PersistentCacheConfig {
                 directory: PathBuf::from("simulated-fuzz-cache"),
                 capacity_bytes: CACHE_CAPACITY_BYTES,
+                open_timeout: PersistentCacheConfig::DEFAULT_OPEN_TIMEOUT,
+                shutdown_timeout: PersistentCacheConfig::DEFAULT_SHUTDOWN_TIMEOUT,
             },
             media,
         )

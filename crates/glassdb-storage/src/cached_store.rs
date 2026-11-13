@@ -1003,6 +1003,8 @@ mod tests {
             PersistentCacheConfig {
                 directory: directory.path().to_path_buf(),
                 capacity_bytes: 2 * 1024 * 1024,
+                open_timeout: PersistentCacheConfig::DEFAULT_OPEN_TIMEOUT,
+                shutdown_timeout: TEST_SHUTDOWN_TIMEOUT,
             },
             "db",
             cache_id(),
@@ -1022,6 +1024,8 @@ mod tests {
             PersistentCacheConfig {
                 directory: directory.path().to_path_buf(),
                 capacity_bytes: 2 * 1024 * 1024,
+                open_timeout: PersistentCacheConfig::DEFAULT_OPEN_TIMEOUT,
+                shutdown_timeout: TEST_SHUTDOWN_TIMEOUT,
             },
             "db",
             cache_id(),
@@ -1111,6 +1115,8 @@ mod tests {
                     PersistentCacheConfig {
                         directory: directory.path().to_path_buf(),
                         capacity_bytes: 2 * 1024 * 1024,
+                        open_timeout: PersistentCacheConfig::DEFAULT_OPEN_TIMEOUT,
+                        shutdown_timeout: TEST_SHUTDOWN_TIMEOUT,
                     },
                     "db",
                     cache_id(),
@@ -1227,6 +1233,10 @@ mod tests {
             .into_installed()
     }
 
+    // Tests that reopen the directory must not depend on disk speed: a timed-out
+    // shutdown drops the clean-shutdown record and keeps the lock until the
+    // blocked I/O returns.
+    const TEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3600);
     const OLD_VALUE: &[u8] = b"old";
     const PROPOSED_VALUE: &[u8] = b"proposed";
     const WINNER_VALUE: &[u8] = b"winner";

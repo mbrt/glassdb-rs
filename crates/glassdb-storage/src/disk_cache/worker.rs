@@ -31,7 +31,7 @@ const PROMOTION_CAP_DIVISOR: u64 = 8;
 impl PersistentCache {
     pub(super) fn attach_worker(
         opened: OpenedPersistentCache,
-        worker: rt::DedicatedJoinHandle<()>,
+        worker: rt::JoinHandle<()>,
     ) -> OpenedPersistentCache {
         if let Some(inner) = &opened.cache.inner {
             inner.attach_worker(worker);
@@ -47,8 +47,8 @@ impl PersistentCache {
         metrics: Arc<CacheMetrics>,
         media: Arc<dyn CacheMedia>,
         completion: oneshot::Sender<OpenedPersistentCache>,
-    ) -> Result<rt::DedicatedJoinHandle<()>, rt::SpawnError> {
-        rt::spawn_dedicated("glassdb-l2", async move {
+    ) -> rt::JoinHandle<()> {
+        rt::spawn(async move {
             Self::run_opening_worker(
                 config,
                 database_name,
@@ -71,6 +71,7 @@ impl PersistentCache {
         media: Arc<dyn CacheMedia>,
         completion: oneshot::Sender<OpenedPersistentCache>,
     ) {
+        let shutdown_timeout = config.shutdown_timeout;
         let (disk, writer, last_sequence_point) = match open_disk(
             config,
             &database_name,
@@ -89,7 +90,7 @@ impl PersistentCache {
                 return;
             }
         };
-        let (inner, worker) = CacheInner::prepare(disk, writer, metrics.clone());
+        let (inner, worker) = CacheInner::prepare(disk, writer, metrics.clone(), shutdown_timeout);
         let opened = OpenedPersistentCache {
             cache: Self {
                 inner: Some(Arc::new(inner)),
@@ -113,7 +114,8 @@ pub(super) struct CacheInner {
     shutdown_started: AtomicBool,
     pub(super) completion: Arc<Completion>,
     worker_joined: Completion,
-    worker: Mutex<Option<rt::DedicatedJoinHandle<()>>>,
+    worker: Mutex<Option<rt::JoinHandle<()>>>,
+    pub(super) shutdown_timeout: Duration,
 }
 
 impl CacheInner {
@@ -189,6 +191,7 @@ impl CacheInner {
         disk: Arc<Disk>,
         writer: WriterState,
         metrics: Arc<CacheMetrics>,
+        shutdown_timeout: Duration,
     ) -> (Self, CacheWorker) {
         let (sender, receiver) = mpsc::channel(WORK_QUEUE_ITEMS);
         let completion = Arc::new(Completion::new());
@@ -209,6 +212,7 @@ impl CacheInner {
                 completion: completion.clone(),
                 worker_joined: Completion::new(),
                 worker: Mutex::new(None),
+                shutdown_timeout,
             },
             CacheWorker {
                 shared,
@@ -219,7 +223,7 @@ impl CacheInner {
         )
     }
 
-    fn attach_worker(&self, worker: rt::DedicatedJoinHandle<()>) {
+    fn attach_worker(&self, worker: rt::JoinHandle<()>) {
         *self.worker.lock().unwrap() = Some(worker);
     }
 
@@ -634,6 +638,10 @@ mod tests {
     use super::*;
 
     const TEST_CAPACITY: u64 = 2 * 1024 * 1024;
+    // Tests that reopen the directory must not depend on disk speed: a timed-out
+    // shutdown drops the clean-shutdown record and keeps the lock until the
+    // blocked I/O returns.
+    const TEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3600);
 
     struct Fixture {
         _directory: TempDir,
@@ -649,6 +657,8 @@ mod tests {
         let config = PersistentCacheConfig {
             directory: directory.path().to_path_buf(),
             capacity_bytes: TEST_CAPACITY,
+            open_timeout: PersistentCacheConfig::DEFAULT_OPEN_TIMEOUT,
+            shutdown_timeout: TEST_SHUTDOWN_TIMEOUT,
         };
         let (disk, writer, _) = open_disk(
             config,
@@ -660,7 +670,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (inner, worker) = CacheInner::prepare(disk, writer, metrics);
+        let (inner, worker) = CacheInner::prepare(disk, writer, metrics, TEST_SHUTDOWN_TIMEOUT);
         Fixture {
             _directory: directory,
             media,

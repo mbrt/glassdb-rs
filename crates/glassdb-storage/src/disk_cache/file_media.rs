@@ -63,55 +63,94 @@ mod native {
     use super::super::media::{CacheFile, CacheMedia};
     use super::FileMedia;
 
+    /// Runs one blocking file operation on Tokio's blocking pool.
+    ///
+    /// The closure owns what it uses. If the caller drops the future, the
+    /// operation still runs to its end, and so it keeps the file and its lock
+    /// until then.
+    async fn blocking<T, F>(operation: F) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> io::Result<T> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(operation)
+            .await
+            .map_err(io::Error::other)?
+    }
+
     struct FileCacheFile {
-        file: File,
+        file: Arc<File>,
     }
 
     #[async_trait]
     impl CacheMedia for FileMedia {
         async fn open_exclusive(&self, directory: &Path) -> io::Result<Arc<dyn CacheFile>> {
-            std::fs::create_dir_all(directory)?;
-            let path = directory.join(CACHE_FILE);
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(path)?;
-            rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive)?;
-            Ok(Arc::new(FileCacheFile { file }))
+            let directory = directory.to_path_buf();
+            blocking(move || {
+                std::fs::create_dir_all(&directory)?;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(directory.join(CACHE_FILE))?;
+                rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive)?;
+                Ok(Arc::new(FileCacheFile {
+                    file: Arc::new(file),
+                }) as Arc<dyn CacheFile>)
+            })
+            .await
         }
     }
 
     #[async_trait]
     impl CacheFile for FileCacheFile {
         async fn len(&self) -> io::Result<u64> {
-            Ok(self.file.metadata()?.len())
+            let file = self.file.clone();
+            blocking(move || Ok(file.metadata()?.len())).await
         }
 
         async fn set_len(&self, len: u64) -> io::Result<()> {
-            self.file.set_len(len)
+            let file = self.file.clone();
+            blocking(move || file.set_len(len)).await
         }
 
         async fn allocate(&self, len: u64) -> io::Result<()> {
-            rustix::fs::fallocate(&self.file, FallocateFlags::empty(), 0, len)
-                .map_err(io::Error::from)
+            let file = self.file.clone();
+            blocking(move || {
+                rustix::fs::fallocate(&*file, FallocateFlags::empty(), 0, len)
+                    .map_err(io::Error::from)
+            })
+            .await
         }
 
         async fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
-            self.file.read_exact_at(bytes, offset)
+            let file = self.file.clone();
+            let len = bytes.len();
+            let read = blocking(move || {
+                let mut buffer = vec![0; len];
+                file.read_exact_at(&mut buffer, offset)?;
+                Ok(buffer)
+            })
+            .await?;
+            bytes.copy_from_slice(&read);
+            Ok(())
         }
 
         async fn write_all_at(&self, bytes: &[u8], offset: u64) -> io::Result<()> {
-            self.file.write_all_at(bytes, offset)
+            let file = self.file.clone();
+            let bytes = bytes.to_vec();
+            blocking(move || file.write_all_at(&bytes, offset)).await
         }
 
         async fn sync_data(&self) -> io::Result<()> {
-            self.file.sync_data()
+            let file = self.file.clone();
+            blocking(move || file.sync_data()).await
         }
 
         async fn sync_all(&self) -> io::Result<()> {
-            self.file.sync_all()
+            let file = self.file.clone();
+            blocking(move || file.sync_all()).await
         }
     }
 }

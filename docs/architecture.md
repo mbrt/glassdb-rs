@@ -785,9 +785,13 @@ of the writer. Eviction does not revoke observations that readers or
 transactions already hold.
 
 The optional L2 stores encoded bodies, revisions, and currentness points on
-disk. One bounded worker does all its file I/O instead of Tokio's blocking pool,
-so under overload GlassDB skips L2 instead of queuing blocking tasks without
-limit. Open and shutdown have deadlines and fail open.
+disk. One bounded worker task owns all its file I/O. It runs each file call on
+Tokio's blocking pool and has one call in flight, so under overload GlassDB
+skips L2 instead of queuing blocking tasks without limit. Open and shutdown have
+deadlines and fail open. A shutdown that times out aborts the worker task, but a
+file call that already runs keeps the file lock until it returns. Open therefore
+retries the lock until the open deadline, so a reopen of the same directory
+survives a slow shutdown.
 
 ### Evidence rules
 

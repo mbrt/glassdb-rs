@@ -31,8 +31,6 @@ use media::CacheMedia;
 use worker::{CacheInner, Work};
 
 const CACHE_FILE: &str = "l2.cache";
-const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Configuration for the optional persistent encoded-body cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +40,22 @@ pub struct PersistentCacheConfig {
     /// Maximum file size, rounded down to the cache block size. Production
     /// caches require at least 131 MiB; 512 MiB or more is recommended.
     pub capacity_bytes: u64,
+    /// Time limit for the whole open, including the wait for the file lock.
+    ///
+    /// While another owner holds the lock, the open retries. When the limit
+    /// passes, the cache is disabled. A live owner of the same directory
+    /// therefore delays the open by the full limit.
+    pub open_timeout: Duration,
+    /// Time limit for a shutdown. When the limit passes, the cache is
+    /// disabled and the worker is aborted without a clean-shutdown record.
+    pub shutdown_timeout: Duration,
+}
+
+impl PersistentCacheConfig {
+    /// Default value for [`Self::open_timeout`].
+    pub const DEFAULT_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+    /// Default value for [`Self::shutdown_timeout`].
+    pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 }
 
 /// Opaque media selection for a persistent cache.
@@ -275,7 +289,7 @@ impl PersistentCache {
         let Some(inner) = &self.inner else {
             return;
         };
-        if rt::timeout(SHUTDOWN_TIMEOUT, inner.shutdown())
+        if rt::timeout(inner.shutdown_timeout, inner.shutdown())
             .await
             .is_err()
         {
@@ -294,8 +308,9 @@ impl PersistentCache {
     ) -> OpenedPersistentCache {
         let metrics = Arc::new(CacheMetrics::new());
         let fallback_metrics = metrics.clone();
+        let open_timeout = config.open_timeout;
         let (completion, result) = oneshot::channel();
-        let worker = match Self::spawn_worker(
+        let worker = Self::spawn_worker(
             config,
             database_name.to_owned(),
             database_id,
@@ -303,16 +318,9 @@ impl PersistentCache {
             metrics,
             media,
             completion,
-        ) {
-            Ok(worker) => worker,
-            Err(error) => {
-                fallback_metrics.l2_error();
-                tracing::warn!(%error, "persistent-cache worker failed to start");
-                return Self::disabled_open(fallback_metrics);
-            }
-        };
+        );
 
-        match rt::timeout(OPEN_TIMEOUT, result).await {
+        match rt::timeout(open_timeout, result).await {
             Ok(Ok(opened)) => Self::attach_worker(opened, worker),
             Ok(Err(_)) => {
                 worker.abort();
@@ -349,14 +357,6 @@ impl PersistentCache {
             media,
             completion,
         );
-        let worker = match worker {
-            Ok(worker) => worker,
-            Err(error) => {
-                fallback_metrics.l2_error();
-                tracing::warn!(%error, "persistent-cache worker failed to start");
-                return Self::disabled_open(fallback_metrics);
-            }
-        };
         match result.await {
             Ok(opened) => Self::attach_worker(opened, worker),
             Err(_) => {
@@ -385,15 +385,22 @@ impl PersistentCache {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::path::Path;
     use std::sync::atomic::AtomicBool;
 
     use super::disk::open_disk;
     use super::format::COMPACT_GEOMETRY;
+    use super::media::CacheFile;
     use super::sim_media::{MediaFaultProfile, SimMedia};
     use super::*;
     use tempfile::TempDir;
 
     const TEST_CAPACITY: u64 = 2 * 1024 * 1024;
+    // Tests that reopen the directory must not depend on disk speed: a timed-out
+    // shutdown drops the clean-shutdown record and keeps the lock until the
+    // blocked I/O returns.
+    const TEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3600);
     const RECORD_CONTENT_OFFSET: u64 = 48;
 
     fn id(byte: u8) -> DatabaseId {
@@ -405,8 +412,24 @@ mod tests {
     }
 
     async fn open_result(dir: &TempDir, database_id: DatabaseId) -> OpenedPersistentCache {
+        open_result_within(
+            dir,
+            database_id,
+            PersistentCacheConfig::DEFAULT_OPEN_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn open_result_within(
+        dir: &TempDir,
+        database_id: DatabaseId,
+        open_timeout: Duration,
+    ) -> OpenedPersistentCache {
         PersistentCache::open_with_geometry(
-            config(dir),
+            PersistentCacheConfig {
+                open_timeout,
+                ..config(dir)
+            },
             "db",
             database_id,
             COMPACT_GEOMETRY,
@@ -428,6 +451,8 @@ mod tests {
         PersistentCacheConfig {
             directory: dir.path().to_path_buf(),
             capacity_bytes: TEST_CAPACITY,
+            open_timeout: PersistentCacheConfig::DEFAULT_OPEN_TIMEOUT,
+            shutdown_timeout: TEST_SHUTDOWN_TIMEOUT,
         }
     }
 
@@ -656,7 +681,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let database_id = id(1);
         let owner = open(&dir, database_id).await;
-        let contender = open(&dir, database_id).await;
+        let contender = open_result_within(&dir, database_id, Duration::from_millis(200))
+            .await
+            .cache;
 
         assert!(owner.is_enabled());
         assert!(!contender.is_enabled());
@@ -672,6 +699,122 @@ mod tests {
             b"body"
         );
         reopened.shutdown().await;
+    }
+
+    /// Media whose `sync_data` keeps its file alive after the caller is
+    /// dropped while a gate is closed. It models a blocking system call that an
+    /// aborted worker cannot interrupt.
+    struct StallableMedia {
+        inner: SimMedia,
+        open: tokio::sync::watch::Receiver<bool>,
+        blocked: Arc<tokio::sync::Notify>,
+    }
+
+    struct StallableFile {
+        inner: Arc<dyn CacheFile>,
+        open: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl CacheMedia for StallableMedia {
+        async fn open_exclusive(&self, directory: &Path) -> io::Result<Arc<dyn CacheFile>> {
+            let inner = match self.inner.open_exclusive(directory).await {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.blocked.notify_one();
+                    return Err(error);
+                }
+                result => result?,
+            };
+            Ok(Arc::new(StallableFile {
+                inner,
+                open: self.open.clone(),
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CacheFile for StallableFile {
+        async fn len(&self) -> io::Result<u64> {
+            self.inner.len().await
+        }
+
+        async fn set_len(&self, len: u64) -> io::Result<()> {
+            self.inner.set_len(len).await
+        }
+
+        async fn allocate(&self, len: u64) -> io::Result<()> {
+            self.inner.allocate(len).await
+        }
+
+        async fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+            self.inner.read_exact_at(bytes, offset).await
+        }
+
+        async fn write_all_at(&self, bytes: &[u8], offset: u64) -> io::Result<()> {
+            self.inner.write_all_at(bytes, offset).await
+        }
+
+        async fn sync_data(&self) -> io::Result<()> {
+            let inner = self.inner.clone();
+            let mut open = self.open.clone();
+            rt::spawn(async move {
+                let result = inner.sync_data().await;
+                let _ = open.wait_for(|is_open| *is_open).await;
+                result
+            })
+            .await
+            .expect("detached sync task panicked")
+        }
+
+        async fn sync_all(&self) -> io::Result<()> {
+            self.inner.sync_all().await
+        }
+    }
+
+    #[tokio::test]
+    async fn open_waits_for_an_aborted_worker_to_release_the_lock() {
+        let dir = TempDir::new().unwrap();
+        let (gate, open) = tokio::sync::watch::channel(true);
+        let blocked = Arc::new(tokio::sync::Notify::new());
+        let media = Arc::new(StallableMedia {
+            inner: SimMedia::new(MediaFaultProfile::Healthy, Vec::new(), 1),
+            open,
+            blocked: blocked.clone(),
+        });
+        let open_cache = |config| {
+            PersistentCache::open_with_geometry(
+                config,
+                "db",
+                id(1),
+                COMPACT_GEOMETRY,
+                Arc::new(CacheMetrics::new()),
+                media.clone(),
+            )
+        };
+        let cache = open_cache(PersistentCacheConfig {
+            shutdown_timeout: Duration::from_millis(100),
+            ..config(&dir)
+        })
+        .await
+        .cache;
+        publish_at(&cache, "db/object", b"r1", b"body", point(17));
+
+        // The sync of the clean shutdown stalls, so the shutdown times out and
+        // aborts the worker. The detached sync still holds the file and its lock.
+        gate.send(false).unwrap();
+        cache.shutdown().await;
+        assert!(!cache.is_enabled());
+        drop(cache);
+
+        // The detached sync returns only after an open found the lock held.
+        let release = async {
+            blocked.notified().await;
+            gate.send(true).unwrap();
+        };
+        let (opened, ()) = tokio::join!(open_cache(config(&dir)), release);
+
+        assert!(opened.cache.is_enabled());
+        opened.cache.shutdown().await;
     }
 
     #[tokio::test]
