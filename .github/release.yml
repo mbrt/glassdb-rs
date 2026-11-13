@@ -3,12 +3,15 @@ changelog:
     labels:
       - dependencies
   categories:
-    - title: Breaking Changes
+    - title: Breaking changes
       labels:
         - breaking
     - title: New features
       labels:
         - enhancement
+    - title: Performance improvements
+      labels:
+        - perf
     - title: Maintenance and bug fixing
       labels:
         - "*"
