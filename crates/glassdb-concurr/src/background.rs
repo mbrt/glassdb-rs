@@ -52,7 +52,8 @@ impl TrackedTask {
     }
 }
 
-struct TaskCompletion {
+/// Reports the end of one task spawned with [`Background::spawn_waited`].
+pub struct TaskCompletion {
     done: AtomicBool,
     notify: Notify,
 }
@@ -65,7 +66,8 @@ impl TaskCompletion {
         }
     }
 
-    async fn wait(&self) {
+    /// Waits until the task ends.
+    pub async fn wait(&self) {
         loop {
             let notified = self.notify.notified();
             if self.done.load(Ordering::Acquire) {
@@ -171,17 +173,17 @@ impl Background {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.spawn_tracked(TaskLane::BestEffort, f);
+        let _ = self.spawn_tracked(TaskLane::BestEffort, f);
     }
 
     /// Spawns `f` as clean-shutdown work. The task runs to completion and
     /// [`Background::shutdown`] waits for it. Work submitted after shutdown
-    /// starts is discarded.
-    pub fn spawn_waited<F>(&self, f: F)
+    /// starts is discarded, and then the result is none.
+    pub fn spawn_waited<F>(&self, f: F) -> Option<Arc<TaskCompletion>>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.spawn_tracked(TaskLane::Waited, f);
+        self.spawn_tracked(TaskLane::Waited, f)
     }
 
     /// Closes task admission, aborts and joins best-effort tasks, and waits for
@@ -216,14 +218,14 @@ impl Background {
         inner.complete = true;
     }
 
-    fn spawn_tracked<F>(&self, lane: TaskLane, f: F)
+    fn spawn_tracked<F>(&self, lane: TaskLane, f: F) -> Option<Arc<TaskCompletion>>
     where
         F: Future<Output = ()> + Send + 'static,
     {
         let (id, task) = {
             let mut inner = self.inner.lock().unwrap();
             if inner.shutting_down {
-                return;
+                return None;
             }
             let task = TrackedTask::new();
             let id = inner.register(lane, task.clone());
@@ -235,7 +237,9 @@ impl Background {
             lane,
             id,
         };
+        let completion = task.completion.clone();
         task.launch(f, guard);
+        Some(completion)
     }
 
     #[cfg(test)]
@@ -336,6 +340,31 @@ mod tests {
 
         assert!(ran.load(Ordering::SeqCst));
         assert_eq!(b.live_task_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_waited_task_reports_its_end() {
+        let b = Background::new();
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        let completion = b
+            .spawn_waited(async move {
+                tokio::task::yield_now().await;
+                r.store(true, Ordering::SeqCst);
+            })
+            .expect("admitted before shutdown");
+
+        completion.wait().await;
+
+        assert!(ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn a_waited_task_is_not_admitted_after_shutdown() {
+        let b = Background::new();
+        b.shutdown().await;
+
+        assert!(b.spawn_waited(async {}).is_none());
     }
 
     #[tokio::test]

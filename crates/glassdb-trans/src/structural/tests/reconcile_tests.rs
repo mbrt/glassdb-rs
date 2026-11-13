@@ -396,3 +396,58 @@ async fn reconciliations_of_one_collection_take_turns() {
     // Each reconciliation gates the parent once and changes it once.
     assert_eq!(gate_writes.load(std::sync::atomic::Ordering::SeqCst), 4);
 }
+
+// A sweep reconciliation holds the gate of the parent. If shutdown cancelled
+// it, peers would wait for the gate until the pending timeout.
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_for_a_started_sweep_reconciliation() {
+    let hook = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let s = store_with_backend(hook.clone());
+    let seeded = seed_unpublished_leaf_chain(&s, &[(b"", "L0")]).await;
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, NodeSizePolicy::default());
+    sp.reconciler.defer(PendingReconciliation {
+        collection: collection(),
+        key: b"m".to_vec(),
+        target: test_node_id("L1"),
+    });
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    hook.set_before({
+        let path = root_path().to_string();
+        let (started, release) = (started.clone(), release.clone());
+        move |op| {
+            let stall = matches!(op, BackendOp::WriteIf { path: written, .. } if *written == path)
+                && armed.swap(false, std::sync::atomic::Ordering::SeqCst);
+            let (started, release) = (started.clone(), release.clone());
+            Box::pin(async move {
+                if stall {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                Ok(())
+            })
+        }
+    });
+    sp.start();
+    started.notified().await;
+
+    let shutdown = tokio::spawn({
+        let bg = bg.clone();
+        async move { bg.shutdown().await }
+    });
+    rt::sleep(Duration::from_secs(1)).await;
+    assert!(!shutdown.is_finished());
+    release.notify_one();
+    shutdown.await.unwrap();
+
+    hook.clear_before();
+    let root = current_root(&s).await;
+    assert_ne!(
+        root.as_index(),
+        seeded.as_index(),
+        "the parent is reconciled"
+    );
+    assert!(root.structural_gate().holders().is_empty());
+}

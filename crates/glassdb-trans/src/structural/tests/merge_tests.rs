@@ -455,6 +455,56 @@ async fn a_new_candidate_does_not_wait_for_the_sweep_interval() {
     assert_merged(&s).await;
 }
 
+// A started merge holds a topology participant and a gate. If shutdown
+// cancelled the merge, peers would wait for these holders until the pending
+// timeout.
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_for_a_started_merge() {
+    let hook = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let s = store_with_backend(hook.clone());
+    seed_two_leaves(&s, &[b"a", b"b"], &[b"m", b"n"]).await;
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, mergeable());
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let prefix = ObjectPath::structural_intents_prefix(&db_prefix("db"));
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    hook.set_before({
+        let (started, release) = (started.clone(), release.clone());
+        move |op| {
+            let stall = matches!(op, BackendOp::WriteIfNotExists { .. })
+                && op.path().starts_with(&prefix)
+                && armed.swap(false, Ordering::SeqCst);
+            let (started, release) = (started.clone(), release.clone());
+            Box::pin(async move {
+                if stall {
+                    started.notify_one();
+                    release.notified().await;
+                }
+                Ok(())
+            })
+        }
+    });
+    sp.start();
+    sp.hints.observe_leaf(
+        &node_path("L0"),
+        &LeafBody::from_entries([live(b"a"), live(b"b")]),
+    );
+    started.notified().await;
+
+    let shutdown = tokio::spawn({
+        let bg = bg.clone();
+        async move { bg.shutdown().await }
+    });
+    rt::sleep(Duration::from_secs(1)).await;
+    assert!(!shutdown.is_finished());
+    release.notify_one();
+    shutdown.await.unwrap();
+
+    hook.clear_before();
+    assert_merged(&s).await;
+}
+
 // Without this rule, a merge that defers to a pending holder would retry after
 // each coalescing delay until the holder finishes.
 #[tokio::test(start_paused = true)]

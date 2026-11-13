@@ -397,17 +397,25 @@ impl Restructurer {
                 .push((route.key, route.target));
         }
         for (collection, routes) in pending {
-            if let Err(failed) = self
-                .changes
-                .reconcile_parents(&collection, routes, None)
-                .await
-            {
-                tracing::debug!(
-                    target: "glassdb::restructurer",
-                    error = %failed.error,
-                    "parent reconciliation deferred"
-                );
-            }
+            // A reconciliation gates the parent, so it runs to its end as a
+            // batch does (see `change_all`).
+            let changes = self.changes.clone();
+            let reconciling = self.bg.upgrade().and_then(|bg| {
+                bg.spawn_waited(async move {
+                    if let Err(failed) = changes.reconcile_parents(&collection, routes, None).await
+                    {
+                        tracing::debug!(
+                            target: "glassdb::restructurer",
+                            error = %failed.error,
+                            "parent reconciliation deferred"
+                        );
+                    }
+                })
+            });
+            let Some(reconciling) = reconciling else {
+                return;
+            };
+            reconciling.wait().await;
         }
     }
 
@@ -433,7 +441,23 @@ impl Restructurer {
                 } else {
                     self.locate_again(batch).await
                 };
-                self.change_batch(batch).await;
+                // A batch makes holders that other instances wait for: topology
+                // participants, structural gates, and merge reservations. If
+                // shutdown cancelled the batch, these would stay until the
+                // pending timeout. Thus the batch is clean-shutdown work:
+                // shutdown stops the sweep between batches, and waits for the
+                // batch that started. The strong reference is not kept across
+                // the wait, because it would stop the drop of `Background`,
+                // which aborts the tasks.
+                let this = self.clone();
+                let changing = self
+                    .bg
+                    .upgrade()
+                    .and_then(|bg| bg.spawn_waited(async move { this.change_batch(batch).await }));
+                let Some(changing) = changing else {
+                    return;
+                };
+                changing.wait().await;
             }
         }
     }
