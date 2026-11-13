@@ -671,6 +671,11 @@ requested recursive parent split and returns the result.
 Splits and merges share one lifecycle and one parent reconciliation step. The
 `Restructurer` gives each candidate to the split module or the merge module.
 
+Graceful shutdown stops a sweep between batches and parent reconciliations,
+and waits for the step that already started. A cancelled step would keep its
+topology participants and gates, and the writers of other instances would wait
+for them until the pending timeout.
+
 ### The topology policy decides, the restructurer changes
 
 Each topology policy is one struct with two traits. `SizeCausesPolicy` has

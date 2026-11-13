@@ -16,7 +16,7 @@ pub mod rt;
 pub mod shard;
 mod tape;
 
-pub use background::Background;
+pub use background::{Background, TaskCompletion};
 pub use dedup::{
     BatchHandle, Dedup, DedupError, DedupKeySnapshot, DedupStats, MergeRequest, Worker,
 };
