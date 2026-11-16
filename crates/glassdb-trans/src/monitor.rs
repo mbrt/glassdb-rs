@@ -20,6 +20,7 @@ use hashlink::{LinkedHashMap, LinkedHashSet};
 use tokio::sync::oneshot;
 
 use crate::error::TransError;
+use crate::gc::GcHints;
 
 const FINAL_STATUS_CACHE_SIZE: usize = 16384;
 
@@ -39,11 +40,13 @@ const MAX_RECENT_LOCAL: usize = 65_536;
 /// wound of it stays pinned.
 const MAX_RETIRED_WITHOUT_RECORD: usize = 65_536;
 
-/// The number of lock sets of pinned identities that one database instance
-/// keeps until GC releases them. A set holds every lock of its identity, so
-/// this limits the count of sets, not their size. When it is full, the oldest
-/// set is dropped, and its locks stay until a writer on the same key removes
-/// them.
+/// The number of lock sets of identities that one database instance pinned as
+/// wounded and keeps until GC releases them. A set is the lock set of an
+/// identity that this instance owned and pinned, or the lock list of the
+/// pending record of an identity that it wounded after its lease expired. That
+/// list can be older than the lock set of its owner. The limit is on the count
+/// of sets, not on their size. When it is full, the oldest set is dropped, and
+/// its locks stay until a writer on the same key removes them.
 const MAX_PINNED_LOCK_SETS: usize = 4_096;
 
 /// Final-status cache activity for one snapshot or accumulated interval.
@@ -564,7 +567,7 @@ struct State {
     // proof, oldest first. GC acknowledges a later wound of one of them.
     retired_without_record: LinkedHashSet<TxId>,
     // The lock sets of the identities that this instance pinned as wounded,
-    // oldest first. GC releases each set once.
+    // oldest first. GC releases each set until one release completes.
     pinned_locks: LinkedHashMap<TxId, Vec<TxLock>>,
 }
 
@@ -612,6 +615,8 @@ struct Inner {
     background: Weak<Background>,
     retry: RetrySchedule,
     timing: ProtocolTiming,
+    // Reports the wounds whose lock sets GC must release.
+    gc_hints: GcHints,
     // Runtime entries are partitioned into independent shards keyed by tid.
     // One lock keeps ownership, liveness, and waiter updates atomic for a given
     // transaction while the role enum prevents owned and foreign state from
@@ -825,6 +830,7 @@ impl Monitor {
         background: Weak<Background>,
         retry: RetrySchedule,
         timing: ProtocolTiming,
+        gc_hints: GcHints,
     ) -> Self {
         Monitor {
             inner: Arc::new(Inner {
@@ -834,6 +840,7 @@ impl Monitor {
                 background,
                 retry,
                 timing,
+                gc_hints,
                 shards: Sharded::new(|_| Mutex::new(State::default())),
             }),
         }
@@ -1284,6 +1291,34 @@ impl Monitor {
             .await
     }
 
+    /// Gives GC the lock list of the pending record `pending` that this
+    /// instance wounded after its lease expired. The owner is probably gone
+    /// and will not acknowledge. The list can be older than the lock set of
+    /// the owner, so the release can miss locks (ADR-095).
+    ///
+    /// Only the instance whose wound write was confirmed gives the list. A
+    /// wound write that was in doubt and landed reads back as an existing
+    /// wound, so its release is lost.
+    fn release_expired_locks(&self, tid: &TxId, pending: &Observation<TxRecord>) {
+        let Some(record) = pending.value() else {
+            return;
+        };
+        if record.locks.is_empty() {
+            return;
+        }
+        let capacity = self.pinned_lock_capacity();
+        self.shard_for(tid)
+            .lock()
+            .unwrap()
+            .note_pinned_locks(*tid, record.locks.clone(), capacity);
+        self.inner.gc_hints.schedule(*tid);
+    }
+
+    /// The number of pinned lock sets that one shard keeps.
+    fn pinned_lock_capacity(&self) -> usize {
+        (MAX_PINNED_LOCK_SETS / self.inner.shards.len()).max(1)
+    }
+
     /// Resolves status at the requested bound together with its exact evidence.
     async fn resolve_tx_status_at(
         &self,
@@ -1691,8 +1726,7 @@ impl Monitor {
             .map(|record| record.recovery.locks)
             .unwrap_or_default();
         if !locks.is_empty() {
-            let capacity = (MAX_PINNED_LOCK_SETS / self.inner.shards.len()).max(1);
-            st.note_pinned_locks(*tid, locks, capacity);
+            st.note_pinned_locks(*tid, locks, self.pinned_lock_capacity());
         }
     }
 
@@ -2127,7 +2161,10 @@ impl Monitor {
             RemoteLivenessDecision::Owned(evidence) => Ok(evidence),
             RemoteLivenessDecision::Live => TxStatusEvidence::observed(status),
             RemoteLivenessDecision::Expired => {
-                let (wounded, _) = self.try_wound_observed(tid, &status.observation).await?;
+                let (wounded, changed) = self.try_wound_observed(tid, &status.observation).await?;
+                if changed {
+                    self.release_expired_locks(tid, &status.observation);
+                }
                 TxStatusEvidence::observed(wounded)
             }
         }
@@ -2727,6 +2764,7 @@ mod tests {
             Arc::downgrade(&bg),
             RetrySchedule::default(),
             timing,
+            crate::gc::GcHints::default(),
         );
         (
             mon,

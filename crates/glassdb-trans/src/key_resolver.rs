@@ -562,6 +562,7 @@ mod tests {
             Arc::downgrade(&bg),
             RetrySchedule::default(),
             crate::monitor::ProtocolTiming::default(),
+            crate::gc::GcHints::default(),
         );
         let nodes = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
         nodes

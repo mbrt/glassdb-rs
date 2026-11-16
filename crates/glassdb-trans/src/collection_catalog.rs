@@ -208,6 +208,7 @@ mod tests {
             Arc::downgrade(&background),
             RetrySchedule::default(),
             crate::monitor::ProtocolTiming::default(),
+            crate::gc::GcHints::default(),
         );
         let state = CollectionStateResolver::new(
             records.clone(),

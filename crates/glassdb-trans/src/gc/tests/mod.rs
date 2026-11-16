@@ -314,7 +314,8 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         RetryTiming::default(),
         std::num::NonZeroUsize::MIN,
     );
-    let hints = GcHints::default();
+    // The monitor reports wounds to the same hints that this GC drains.
+    let hints = foundation.gc_hints.clone();
     let gc = Gc::new(
         tx_records.clone(),
         nodes.clone(),
@@ -4302,5 +4303,61 @@ async fn gc_releases_the_locks_of_a_pinned_identity_once() {
     assert_eq!(
         lookup_entry(&ctx, b"k").await.unwrap().lock_holders(),
         std::slice::from_ref(&id)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn gc_releases_the_listed_locks_of_an_expired_wound() {
+    let ctx = new_ctx().await;
+    let (expired, live) = (tx(1), tx(2));
+    // A crashed owner left a pending record whose lease expired, and a live
+    // owner holds a fresh lease.
+    for (id, age) in [(expired, PAST_HORIZON), (live, Duration::ZERO)] {
+        let mut pending = TxRecord::new(id, TxCommitStatus::Pending);
+        pending.timestamp = Some(base() - age);
+        pending.locks = vec![write_lock(b"k")];
+        ctx.tx_records.set(&pending).await.unwrap();
+    }
+    store_entry(&ctx, b"k", locked_entry(b"k", &expired)).await;
+    store_entry(&ctx, b"j", locked_entry(b"j", &expired)).await;
+
+    // A reader that meets the expired holder wounds it.
+    assert_eq!(
+        ctx.mon.tx_status(&expired).await.unwrap(),
+        TxCommitStatus::Wounded
+    );
+    assert_eq!(
+        ctx.mon.tx_status(&live).await.unwrap(),
+        TxCommitStatus::Pending
+    );
+
+    // The wound reports itself to GC, which releases the listed lock once.
+    let background = Background::new();
+    ctx.gc.start(&background);
+    for _ in 0..2 {
+        wait_for_hint_deadline(&ctx).await;
+    }
+    background.shutdown().await;
+    // The record did not list `j`, but a release clears the identity from
+    // every entry of the leaf that it loads.
+    for key in [b"k", b"j"] {
+        assert!(
+            lookup_entry(&ctx, key)
+                .await
+                .is_none_or(|entry| entry.lock_holders().is_empty())
+        );
+    }
+    let status = |id: TxId| {
+        let tx_records = ctx.tx_records.clone();
+        async move {
+            let observed = tx_records.get_at(&id, Requirement::ANY).await.unwrap();
+            observed.value().unwrap().status
+        }
+    };
+    assert_eq!(status(expired).await, TxCommitStatus::Wounded);
+    assert_eq!(status(live).await, TxCommitStatus::Pending);
+    assert!(
+        ctx.mon.pinned_locks(&expired).is_none(),
+        "a complete release drops the set, so GC does not release it again"
     );
 }

@@ -849,6 +849,7 @@ mod tests {
             Arc::downgrade(&background),
             RetrySchedule::default(),
             crate::monitor::ProtocolTiming::default(),
+            crate::gc::GcHints::default(),
         );
         let retry = RetrySchedule {
             initial_interval: Duration::ZERO,
@@ -965,6 +966,7 @@ mod tests {
             Arc::downgrade(&background),
             RetrySchedule::default(),
             crate::monitor::ProtocolTiming::default(),
+            crate::gc::GcHints::default(),
         );
         let lifecycle = CollectionLifecycle::new(
             primary.records.clone(),

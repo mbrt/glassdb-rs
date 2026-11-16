@@ -11,8 +11,9 @@
 //! reference (ADR-079). Pinned wounds stay until owner acknowledgement
 //! (ADR-059). GC acknowledges for the owner only a wound of an identity that
 //! retired in this instance without a record, from the proof that `Monitor`
-//! keeps. For an identity that this instance pinned, GC releases once the
-//! lock set that `Monitor` kept, and the record stays pinned.
+//! keeps. For an identity that this instance pinned, or wounded after its
+//! lease expired, GC releases once the lock set that `Monitor` kept, and the
+//! record stays pinned.
 //!
 //! Lock reclamation uses the locker's coordinator-backed operations (ADR-029),
 //! so GC does not issue its own leaf mutations.

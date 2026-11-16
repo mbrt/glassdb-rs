@@ -559,7 +559,12 @@ The `Monitor` handles a crash or a dropped transaction future:
    If the record does not exist yet, because the owner writes it lazily, the
    competitor creates it. If the CAS loses to a refresh or a commit, the
    competitor waits longer. CAS makes sure that only one of a wound and a
-   commit wins.
+   commit wins. When the competitor wounds a pending record, it gives the
+   lock list of that record to GC, which releases it as for a pinned
+   identity (step 3). The list can be older than the lock set of the owner,
+   so the release can miss locks. If the wound write was in doubt and
+   landed, the competitor reads back an existing wound, and the release is
+   lost.
 3. **Owner acknowledgement.** An owner that returns and proves that no operation
    can still publish changes `Wounded` to `Aborted`. Only then does normal GC
    retention apply. Local pending state cannot rule out a wound from another
@@ -581,10 +586,10 @@ The `Monitor` handles a crash or a dropped transaction future:
    lock set. The `Monitor` keeps that set, with a limit on the number of
    sets, and the GC hint of the pinned identity makes GC release the locks
    inside its write budget. GC tries again after a failed release, and drops
-   the set after one release completes. The record stays pinned. A lock that an unresolved operation adds
-   later stays until a writer on the same key removes it. A reader drops it
-   at once, so it costs no grace wait. A single release does not repeat the
-   cost that ADR-071 rejects.
+   the set after one release completes. The record stays pinned. A lock that
+   an unresolved operation adds later stays until a writer on the same key
+   removes it. A reader drops it at once, so it costs no grace wait. A single
+   release does not repeat the cost that ADR-071 rejects.
 4. **Retirement handoff.** Cancellation, unwinding, and failed finalization keep
    the retirement guard armed, and the handoff gives the identity to waited
    recovery before control leaves the owner. A failed retirement is only a
@@ -973,12 +978,12 @@ mark-sweep ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
   ([ADR-071](adr/071-gc-skips-pending-and-wounded-transactions.md)). The two
   exceptions are the owner acknowledgement of a wound that GC makes from a
   retirement proof of its own instance, and the single release of the lock
-  set of an identity that its own instance pinned. Crash recovery describes
-  both. GC reads
-  the status first, then captures a currentness barrier, and makes the reads
-  that prove the absence of a reference after that barrier. Write-back sets a
-  committed transaction as the writer of each key it wrote, and only an owner
-  with a retirement proof writes `Aborted`
+  set of an identity that its own instance pinned, or wounded after its
+  lease expired. Crash recovery describes both. GC reads the status first,
+  then captures a currentness barrier, and makes the reads that prove the
+  absence of a reference after that barrier. Write-back sets a committed
+  transaction as the writer of each key it wrote, and only an owner with a
+  retirement proof writes `Aborted`
   ([ADR-059](adr/059-pin-foreign-wounds-until-owner-retirement.md)). So the
   check cannot miss a writer or a value-bearing lock, and its safety does not
   depend on time ([ADR-079](adr/079-gc-safety-does-not-depend-on-time.md)).

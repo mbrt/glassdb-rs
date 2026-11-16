@@ -395,6 +395,7 @@ struct AssemblyFoundation {
     tx_records: TxRecordStore,
     background: Arc<Background>,
     monitor: Monitor,
+    gc_hints: GcHints,
 }
 
 impl AssemblyFoundation {
@@ -413,12 +414,14 @@ impl AssemblyFoundation {
         let structural_intents = StructuralIntentStore::new(objects.clone());
         let tx_records = TxRecordStore::new(objects.clone(), db_prefix);
         let background = Arc::new(Background::new());
+        let gc_hints = GcHints::new(config.gc_limits);
         let monitor = Monitor::with_config(
             tx_records.clone(),
             timeline.clone(),
             Arc::downgrade(&background),
             config.retry.wait,
             config.protocol_timing,
+            gc_hints.clone(),
         );
         Self {
             backend,
@@ -430,6 +433,7 @@ impl AssemblyFoundation {
             tx_records,
             background,
             monitor,
+            gc_hints,
         }
     }
 }
@@ -447,6 +451,7 @@ pub(crate) struct AssemblyFixture {
     pub(crate) tx_records: TxRecordStore,
     pub(crate) background: Arc<Background>,
     pub(crate) monitor: Monitor,
+    pub(crate) gc_hints: GcHints,
 }
 
 #[cfg(test)]
@@ -473,6 +478,7 @@ impl AssemblyFixture {
             tx_records: foundation.tx_records.clone(),
             background: foundation.background.clone(),
             monitor: foundation.monitor.clone(),
+            gc_hints: foundation.gc_hints.clone(),
             foundation,
         }
     }
@@ -490,6 +496,7 @@ impl AssemblyFixture {
             Arc::downgrade(background),
             retry,
             protocol_timing,
+            self.foundation.gc_hints.clone(),
         )
     }
 }
@@ -548,7 +555,6 @@ impl DormantEngine {
             transaction_leaf_parallelism,
             collection_reservation_limit,
             gc_parallelism,
-            gc_limits,
             ..
         } = config;
         let AssemblyFoundation {
@@ -561,6 +567,7 @@ impl DormantEngine {
             tx_records,
             background,
             monitor,
+            gc_hints,
         } = foundation;
         let background_weak = Arc::downgrade(&background);
         let collection_state = CollectionStateResolver::new(
@@ -573,7 +580,6 @@ impl DormantEngine {
         let collection_catalog = CollectionCatalog::new(collection_state.clone());
         let key_state = KeyStateResolver::new(monitor.clone());
         let router = TreeRouter::new(nodes.clone(), transaction_leaf_parallelism);
-        let gc_hints = GcHints::new(gc_limits);
         // Structural changes and GC remove the same topology participants.
         let topology = TopologyMembership::new(records.clone(), monitor.clone(), retry.contention);
         let (coord, restructurer) = Restructurer::with_coordinator(
