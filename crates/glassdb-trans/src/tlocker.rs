@@ -206,8 +206,8 @@ impl LockedTx {
         })
     }
 
-    /// The typed entry and leaf locks GC records on the transaction record for
-    /// its GC check and lock pruning (ADR-022).
+    /// The typed entry and leaf locks that this acquisition holds. The owner
+    /// adds them to the lock set of the identity (ADR-095).
     pub(crate) fn locked_paths(&self) -> Vec<TxLock> {
         let mut out = Vec::new();
         for group in self.groups.values() {
@@ -227,6 +227,27 @@ impl LockedTx {
         }
         out
     }
+}
+
+/// The locks that an acquisition of `groups` asks for. A CAS can land after
+/// its pass failed, so the owner records these before it sends any (ADR-095).
+/// A key write can also take a write membership lock, which the held locks
+/// add after the pass. A release of the key's leaf also removes that lock.
+fn planned_locks(groups: &BTreeMap<ObjectPath, RoutedLockGroup>) -> Vec<TxLock> {
+    let mut out = Vec::new();
+    for group in groups.values() {
+        out.extend(group.intents.iter().map(|intent| TxLock::Key {
+            key: intent.key.clone(),
+            typ: lock_type(intent.desired),
+        }));
+        if group.membership != LockType::None {
+            out.push(TxLock::Membership {
+                leaf: group.leaf.clone(),
+                typ: group.membership,
+            });
+        }
+    }
+    out
 }
 
 /// The lock type a `Desired` intention records for a key lock.
@@ -1261,6 +1282,7 @@ impl KeyLocker {
         // long-lived holder's pending record is written lazily, keeping its
         // lease alive (the transaction record is otherwise written only at commit).
         if !groups.is_empty() {
+            self.tmon.add_tx_locks(id, planned_locks(groups));
             self.tmon.start_refresh_tx(id);
         }
 
@@ -2019,6 +2041,15 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, LeafSetOutcome::LeafFull));
         assert!(entry_of(&ctx, b"z").await.is_none());
+        // A CAS of a failed pass can still land, so the identity records the
+        // lock before the pass (ADR-095).
+        assert_eq!(
+            ctx.monitor.add_tx_locks(&tx, []),
+            vec![TxLock::Key {
+                key: logical_key(b"z"),
+                typ: LockType::Write,
+            }]
+        );
         let loaded = ctx
             .nodes
             .load_leaf(

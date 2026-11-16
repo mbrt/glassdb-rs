@@ -649,9 +649,10 @@ impl Gc {
 
     /// A committed candidate past its retention period is deleted only once its complete
     /// record proves it unreferenced. Any recorded write still pointed at by a
-    /// `current_writer`, or any recorded lock still held (the commit→write-back
-    /// gap), keeps it. A committed record is never pruned or force-aborted — its
-    /// locks become `current_writer` through write-back, never through GC.
+    /// `current_writer`, or a held lock on a key that it wrote (the
+    /// commit→write-back gap), keeps it. Those locks become `current_writer`
+    /// through write-back, never through GC. GC releases the other locks, which
+    /// hold no value, before it deletes the record (ADR-095).
     async fn reclaim_committed(
         &self,
         tid: &TxId,
@@ -700,12 +701,14 @@ impl Gc {
         // The original record's entry references are clear. Applied directory
         // write-back proves removal even after cache eviction: this
         // committed identity cannot acquire those holders again. Keep every
-        // other directory and all membership/topology obligations.
+        // other directory, the locks on keys that it did not write, and all
+        // membership/topology obligations.
+        let written = written_keys(record);
         let mut remaining: Vec<_> = record
             .locks
             .iter()
             .filter(|lock| match lock {
-                TxLock::Key { .. } => false,
+                TxLock::Key { key, .. } => !written.contains(key),
                 TxLock::Directory { collection, .. } => !removed_directories.contains(collection),
                 _ => true,
             })
@@ -782,8 +785,8 @@ impl Gc {
         Ok(reclaimed)
     }
 
-    /// Reports whether any entry the candidate recorded still names its transaction identity: a
-    /// written key's `current_writer` or a locked key's `locked_by`. Checking
+    /// Reports whether any key that the candidate wrote still names its
+    /// transaction identity, as `current_writer` or in `locked_by`. Checking
     /// only the recorded set is equivalent to scanning every leaf, because an
     /// entry can name the identity only if that transaction put it there.
     ///
@@ -799,13 +802,18 @@ impl Gc {
         record: &TxRecord,
         barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
+        // A lock on a key that the candidate did not write holds no value, so
+        // GC releases it instead (ADR-095).
+        let written = written_keys(record);
         let mut items: Vec<(LogicalKey, CheckKind)> = record
             .writes
             .iter()
             .map(|write| (write.key.clone(), CheckKind::Writer))
             .collect();
         for lock in &record.locks {
-            if let TxLock::Key { key, .. } = lock {
+            if let TxLock::Key { key, .. } = lock
+                && written.contains(key)
+            {
                 items.push((key.clone(), CheckKind::Holder));
             }
         }
@@ -905,6 +913,11 @@ impl Gc {
             changed,
         })
     }
+}
+
+/// The keys that a committed record wrote.
+fn written_keys(record: &TxRecord) -> BTreeSet<&LogicalKey> {
+    record.writes.iter().map(|write| &write.key).collect()
 }
 
 impl GcOutcome {

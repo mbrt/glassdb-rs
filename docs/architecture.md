@@ -406,7 +406,8 @@ from older layouts, and older binaries must not use the same database.
 
 The record holds the transaction status, the lease timestamp, the recovery
 manifest, and, after commit, the committed values
-([ADR-019](adr/019-unified-transaction-object.md)). Lock state is in the leaves,
+([ADR-019](adr/019-unified-transaction-object.md)). A `Wounded` record holds
+only the identity and the status. Lock state is in the leaves,
 not in the record. The record has two jobs:
 
 1. **Commit point.** A locked commit takes effect if and only if its record is
@@ -418,6 +419,12 @@ not in the record. The record has two jobs:
 `Wounded` has the same meaning as aborted for readers, but GC cannot delete it
 until the owner acknowledges it as `Aborted`
 ([ADR-059](adr/059-pin-foreign-wounds-until-owner-retirement.md)).
+
+The owner keeps one lock set for the identity, for all its commit passes. It
+adds each lock before it sends the CAS that takes the lock, and it writes the
+`Aborted` and committed records from this set. A `Wounded` record holds only
+the identity and the status
+([ADR-095](adr/095-the-record-lists-every-lock-of-the-identity.md)).
 
 ### Locked commit
 
@@ -952,8 +959,10 @@ mark-sweep ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
   ([ADR-059](adr/059-pin-foreign-wounds-until-owner-retirement.md)). So the
   check cannot miss a writer or a value-bearing lock, and its safety does not
   depend on time ([ADR-079](adr/079-gc-safety-does-not-depend-on-time.md)).
-  Locks on keys whose value the transaction does not hold can stay behind as
-  stray holders. Each costs a grace wait and a `Wounded` record.
+  Before GC deletes a committed record, it releases the locks on keys that the
+  transaction did not write. Only a lock CAS that lands after the retention
+  period can leave a stray holder, which costs a grace wait and a `Wounded`
+  record ([ADR-095](adr/095-the-record-lists-every-lock-of-the-identity.md)).
 - **Retention period.** GC still waits the pending timeout plus the allowed
   clock skew, from the last update of the record, before it checks a final
   record ([ADR-079](adr/079-gc-safety-does-not-depend-on-time.md)). The wait
