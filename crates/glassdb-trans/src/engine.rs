@@ -619,7 +619,7 @@ impl DormantEngine {
             locker.clone(),
             topology,
             collection_lifecycle.clone(),
-            monitor.protocol_timing(),
+            monitor.clone(),
             gc_hints.clone(),
             gc_parallelism,
             Some(backend.write_meter()),

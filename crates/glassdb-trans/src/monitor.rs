@@ -16,7 +16,7 @@ use glassdb_storage::transaction::{
     TxRecordStore, TxStatus,
 };
 use glassdb_storage::{LockType, Observation, Requirement, StorageError, Timeline};
-use hashlink::LinkedHashMap;
+use hashlink::{LinkedHashMap, LinkedHashSet};
 use tokio::sync::oneshot;
 
 use crate::error::TransError;
@@ -33,6 +33,11 @@ pub(crate) const LOCAL_RETENTION: Duration = Duration::from_secs(60);
 /// identities stop being local early. Read-only identities fill it too, but no
 /// leaf entry names them as its writer.
 const MAX_RECENT_LOCAL: usize = 65_536;
+
+/// The retired identities without a record that one database instance keeps.
+/// When it is full, the oldest identity loses its retirement proof, and a
+/// wound of it stays pinned.
+const MAX_RETIRED_WITHOUT_RECORD: usize = 65_536;
 
 /// Final-status cache activity for one snapshot or accumulated interval.
 ///
@@ -322,6 +327,19 @@ impl OwnerLifecycle {
         }
     }
 
+    /// Reports whether the owner can prove that no operation of the identity
+    /// is active or can still publish an effect.
+    fn is_quiescent(&self) -> bool {
+        matches!(
+            self.operations,
+            OwnerOperations::Internal
+                | OwnerOperations::Guarded {
+                    active: 0,
+                    unresolved: false,
+                }
+        )
+    }
+
     fn has_active_operations(&self) -> bool {
         matches!(
             self.operations,
@@ -341,6 +359,21 @@ impl OwnedTxRuntime {
             record,
             lifecycle: OwnerLifecycle::default(),
         }
+    }
+
+    /// Reports whether the identity sent no record write, holds no recovery
+    /// manifest, and has a retirement proof. Then a later wound of it can be
+    /// acknowledged after its owner state is gone (ADR-059).
+    fn retires_without_record(&self) -> bool {
+        let Some(record) = &self.record else {
+            return false;
+        };
+        record.status == TxCommitStatus::Pending
+            && record.last_observation.is_none()
+            && record.refresh_state == RefreshState::NotStarted
+            && record.recovery == TxRecoveryManifest::default()
+            && self.lifecycle.commit_write == CommitWrite::NotStarted
+            && self.lifecycle.is_quiescent()
     }
 
     fn close(&mut self, reason: OwnerCloseReason) -> OwnerClosePlan {
@@ -520,6 +553,9 @@ struct State {
     // The identities of the recent owner operations, oldest first, with the
     // instant of their last operation (ADR-085).
     recent_local: LinkedHashMap<TxId, rt::Instant>,
+    // The identities that retired without a record and with a retirement
+    // proof, oldest first. GC acknowledges a later wound of one of them.
+    retired_without_record: LinkedHashSet<TxId>,
 }
 
 impl State {
@@ -534,6 +570,15 @@ impl State {
                 || now.saturating_duration_since(*at) >= LOCAL_RETENTION)
         {
             self.recent_local.pop_front();
+        }
+    }
+
+    /// Keeps the retirement proof of `tid`, in a shard that keeps at most
+    /// `capacity` of them.
+    fn note_retired_without_record(&mut self, tid: TxId, capacity: usize) {
+        self.retired_without_record.insert(tid);
+        while self.retired_without_record.len() > capacity {
+            self.retired_without_record.pop_front();
         }
     }
 }
@@ -989,10 +1034,40 @@ impl Monitor {
             // `persist_committed_record` because the record is keyed by transaction
             // identity and the write is idempotent.
             result.map_err(|error| error.error.context("writing transaction record"))?;
+            self.finish_local_tx(&tid);
+        } else {
+            self.finish_tx_without_record(&tid);
         }
-
-        self.finish_local_tx(&tid);
         Ok(())
+    }
+
+    /// Acknowledges the wound `observed` of an identity that retired in this
+    /// database instance without a record. Returns the `Aborted` status, or
+    /// `None` when this instance has no retirement proof for the identity.
+    ///
+    /// A peer can wound such an identity after it retired, through an old
+    /// view of one of its holders. Its owner state is gone, so only this
+    /// proof lets the wound be acknowledged (ADR-059).
+    pub(crate) async fn acknowledge_retired_wound(
+        &self,
+        tid: &TxId,
+        observed: &Observation<TxRecord>,
+    ) -> Result<Option<TxStatus>, TransError> {
+        let retired = self
+            .shard_for(tid)
+            .lock()
+            .unwrap()
+            .retired_without_record
+            .contains(tid);
+        if !retired {
+            return Ok(None);
+        }
+        // The proof stays until eviction, so a later wound of the same
+        // identity is acknowledged too.
+        let (status, _) = self
+            .advance_abort_transition(tid, observed, AbortTransition::Acknowledge)
+            .await?;
+        Ok((status.status == TxCommitStatus::Aborted).then_some(status))
     }
 
     /// Aborts a transaction owned by this Database, deriving the strongest safe
@@ -1546,6 +1621,26 @@ impl Monitor {
         }) = st.transactions.get_mut(tid)
         {
             owned.lifecycle.finish_commit_write(create_may_land);
+        }
+    }
+
+    /// Finishes a local identity that wrote no record, and keeps its
+    /// retirement proof when it has one.
+    fn finish_tx_without_record(&self, tid: &TxId) {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        let retires = match st.transactions.get(tid) {
+            Some(TxRuntimeEntry {
+                role: TxRuntimeRole::Owned(owned),
+                ..
+            }) => owned.retires_without_record(),
+            _ => return,
+        };
+        if let Some(mut entry) = st.transactions.remove(tid) {
+            notify_waiters(&mut entry.waiters);
+        }
+        if retires {
+            let capacity = (MAX_RETIRED_WITHOUT_RECORD / self.inner.shards.len()).max(1);
+            st.note_retired_without_record(*tid, capacity);
         }
     }
 

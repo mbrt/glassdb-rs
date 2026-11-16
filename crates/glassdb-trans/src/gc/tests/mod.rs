@@ -329,7 +329,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
             RetrySchedule::default(),
             Arc::new(UnexpectedTopologySettler),
         ),
-        mon.protocol_timing(),
+        mon.clone(),
         hints.clone(),
         DEFAULT_GC_PARALLELISM,
         None,
@@ -4149,4 +4149,65 @@ async fn dropped_hints_keep_scans_fast() {
             assert!(lists < 20, "idle scans did not back off: {lists}");
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn gc_acknowledges_a_late_wound_of_an_identity_retired_without_record() {
+    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let owner = new_ctx_with(backend.clone()).await;
+    let peer = AssemblyFixture::new(
+        backend,
+        DbPrefix::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let (retired, busy, foreign) = (tx(1), tx(2), tx(3));
+    // A structural worker retires like this: it writes no record.
+    owner.mon.begin_tx(&retired);
+    owner
+        .mon
+        .commit_tx(TxRecord::new(retired, TxCommitStatus::Committed))
+        .await
+        .unwrap();
+    // An operation that is still active can publish effects later, so this
+    // identity has no retirement proof.
+    owner.mon.begin_tx(&busy);
+    let operation = owner.mon.begin_owner_operation(&busy).unwrap();
+    owner
+        .mon
+        .commit_tx(TxRecord::new(busy, TxCommitStatus::Committed))
+        .await
+        .unwrap();
+    // A peer with an old view of a holder wounds the identities after that.
+    // The owner of `foreign` is not this instance.
+    for id in [retired, busy, foreign] {
+        assert_eq!(
+            peer.monitor.preempt_tx(&id).await.unwrap(),
+            crate::monitor::TxFinalStatus::Aborted
+        );
+    }
+
+    // The acknowledgement restarts the retention period.
+    assert!(matches!(
+        check_candidate(&owner.gc, &retired).await.unwrap(),
+        GcOutcome::Deferred(_)
+    ));
+    for id in [busy, foreign] {
+        assert_eq!(
+            check_candidate(&owner.gc, &id).await.unwrap(),
+            GcOutcome::Retained
+        );
+    }
+    operation.complete();
+    let status = |id: TxId| {
+        let tx_records = owner.tx_records.clone();
+        async move {
+            tx_records
+                .get_at(&id, Requirement::ANY)
+                .await
+                .map(|observed| observed.value().unwrap().status)
+        }
+    };
+    assert_eq!(status(retired).await.unwrap(), TxCommitStatus::Aborted);
+    assert_eq!(status(busy).await.unwrap(), TxCommitStatus::Wounded);
+    assert_eq!(status(foreign).await.unwrap(), TxCommitStatus::Wounded);
 }

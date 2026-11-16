@@ -9,7 +9,9 @@
 //! retention period before capturing the currentness barrier of their reference
 //! checks. Cached leaf contents from before eligibility cannot rule out a
 //! reference (ADR-079). Pinned wounds stay until owner acknowledgement
-//! (ADR-059).
+//! (ADR-059). GC acknowledges for the owner only a wound of an identity that
+//! retired in this instance without a record, from the proof that `Monitor`
+//! keeps.
 //!
 //! Lock reclamation uses the locker's coordinator-backed operations (ADR-029),
 //! so GC does not issue its own leaf mutations.
@@ -41,7 +43,7 @@ use tokio::sync::Notify;
 
 use crate::collections::CollectionLifecycle;
 use crate::error::TransError;
-use crate::monitor::ProtocolTiming;
+use crate::monitor::{Monitor, ProtocolTiming};
 use crate::structural::TopologyMembership;
 use crate::tlocker::Locker;
 use budget::WriteBudget;
@@ -390,6 +392,7 @@ pub(crate) struct Gc {
     router: TreeRouter,
     locker: Locker,
     topology: TopologyMembership,
+    monitor: Monitor,
     timing: ProtocolTiming,
     timeline: Timeline,
     hints: GcHints,
@@ -414,7 +417,7 @@ impl Gc {
         locker: Locker,
         topology: TopologyMembership,
         collection_lifecycle: CollectionLifecycle,
-        timing: ProtocolTiming,
+        monitor: Monitor,
         hints: GcHints,
         max_checks: NonZeroUsize,
         writes: Option<WriteMeter>,
@@ -426,7 +429,8 @@ impl Gc {
             router: TreeRouter::new(nodes, std::num::NonZeroUsize::MIN),
             locker,
             topology,
-            timing,
+            timing: monitor.protocol_timing(),
+            monitor,
             timeline,
             own_writes: hints.counters.background_writes.clone(),
             hints,
@@ -577,14 +581,25 @@ impl Gc {
         // GC needs exact durable evidence for reclamation. A status cached
         // without its record cannot authorize deletion, and absence must not
         // create a wound merely because a scan or hint named an ID.
-        let status = self
+        let mut status = self
             .tx_records
             .commit_status_at(tid, Requirement::after(barrier))
             .await?;
         match TxRecordState::try_from_observation(&status.observation)? {
             TxRecordState::Missing => return Ok(GcEligibility::Missing),
-            TxRecordState::Pending | TxRecordState::Wounded => {
-                return Ok(GcEligibility::Retained);
+            TxRecordState::Pending => return Ok(GcEligibility::Retained),
+            // A wound stays pinned, unless this instance retired the identity
+            // with a proof and so acknowledges for its owner (ADR-059). The
+            // acknowledgement restarts the retention period.
+            TxRecordState::Wounded => {
+                match self
+                    .monitor
+                    .acknowledge_retired_wound(tid, &status.observation)
+                    .await?
+                {
+                    Some(aborted) => status = aborted,
+                    None => return Ok(GcEligibility::Retained),
+                }
             }
             TxRecordState::Committed | TxRecordState::Aborted => {}
         }
