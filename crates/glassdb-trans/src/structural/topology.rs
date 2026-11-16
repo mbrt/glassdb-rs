@@ -6,7 +6,7 @@ use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord};
 use glassdb_storage::{CollectionStore, Requirement, StorageError};
 
 use crate::error::TransError;
-use crate::monitor::{Monitor, TxRecoveryManifest};
+use crate::monitor::{Monitor, OwnerAbortOutcome, TxRecoveryManifest};
 
 /// Adds and removes the topology participants of collection records.
 #[derive(Clone)]
@@ -149,13 +149,28 @@ impl TopologyMembership {
     }
 
     /// Gives a topology participant its final status, so that recovery does
-    /// not treat it as in-flight work.
+    /// not treat it as in-flight work. If a peer wounded the participant, this
+    /// acknowledges the wound, so that GC can delete the record (ADR-059).
     pub(super) async fn finalize(&self, collection: &CollectionAddress, id: &TxId) {
         let mut record = TxRecord::new(*id, TxCommitStatus::Committed);
         record.locks.push(TxLock::TopologyParticipant {
             collection: collection.clone(),
         });
-        if let Err(e) = self.mon.commit_tx(record).await {
+        let result = match self.mon.commit_tx(record).await {
+            Err(TransError::AlreadyFinalized) => match self.mon.abort_owned_tx(id).await {
+                Ok(OwnerAbortOutcome::Pinned) => {
+                    tracing::debug!(
+                        target: "glassdb::restructurer",
+                        participant = %id,
+                        "wound of topology participant stays pinned"
+                    );
+                    Ok(())
+                }
+                result => result.map(|_| ()),
+            },
+            result => result,
+        };
+        if let Err(e) = result {
             tracing::debug!(
                 target: "glassdb::restructurer",
                 error = %e,

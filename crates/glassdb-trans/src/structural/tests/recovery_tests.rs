@@ -1801,3 +1801,43 @@ async fn explicit_settlement_returns_a_parent_split_error() {
     ));
     drop(bg);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_late_wound_of_a_retired_worker_can_be_acknowledged() {
+    let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let s = store_with_backend(memory.clone());
+    let peer = store_with_backend(memory);
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, tiny());
+    let peer_mon = peer.foundation.monitor_for(
+        &bg,
+        RetrySchedule::default(),
+        crate::monitor::ProtocolTiming::default(),
+    );
+    let worker = tx_id(b"worker");
+    sp.changes.structural_nodes.begin_worker(&worker);
+    sp.changes.structural_nodes.finalize_worker(&worker).await;
+    // A peer with an old view of the worker's gate wounds it after that.
+    assert_eq!(
+        peer_mon.preempt_tx(&worker).await.unwrap(),
+        TxFinalStatus::Aborted
+    );
+
+    // GC of the worker's instance acknowledges the wound for the worker.
+    let wounded = s
+        .foundation
+        .tx_records
+        .get_at(
+            &worker,
+            Requirement::after(s.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    let acknowledged = sp
+        .mon
+        .acknowledge_retired_wound(&worker, &wounded)
+        .await
+        .unwrap()
+        .expect("the worker retired with a proof");
+    assert_eq!(acknowledged.status, TxCommitStatus::Aborted);
+}

@@ -4,7 +4,7 @@ use crate::collections::TopologySettler;
 use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, NoStructuralHints};
-use crate::monitor::Monitor;
+use crate::monitor::{Monitor, OwnerAbortOutcome};
 use crate::retry_timing::RetryTiming;
 use crate::tlocker::LockOutcome;
 use async_trait::async_trait;
@@ -314,7 +314,8 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         RetryTiming::default(),
         std::num::NonZeroUsize::MIN,
     );
-    let hints = GcHints::default();
+    // The monitor reports wounds to the same hints that this GC drains.
+    let hints = foundation.gc_hints.clone();
     let gc = Gc::new(
         tx_records.clone(),
         nodes.clone(),
@@ -329,7 +330,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
             RetrySchedule::default(),
             Arc::new(UnexpectedTopologySettler),
         ),
-        mon.protocol_timing(),
+        mon.clone(),
         hints.clone(),
         DEFAULT_GC_PARALLELISM,
         None,
@@ -473,6 +474,7 @@ async fn check_candidate(gc: &Gc, tid: &TxId) -> Result<GcOutcome, TransError> {
         GcEligibility::Deferred(delay) => Ok(GcOutcome::Deferred(delay)),
         GcEligibility::Retained => Ok(GcOutcome::Retained),
         GcEligibility::Missing => Ok(GcOutcome::Missing),
+        GcEligibility::Checked(outcome) => Ok(outcome),
     }
 }
 
@@ -1157,7 +1159,7 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
     use crate::access::{AccessSet, ScanRange, WriteAccess};
     use crate::engine::engine_fixture;
     use crate::key_resolver::KeyResolver;
-    use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
+    use crate::monitor::TxRecoveryManifest;
     use glassdb_data::LeafRef;
 
     // One key uses direct descent; two keys use batched descent. The scan also
@@ -4149,4 +4151,213 @@ async fn dropped_hints_keep_scans_fast() {
             assert!(lists < 20, "idle scans did not back off: {lists}");
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn gc_acknowledges_a_late_wound_of_an_identity_retired_without_record() {
+    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let owner = new_ctx_with(backend.clone()).await;
+    let peer = AssemblyFixture::new(
+        backend,
+        DbPrefix::try_from("db").unwrap(),
+        &EngineConfig::default(),
+    );
+    let (retired, busy, foreign) = (tx(1), tx(2), tx(3));
+    // A structural worker retires like this: it writes no record.
+    owner.mon.begin_tx(&retired);
+    owner
+        .mon
+        .commit_tx(TxRecord::new(retired, TxCommitStatus::Committed))
+        .await
+        .unwrap();
+    // An operation that is still active can publish effects later, so this
+    // identity has no retirement proof.
+    owner.mon.begin_tx(&busy);
+    let operation = owner.mon.begin_owner_operation(&busy).unwrap();
+    owner
+        .mon
+        .commit_tx(TxRecord::new(busy, TxCommitStatus::Committed))
+        .await
+        .unwrap();
+    // A peer with an old view of a holder wounds the identities after that.
+    // The owner of `foreign` is not this instance.
+    for id in [retired, busy, foreign] {
+        assert_eq!(
+            peer.monitor.preempt_tx(&id).await.unwrap(),
+            crate::monitor::TxFinalStatus::Aborted
+        );
+    }
+
+    // The acknowledgement restarts the retention period.
+    assert!(matches!(
+        check_candidate(&owner.gc, &retired).await.unwrap(),
+        GcOutcome::Deferred(_)
+    ));
+    for id in [busy, foreign] {
+        assert_eq!(
+            check_candidate(&owner.gc, &id).await.unwrap(),
+            GcOutcome::Retained
+        );
+    }
+    operation.complete();
+    let status = |id: TxId| {
+        let tx_records = owner.tx_records.clone();
+        async move {
+            tx_records
+                .get_at(&id, Requirement::ANY)
+                .await
+                .map(|observed| observed.value().unwrap().status)
+        }
+    };
+    assert_eq!(status(retired).await.unwrap(), TxCommitStatus::Aborted);
+    assert_eq!(status(busy).await.unwrap(), TxCommitStatus::Wounded);
+    assert_eq!(status(foreign).await.unwrap(), TxCommitStatus::Wounded);
+}
+
+#[tokio::test(start_paused = true)]
+async fn gc_releases_the_locks_of_a_pinned_identity_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let recording = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+    let operations = recording.log();
+    let hooks = HookBackend::new(Arc::new(recording));
+    let ctx = new_ctx_with(hooks.clone()).await;
+    let id = tx(1);
+    ctx.mon.begin_tx(&id);
+    ctx.mon.add_tx_locks(&id, [write_lock(b"k")]);
+    store_entry(&ctx, b"k", locked_entry(b"k", &id)).await;
+    // A dropped owner operation can still publish an effect, so the owner
+    // pins its own identity as wounded.
+    drop(ctx.mon.begin_owner_operation(&id).unwrap());
+    assert_eq!(
+        ctx.mon.abort_owned_tx(&id).await.unwrap(),
+        OwnerAbortOutcome::Pinned
+    );
+
+    // A failed release keeps the lock set for the next check.
+    let fail = Arc::new(AtomicBool::new(true));
+    hooks.set_before({
+        let fail = fail.clone();
+        move |op| {
+            let fail =
+                matches!(op, BackendOp::WriteIf { .. }) && fail.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if fail {
+                    Err(BackendError::other("leaf CAS failed"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    });
+    assert!(check_candidate(&ctx.gc, &id).await.is_err());
+    assert!(
+        !fail.load(Ordering::SeqCst),
+        "the release must reach a leaf CAS"
+    );
+    hooks.clear_before();
+
+    // The GC hint of the pinned identity releases the set.
+    let background = Background::new();
+    ctx.gc.start(&background);
+    ctx.hints.schedule(id);
+    for _ in 0..2 {
+        wait_for_hint_deadline(&ctx).await;
+    }
+    // Without a holder or a value, the entry is vestigial and goes away.
+    assert!(
+        lookup_entry(&ctx, b"k")
+            .await
+            .is_none_or(|entry| entry.lock_holders().is_empty())
+    );
+    let got = ctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
+    assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
+
+    // A lock that lands after the release stays. GC releases the set once and
+    // does not check the pinned record again.
+    store_entry(&ctx, b"k", locked_entry(b"k", &id)).await;
+    operations.lock().unwrap().clear();
+    ctx.hints.schedule(id);
+    for _ in 0..2 {
+        wait_for_hint_deadline(&ctx).await;
+    }
+    background.shutdown().await;
+    let path = ObjectPath::Transaction {
+        db_prefix: DbPrefix::try_from("db").unwrap(),
+        id,
+    }
+    .to_string();
+    {
+        let operations = operations.lock().unwrap();
+        assert!(
+            operations.iter().any(|op| op.path == path),
+            "GC must check the hinted candidate again"
+        );
+        assert!(
+            operations
+                .iter()
+                .all(|op| op.op == "list" || op.path == path),
+            "a later check only reads the pinned record"
+        );
+    }
+    assert_eq!(
+        lookup_entry(&ctx, b"k").await.unwrap().lock_holders(),
+        std::slice::from_ref(&id)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn gc_releases_the_listed_locks_of_an_expired_wound() {
+    let ctx = new_ctx().await;
+    let (expired, live) = (tx(1), tx(2));
+    // A crashed owner left a pending record whose lease expired, and a live
+    // owner holds a fresh lease.
+    for (id, age) in [(expired, PAST_HORIZON), (live, Duration::ZERO)] {
+        let mut pending = TxRecord::new(id, TxCommitStatus::Pending);
+        pending.timestamp = Some(base() - age);
+        pending.locks = vec![write_lock(b"k")];
+        ctx.tx_records.set(&pending).await.unwrap();
+    }
+    store_entry(&ctx, b"k", locked_entry(b"k", &expired)).await;
+    store_entry(&ctx, b"j", locked_entry(b"j", &expired)).await;
+
+    // A reader that meets the expired holder wounds it.
+    assert_eq!(
+        ctx.mon.tx_status(&expired).await.unwrap(),
+        TxCommitStatus::Wounded
+    );
+    assert_eq!(
+        ctx.mon.tx_status(&live).await.unwrap(),
+        TxCommitStatus::Pending
+    );
+
+    // The wound reports itself to GC, which releases the listed lock once.
+    let background = Background::new();
+    ctx.gc.start(&background);
+    for _ in 0..2 {
+        wait_for_hint_deadline(&ctx).await;
+    }
+    background.shutdown().await;
+    // The record did not list `j`, but a release clears the identity from
+    // every entry of the leaf that it loads.
+    for key in [b"k", b"j"] {
+        assert!(
+            lookup_entry(&ctx, key)
+                .await
+                .is_none_or(|entry| entry.lock_holders().is_empty())
+        );
+    }
+    let status = |id: TxId| {
+        let tx_records = ctx.tx_records.clone();
+        async move {
+            let observed = tx_records.get_at(&id, Requirement::ANY).await.unwrap();
+            observed.value().unwrap().status
+        }
+    };
+    assert_eq!(status(expired).await, TxCommitStatus::Wounded);
+    assert_eq!(status(live).await, TxCommitStatus::Pending);
+    assert!(
+        ctx.mon.pinned_locks(&expired).is_none(),
+        "a complete release drops the set, so GC does not release it again"
+    );
 }

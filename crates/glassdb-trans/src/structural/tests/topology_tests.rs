@@ -77,3 +77,51 @@ async fn departure_backs_off_after_a_rejected_cas() {
         vec![admitted]
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn finalize_acknowledges_a_wound_of_the_participant() {
+    let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let owner = store_with_backend(memory.clone());
+    let peer = store_with_backend(memory);
+    let bg = Arc::new(Background::new());
+    let mon = owner.foundation.monitor_for(
+        &bg,
+        RetrySchedule::default(),
+        crate::monitor::ProtocolTiming::default(),
+    );
+    let peer_mon = peer.foundation.monitor_for(
+        &bg,
+        RetrySchedule::default(),
+        crate::monitor::ProtocolTiming::default(),
+    );
+    let topology = TopologyMembership::new(
+        owner.records.clone(),
+        mon,
+        RetryTiming::default().contention,
+    );
+    let participant = tx_id(b"participant");
+    topology.begin(&collection(), &participant).await.unwrap();
+    assert_eq!(
+        peer_mon.preempt_tx(&participant).await.unwrap(),
+        TxFinalStatus::Aborted
+    );
+
+    topology.finalize(&collection(), &participant).await;
+
+    // Only the owner can change the pinned wound, and GC deletes the record
+    // only after that change (ADR-059).
+    let record = peer
+        .foundation
+        .tx_records
+        .get_at(
+            &participant,
+            Requirement::after(peer.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    let record = record.value().unwrap();
+    assert_eq!(record.status, TxCommitStatus::Aborted);
+    assert!(record.locks.contains(&TxLock::TopologyParticipant {
+        collection: collection(),
+    }));
+}

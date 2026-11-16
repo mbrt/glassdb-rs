@@ -9,7 +9,11 @@
 //! retention period before capturing the currentness barrier of their reference
 //! checks. Cached leaf contents from before eligibility cannot rule out a
 //! reference (ADR-079). Pinned wounds stay until owner acknowledgement
-//! (ADR-059).
+//! (ADR-059). GC acknowledges for the owner only a wound of an identity that
+//! retired in this instance without a record, from the proof that `Monitor`
+//! keeps. For an identity that this instance pinned, or wounded after its
+//! lease expired, GC releases once the lock set that `Monitor` kept, and the
+//! record stays pinned.
 //!
 //! Lock reclamation uses the locker's coordinator-backed operations (ADR-029),
 //! so GC does not issue its own leaf mutations.
@@ -41,7 +45,7 @@ use tokio::sync::Notify;
 
 use crate::collections::CollectionLifecycle;
 use crate::error::TransError;
-use crate::monitor::ProtocolTiming;
+use crate::monitor::{Monitor, ProtocolTiming};
 use crate::structural::TopologyMembership;
 use crate::tlocker::Locker;
 use budget::WriteBudget;
@@ -115,6 +119,8 @@ enum GcEligibility {
     Deferred(Duration),
     Retained,
     Missing,
+    /// The status read already completed the check.
+    Checked(GcOutcome),
 }
 
 /// Result of a GC candidate check.
@@ -390,6 +396,7 @@ pub(crate) struct Gc {
     router: TreeRouter,
     locker: Locker,
     topology: TopologyMembership,
+    monitor: Monitor,
     timing: ProtocolTiming,
     timeline: Timeline,
     hints: GcHints,
@@ -414,7 +421,7 @@ impl Gc {
         locker: Locker,
         topology: TopologyMembership,
         collection_lifecycle: CollectionLifecycle,
-        timing: ProtocolTiming,
+        monitor: Monitor,
         hints: GcHints,
         max_checks: NonZeroUsize,
         writes: Option<WriteMeter>,
@@ -426,7 +433,8 @@ impl Gc {
             router: TreeRouter::new(nodes, std::num::NonZeroUsize::MIN),
             locker,
             topology,
-            timing,
+            timing: monitor.protocol_timing(),
+            monitor,
             timeline,
             own_writes: hints.counters.background_writes.clone(),
             hints,
@@ -577,14 +585,29 @@ impl Gc {
         // GC needs exact durable evidence for reclamation. A status cached
         // without its record cannot authorize deletion, and absence must not
         // create a wound merely because a scan or hint named an ID.
-        let status = self
+        let mut status = self
             .tx_records
             .commit_status_at(tid, Requirement::after(barrier))
             .await?;
         match TxRecordState::try_from_observation(&status.observation)? {
             TxRecordState::Missing => return Ok(GcEligibility::Missing),
-            TxRecordState::Pending | TxRecordState::Wounded => {
-                return Ok(GcEligibility::Retained);
+            TxRecordState::Pending => return Ok(GcEligibility::Retained),
+            // A wound stays pinned, unless this instance retired the identity
+            // with a proof and so acknowledges for its owner (ADR-059). The
+            // acknowledgement restarts the retention period.
+            TxRecordState::Wounded => {
+                match self
+                    .monitor
+                    .acknowledge_retired_wound(tid, &status.observation)
+                    .await?
+                {
+                    Some(aborted) => status = aborted,
+                    None => {
+                        return Ok(GcEligibility::Checked(
+                            self.release_pinned_locks(tid, barrier).await?,
+                        ));
+                    }
+                }
             }
             TxRecordState::Committed | TxRecordState::Aborted => {}
         }
@@ -597,6 +620,27 @@ impl Gc {
             ));
         }
         Ok(GcEligibility::Ready(status.observation))
+    }
+
+    /// Releases the lock set that this instance kept when it pinned `tid` as
+    /// wounded, until one release completes. The record stays pinned, and GC
+    /// does not check its resources after that (ADR-071).
+    async fn release_pinned_locks(
+        &self,
+        tid: &TxId,
+        barrier: CurrentnessBarrier,
+    ) -> Result<GcOutcome, TransError> {
+        let Some(locks) = self.monitor.pinned_locks(tid) else {
+            return Ok(GcOutcome::Retained);
+        };
+        let reclaimed = self.release_locks(tid, &locks, barrier).await?;
+        if reclaimed.changed {
+            self.count_writes(locks.len() as u64);
+        }
+        if reclaimed.complete {
+            self.monitor.forget_pinned_locks(tid);
+        }
+        Ok(GcOutcome::from_progress(reclaimed.changed))
     }
 
     /// Adds to the estimate of the writes of this GC. The estimate is about
