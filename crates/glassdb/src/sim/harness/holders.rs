@@ -19,8 +19,9 @@ use crate::Database;
 const LIST_PAGE: ListLimit = NonZeroUsize::new(1000).unwrap();
 const GC_PARALLELISM: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
-/// Runs full GCs on `db` until no garbage is left, then panics if a leaf in
-/// `backend` names a lock holder that has no transaction record.
+/// Runs full GCs on `db` until no garbage is left, then panics if a GC check
+/// failed, or if a leaf in `backend` names a lock holder that has no
+/// transaction record.
 pub(super) async fn assert_no_stray_holders(db: &Database, backend: &dyn Backend, db_name: &str) {
     collect_all_garbage(db).await;
     let mut stray = Vec::new();
@@ -41,16 +42,20 @@ pub(super) async fn assert_no_stray_holders(db: &Database, backend: &dyn Backend
     );
 }
 
-/// Repeats full GCs until a GC defers nothing and releases no effects. The
-/// records of the last retention period are deferred, so this waits for it. A
-/// failed check keeps its record, so it cannot leave a stray holder.
+/// Repeats full GCs until a GC defers nothing and makes no progress, then
+/// panics if a check of that GC failed. The records of the last retention
+/// period are deferred, so this waits for it. A check can fail until a later
+/// record of the same GC is deleted, for example a lock release on a dropped
+/// collection that the drop did not reclaim yet. So a GC that deletes records
+/// is repeated too.
 async fn collect_all_garbage(db: &Database) {
     loop {
         let report = db
             .collect_garbage(GC_PARALLELISM)
             .await
             .expect("full GC after the run");
-        if report.deferred == 0 && report.reclaimed_effects == 0 {
+        if report.deferred == 0 && report.reclaimed_effects == 0 && report.deleted == 0 {
+            assert_eq!(report.failed, 0, "full GC checks failed: {report:?}");
             return;
         }
         rt::sleep(report.retry_after.unwrap_or_default()).await;
