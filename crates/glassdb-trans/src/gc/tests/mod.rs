@@ -1130,6 +1130,29 @@ async fn committed_key_lock_keeps_the_record_and_lock() {
 }
 
 #[tokio::test]
+async fn committed_releases_a_lock_on_a_key_it_did_not_write() {
+    let ctx = new_ctx().await;
+    let id = tx(1);
+    // An earlier commit pass locked `r`. The last pass wrote only `k`, and a
+    // later writer already replaced `k`.
+    ctx.tx_records
+        .set(&committed(id, PAST_HORIZON, &[b"k"], &[b"k", b"r"]))
+        .await
+        .unwrap();
+    store_entry(&ctx, b"k", writer_entry(b"k", &tx(2))).await;
+    store_entry(&ctx, b"r", locked_entry(b"r", &id)).await;
+
+    check_hints_and_scan_page(&ctx).await;
+
+    assert!(is_gone(&ctx.tx_records, &id).await);
+    assert!(
+        lookup_entry(&ctx, b"r")
+            .await
+            .is_none_or(|entry| entry.lock_holders().is_empty())
+    );
+}
+
+#[tokio::test]
 async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
     use crate::access::{AccessSet, ScanRange, WriteAccess};
     use crate::engine::engine_fixture;
@@ -2815,16 +2838,17 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropR
         .await
         .unwrap();
     let operation = owner.monitor.begin_owner_operation(&id).unwrap();
-    lock_directory(&locker, &collection(), &id, LockType::Write).await;
-    lock_directory(&locker, &target, &id, LockType::Read).await;
-    owner.monitor.record_tx_locks(&id, locks.clone());
+    // Without `durable_locks`, the identity takes and records only the drop.
+    if durable_locks {
+        owner.monitor.add_tx_locks(&id, locks.clone());
+        lock_directory(&locker, &collection(), &id, LockType::Write).await;
+        lock_directory(&locker, &target, &id, LockType::Read).await;
+    }
     lifecycle
         .install_drop_intents(&id, std::slice::from_ref(&change))
         .await
         .unwrap();
     operation.complete();
-    // Paused time keeps the refresher from copying the local lock list. An
-    // acknowledged abort can retain the earlier durable drop-only manifest.
     assert_eq!(
         owner.monitor.abort_owned_tx(&id).await.unwrap(),
         OwnerAbortOutcome::Acknowledged

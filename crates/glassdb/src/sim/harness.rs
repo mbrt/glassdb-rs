@@ -1,6 +1,7 @@
 //! Shared deterministic execution, failure/delay injection, replay, and PCT harness.
 
 mod client;
+mod holders;
 mod nemesis;
 #[cfg(sim)]
 mod scheduling;
@@ -500,6 +501,11 @@ impl<W: SimWorkload> RunContext<W> {
                 self.faults.failures_enabled() || timed_out,
             )
             .await;
+        // A late lock CAS can still leave a stray holder (ADR-095). Without
+        // failures and slow mutations, every CAS lands before its pass ends.
+        if !self.faults.failures_enabled() && !self.faults.slow_mutations_enabled() && !timed_out {
+            holders::assert_no_stray_holders(&verify_db, self.backbone.as_ref(), DB_NAME).await;
+        }
         verify_db.shutdown().await;
         drop(self.client_backbone);
         self.log

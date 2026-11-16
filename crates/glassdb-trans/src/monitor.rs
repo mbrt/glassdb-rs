@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use glassdb_concurr::{Background, Backoff, RetrySchedule, rt, shard::Sharded};
-use glassdb_data::{CollectionAddress, LogicalKey, TxId};
+use glassdb_data::{CollectionAddress, LeafRef, LogicalKey, TxId};
 use glassdb_storage::transaction::{
     TxCollectionChange, TxCommitStatus, TxLifecycleRelation, TxLock, TxRecord, TxRecordState,
     TxRecordStore, TxStatus,
 };
-use glassdb_storage::{Observation, Requirement, StorageError, Timeline};
+use glassdb_storage::{LockType, Observation, Requirement, StorageError, Timeline};
 use hashlink::LinkedHashMap;
 use tokio::sync::oneshot;
 
@@ -613,6 +613,7 @@ pub(crate) struct TxRecoveryManifest {
 
 impl TxRecoveryManifest {
     /// Extracts the durable recovery manifest from a transaction record.
+    #[cfg(test)]
     pub(crate) fn from_record(record: &TxRecord) -> Self {
         Self {
             locks: record.locks.clone(),
@@ -626,6 +627,53 @@ impl TxRecoveryManifest {
         record.locks = self.locks;
         record.collection_changes = self.collection_changes;
         record.prepared_collections = self.prepared_collections;
+    }
+
+    /// Adds `locks` to the lock set of the identity (ADR-095). A lock on a
+    /// target that the set already has replaces it only when the new lock is a
+    /// write lock.
+    fn add_locks(&mut self, locks: impl IntoIterator<Item = TxLock>) {
+        let mut index: HashMap<LockTarget, usize> = self
+            .locks
+            .iter()
+            .enumerate()
+            .map(|(i, lock)| (LockTarget::of(lock), i))
+            .collect();
+        for lock in locks {
+            match index.entry(LockTarget::of(&lock)) {
+                Entry::Occupied(entry) => {
+                    if lock.typ() == LockType::Write {
+                        self.locks[*entry.get()] = lock;
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(self.locks.len());
+                    self.locks.push(lock);
+                }
+            }
+        }
+    }
+}
+
+/// The object that a recorded lock locks, without its lock type.
+#[derive(PartialEq, Eq, Hash)]
+enum LockTarget {
+    Key(LogicalKey),
+    Membership(LeafRef),
+    Directory(CollectionAddress),
+    TopologyParticipant(CollectionAddress),
+}
+
+impl LockTarget {
+    fn of(lock: &TxLock) -> Self {
+        match lock {
+            TxLock::Key { key, .. } => Self::Key(key.clone()),
+            TxLock::Membership { leaf, .. } => Self::Membership(leaf.clone()),
+            TxLock::Directory { collection, .. } => Self::Directory(collection.clone()),
+            TxLock::TopologyParticipant { collection } => {
+                Self::TopologyParticipant(collection.clone())
+            }
+        }
     }
 }
 
@@ -839,20 +887,32 @@ impl Monitor {
             })
     }
 
-    /// Records the lock set a transaction currently holds, so the refresher can
-    /// stamp it onto the pending transaction record (ADR-022). Overwrites any
-    /// previously recorded set with the latest acquire; a no-op if the
-    /// transaction is no longer tracked (already has a final status).
-    pub(crate) fn record_tx_locks(&self, tid: &TxId, locks: Vec<TxLock>) {
+    /// Adds `locks` to the lock set of an owned identity and returns the whole
+    /// set (ADR-095). The owner adds a lock before it sends the CAS that takes
+    /// it, so every record that the owner writes lists the lock even if the CAS
+    /// lands late. The set keeps the locks of every commit pass of the
+    /// identity. Returns only `locks` if the transaction is no longer tracked.
+    pub(crate) fn add_tx_locks(
+        &self,
+        tid: &TxId,
+        locks: impl IntoIterator<Item = TxLock>,
+    ) -> Vec<TxLock> {
         let mut st = self.shard_for(tid).lock().unwrap();
-        if let Some(TxRuntimeEntry {
-            role: TxRuntimeRole::Owned(owned),
-            ..
-        }) = st.transactions.get_mut(tid)
-            && let Some(record) = owned.record.as_mut()
-        {
-            record.recovery.locks = locks;
-        }
+        let mut recovery = match st.transactions.get_mut(tid) {
+            Some(TxRuntimeEntry {
+                role: TxRuntimeRole::Owned(owned),
+                ..
+            }) => match owned.record.as_mut() {
+                Some(record) => {
+                    record.recovery.add_locks(locks);
+                    return record.recovery.locks.clone();
+                }
+                None => TxRecoveryManifest::default(),
+            },
+            _ => TxRecoveryManifest::default(),
+        };
+        recovery.add_locks(locks);
+        recovery.locks
     }
 
     /// Starts a background task that periodically refreshes the pending record so
@@ -1252,7 +1312,7 @@ impl Monitor {
                 }
                 AbortObservationAction::Write(target) => target,
             };
-            let abort_record = self.build_abort_record(tid, &expected, target);
+            let abort_record = self.build_abort_record(tid, target);
             let r = if expected.is_absent() {
                 self.inner.tx_records.set(&abort_record).await
             } else {
@@ -1302,22 +1362,21 @@ impl Monitor {
         }
     }
 
-    /// Builds an abort-side transaction record that retains recovery ownership.
-    fn build_abort_record(
-        &self,
-        tid: &TxId,
-        expected: &Observation<TxRecord>,
-        target: TxCommitStatus,
-    ) -> TxRecord {
+    /// Builds an abort-side transaction record. An `Aborted` record keeps the
+    /// recovery manifest that GC needs to release the effects of the identity.
+    fn build_abort_record(&self, tid: &TxId, target: TxCommitStatus) -> TxRecord {
         debug_assert!(matches!(
             target,
             TxCommitStatus::Aborted | TxCommitStatus::Wounded
         ));
         let mut abort_record = TxRecord::new(*tid, target);
-        if let Some(current) = expected.value() {
-            abort_record.writes = current.writes.clone();
-            TxRecoveryManifest::from_record(current).apply_to(&mut abort_record);
-        } else if let Some(TxRuntimeEntry {
+        // Only the owner writes `Aborted`, and its own manifest is newer than
+        // the stored one. GC reads nothing of a `Wounded` record past its
+        // status, so a wound holds no manifest (ADR-095).
+        if target == TxCommitStatus::Wounded {
+            return abort_record;
+        }
+        if let Some(TxRuntimeEntry {
             role: TxRuntimeRole::Owned(owned),
             ..
         }) = self.shard_for(tid).lock().unwrap().transactions.get(tid)
@@ -2767,6 +2826,49 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn an_owner_abort_lists_locks_newer_than_the_pending_record() {
+        let b: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (mon, t) = new_test_monitor(b);
+        let tx = tx_id(b"newer-locks");
+        mon.begin_persisted_tx(&tx, TxRecoveryManifest::default())
+            .await
+            .unwrap();
+        // Paused time keeps the refresher from writing the new locks.
+        let lock = TxLock::Key {
+            key: logical_key(b"k"),
+            typ: LockType::Write,
+        };
+        mon.add_tx_locks(&tx, [lock.clone()]);
+
+        mon.abort_owned_tx(&tx).await.unwrap();
+
+        let observed = t.tx_records.get_at(&tx, Requirement::ANY).await.unwrap();
+        let stored = observed.value().unwrap();
+        assert_eq!(stored.status, TxCommitStatus::Aborted);
+        assert_eq!(stored.locks, vec![lock]);
+    }
+
+    #[tokio::test]
+    async fn the_lock_set_keeps_one_lock_for_each_target() {
+        let (mon, _t) = new_test_monitor(Arc::new(MemoryBackend::new()));
+        let tx = tx_id(b"lock-set");
+        mon.begin_tx(&tx);
+        let key = |typ| TxLock::Key {
+            key: logical_key(b"k"),
+            typ,
+        };
+        let other = TxLock::Key {
+            key: logical_key(b"other"),
+            typ: LockType::Read,
+        };
+
+        mon.add_tx_locks(&tx, [key(LockType::Read), other.clone()]);
+        let locks = mon.add_tx_locks(&tx, [key(LockType::Write), key(LockType::Read)]);
+
+        assert_eq!(locks, vec![key(LockType::Write), other]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn persisted_refresh_reuses_its_exact_observation() {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
@@ -3658,7 +3760,11 @@ mod tests {
             .get_at(&tx, Requirement::ANY)
             .await
             .unwrap();
-        assert_eq!(final_record.value().unwrap().locks, refreshed.locks);
+        // The wound replaced the refreshed record, and it holds no manifest
+        // (ADR-095).
+        let final_record = final_record.value().unwrap();
+        assert_eq!(final_record.status, TxCommitStatus::Wounded);
+        assert!(final_record.locks.is_empty());
     }
 
     #[tokio::test]
@@ -3905,7 +4011,7 @@ mod tests {
             typ: LockType::Write,
         }];
         mon.begin_tx(&tx);
-        mon.record_tx_locks(&tx, locks.clone());
+        mon.add_tx_locks(&tx, locks.clone());
         mon.start_refresh_tx(&tx);
 
         // Advance past the refresh interval so the refresher materializes the

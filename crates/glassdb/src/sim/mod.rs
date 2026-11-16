@@ -10,7 +10,9 @@
 //! cases available. The optional cycle observer uses a separate instance and a
 //! faultless transport. Five workloads check database consistency through public
 //! state and transaction histories; retained protocol resources alone are outside
-//! their scope:
+//! their scope. The harness checks one protocol resource itself: without
+//! transport failures and slow mutations, a full GC after the run leaves no
+//! leaf lock whose holder has no transaction record:
 //!
 //! - [`RmwWorkload`] stresses shared-key serializability and in-doubt increments.
 //! - [`CycleWorkload`] detects isolation failures with non-commuting ring updates.

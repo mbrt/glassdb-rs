@@ -156,9 +156,9 @@ impl IdentityRetirement {
                 self.collection_commit.abort(tx_id, resources).await
             }
             // A dropped or otherwise unresolved owner operation was pinned as
-            // `Wounded`. Its durable manifest and repeated GC passes own
-            // cleanup; local rollback must not race an effect that may land
-            // after this future returns.
+            // `Wounded`. GC keeps the record and its effects (ADR-071). Local
+            // rollback must not race an effect that may land after this
+            // future returns.
             OwnerAbortOutcome::Pinned => {
                 self.gc_hints.schedule(*tx_id);
                 Ok(())
@@ -890,15 +890,11 @@ impl Algo {
             }
         };
 
-        // Record the held lock set so both the committed record (below) and the
-        // refresher's pending record describe their own recovery manifest, which
-        // is what lets GC prune this transaction's locks by a GC check
-        // (ADR-022). This tracks the latest acquire; a body replay that drops
-        // keys may under-record, which only defers those stale locks to lazy
-        // reclaim, never a correctness loss.
-        let mut locks = locked.locked_paths();
-        locks.extend(tx.directory_locks.durable_locks());
-        self.mon.record_tx_locks(&tx.id, locks.clone());
+        // The locker added the planned locks before its CASes. The held set
+        // can have stronger membership locks than planned. The committed record
+        // lists the set of every pass, so that GC can release the locks that
+        // the last pass did not take again (ADR-095).
+        let locks = self.mon.add_tx_locks(&tx.id, locked.locked_paths());
 
         // Validate point reads and scans after their entry/predicate locks are
         // held. An invalidated read replays the body under the same id while the
@@ -997,9 +993,7 @@ impl Algo {
                 });
             }
         };
-        let mut locks = locked.locked_paths();
-        locks.extend(tx.directory_locks.durable_locks());
-        self.mon.record_tx_locks(&tx.id, locks.clone());
+        self.mon.add_tx_locks(&tx.id, locked.locked_paths());
         if self
             .validate(
                 &tx.accesses,
@@ -1036,6 +1030,8 @@ impl Algo {
         if tx.directory_locks.covers(&directory_locks) {
             return Ok(());
         }
+        self.mon
+            .add_tx_locks(&tx.id, directory_locks.durable_locks());
         self.locker
             .collections()
             .lock(&tx.id, &directory_locks)
@@ -2016,6 +2012,49 @@ mod tests {
         assert_eq!(e.lock_holders(), std::slice::from_ref(h.id()));
 
         tm.end(&mut h).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_replay_that_drops_a_key_keeps_its_lock_in_the_record() {
+        let (tm, tctx) = new_algo().await;
+        let (tm2, _t2) = new_algo_from_backend(tctx.backend.clone()).await;
+        let ka = logical_key(b"k");
+        let kb = logical_key(b"k2");
+        commit_writes(&tm2, vec![wa(&ka, b"v1")]).await;
+        commit_writes(&tm2, vec![wa(&kb, b"x1")]).await;
+        let stale = do_read(&tctx, &ka).await;
+        commit_writes(&tm2, vec![wa(&ka, b"v2")]).await;
+
+        let external = vec![b'x'; InlinePolicy::default().max_value_bytes + 1];
+        let mut h = begin_accesses(
+            &tm,
+            AccessSet::new(
+                vec![stale],
+                vec![wa(&ka, b"v3"), wa(&kb, &external)],
+                Vec::new(),
+            ),
+        );
+        assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
+
+        // The replay of the same identity no longer writes `k2`.
+        let fresh = do_read(&tctx, &ka).await;
+        h.accesses = AccessSet::new(vec![fresh], vec![wa(&ka, &external)], Vec::new());
+        assert_eq!(
+            tm.commit(&mut h).await.unwrap(),
+            BodyDecision::ReturnOutcome
+        );
+
+        let record = tctx
+            .tx_records
+            .get_at(h.id(), Requirement::ANY)
+            .await
+            .unwrap();
+        let record = record.value().unwrap();
+        assert_eq!(record.status, TxCommitStatus::Committed);
+        assert!(record.locks.contains(&TxLock::Key {
+            key: kb,
+            typ: LockType::Write,
+        }));
     }
 
     fn directory_read(parent: CollectionAddress) -> DirectoryRead {
