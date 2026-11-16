@@ -11,7 +11,8 @@
 //! reference (ADR-079). Pinned wounds stay until owner acknowledgement
 //! (ADR-059). GC acknowledges for the owner only a wound of an identity that
 //! retired in this instance without a record, from the proof that `Monitor`
-//! keeps.
+//! keeps. For an identity that this instance pinned, GC releases once the
+//! lock set that `Monitor` kept, and the record stays pinned.
 //!
 //! Lock reclamation uses the locker's coordinator-backed operations (ADR-029),
 //! so GC does not issue its own leaf mutations.
@@ -117,6 +118,8 @@ enum GcEligibility {
     Deferred(Duration),
     Retained,
     Missing,
+    /// The status read already completed the check.
+    Checked(GcOutcome),
 }
 
 /// Result of a GC candidate check.
@@ -598,7 +601,11 @@ impl Gc {
                     .await?
                 {
                     Some(aborted) => status = aborted,
-                    None => return Ok(GcEligibility::Retained),
+                    None => {
+                        return Ok(GcEligibility::Checked(
+                            self.release_pinned_locks(tid, barrier).await?,
+                        ));
+                    }
                 }
             }
             TxRecordState::Committed | TxRecordState::Aborted => {}
@@ -612,6 +619,27 @@ impl Gc {
             ));
         }
         Ok(GcEligibility::Ready(status.observation))
+    }
+
+    /// Releases the lock set that this instance kept when it pinned `tid` as
+    /// wounded, until one release completes. The record stays pinned, and GC
+    /// does not check its resources after that (ADR-071).
+    async fn release_pinned_locks(
+        &self,
+        tid: &TxId,
+        barrier: CurrentnessBarrier,
+    ) -> Result<GcOutcome, TransError> {
+        let Some(locks) = self.monitor.pinned_locks(tid) else {
+            return Ok(GcOutcome::Retained);
+        };
+        let reclaimed = self.release_locks(tid, &locks, barrier).await?;
+        if reclaimed.changed {
+            self.count_writes(locks.len() as u64);
+        }
+        if reclaimed.complete {
+            self.monitor.forget_pinned_locks(tid);
+        }
+        Ok(GcOutcome::from_progress(reclaimed.changed))
     }
 
     /// Adds to the estimate of the writes of this GC. The estimate is about

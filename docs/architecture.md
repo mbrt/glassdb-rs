@@ -576,6 +576,15 @@ The `Monitor` handles a crash or a dropped transaction future:
    reasons. A restart or an eviction from the set loses the proof, and the
    wound stays pinned. We accept this cost instead of a read or a record
    write each time such an identity retires.
+
+   An owner that pins its own identity cannot acknowledge, but it knows its
+   lock set. The `Monitor` keeps that set, with a limit on the number of
+   sets, and the GC hint of the pinned identity makes GC release the locks
+   inside its write budget. GC tries again after a failed release, and drops
+   the set after one release completes. The record stays pinned. A lock that an unresolved operation adds
+   later stays until a writer on the same key removes it. A reader drops it
+   at once, so it costs no grace wait. A single release does not repeat the
+   cost that ADR-071 rejects.
 4. **Retirement handoff.** Cancellation, unwinding, and failed finalization keep
    the retirement guard armed, and the handoff gives the identity to waited
    recovery before control leaves the owner. A failed retirement is only a
@@ -961,9 +970,11 @@ mark-sweep ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
   it. Memory, admission, and concurrency are all bounded. GC scans have their
   own capacity, so they can find work after hints are dropped.
 - **Status before leaves.** GC checks only committed and aborted records
-  ([ADR-071](adr/071-gc-skips-pending-and-wounded-transactions.md)). The one
-  exception is the owner acknowledgement of a wound that GC makes from a
-  retirement proof of its own instance, described in crash recovery. It reads
+  ([ADR-071](adr/071-gc-skips-pending-and-wounded-transactions.md)). The two
+  exceptions are the owner acknowledgement of a wound that GC makes from a
+  retirement proof of its own instance, and the single release of the lock
+  set of an identity that its own instance pinned. Crash recovery describes
+  both. GC reads
   the status first, then captures a currentness barrier, and makes the reads
   that prove the absence of a reference after that barrier. Write-back sets a
   committed transaction as the writer of each key it wrote, and only an owner

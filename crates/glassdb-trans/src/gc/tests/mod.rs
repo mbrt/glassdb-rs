@@ -4,7 +4,7 @@ use crate::collections::TopologySettler;
 use crate::engine::{AssemblyFixture, EngineConfig};
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{LeafCoordinator, NoStructuralHints};
-use crate::monitor::Monitor;
+use crate::monitor::{Monitor, OwnerAbortOutcome};
 use crate::retry_timing::RetryTiming;
 use crate::tlocker::LockOutcome;
 use async_trait::async_trait;
@@ -473,6 +473,7 @@ async fn check_candidate(gc: &Gc, tid: &TxId) -> Result<GcOutcome, TransError> {
         GcEligibility::Deferred(delay) => Ok(GcOutcome::Deferred(delay)),
         GcEligibility::Retained => Ok(GcOutcome::Retained),
         GcEligibility::Missing => Ok(GcOutcome::Missing),
+        GcEligibility::Checked(outcome) => Ok(outcome),
     }
 }
 
@@ -1157,7 +1158,7 @@ async fn aborted_entry_release_refreshes_leaves_without_refreshing_indexes() {
     use crate::access::{AccessSet, ScanRange, WriteAccess};
     use crate::engine::engine_fixture;
     use crate::key_resolver::KeyResolver;
-    use crate::monitor::{OwnerAbortOutcome, TxRecoveryManifest};
+    use crate::monitor::TxRecoveryManifest;
     use glassdb_data::LeafRef;
 
     // One key uses direct descent; two keys use batched descent. The scan also
@@ -4210,4 +4211,96 @@ async fn gc_acknowledges_a_late_wound_of_an_identity_retired_without_record() {
     assert_eq!(status(retired).await.unwrap(), TxCommitStatus::Aborted);
     assert_eq!(status(busy).await.unwrap(), TxCommitStatus::Wounded);
     assert_eq!(status(foreign).await.unwrap(), TxCommitStatus::Wounded);
+}
+
+#[tokio::test(start_paused = true)]
+async fn gc_releases_the_locks_of_a_pinned_identity_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let recording = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+    let operations = recording.log();
+    let hooks = HookBackend::new(Arc::new(recording));
+    let ctx = new_ctx_with(hooks.clone()).await;
+    let id = tx(1);
+    ctx.mon.begin_tx(&id);
+    ctx.mon.add_tx_locks(&id, [write_lock(b"k")]);
+    store_entry(&ctx, b"k", locked_entry(b"k", &id)).await;
+    // A dropped owner operation can still publish an effect, so the owner
+    // pins its own identity as wounded.
+    drop(ctx.mon.begin_owner_operation(&id).unwrap());
+    assert_eq!(
+        ctx.mon.abort_owned_tx(&id).await.unwrap(),
+        OwnerAbortOutcome::Pinned
+    );
+
+    // A failed release keeps the lock set for the next check.
+    let fail = Arc::new(AtomicBool::new(true));
+    hooks.set_before({
+        let fail = fail.clone();
+        move |op| {
+            let fail =
+                matches!(op, BackendOp::WriteIf { .. }) && fail.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if fail {
+                    Err(BackendError::other("leaf CAS failed"))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    });
+    assert!(check_candidate(&ctx.gc, &id).await.is_err());
+    assert!(
+        !fail.load(Ordering::SeqCst),
+        "the release must reach a leaf CAS"
+    );
+    hooks.clear_before();
+
+    // The GC hint of the pinned identity releases the set.
+    let background = Background::new();
+    ctx.gc.start(&background);
+    ctx.hints.schedule(id);
+    for _ in 0..2 {
+        wait_for_hint_deadline(&ctx).await;
+    }
+    // Without a holder or a value, the entry is vestigial and goes away.
+    assert!(
+        lookup_entry(&ctx, b"k")
+            .await
+            .is_none_or(|entry| entry.lock_holders().is_empty())
+    );
+    let got = ctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
+    assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
+
+    // A lock that lands after the release stays. GC releases the set once and
+    // does not check the pinned record again.
+    store_entry(&ctx, b"k", locked_entry(b"k", &id)).await;
+    operations.lock().unwrap().clear();
+    ctx.hints.schedule(id);
+    for _ in 0..2 {
+        wait_for_hint_deadline(&ctx).await;
+    }
+    background.shutdown().await;
+    let path = ObjectPath::Transaction {
+        db_prefix: DbPrefix::try_from("db").unwrap(),
+        id,
+    }
+    .to_string();
+    {
+        let operations = operations.lock().unwrap();
+        assert!(
+            operations.iter().any(|op| op.path == path),
+            "GC must check the hinted candidate again"
+        );
+        assert!(
+            operations
+                .iter()
+                .all(|op| op.op == "list" || op.path == path),
+            "a later check only reads the pinned record"
+        );
+    }
+    assert_eq!(
+        lookup_entry(&ctx, b"k").await.unwrap().lock_holders(),
+        std::slice::from_ref(&id)
+    );
 }

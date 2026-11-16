@@ -39,6 +39,13 @@ const MAX_RECENT_LOCAL: usize = 65_536;
 /// wound of it stays pinned.
 const MAX_RETIRED_WITHOUT_RECORD: usize = 65_536;
 
+/// The number of lock sets of pinned identities that one database instance
+/// keeps until GC releases them. A set holds every lock of its identity, so
+/// this limits the count of sets, not their size. When it is full, the oldest
+/// set is dropped, and its locks stay until a writer on the same key removes
+/// them.
+const MAX_PINNED_LOCK_SETS: usize = 4_096;
+
 /// Final-status cache activity for one snapshot or accumulated interval.
 ///
 /// Each final-status cache lookup counts once. Reads from local owner state
@@ -556,6 +563,9 @@ struct State {
     // The identities that retired without a record and with a retirement
     // proof, oldest first. GC acknowledges a later wound of one of them.
     retired_without_record: LinkedHashSet<TxId>,
+    // The lock sets of the identities that this instance pinned as wounded,
+    // oldest first. GC releases each set once.
+    pinned_locks: LinkedHashMap<TxId, Vec<TxLock>>,
 }
 
 impl State {
@@ -570,6 +580,15 @@ impl State {
                 || now.saturating_duration_since(*at) >= LOCAL_RETENTION)
         {
             self.recent_local.pop_front();
+        }
+    }
+
+    /// Keeps the lock set of the pinned identity `tid`, in a shard that keeps
+    /// at most `capacity` of them.
+    fn note_pinned_locks(&mut self, tid: TxId, locks: Vec<TxLock>, capacity: usize) {
+        self.pinned_locks.insert(tid, locks);
+        while self.pinned_locks.len() > capacity {
+            self.pinned_locks.pop_front();
         }
     }
 
@@ -1117,7 +1136,11 @@ impl Monitor {
                 TxCommitStatus::Wounded | TxCommitStatus::Pending | TxCommitStatus::Unknown => None,
             };
             if let Some(outcome) = outcome {
-                self.finish_local_tx(tid);
+                if outcome == OwnerAbortOutcome::Pinned {
+                    self.finish_pinned_tx(tid);
+                } else {
+                    self.finish_local_tx(tid);
+                }
                 return Ok(outcome);
             }
             rt::sleep(backoff.next_delay()).await;
@@ -1621,6 +1644,55 @@ impl Monitor {
         }) = st.transactions.get_mut(tid)
         {
             owned.lifecycle.finish_commit_write(create_may_land);
+        }
+    }
+
+    /// Returns the lock set that this instance kept when it pinned `tid` as
+    /// wounded. The set stays until [`Self::forget_pinned_locks`], so a
+    /// failed or cancelled release can run again.
+    pub(crate) fn pinned_locks(&self, tid: &TxId) -> Option<Vec<TxLock>> {
+        self.shard_for(tid)
+            .lock()
+            .unwrap()
+            .pinned_locks
+            .get(tid)
+            .cloned()
+    }
+
+    /// Drops the lock set of the pinned identity `tid` after a complete
+    /// release. An unresolved owner operation can still add a lock later. That
+    /// lock stays until a writer on the same key removes it, and a reader
+    /// drops it at once.
+    pub(crate) fn forget_pinned_locks(&self, tid: &TxId) {
+        self.shard_for(tid).lock().unwrap().pinned_locks.remove(tid);
+    }
+
+    /// Finishes a local identity that this instance pinned as wounded, and
+    /// keeps its lock set for GC. The wound is durable, so a release of these
+    /// locks cannot expose an effect of the identity (ADR-059).
+    fn finish_pinned_tx(&self, tid: &TxId) {
+        let mut st = self.shard_for(tid).lock().unwrap();
+        let Some(TxRuntimeEntry {
+            role: TxRuntimeRole::Owned(_),
+            ..
+        }) = st.transactions.get(tid)
+        else {
+            return;
+        };
+        let Some(mut entry) = st.transactions.remove(tid) else {
+            return;
+        };
+        notify_waiters(&mut entry.waiters);
+        let TxRuntimeRole::Owned(owned) = entry.role else {
+            return;
+        };
+        let locks = owned
+            .record
+            .map(|record| record.recovery.locks)
+            .unwrap_or_default();
+        if !locks.is_empty() {
+            let capacity = (MAX_PINNED_LOCK_SETS / self.inner.shards.len()).max(1);
+            st.note_pinned_locks(*tid, locks, capacity);
         }
     }
 

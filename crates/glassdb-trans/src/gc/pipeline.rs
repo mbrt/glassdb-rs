@@ -146,6 +146,7 @@ impl CheckPipeline {
                         Ok(GcEligibility::Deferred(delay)) => Ok(GcOutcome::Deferred(delay)),
                         Ok(GcEligibility::Retained) => Ok(GcOutcome::Retained),
                         Ok(GcEligibility::Missing) => Ok(GcOutcome::Missing),
+                        Ok(GcEligibility::Checked(outcome)) => Ok(outcome),
                         Err(error) => Err(error),
                     };
                     self.refill();
