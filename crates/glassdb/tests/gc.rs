@@ -4,7 +4,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb::backend::{BackendError, memory::MemoryBackend};
 use glassdb::middleware::{BackendOp, HookBackend};
-use glassdb::{Backend, Database, GcLimits};
+use glassdb::{Backend, Database, GcLimits, ProtocolTiming};
 use glassdb_data::{DbPrefix, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxRecord, TxRecordStore};
 use glassdb_storage::{CachedStore, Requirement, StorageError, Timeline};
@@ -290,6 +290,50 @@ async fn a_full_gc_completes_the_checks_of_a_dropped_one() {
 
     assert_eq!(report.deleted, 1);
     assert!(!record_exists(backend.clone(), &ids[0]).await);
+    db.shutdown().await;
+}
+
+// The record of the writer holds a membership lock on the root leaf of the
+// collection. After the drop reclaims the collection, that leaf is missing, and
+// the release of the lock must succeed. GC retention follows the system clock,
+// so this test runs in real time with a short pending timeout.
+#[tokio::test]
+async fn full_gc_releases_the_locks_of_a_reclaimed_collection() {
+    let backend = Arc::new(MemoryBackend::new());
+    let db = Database::builder("gc", backend.clone())
+        .protocol_timing(ProtocolTiming::new(
+            Duration::from_millis(100),
+            Duration::ZERO,
+        ))
+        .open()
+        .await
+        .unwrap();
+    let dropped = db
+        .tx(|tx| async move {
+            let created = tx
+                .create_collection(&tx.root_collection(), b"dropped")
+                .await?;
+            tx.write(&created, b"k", b"v")?;
+            Ok(created)
+        })
+        .await
+        .unwrap();
+    dropped.drop_collection().await.unwrap();
+
+    let report = loop {
+        let report = db.collect_garbage(NonZeroUsize::MIN).await.unwrap();
+        if report.deferred == 0 && report.reclaimed_effects == 0 && report.deleted == 0 {
+            break report;
+        }
+        tokio::time::sleep(report.retry_after.unwrap_or_default()).await;
+    };
+
+    assert_eq!(report.failed, 0, "{report:?}");
+    let records = backend
+        .list("gc/_t/", None, NonZeroUsize::new(10).unwrap())
+        .await
+        .unwrap();
+    assert!(records.objects.is_empty(), "{:?}", records.objects);
     db.shutdown().await;
 }
 

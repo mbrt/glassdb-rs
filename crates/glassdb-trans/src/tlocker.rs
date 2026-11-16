@@ -1194,6 +1194,7 @@ impl KeyLocker {
     }
 
     /// Releases recorded entry and membership locks without changing committed values.
+    /// A missing tree or leaf holds none of the locks.
     async fn release(
         &self,
         id: &TxId,
@@ -1219,10 +1220,12 @@ impl KeyLocker {
         for items in by_collection.into_values() {
             // Cached indexes are routing hints. Right links and the bounded
             // leaf read correct stale split placement; splits resolve holds
-            // before moving entries. Missing routes rely on the identity and
-            // publication rules in the cache guide. GC releases entries only
-            // after acknowledged abort, which excludes later lock acquisition
-            // under a missing prepared root.
+            // before moving entries. Missing routes and leaves rely on the
+            // identity and publication rules in the cache guide: published
+            // nodes stay until their collection is reclaimed, and reclamation
+            // removes every holder with them. GC releases locks only after
+            // commit or acknowledged abort, so the identity cannot acquire a
+            // lock later under a missing prepared root.
             match self
                 .router
                 .route_keys_with_requirements(items, Requirement::ANY, requirement)
@@ -1241,7 +1244,14 @@ impl KeyLocker {
         .await;
         let mut changed = false;
         for result in results {
-            changed |= result?;
+            match result {
+                Ok(released) => changed |= released,
+                // A missing leaf, as a missing route above.
+                Err(TransError::Storage(
+                    StorageError::NotFound | StorageError::StaleCollection,
+                )) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(changed)
     }
