@@ -25,9 +25,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  fuzz:
-    environment: fuzz-corpus-writer
+  changes:
     runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.changes.outputs.run }}
     steps:
 
     - uses: actions/checkout@v4
@@ -63,12 +64,24 @@ jobs:
           echo "run=true" >> "$GITHUB_OUTPUT"
         fi
 
+  # The fuzz and pct jobs run in parallel. They are separate jobs, so a failure
+  # in one job does not cancel the other.
+  fuzz:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    environment: fuzz-corpus-writer
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0      # the corpus push rebases onto a newer main
+        persist-credentials: false
+
     - name: Install nightly Rust toolchain
-      if: steps.changes.outputs.run == 'true'
       uses: dtolnay/rust-toolchain@nightly
 
     - uses: Swatinem/rust-cache@v2
-      if: steps.changes.outputs.run == 'true'
       with:
         workspaces: |
           . -> target
@@ -80,11 +93,9 @@ jobs:
     # the sanitizer (rust-fuzz/cargo-fuzz#398). A source build targets the gnu
     # host, so `cargo fuzz` picks the correct default target.
     - name: Install cargo-fuzz
-      if: steps.changes.outputs.run == 'true'
       run: cargo install --locked cargo-fuzz
 
     - name: Fuzz, then minimize
-      if: steps.changes.outputs.run == 'true'
       env:
         DURATION_MINUTES: ${{ inputs.duration || 30 }}
       run: |
@@ -102,7 +113,7 @@ jobs:
         make fuzz-min
 
     - name: Upload crash artifacts
-      if: failure() && steps.changes.outputs.run == 'true'
+      if: failure()
       uses: actions/upload-artifact@v4
       with:
         name: fuzz-crashes-${{ github.run_id }}
@@ -111,7 +122,6 @@ jobs:
         retention-days: 30
 
     - name: Create corpus push token
-      if: steps.changes.outputs.run == 'true'
       id: push-token
       uses: actions/create-github-app-token@v3
       with:
@@ -120,7 +130,6 @@ jobs:
         permission-contents: write
 
     - name: Commit and push corpus updates
-      if: steps.changes.outputs.run == 'true'
       env:
         GH_TOKEN: ${{ steps.push-token.outputs.token }}
       run: |
@@ -138,16 +147,31 @@ jobs:
         git rebase --autostash origin/main
         git push origin HEAD:main
 
-    # PCT finds a race only on the seeds that it runs, and `make test` runs a
-    # small number of seeds per sweep. This step runs many more seeds in each
-    # sweep. A failure prints its seed, and `pct_assert` with that seed
-    # reproduces it. The corpus push can rebase onto a newer main, so the step
-    # prints the commit that it tests.
+  # PCT finds a race only on the seeds that it runs, and `make test` runs a
+  # small number of seeds per sweep. This job runs many more seeds in each
+  # sweep, sized to take about as long as the fuzz job. A failure prints its
+  # seed, and `pct_assert` with that seed reproduces it. The job skips the
+  # corpus replay tests (`replays_committed_*`), because the seed count does
+  # not change them and `make test` already runs them.
+  pct:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+
     - name: Deep PCT seed sweep
-      if: steps.changes.outputs.run == 'true'
       timeout-minutes: 90
       env:
-        GLASSDB_PCT_SEEDS: 16384
+        GLASSDB_PCT_SEEDS: 49152
       run: |
         echo "Sweeping commit $(git rev-parse HEAD)"
-        make test-sim
+        make test-sim SIM_TEST_ARGS="--skip replays_committed_"

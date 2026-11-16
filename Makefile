@@ -114,13 +114,15 @@ flamegraph:
 # is a substring filter over each full test name. Put every selected test in a
 # `sim_tests` module. The stable test policy discovers source roots marked with
 # `#![cfg(sim)]` and enforces this.
+#   SIM_TEST_ARGS  extra arguments for the test binaries (for example, `--skip`)
+SIM_TEST_ARGS ?=
 test-sim:
 	RUSTFLAGS="$(SIM_RUSTFLAGS)" cargo test --profile sim-test \
 		-p glassdb-concurr -p glassdb-backend \
 		-p glassdb-storage -p glassdb \
 		--lib --test sim \
 		--features glassdb-storage/sim,glassdb/sim \
-		sim_test
+		sim_test -- $(SIM_TEST_ARGS)
 
 # Run the fuzzers one target after another. Needs nightly and cargo-fuzz.
 #   FUZZ_TARGETS  targets to fuzz (default: all targets of `cargo fuzz list`)
