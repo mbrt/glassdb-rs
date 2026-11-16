@@ -36,7 +36,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use glassdb_concurr::{join_all_bounded, map_all_bounded, rt};
 use glassdb_data::{LeafRef, LogicalKey, ObjectPath, TxId};
-use glassdb_storage::transaction::TxLock;
+use glassdb_storage::transaction::{TxCommitStatus, TxLock};
 use glassdb_storage::{
     CurrentState, CurrentnessBarrier, KeyLockState, LeafEntry, LeafObservation, LockType,
     NodeLocks, Requirement, StorageError, TreeRouter,
@@ -390,13 +390,24 @@ impl MemberPolicy for AcquireOperation {
         let mut membership = self.membership;
         let mut admission = StageAdmission::ExistingKeys;
         let mut entries = Vec::with_capacity(self.intents.len());
+        // The holders that this stage removed from its own entries.
+        let mut removed = BTreeSet::new();
         for intent in self.intents.iter() {
             let cur = staged.get(&intent.raw_key).cloned();
             // The lock of an absent key needs a new entry, also for a read or
             // a delete (ADR-093).
             let adds_entry = cur.as_ref().is_none_or(LeafEntry::is_vestigial);
+            let before: Vec<TxId> = cur
+                .as_ref()
+                .map(|entry| entry.lock_holders().to_vec())
+                .unwrap_or_default();
             match resolve_and_lock(ctx, &self.id, intent, cur).await? {
                 EntryResolution::Locked(entry, changes_membership) => {
+                    removed.extend(
+                        before
+                            .into_iter()
+                            .filter(|holder| !entry.is_locked_by(holder)),
+                    );
                     if changes_membership {
                         membership = LockType::Write;
                     }
@@ -443,6 +454,7 @@ impl MemberPolicy for AcquireOperation {
         if retained {
             return Ok(Step::Skip { outcome });
         }
+        sweep_aborted_holders(ctx.tmon, &removed, staged, &mut entries);
         Ok(Step::Stage {
             entries,
             locks,
@@ -887,6 +899,44 @@ async fn resolve_and_lock(
         Desired::Read => false,
     };
     Ok(EntryResolution::Locked(e, changes_membership))
+}
+
+/// Removes from the other entries of the leaf the locks of each holder in
+/// `removed` whose aborted or wounded status this instance already knows.
+/// A holder in `removed` left an entry of the stage, so the stage writes the
+/// leaf anyway, and this adds no request. A committed holder keeps its other
+/// locks, because write-back or help-forward still needs them.
+fn sweep_aborted_holders(
+    tmon: &Monitor,
+    removed: &BTreeSet<TxId>,
+    staged: &BTreeMap<Vec<u8>, LeafEntry>,
+    entries: &mut Vec<(Vec<u8>, LeafEntry)>,
+) {
+    let aborted: Vec<&TxId> = removed
+        .iter()
+        .filter(|holder| {
+            matches!(
+                tmon.known_final_status(holder),
+                Some(TxCommitStatus::Aborted | TxCommitStatus::Wounded)
+            )
+        })
+        .collect();
+    if aborted.is_empty() {
+        return;
+    }
+    for (key, entry) in staged {
+        if entries.iter().any(|(staged_key, _)| staged_key == key) {
+            continue;
+        }
+        let mut swept = entry.clone();
+        let mut changed = false;
+        for holder in &aborted {
+            changed |= swept.release_lock(holder);
+        }
+        if changed {
+            entries.push((key.clone(), swept));
+        }
+    }
 }
 
 /// Stages `id`'s write-back on its `intents`: publish the committed current state
@@ -1496,7 +1546,6 @@ mod tests {
     use glassdb_backend::{Backend, memory::MemoryBackend};
     use glassdb_concurr::RetrySchedule;
     use glassdb_data::{CollectionAddress, CollectionId, CollectionName, DbPrefix, ObjectPath};
-    use glassdb_storage::transaction::TxCommitStatus;
     use glassdb_storage::{
         CollectionRecord, LeafBody, LeafEntry, Node, NodeSizePolicy, NodeStore, Timeline,
         TreeRouter,
@@ -2276,6 +2325,93 @@ mod tests {
         );
     }
 
+    // A writer that drops an aborted or wounded holder also removes the other
+    // locks of that holder in the same leaf, in the CAS that it writes anyway.
+    // A committed holder keeps its other locks.
+    #[tokio::test(start_paused = true)]
+    async fn writer_sweeps_the_other_locks_of_dead_holders() {
+        use glassdb_storage::transaction::{TxRecord, TxWrite};
+        let (locker, ctx) = init_tl_test().await;
+        // Existing keys take write locks, so no stage needs the membership
+        // lock, whose removal of a dead writer already clears its key locks.
+        seed_inline(&ctx, &[b"j", b"k", b"m", b"n", b"p", b"q"]).await;
+
+        let young = mk_tid(3, "young");
+        ctx.monitor.begin_tx(&young);
+        lock_ok(
+            &locker,
+            &young,
+            &group_of_intents(vec![put_intent(b"k"), put_intent(b"n")]),
+        )
+        .await;
+        let done = mk_tid(2, "done");
+        ctx.monitor.begin_tx(&done);
+        lock_ok(
+            &locker,
+            &done,
+            &group_of_intents(vec![put_intent(b"j"), read_intent(b"m")]),
+        )
+        .await;
+        let mut record = TxRecord::new(done, TxCommitStatus::Committed);
+        record.writes = vec![TxWrite {
+            key: logical_key(b"j"),
+            value: Arc::from(&b"v"[..]),
+            deleted: false,
+        }];
+        record.locks = vec![
+            TxLock::Key {
+                key: logical_key(b"j"),
+                typ: LockType::Write,
+            },
+            TxLock::Key {
+                key: logical_key(b"m"),
+                typ: LockType::Read,
+            },
+        ];
+        ctx.monitor.commit_tx(record).await.unwrap();
+        let aborted = mk_tid(4, "aborted");
+        ctx.monitor.begin_tx(&aborted);
+        lock_ok(
+            &locker,
+            &aborted,
+            &group_of_intents(vec![put_intent(b"p"), put_intent(b"q")]),
+        )
+        .await;
+        assert_eq!(
+            ctx.monitor.abort_owned_tx(&aborted).await.unwrap(),
+            crate::monitor::OwnerAbortOutcome::Acknowledged
+        );
+
+        // `old` wounds `young` on `k`, help-forwards `done` on `j`, and drops
+        // `aborted` on `p`.
+        let old = mk_tid(1, "old");
+        ctx.monitor.begin_tx(&old);
+        lock_ok(
+            &locker,
+            &old,
+            &group_of_intents(vec![put_intent(b"j"), put_intent(b"k"), put_intent(b"p")]),
+        )
+        .await;
+
+        for key in [b"j", b"k", b"p"] {
+            let entry = entry_of(&ctx, key).await.unwrap();
+            assert_eq!(entry.lock_holders(), std::slice::from_ref(&old));
+        }
+        for key in [b"n", b"q"] {
+            assert!(
+                entry_of(&ctx, key)
+                    .await
+                    .is_none_or(|entry| entry.lock_holders().is_empty()),
+                "a dead holder keeps no lock in the leaf"
+            );
+        }
+        assert_eq!(
+            entry_of(&ctx, b"m").await.unwrap().lock_holders(),
+            std::slice::from_ref(&done),
+            "a committed holder keeps its other locks"
+        );
+    }
+
     // Hold-and-wait (ADR-024): a younger transaction cannot wound an older
     // holder, so it *waits* for it (keeping any other locks) and proceeds once
     // the holder finalizes — it never aborts on the conflict.
@@ -2732,11 +2868,34 @@ mod tests {
         ctx.monitor.commit_tx(record).await.unwrap();
 
         // Install the committed current state directly in the collection's leaf `_r`.
-        let path = root_path();
+        install_entries(
+            ctx,
+            [LeafEntry::new(key).with_current(CurrentState::External { writer })],
+        )
+        .await;
+    }
+
+    // Installs an inline committed value for each key in the root leaf.
+    async fn seed_inline(ctx: &TlCtx, keys: &[&[u8]]) {
+        let writer = mk_tid(0, "seed");
+        install_entries(
+            ctx,
+            keys.iter().map(|key| {
+                LeafEntry::new(*key).with_current(CurrentState::Inline {
+                    writer,
+                    value: Arc::from(&b"v0"[..]),
+                })
+            }),
+        )
+        .await;
+    }
+
+    // Replaces the root leaf entries with the same keys as `installed`.
+    async fn install_entries(ctx: &TlCtx, installed: impl IntoIterator<Item = LeafEntry>) {
         let loaded = ctx
             .nodes
             .load_leaf(
-                &path,
+                &root_path(),
                 Requirement::after(ctx.timeline.currentness_barrier()),
             )
             .await
@@ -2747,13 +2906,11 @@ mod tests {
             .cloned()
             .map(|e| (e.key.clone(), e))
             .collect();
-        entries.insert(
-            key.to_vec(),
-            LeafEntry::new(key).with_current(CurrentState::External { writer }),
-        );
-        let new_leaf = LeafBody::from_entries(entries.into_values());
+        for entry in installed {
+            entries.insert(entry.key.clone(), entry);
+        }
         let mut edit = loaded.into_edit();
-        edit.set_entries(new_leaf);
+        edit.set_entries(LeafBody::from_entries(entries.into_values()));
         assert!(ctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
     }
 

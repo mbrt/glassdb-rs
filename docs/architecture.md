@@ -336,6 +336,14 @@ batching window before it loads the leaf, so that the operations that arrive
 during the window share its CAS
 ([ADR-087](adr/087-coordinator-rounds-wait-for-a-batching-window.md)).
 
+A lock request removes the holders of its keys that ended aborted or wounded.
+A holder whose record stays missing is wounded first. If this database
+instance already knows the final status of such a holder, the same CAS also
+removes its locks on the other keys of the leaf. The CAS changes the leaf
+anyway, so this adds no request. On keys that nobody writes, this cleans up
+locks that a wound or a GC release did not reach. A committed holder keeps its
+other locks, because write-back or help-forward still needs them.
+
 The current state is absent, an external value, an inline value, or a
 tombstone ([ADR-051](adr/051-inline-latest-values.md)). A read of an inline value or a
 tombstone needs no transaction record read. Only a direct commit creates an
@@ -587,9 +595,10 @@ The `Monitor` handles a crash or a dropped transaction future:
    sets, and the GC hint of the pinned identity makes GC release the locks
    inside its write budget. GC tries again after a failed release, and drops
    the set after one release completes. The record stays pinned. A lock that
-   an unresolved operation adds later stays until a writer on the same key
-   removes it. A reader drops it at once, so it costs no grace wait. A single
-   release does not repeat the cost that ADR-071 rejects.
+   an unresolved operation adds later stays until a lock request on the same
+   leaf removes it (see "Locks live in leaf content"). A reader drops it at
+   once, so it costs no grace wait. A single release does not repeat the cost
+   that ADR-071 rejects.
 4. **Retirement handoff.** Cancellation, unwinding, and failed finalization keep
    the retirement guard armed, and the handoff gives the identity to waited
    recovery before control leaves the owner. A failed retirement is only a
