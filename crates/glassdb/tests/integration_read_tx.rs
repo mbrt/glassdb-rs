@@ -209,7 +209,12 @@ async fn read_tx_after_tx_can_miss_a_foreign_write_that_tx_saw() {
 
     assert_eq!(tx_read_all(&reader, &[x]).await, [b"new"]);
     // Only stale read-only transactions raise the floor.
-    assert_eq!(read_tx_all(&reader, STALENESS, &[z]).await, [b"old"]);
+    assert_eq!(
+        read_tx_all(&reader, STALENESS, std::slice::from_ref(&z)).await,
+        [b"old"]
+    );
+    // A zero bound follows every commit that completed before the call.
+    assert_eq!(read_tx_all(&reader, Duration::ZERO, &[z]).await, [b"new"]);
 }
 
 #[tokio::test(start_paused = true)]

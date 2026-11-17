@@ -398,10 +398,17 @@ impl Database {
     /// validates its reads like [`Database::tx`]. The body can run more than
     /// once, as in [`Database::tx`].
     ///
-    /// A `read_tx` that follows a [`Database::tx`] of the same instance can
-    /// miss a write of another instance that the `tx` saw. Use
-    /// [`Database::tx`] when the reads must follow everything that this
-    /// instance observed.
+    /// With `Duration::ZERO`, the cut point is after the start of the call.
+    /// The result then contains every transaction of any instance that
+    /// committed before the call started, as the result of a read-only
+    /// [`Database::tx`] does. The body still reads the cache, and the cut
+    /// checks the states that are older than the cut point. The cost is at
+    /// most the validation cost of [`Database::tx`].
+    ///
+    /// With a bound above zero, a `read_tx` that follows a [`Database::tx`] of
+    /// the same instance can miss a write of another instance that the `tx`
+    /// saw. Use `Duration::ZERO` or [`Database::tx`] when the reads must
+    /// follow everything that this instance observed.
     pub async fn read_tx<T, F, Fut>(&self, max_staleness: Duration, mut f: F) -> Result<T, Error>
     where
         F: FnMut(ReadTransaction) -> Fut + Send,

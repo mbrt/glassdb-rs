@@ -85,8 +85,11 @@ staleness from the start of the read. A cutoff that is computed after the body
 would be later than the fetches that the body made. Then a read of one state
 that the cache does not have would need a second check with a zero bound,
 because its fetch was invoked before that cutoff. The cutoff converts a
-duration to a sequence point by approximation. It is not a currentness
-barrier, so a zero bound does not make the transaction strict serializable.
+duration to a sequence point by approximation, so it is not a currentness
+barrier. A zero bound subtracts nothing, though: its cutoff is a point
+allocated at the start of the call. The cut point then follows every
+operation that completed before the call, so the transaction sees every
+transaction that committed before it started.
 
 The caller gets the state of the database at the cut point. Every transaction
 whose commit point is before the cut point is visible, and no later

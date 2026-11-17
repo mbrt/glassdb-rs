@@ -216,6 +216,11 @@ impl Timeline {
 
     /// Captures the staleness cutoff of a stale read-only transaction that
     /// starts now and accepts a cut point no older than `max_staleness`.
+    ///
+    /// A zero bound subtracts nothing, so its cutoff is a point allocated
+    /// now, as a currentness barrier is. A stale read-only transaction with a
+    /// zero bound relies on this to follow every operation that completed
+    /// before it started.
     pub fn staleness_cutoff(&self, max_staleness: Duration) -> StalenessCutoff {
         if max_staleness == Duration::MAX {
             StalenessCutoff::ANY
@@ -283,6 +288,13 @@ mod tests {
 
         assert!(first < second);
         assert!(second < third);
+    }
+
+    #[test]
+    fn a_zero_staleness_cutoff_follows_every_earlier_point() {
+        let timeline = Timeline::with_source(Arc::new(FixedSource(Duration::from_secs(2))));
+        let earlier = timeline.now();
+        assert!(timeline.staleness_cutoff(Duration::ZERO).point() > earlier);
     }
 
     #[test]
