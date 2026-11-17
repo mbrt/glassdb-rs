@@ -25,7 +25,6 @@
 //! renewed for **serial acquisition** in sorted order. First-CAS-wins on the
 //! lowest contended leaf then guarantees that one contender makes progress.
 
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -474,8 +473,6 @@ pub struct Algo {
     floor: MonotonicFloor,
     /// The collection records behind the directory reads of a cut.
     records: CollectionStore,
-    /// The bound on the parallel checks of the records of one cut.
-    parallelism: NonZeroUsize,
 }
 
 impl Algo {
@@ -502,7 +499,6 @@ impl Algo {
         structural_hints: StructuralHintSink,
         landed_splits: LandedSplits,
         records: CollectionStore,
-        parallelism: NonZeroUsize,
     ) -> Self {
         let direct_commit = DirectCommit::new(
             router,
@@ -535,7 +531,6 @@ impl Algo {
             background,
             floor: MonotonicFloor::new(),
             records,
-            parallelism,
         }
     }
 
@@ -647,7 +642,7 @@ impl Algo {
         let (leaves, records) = futures::future::join(
             self.nodes.refresh_leaves_for_cut(&states.leaves, &target),
             self.records
-                .refresh_records_for_cut(&states.records, &target, self.parallelism),
+                .refresh_records_for_cut(&states.records, &target),
         )
         .await;
         if !(leaves? && records?) {

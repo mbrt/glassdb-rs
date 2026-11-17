@@ -6,8 +6,8 @@ use std::time::Duration;
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
 
-use super::knowledge::{Knowledge, PresentSeed};
-use super::path_lane::PathState;
+use super::knowledge::{EvictionSink, Knowledge, PresentSeed};
+use super::path_lane::{PathCoordinator, PathState};
 use super::{Codec, Evidence, ObjectKey, Revision};
 use crate::cache_stats::CacheMetrics;
 use crate::disk_cache::{
@@ -27,11 +27,14 @@ pub(super) struct PersistentPath {
 #[derive(Clone)]
 pub(super) struct PersistentBridge {
     cache: Option<PersistentCache>,
+    /// The path lane of the cached store, for the changes that eviction and
+    /// shutdown queue.
+    coordinator: PathCoordinator,
 }
 
 impl PersistentBridge {
-    pub(super) fn new(cache: Option<PersistentCache>) -> Self {
-        Self { cache }
+    pub(super) fn new(cache: Option<PersistentCache>, coordinator: PathCoordinator) -> Self {
+        Self { cache, coordinator }
     }
 
     pub(super) fn metrics(&self) -> Option<Arc<CacheMetrics>> {
@@ -62,49 +65,25 @@ impl PersistentBridge {
         cache.record_present_hit(path, PathOwner::shared(state));
     }
 
-    /// Queues the watermark of a present state for its persistent copy, when
-    /// the watermark is newer than the one that the copy has. The persistent
-    /// cache writes it only if its current record of `path` is this revision.
-    pub(super) fn persist_watermark(
-        &self,
-        path: &Arc<str>,
-        state: &Arc<PathState>,
-        revision: &Revision,
-        evidence: &Evidence,
-    ) {
-        let Some(cache) = &self.cache else {
-            return;
-        };
-        let Some(watermark) = evidence.unpersisted_watermark() else {
-            return;
-        };
-        if cache.advance_watermark(
-            path.clone(),
-            PathOwner::shared(state),
-            revision.serialize().as_bytes().to_vec(),
-            watermark,
-        ) {
-            evidence.persisted_at(watermark);
-        }
-    }
-
-    /// Queues the newer watermarks of many states as one work item, for a
-    /// clean shutdown. Each state is a path, its path state, its revision, and
-    /// its evidence.
+    /// Queues the newer watermarks of the present states that L1 still has,
+    /// as one work item, for a clean shutdown. Each state is a path, its
+    /// revision, and its evidence. One work item for all states keeps a large
+    /// L1 from exhausting the reservations for optional work.
     pub(super) fn persist_watermarks<'a>(
         &self,
-        states: impl IntoIterator<Item = (Arc<str>, Arc<PathState>, &'a Revision, &'a Evidence)>,
+        states: impl IntoIterator<Item = (&'a str, &'a Revision, &'a Evidence)>,
     ) {
         let Some(cache) = &self.cache else {
             return;
         };
         let mut queued = Vec::new();
         let mut advances = Vec::new();
-        for (path, state, revision, evidence) in states {
+        for (path, revision, evidence) in states {
             let Some(watermark) = evidence.unpersisted_watermark() else {
                 continue;
             };
-            let owner: Arc<dyn PathChangeOwner> = PathOwner::shared(&state);
+            let path = Arc::<str>::from(path);
+            let owner: Arc<dyn PathChangeOwner> = PathOwner::shared(&self.coordinator.state(&path));
             advances.push((
                 path,
                 owner,
@@ -192,6 +171,31 @@ impl PersistentBridge {
         );
         cache.record_present_hit(key.encoded(), owner);
         Some(seed)
+    }
+}
+
+/// A state that leaves L1 keeps its newest watermark in L2 (ADR-097).
+impl EvictionSink for PersistentBridge {
+    /// Queues the watermark of an evicted state for its persistent copy, when
+    /// the watermark is newer than the one that the copy has. The persistent
+    /// cache writes it only if its current record of `path` is this revision.
+    fn evicted(&self, path: &str, revision: &Revision, evidence: &Evidence) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        let Some(watermark) = evidence.unpersisted_watermark() else {
+            return;
+        };
+        let path = Arc::<str>::from(path);
+        let state = self.coordinator.state(&path);
+        if cache.advance_watermark(
+            path,
+            PathOwner::shared(&state),
+            revision.serialize().as_bytes().to_vec(),
+            watermark,
+        ) {
+            evidence.persisted_at(watermark);
+        }
     }
 }
 

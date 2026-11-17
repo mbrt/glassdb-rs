@@ -412,7 +412,7 @@ impl AssemblyFoundation {
         let dyn_backend: Arc<dyn Backend> = backend.clone();
         let objects =
             CachedStore::new(dyn_backend, config.cache_size, timeline.clone(), persistent);
-        let records = CollectionStore::new(objects.clone());
+        let records = CollectionStore::new(objects.clone(), config.transaction_leaf_parallelism);
         let nodes = NodeStore::new(objects.clone(), config.transaction_leaf_parallelism);
         let structural_intents = StructuralIntentStore::new(objects.clone());
         let tx_records = TxRecordStore::new(objects.clone(), db_prefix);
@@ -657,7 +657,6 @@ impl DormantEngine {
             restructurer.hint_sink(),
             restructurer.landed_splits(),
             records,
-            transaction_leaf_parallelism,
         );
         let engine = Engine {
             backend,

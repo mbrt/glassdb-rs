@@ -283,13 +283,17 @@ impl Codec for CollectionRecord {
 #[derive(Clone)]
 pub struct CollectionStore {
     records: crate::cached_store::TypedCachedStore<CollectionRecord>,
+    /// The bound on the parallel checks of one batch of records.
+    parallelism: NonZeroUsize,
 }
 
 impl CollectionStore {
-    /// Creates a collection store over the shared decoded-object cache.
-    pub fn new(objects: CachedStore) -> Self {
+    /// Creates a collection store over the shared decoded-object cache. A
+    /// batch of record checks runs at most `parallelism` checks at a time.
+    pub fn new(objects: CachedStore, parallelism: NonZeroUsize) -> Self {
         CollectionStore {
             records: objects.typed(),
+            parallelism,
         }
     }
 
@@ -307,10 +311,9 @@ impl CollectionStore {
         &self,
         observations: &[Observation<CollectionRecord>],
         target: &CutTarget,
-        parallelism: NonZeroUsize,
     ) -> Result<bool, StorageError> {
         self.records
-            .refresh_for_cut(observations, target, parallelism)
+            .refresh_for_cut(observations, target, self.parallelism)
             .await
     }
 
@@ -628,7 +631,7 @@ mod tests {
             timeline.clone(),
             None,
         );
-        let records = CollectionStore::new(objects.clone());
+        let records = CollectionStore::new(objects.clone(), std::num::NonZeroUsize::MIN);
         let nodes = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
         let collection = CollectionAddress::new("db", collection_id(9));
 

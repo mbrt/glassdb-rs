@@ -50,7 +50,7 @@ pub use cut::{CutSearch, CutTarget};
 use evidence::Evidence;
 pub use evidence::{CasReceipt, CasResult, Observation, ObservationCheck, Revision};
 
-use knowledge::{FetchResult, Knowledge, PresentSeed, UnpersistedHook};
+use knowledge::{EvictionSink, FetchResult, Knowledge, PresentSeed};
 use mutation::{MutationOutcome, MutationRound};
 use path_lane::{FlightOutcome, PathCoordinator, PathState, ReadAdmission};
 use persistent_bridge::PersistentBridge;
@@ -179,24 +179,17 @@ impl CachedStore {
         timeline: Timeline,
         persistent: Option<PersistentCache>,
     ) -> Self {
-        let persistent = PersistentBridge::new(persistent);
+        let coordinator = PathCoordinator::new();
+        let persistent = PersistentBridge::new(persistent, coordinator.clone());
         let metrics = persistent
             .metrics()
             .unwrap_or_else(|| Arc::new(CacheMetrics::new()));
-        let coordinator = PathCoordinator::new();
-        // A state that leaves L1 keeps its newest watermark in L2 (ADR-097).
-        let evicted = persistent.is_configured().then(|| {
-            let persistent = persistent.clone();
-            let coordinator = coordinator.clone();
-            Box::new(
-                move |path: &str, revision: &Revision, evidence: &Evidence| {
-                    Self::persist_watermark(&persistent, &coordinator, path, revision, evidence);
-                },
-            ) as UnpersistedHook
-        });
+        let sink = persistent
+            .is_configured()
+            .then(|| Arc::new(persistent.clone()) as Arc<dyn EvictionSink>);
         CachedStore {
             backend,
-            knowledge: Knowledge::new(max_size, timeline.clone(), evicted),
+            knowledge: Knowledge::new(max_size, timeline.clone(), sink),
             timeline,
             coordinator,
             metrics,
@@ -218,34 +211,14 @@ impl CachedStore {
     /// drain, it queues the newer watermarks of the states that L1 still has.
     pub async fn shutdown(&self) {
         if self.persistent.is_configured() {
-            // One work item for all states, so that a large L1 does not
-            // exhaust the reservations for optional work.
-            let mut states = Vec::new();
-            self.knowledge
-                .for_each_unpersisted(|path, revision, evidence| {
-                    let path = Arc::<str>::from(path);
-                    let state = self.coordinator.state(&path);
-                    states.push((path, state, revision.clone(), evidence.clone()));
-                });
-            self.persistent.persist_watermarks(states.iter().map(
-                |(path, state, revision, evidence)| {
-                    (path.clone(), state.clone(), revision, evidence)
-                },
-            ));
+            let states = self.knowledge.present_states();
+            self.persistent.persist_watermarks(
+                states
+                    .iter()
+                    .map(|(path, revision, evidence)| (path.as_str(), revision, evidence)),
+            );
         }
         self.persistent.shutdown().await;
-    }
-
-    fn persist_watermark(
-        persistent: &PersistentBridge,
-        coordinator: &PathCoordinator,
-        path: &str,
-        revision: &Revision,
-        evidence: &Evidence,
-    ) {
-        let path = Arc::<str>::from(path);
-        let state = coordinator.state(&path);
-        persistent.persist_watermark(&path, &state, revision, evidence);
     }
 
     pub(crate) fn typed<C: Codec>(&self) -> TypedCachedStore<C> {
@@ -3934,41 +3907,36 @@ mod tests {
     }
 
     #[test]
-    fn eviction_reports_only_watermarks_newer_than_the_persistent_copy() {
-        let reported = Arc::new(Mutex::new(Vec::new()));
-        let sink = reported.clone();
-        let hook: UnpersistedHook = Box::new(move |path, revision, evidence| {
-            sink.lock()
-                .unwrap()
-                .push((path.to_owned(), revision.clone(), evidence.get()));
-        });
+    fn eviction_reports_each_evicted_present_state() {
+        struct Recorder(Mutex<Vec<(String, SequencePoint)>>);
+        impl EvictionSink for Recorder {
+            fn evicted(&self, path: &str, _: &Revision, evidence: &Evidence) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((path.to_owned(), evidence.get()));
+            }
+        }
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
         // A zero budget evicts each state as soon as it is installed.
-        let knowledge = Knowledge::new(0, Timeline::new(), Some(hook));
+        let knowledge = Knowledge::new(0, Timeline::new(), Some(recorder.clone()));
         let revision = Revision::from_backend(backend::Revision::new("r1".to_owned()));
         let point = SequencePoint::from_raw;
 
-        // L2 has no copy of a fetched state until its publication.
         knowledge.install_fetched::<Bytes>("fetched", v(b"a"), 1, revision.clone(), point(3));
-        // L2 already has the watermark of a loaded state.
-        let seed = knowledge.install_persistent::<Bytes>(
-            "loaded",
-            v(b"a"),
-            1,
-            revision.clone(),
-            point(5),
-            Some(point(6)),
-        );
-        assert!(reported.lock().unwrap().is_empty());
-
-        knowledge.confirm_unchanged("loaded", seed, point(9));
+        knowledge.install_persistent::<Bytes>("loaded", v(b"a"), 1, revision, point(5), None);
+        knowledge.install_absent_result("gone", point(7));
         assert_eq!(
-            *reported.lock().unwrap(),
-            vec![("loaded".to_owned(), revision, point(9))]
+            *recorder.0.lock().unwrap(),
+            vec![
+                ("fetched".to_owned(), point(3)),
+                ("loaded".to_owned(), point(5))
+            ]
         );
     }
 
     #[test]
-    fn shutdown_lists_only_watermarks_newer_than_the_persistent_copy() {
+    fn only_watermarks_newer_than_the_persistent_copy_are_unpersisted() {
         let knowledge = Knowledge::new(1 << 20, Timeline::new(), None);
         let revision = Revision::from_backend(backend::Revision::new("r1".to_owned()));
         let point = SequencePoint::from_raw;
@@ -3981,22 +3949,25 @@ mod tests {
             None,
         );
         knowledge.install_persistent::<Bytes>("same", v(b"a"), 1, revision.clone(), point(5), None);
+        // The persistent cache has no copy of a fetched state until its
+        // publication.
         knowledge.install_fetched::<Bytes>("fetched", v(b"a"), 1, revision.clone(), point(7));
         knowledge.confirm_unchanged("advanced", advanced, point(9));
 
-        let unpersisted = |knowledge: &Knowledge| {
-            let mut paths = Vec::new();
-            knowledge.for_each_unpersisted(|path, _, evidence| {
-                paths.push((path.to_owned(), evidence.get()));
-                evidence.persisted_at(evidence.get());
-            });
-            paths
-        };
+        let unpersisted: BTreeMap<_, _> = knowledge
+            .present_states()
+            .into_iter()
+            .map(|(path, _, evidence)| (path, evidence))
+            .collect();
         assert_eq!(
-            unpersisted(&knowledge),
-            vec![("advanced".to_owned(), point(9))]
+            unpersisted["advanced"].unpersisted_watermark(),
+            Some(point(9))
         );
-        assert!(unpersisted(&knowledge).is_empty());
+        assert_eq!(unpersisted["same"].unpersisted_watermark(), None);
+        assert_eq!(unpersisted["fetched"].unpersisted_watermark(), None);
+        // A queued write of the newer watermark brings the copy up to date.
+        unpersisted["advanced"].persisted_at(point(9));
+        assert_eq!(unpersisted["advanced"].unpersisted_watermark(), None);
     }
 
     async fn recorded_backend_with_p() -> (Arc<dyn Backend>, OpLog) {

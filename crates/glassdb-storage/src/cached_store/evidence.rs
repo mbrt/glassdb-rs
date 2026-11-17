@@ -129,29 +129,37 @@ pub enum ObservationCheck<V> {
     Changed(Observation<V>),
 }
 
-/// A shared, monotonically-advanceable currentness watermark. Observations of one
-/// state and that state's current cache entry hold clones of the same cell, so
-/// checking advances the evidence every holder sees. An `Arc` held by a caller
-/// outlives eviction of the corresponding cache entry.
+/// The shared cell of one observed state: its currentness evidence, and what
+/// the persistent cache has of it.
 ///
-/// The cell also keeps the start of the currentness interval of the state
-/// (ADR-097): the completion of the first operation that observed it. The state
-/// was current at every point from the start to the watermark. The persistent
-/// cache keeps the start, so it can come from an earlier open of the same
-/// cache. The start is unknown for a state that the persistent cache supplied
-/// without one.
-///
-/// The cell also keeps the newest watermark that the persistent cache has for
-/// this state, so that eviction and shutdown write only a newer one. It is not
-/// evidence: it only avoids useless persistent-cache work.
+/// Observations of one state and that state's current cache entry hold clones
+/// of the same cell, so a check advances the evidence that every holder sees.
+/// An `Arc` held by a caller outlives eviction of the corresponding cache
+/// entry. The cell is the only thing that identifies the state across cache
+/// entries: when a state that L1 evicted comes back from a retained
+/// observation, its new entry gets this cell.
 /// Keep the counters private so updates cannot bypass monotonic advancement.
 #[derive(Debug, Clone)]
-pub(super) struct Evidence(Arc<EvidenceCell>);
+pub(super) struct Evidence(Arc<StateCell>);
 
 #[derive(Debug)]
-struct EvidenceCell {
+struct StateCell {
+    /// The currentness watermark: the invocation point of the newest
+    /// operation that confirmed the state.
     watermark: AtomicU64,
+    /// The start of the currentness interval (ADR-097): the completion of the
+    /// first operation that observed the state. The state was current at
+    /// every point from the start to the watermark. The persistent cache
+    /// keeps the start, so it can come from an earlier open of the same
+    /// cache. It is unknown for a state that the persistent cache supplied
+    /// without one.
     start: AtomicU64,
+    /// The newest watermark that the persistent copy of the state has, or
+    /// that queued work writes there. It is not evidence. It lets eviction
+    /// and shutdown skip a persistent write that would not advance the copy,
+    /// which L2 can only find out with disk reads. It is here and not in the
+    /// cache entry because it describes the state, and so must survive a
+    /// return of the state from a retained observation.
     persisted: AtomicU64,
 }
 
@@ -161,7 +169,7 @@ const NOT_PERSISTED: u64 = 0;
 
 impl Evidence {
     pub(super) fn new(t: SequencePoint) -> Self {
-        Evidence(Arc::new(EvidenceCell {
+        Evidence(Arc::new(StateCell {
             watermark: AtomicU64::new(t.raw()),
             start: AtomicU64::new(UNKNOWN_START),
             persisted: AtomicU64::new(NOT_PERSISTED),

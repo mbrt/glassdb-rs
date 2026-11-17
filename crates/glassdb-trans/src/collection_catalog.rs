@@ -207,7 +207,7 @@ mod tests {
             timeline.clone(),
             None,
         );
-        let records = CollectionStore::new(objects.clone());
+        let records = CollectionStore::new(objects.clone(), std::num::NonZeroUsize::MIN);
         let background = Arc::new(Background::new());
         let transactions = TxRecordStore::new(objects, DbPrefix::try_from("db").unwrap());
         let monitor = Monitor::with_config(
