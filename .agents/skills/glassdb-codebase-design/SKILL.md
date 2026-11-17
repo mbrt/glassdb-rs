@@ -21,7 +21,7 @@ Increasing level of care is necessary when:
 
 Not all changes require both levels of design, and judgment is necessary to determine which level is appropriate for the change in hand. When solving a problem, generally prefer the lowest impact that solves it.
 
-If one or both levels are required, frontload discussion and ADR writing before implementing.
+If one or both levels are required, agree on the design with the user through the `glassdb-align` skill, and write any ADR, before you implement.
 
 ## ADRs
 
