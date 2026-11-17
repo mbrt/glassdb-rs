@@ -1,6 +1,6 @@
 ---
 name: glassdb-align
-description: Agree with the user on a GlassDB bug fix, design, or implementation before you build it. Use when the user asks you to reproduce or root-cause an issue and discuss fixes, to propose a solution "we discuss together", to design something together, or to stress-test a plan.
+description: Agree with the user on a GlassDB bug fix, performance improvement, design, or implementation before you build it. Use when the user asks you to root-cause an issue and discuss fixes, to propose a solution for joint discussion, to design something together, or to stress-test a plan.
 ---
 
 # Align with the user
@@ -8,12 +8,11 @@ description: Agree with the user on a GlassDB bug fix, design, or implementation
 The user decides the design. You bring the facts, one proposal, and only the
 questions that the user must answer.
 
-Facts come first, every time: get them before you ask a question and before
-you answer one.
+Get the facts before you ask a question and before you answer one.
 
 ## 1. Get the facts first
 
-Do not ask questions before you have facts. Use sub-agents where it helps.
+Use sub-agents where it helps.
 
 - **Bug fix:** reproduce the bug. Find the root cause, not only the trigger.
   Have evidence, for example a failing test, a seed, or a log line.
@@ -58,7 +57,8 @@ questions:
 Ask a question only if all of these are true:
 
 - The answer changes what you build.
-- The code, the docs, the principles, or a measurement cannot answer it.
+- The code, the docs, the principles, a measurement, or a prototype cannot
+  answer it.
 - The decision is hard to undo or the user can see it, for example a public
   API, an ADR, or a public name.
 
@@ -68,10 +68,10 @@ follow-up.
 
 Ask the forks with the `AskUserQuestion` tool, after the proposal text. Put your
 recommended option first. If a question does not fit two to four options, for
-example a question about the intent of a test, ask it in plain text.
+example a question about the intent of a test, ask it in plain text. If you
+do not have the tool, ask in plain text.
 
-Do not ask a question to confirm your preferred answer. Do not ask about a
-value that a prototype or a measurement can decide.
+Do not ask a question to confirm your preferred answer.
 
 ## 4. Iterate
 
