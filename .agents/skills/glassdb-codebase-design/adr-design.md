@@ -4,7 +4,7 @@ Record only meaningful architectural decisions and explicit trade-offs in ADRs (
 
 ## Discussion
 
-Make sure important decisions and trade-offs are first discussed with the user. Use the `glassdb-grill` skill to discuss them.
+Make sure important decisions and trade-offs are first discussed with the user. Use the `glassdb-align` skill to discuss them.
 
 Questions should revolve around:
 
