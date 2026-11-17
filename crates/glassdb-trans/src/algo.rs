@@ -25,6 +25,7 @@
 //! renewed for **serial acquisition** in sorted order. First-CAS-wins on the
 //! lowest contended leaf then guarantees that one contender makes progress.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -32,7 +33,8 @@ use glassdb_concurr::{Background, Backoff, RetrySchedule, rt};
 use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord, TxWrite};
 use glassdb_storage::{
-    CurrentnessBarrier, InlinePolicy, LeafObservationCheck, LockType, NodeSizePolicy, NodeStore,
+    CollectionRecord, CollectionStore, CurrentnessBarrier, InlinePolicy, LeafObservation,
+    LeafObservationCheck, LockType, MonotonicFloor, NodeSizePolicy, NodeStore, Observation,
     Requirement, StorageError, Timeline, TreeRouter,
 };
 
@@ -234,9 +236,16 @@ pub struct Handle {
     /// The directory locks that this identity holds. The identity keeps them
     /// until it commits or ends (ADR-090).
     directory_locks: DirectoryLocks,
+    /// The staleness bound of a stale read-only transaction (ADR-097).
+    max_staleness: Option<Duration>,
 }
 
 impl Handle {
+    /// Makes this a stale read-only transaction (ADR-097).
+    pub(crate) fn set_max_staleness(&mut self, max_staleness: Duration) {
+        self.max_staleness = Some(max_staleness);
+    }
+
     /// The transaction's ID.
     pub fn id(&self) -> &TxId {
         &self.id
@@ -377,6 +386,56 @@ impl<'a> ValidationContext<'a> {
     }
 }
 
+/// How a read-only pass certifies its reads.
+enum ReadCertification {
+    /// A cut point covers every read (ADR-097).
+    AtCutPoint,
+    /// Optimistic validation must certify the reads at this barrier.
+    ValidateAt(CurrentnessBarrier),
+}
+
+/// The observed states that the reads of a stale read-only transaction
+/// depend on, when no holder can change what the reads found (ADR-097).
+struct CutStates {
+    leaves: Vec<LeafObservation>,
+    records: Vec<Observation<CollectionRecord>>,
+}
+
+impl CutStates {
+    /// Returns `None` when a read depends on a holder, which needs a fresh
+    /// barrier. Every directory read needs its record, also a binding read
+    /// that a key access covers: that coverage needs a lock or a CAS
+    /// (ADR-092), and a cut has neither.
+    fn collect(
+        accesses: &AccessSet,
+        catalog: &CatalogAccesses,
+    ) -> Result<Option<Self>, TransError> {
+        let mut leaves = Vec::new();
+        for read in accesses.point_reads() {
+            if read_observation_has_exclusive_holder(read)? {
+                return Ok(None);
+            }
+            leaves.push(read.observation().clone());
+        }
+        for scan in accesses.range_scans() {
+            for coverage in scan.covered() {
+                if !coverage.pending_membership.is_empty() {
+                    return Ok(None);
+                }
+                leaves.push(coverage.observation.clone());
+            }
+        }
+        let mut records = Vec::new();
+        for read in &catalog.reads {
+            let Some(record) = &read.evidence.0 else {
+                return Ok(None);
+            };
+            records.push(record.clone());
+        }
+        Ok(Some(Self { leaves, records }))
+    }
+}
+
 /// Reports whether the observed leaf contains an exclusive holder whose final
 /// state can change the effective writer without rewriting the leaf.
 fn read_observation_has_exclusive_holder(read: &ReadAccess) -> Result<bool, TransError> {
@@ -415,6 +474,12 @@ pub struct Algo {
     // Weak so a captured `Algo` clone inside a spawned retirement task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
+    /// Orders the stale read-only transactions of this instance (ADR-097).
+    floor: MonotonicFloor,
+    /// The collection records behind the directory reads of a cut.
+    records: CollectionStore,
+    /// The bound on the parallel checks of the records of one cut.
+    parallelism: NonZeroUsize,
 }
 
 impl Algo {
@@ -440,6 +505,8 @@ impl Algo {
         inline_policy: InlinePolicy,
         structural_hints: StructuralHintSink,
         landed_splits: LandedSplits,
+        records: CollectionStore,
+        parallelism: NonZeroUsize,
     ) -> Self {
         let direct_commit = DirectCommit::new(
             router,
@@ -470,6 +537,9 @@ impl Algo {
             collection_commit,
             retirement,
             background,
+            floor: MonotonicFloor::new(),
+            records,
+            parallelism,
         }
     }
 
@@ -493,6 +563,7 @@ impl Algo {
             id,
             backoff: self.acquisition_retry.backoff(),
             directory_locks: DirectoryLocks::default(),
+            max_staleness: None,
         }
     }
 
@@ -540,6 +611,52 @@ impl Algo {
                 }
                 Err(error) => return self.replay_changed_catalog(tx, error).await,
             }
+        }
+    }
+
+    /// Certifies the reads of a read-only pass at a cut point, or returns the
+    /// barrier for optimistic validation (ADR-097).
+    ///
+    /// A stale read-only transaction validates at the barrier of its planned
+    /// cut, so the states that the cut search already checked need no second
+    /// check.
+    async fn certify_at_cut(&self, tx: &Handle) -> Result<ReadCertification, TransError> {
+        let fresh = || {
+            Ok(ReadCertification::ValidateAt(
+                self.timeline.currentness_barrier(),
+            ))
+        };
+        let Some(max_staleness) = tx.max_staleness else {
+            return fresh();
+        };
+        let Some(states) = CutStates::collect(&tx.accesses, tx.collections.accesses())? else {
+            return fresh();
+        };
+        let mut search = self.nodes.cut_search();
+        self.nodes.add_leaves_to_cut(&mut search, &states.leaves)?;
+        self.records
+            .add_records_to_cut(&mut search, &states.records)?;
+        let Some(target) = search.plan(max_staleness, &self.floor) else {
+            return fresh();
+        };
+        let (leaves, records) = futures::future::join(
+            self.nodes.refresh_leaves_for_cut(&states.leaves, &target),
+            self.records
+                .refresh_records_for_cut(&states.records, &target, self.parallelism),
+        )
+        .await;
+        if !(leaves? && records?) {
+            return Ok(ReadCertification::ValidateAt(target.barrier()));
+        }
+        target.raise_floor(&self.floor);
+        Ok(ReadCertification::AtCutPoint)
+    }
+
+    /// Raises the monotonic floor after a stale read-only transaction
+    /// validated its reads at `barrier` (ADR-097).
+    fn raise_floor_after_validation(&self, tx: &Handle, barrier: CurrentnessBarrier) {
+        if tx.max_staleness.is_some() {
+            self.floor.raise_to_barrier(barrier);
         }
     }
 
@@ -716,9 +833,19 @@ impl Algo {
         if !tx.accesses.has_writes() && !tx.collections.has_writes() {
             if tx.should_lock_reads() {
                 self.validate_coordination_keys(&tx.accesses)?;
-                return self.commit_locked(tx).await;
+                let outcome = self.commit_locked(tx).await;
+                if matches!(outcome, Ok(PassOutcome::Complete)) {
+                    self.raise_floor_after_validation(tx, self.timeline.currentness_barrier());
+                }
+                return outcome;
             }
-            return self.commit_readonly(tx).await;
+            return match self.certify_at_cut(tx).await? {
+                ReadCertification::AtCutPoint => {
+                    tx.commit();
+                    Ok(PassOutcome::Complete)
+                }
+                ReadCertification::ValidateAt(barrier) => self.commit_readonly(tx, barrier).await,
+            };
         }
         self.validate_coordination_keys(&tx.accesses)?;
         // Try direct commit first: a complete point transaction whose
@@ -772,11 +899,18 @@ impl Algo {
             ));
         }
         if tx.should_lock_reads() {
-            return self.validate_locked_reads(tx).await;
+            let outcome = self.validate_locked_reads(tx).await;
+            if matches!(outcome, Ok(PassOutcome::Complete)) {
+                self.raise_floor_after_validation(tx, self.timeline.currentness_barrier());
+            }
+            return outcome;
         }
         // The transaction body has finished and no CAS has yet certified its
         // reads, so optimistic validation must establish its own lower bound.
-        let barrier = self.timeline.currentness_barrier();
+        let barrier = match self.certify_at_cut(tx).await? {
+            ReadCertification::AtCutPoint => return Ok(PassOutcome::Complete),
+            ReadCertification::ValidateAt(barrier) => barrier,
+        };
         if self
             .validate(&tx.accesses, ValidationContext::Optimistic, barrier)
             .await?
@@ -785,6 +919,7 @@ impl Algo {
                 .validate(None, tx.collections.accesses(), barrier)
                 .await?
         {
+            self.raise_floor_after_validation(tx, barrier);
             return Ok(PassOutcome::Complete);
         }
         tx.fail_optimistic_validation();
@@ -814,10 +949,14 @@ impl Algo {
     /// add commit latency.
     ///
     /// [`Retry`]: TransError::Retry
-    async fn commit_readonly(&self, tx: &mut Handle) -> Result<PassOutcome, TransError> {
-        // Read-only commit has no CAS receipt; this barrier separates the
-        // completed body from the physical observations that certify it.
-        let barrier = self.timeline.currentness_barrier();
+    ///
+    /// Read-only commit has no CAS receipt, so `barrier` must separate the
+    /// completed body from the physical observations that certify it.
+    async fn commit_readonly(
+        &self,
+        tx: &mut Handle,
+        barrier: CurrentnessBarrier,
+    ) -> Result<PassOutcome, TransError> {
         if self
             .validate(&tx.accesses, ValidationContext::Optimistic, barrier)
             .await?
@@ -826,6 +965,7 @@ impl Algo {
                 .validate(None, tx.collections.accesses(), barrier)
                 .await?
         {
+            self.raise_floor_after_validation(tx, barrier);
             tx.commit();
             return Ok(PassOutcome::Complete);
         }
@@ -1408,7 +1548,9 @@ mod tests {
 
     use super::*;
     use crate::access::{ScanRange, WriteAccess};
-    use crate::collections::{CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind};
+    use crate::collections::{
+        CollectionChange, CollectionOp, DirectoryEvidence, DirectoryRead, DirectoryReadKind,
+    };
     use crate::engine::{AssemblyFixture, Engine, EngineConfig, EngineFixture, engine_fixture};
     use crate::key_state_resolver::KeyStateResolver;
     use crate::monitor::{ProtocolTiming, TxRecoveryManifest};
@@ -2064,6 +2206,7 @@ mod tests {
                 name: CollectionName::new("child").unwrap(),
                 collection: None,
             },
+            evidence: DirectoryEvidence::default(),
         }
     }
 

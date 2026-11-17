@@ -205,7 +205,7 @@ The built-in kinds:
 | Kind | Parameters | Transaction |
 | --- | --- | --- |
 | `read-modify-write` | `keys`, `value-bytes`, `collections`, `open-in-body` | Reads `keys` keys and writes each of them. With `collections` > 1, it uses the same keys in that many collections of the pool, from the home collection on. With `open-in-body`, the body first opens each of its collections by name, so the transaction also reads the directory of the root collection. |
-| `read` | `keys` | Serializable read of `keys` keys. |
+| `read` | `keys`, `staleness`, `pause` | Serializable read of `keys` keys. With `staleness`, it runs a stale read-only transaction (`Database::read_tx`) with that bound. With `pause`, the worker sleeps that long after each transaction, and the measured latency includes the pause. In `--time=virtual`, only backend latency advances model time, so a transaction with no backend operation needs a pause. |
 | `write` | `value-bytes` | Writes one key without a read. A single-key write commits direct. |
 | `scan` | `span` | Scans `span` keys from the selected key. `span = "all"` scans the whole collection. |
 | `create-delete` | `value-bytes`, `locked` | Creates the selected key, and deletes it in the next transaction of the worker. With `locked = true`, the transaction first scans the whole collection, so it cannot commit direct and takes the membership lock. |

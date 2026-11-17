@@ -5,8 +5,9 @@ Two type modules require stricter correctness review. Paths are relative to
 
 | Module | Types | Rules |
 | --- | --- | --- |
-| `timeline.rs` | `Timeline`, `SequencePoint`, `CurrentnessBarrier`, `Requirement` | E1, E2 |
-| `cached_store/evidence.rs` | `Observation`, `Revision`, `CasReceipt`, and their result and shared evidence types | E3, E4 |
+| `timeline.rs` | `Timeline`, `SequencePoint`, `CurrentnessBarrier`, `Requirement`, `MonotonicFloor` | E1, E2, E5 |
+| `cached_store/evidence.rs` | `Observation`, `Revision`, `CasReceipt`, and their result and shared evidence types | E3, E4, E5 |
+| `cached_store/cut.rs` | `CutSearch`, `CutTarget` | E5 |
 
 Review every change to these files, including visibility, conversions, tests,
 and moves. Changes to their exports must preserve the same restrictions. The
@@ -87,6 +88,38 @@ the expected revision and the installed body, because they identify different
 sides of the transition. Do not add `Deref`, `AsRef`, `From`, payload mapping,
 or raw-point extraction. Participation in a coordinator batch is a separate
 proof owned by that coordinator.
+
+## E5: A cut point lies inside every currentness interval
+
+The shared evidence of a state also keeps the start of its currentness
+interval: the completion point of the first operation that observed the
+state. It is allocated after the operation completes, so it can only begin an
+interval. It never advances a watermark, and a later completion never moves
+the start. The persistent cache stores the start with the watermark, and a
+reopened timeline follows both, so a start can come from an earlier open of
+the same cache. A state that the persistent cache supplied with no stored
+start has no interval. An absence has no interval either: it has no revision,
+so a later absence shares its evidence even if the object existed between
+them. When the decoded cache evicts a present state, and at
+clean shutdown, the persistent cache keeps a newer watermark for the same path
+and revision. It writes it only in the index slot, under the slot's integrity
+check, and the reopened timeline follows it too.
+
+A cut search reads the starts and the watermarks only inside the cached-store
+module. A planned target is the latest start among several states, raised to
+the staleness cutoff and to the monotonic floor. One state needs no start.
+A state whose watermark is before the target is checked against the barrier
+that the plan captures after the target. That barrier follows the target, so
+the target never becomes a requirement. The plan runs after the body, so the
+same barrier also serves as the validation barrier when a state changed.
+
+Only a stale read-only transaction raises the floor. A completed cut raises
+it to the latest start of its states. A fallback to optimistic validation
+raises it to the validation barrier, and a locked validation raises it to a
+barrier captured after the locked pass.
+
+The floor exposes its point only to storage modules. Do not convert it to a
+barrier or a requirement, and do not raise it from a requirement.
 
 ## Review
 

@@ -12,7 +12,7 @@ use glassdb_backend as backend;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 
 use crate::cached_store::{
-    CachedStore, CasResult, Codec, Observation, ObservationCheck, Requirement,
+    CachedStore, CasResult, Codec, CutSearch, CutTarget, Observation, ObservationCheck, Requirement,
 };
 use crate::error::StorageError;
 use crate::leaf::LeafBody;
@@ -192,6 +192,31 @@ impl NodeStore {
     ) -> Vec<Result<LeafObservationCheck, StorageError>> {
         self.nodes
             .check_many_current(observations, requirement, self.parallelism)
+            .await
+    }
+
+    /// Starts a cut search on the timeline of the node cache (ADR-097).
+    pub fn cut_search(&self) -> CutSearch {
+        self.nodes.cut_search()
+    }
+
+    /// Adds retained leaf observations to a cut search (ADR-097).
+    pub fn add_leaves_to_cut(
+        &self,
+        search: &mut CutSearch,
+        observations: &[LeafObservation],
+    ) -> Result<(), StorageError> {
+        self.nodes.add_to_cut(search, observations)
+    }
+
+    /// Checks the leaf observations that do not reach a cut target.
+    pub async fn refresh_leaves_for_cut(
+        &self,
+        observations: &[LeafObservation],
+        target: &CutTarget,
+    ) -> Result<bool, StorageError> {
+        self.nodes
+            .refresh_for_cut(observations, target, self.parallelism)
             .await
     }
 

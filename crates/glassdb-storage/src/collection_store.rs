@@ -5,13 +5,16 @@
 //! `{prefix}/_r`, so data-path mutations cannot conflict with this record.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use glassdb_data::{CollectionAddress, CollectionId, CollectionName, ObjectPath, TxId};
 use glassdb_proto as pb;
 use prost::Message;
 
-use crate::cached_store::{CachedStore, CasResult, Codec, Observation, Requirement};
+use crate::cached_store::{
+    CachedStore, CasResult, Codec, CutSearch, CutTarget, Observation, Requirement,
+};
 use crate::error::StorageError;
 use crate::lock::SharedExclusiveLock;
 use crate::wire_id::{decode_id, decode_optional_id};
@@ -288,6 +291,27 @@ impl CollectionStore {
         CollectionStore {
             records: objects.typed(),
         }
+    }
+
+    /// Adds retained record observations to a cut search (ADR-097).
+    pub fn add_records_to_cut(
+        &self,
+        search: &mut CutSearch,
+        observations: &[Observation<CollectionRecord>],
+    ) -> Result<(), StorageError> {
+        self.records.add_to_cut(search, observations)
+    }
+
+    /// Checks the record observations that do not reach a cut target.
+    pub async fn refresh_records_for_cut(
+        &self,
+        observations: &[Observation<CollectionRecord>],
+        target: &CutTarget,
+        parallelism: NonZeroUsize,
+    ) -> Result<bool, StorageError> {
+        self.records
+            .refresh_for_cut(observations, target, parallelism)
+            .await
     }
 
     /// Loads a collection record, or returns [`StorageError::NotFound`].

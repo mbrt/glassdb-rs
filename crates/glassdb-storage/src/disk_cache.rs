@@ -28,7 +28,7 @@ pub(crate) use change::{PathChangeOwner, PathChanges, PendingChange};
 use file_media::FileMedia;
 use format::{CacheGeometry, PRODUCTION_GEOMETRY};
 use media::CacheMedia;
-use worker::{CacheInner, Work};
+use worker::{CacheInner, WatermarkAdvance, Work};
 
 const CACHE_FILE: &str = "l2.cache";
 
@@ -87,6 +87,9 @@ pub(crate) struct EncodedBody {
     pub(crate) revision: Vec<u8>,
     pub(crate) body: Vec<u8>,
     pub(crate) current_after: SequencePoint,
+    /// The start of the state's currentness interval, when this or an earlier
+    /// open observed it.
+    pub(crate) start: Option<SequencePoint>,
 }
 
 impl PersistentCache {
@@ -214,6 +217,7 @@ impl PersistentCache {
         revision: Vec<u8>,
         body: Vec<u8>,
         current_after: SequencePoint,
+        start: Option<SequencePoint>,
         change: PendingChange,
     ) {
         let Some(inner) = &self.inner else {
@@ -240,6 +244,7 @@ impl PersistentCache {
             revision,
             body,
             current_after,
+            start,
             change,
             payload,
         });
@@ -283,6 +288,67 @@ impl PersistentCache {
             optional,
             promotion,
         });
+    }
+
+    /// Queues a newer watermark for the persistent copy of one state, given by
+    /// its path and revision. The worker writes it only into the index slot of
+    /// that exact record, and only when the latest path change at this call
+    /// has ended and no later one started. Returns whether the work was
+    /// queued; full queues drop it.
+    pub(crate) fn advance_watermark(
+        &self,
+        path: Arc<str>,
+        owner: Arc<dyn PathChangeOwner>,
+        revision: Vec<u8>,
+        current_after: SequencePoint,
+    ) -> bool {
+        let Some(inner) = &self.inner else {
+            return false;
+        };
+        if !inner.shared.enabled.load(Ordering::Acquire) || u32::try_from(path.len()).is_err() {
+            return false;
+        }
+        // A change that is pending now either has its work ahead of this one,
+        // and ends before the worker takes it, or the worker skips this work.
+        let (latest, _) = owner.path_changes().snapshot();
+        inner.enqueue_optional(move |optional| Work::Advance {
+            path,
+            owner,
+            latest,
+            revision,
+            current_after,
+            optional,
+        })
+    }
+
+    /// Queues the newer watermarks of a clean shutdown as one work item, under
+    /// the same rules as [`Self::advance_watermark`]. Returns whether it was
+    /// queued.
+    pub(crate) fn advance_watermarks(
+        &self,
+        advances: impl IntoIterator<Item = (Arc<str>, Arc<dyn PathChangeOwner>, Vec<u8>, SequencePoint)>,
+    ) -> bool {
+        let Some(inner) = &self.inner else {
+            return false;
+        };
+        let advances = advances
+            .into_iter()
+            .filter(|(path, ..)| u32::try_from(path.len()).is_ok())
+            .map(|(path, owner, revision, current_after)| {
+                let (latest, _) = owner.path_changes().snapshot();
+                WatermarkAdvance {
+                    path,
+                    owner,
+                    latest,
+                    revision,
+                    current_after,
+                }
+            })
+            .collect::<Vec<_>>();
+        if advances.is_empty() {
+            return true;
+        }
+        inner.enqueue_unreserved(Work::AdvanceBatch(advances))
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -389,7 +455,7 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicBool;
 
-    use super::disk::open_disk;
+    use super::disk::{Slot, open_disk};
     use super::format::COMPACT_GEOMETRY;
     use super::media::CacheFile;
     use super::sim_media::{MediaFaultProfile, SimMedia};
@@ -401,7 +467,7 @@ mod tests {
     // shutdown drops the clean-shutdown record and keeps the lock until the
     // blocked I/O returns.
     const TEST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3600);
-    const RECORD_CONTENT_OFFSET: u64 = 48;
+    const RECORD_CONTENT_OFFSET: u64 = 56;
 
     fn id(byte: u8) -> DatabaseId {
         DatabaseId::from_bytes([byte; 16])
@@ -484,6 +550,17 @@ mod tests {
         body: &[u8],
         current_after: SequencePoint,
     ) {
+        publish_with_start(cache, path, revision, body, current_after, None);
+    }
+
+    fn publish_with_start(
+        cache: &PersistentCache,
+        path: &str,
+        revision: &[u8],
+        body: &[u8],
+        current_after: SequencePoint,
+        start: Option<SequencePoint>,
+    ) {
         let path_changes = Arc::new(PathChanges::default());
         let change = cache.begin_change(path_changes).unwrap();
         cache.replace(
@@ -491,6 +568,7 @@ mod tests {
             revision.to_vec(),
             body.to_vec(),
             current_after,
+            start,
             change,
         );
     }
@@ -557,33 +635,35 @@ mod tests {
     #[tokio::test]
     async fn persistent_format_bytes_and_clean_tail_are_golden() {
         const HEADER_PREFIX: [u8; 80] = [
-            0x47, 0x4c, 0x32, 0x54, 0x45, 0x53, 0x54, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0xab, 0xa6, 0xbc, 0xa7, 0x95, 0x1d, 0x2a, 0xe1, 0xeb, 0x89, 0xbe, 0x6e,
-            0x5f, 0xc5, 0xf3, 0xec, 0x78, 0x30, 0x91, 0x89, 0x0c, 0x8e, 0x38, 0xfd, 0x2b, 0xb5,
-            0x7a, 0x55, 0xd0, 0x90, 0x46, 0xb3, 0xb2, 0x2a, 0xdd, 0x22, 0xe1, 0x63, 0x35, 0x0e,
-            0x3e, 0x89, 0x5d, 0x36, 0x9d, 0x7e, 0x6f, 0x59, 0xcc, 0x08, 0xec, 0xdc, 0x42, 0xf0,
-            0xff, 0xc9, 0x36, 0xba, 0xe4, 0x99, 0x5f, 0x87, 0x7c, 0x0a,
+            0x47, 0x4c, 0x32, 0x54, 0x45, 0x53, 0x54, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x0f, 0x94, 0x41, 0x63, 0x33, 0xcf, 0x8b, 0xd4, 0xb1, 0x34, 0x49, 0xad,
+            0xc3, 0x54, 0xf6, 0x31, 0x52, 0x28, 0xc4, 0x95, 0x68, 0x04, 0xa1, 0x32, 0x2a, 0xac,
+            0x2d, 0x9b, 0x6b, 0xf3, 0x0c, 0xc1, 0xf0, 0x79, 0x19, 0x17, 0x86, 0xc8, 0x89, 0xf5,
+            0x3c, 0x7b, 0xbf, 0x60, 0x27, 0x41, 0x02, 0x1b, 0x61, 0x99, 0x70, 0x45, 0x4b, 0xa4,
+            0x32, 0xc0, 0x58, 0xa8, 0x27, 0xa0, 0xb4, 0xd6, 0xb2, 0x0f,
         ];
-        const SLOT: [u8; 40] = [
-            0xea, 0xb3, 0x14, 0x9e, 0xb7, 0xf7, 0x4a, 0x7a, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        const SLOT: [u8; 56] = [
+            0x0e, 0xbe, 0xe6, 0x9f, 0x3e, 0x56, 0x64, 0x1a, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x13, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc4, 0xd7, 0x26, 0x2c, 0x18, 0xf7, 0x80, 0x0d,
         ];
         const MARKER_PREFIX: [u8; 48] = [
             0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0xdc, 0xaf, 0xa0, 0xb5, 0x62, 0xea, 0x64, 0xd8, 0xa8, 0xb4, 0x28, 0x8b,
-            0x24, 0x0c, 0xeb, 0xc6, 0xf0, 0x03, 0xa2, 0x35, 0xa2, 0x29, 0x72, 0x66, 0xa2, 0xb5,
-            0x03, 0xbc, 0x69, 0x1b, 0xcd, 0x79,
+            0x00, 0x00, 0x30, 0x29, 0xd6, 0x5f, 0x03, 0x34, 0x57, 0xdd, 0x41, 0xa5, 0x45, 0xa2,
+            0x61, 0xd5, 0x63, 0xb6, 0x27, 0x9c, 0x70, 0x3e, 0x58, 0x8a, 0xdb, 0xa1, 0xa4, 0xa5,
+            0x5a, 0xca, 0x70, 0xf9, 0x89, 0x00,
         ];
-        const RECORD_PREFIX: [u8; 54] = [
+        const RECORD_PREFIX: [u8; 62] = [
             0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x49, 0xf2, 0x1a, 0xce, 0x4f, 0xbe, 0xfd, 0x52, 0x25, 0x8f, 0xc2, 0x4b,
-            0x18, 0x3f, 0x52, 0xc6, 0xe7, 0xe3, 0x66, 0x8e, 0x13, 0x34, 0x7d, 0x56, 0xff, 0x2b,
-            0x6a, 0x4f, 0xf1, 0x41, 0x59, 0xf2, 0x72, 0x31, 0x62, 0x6f, 0x64, 0x79,
+            0x00, 0x00, 0x13, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x66, 0x56, 0x72, 0x68,
+            0x58, 0xbf, 0xa5, 0x55, 0x2e, 0xf6, 0x6b, 0xf0, 0x34, 0xa0, 0x18, 0xd9, 0x88, 0x9c,
+            0x4f, 0xbc, 0xaa, 0x03, 0x10, 0x48, 0xaf, 0x49, 0xaf, 0xd1, 0x6f, 0x53, 0xd6, 0x39,
+            0x72, 0x31, 0x62, 0x6f, 0x64, 0x79,
         ];
         const HEADER_OFFSET: usize = 0;
         const MARKER_OFFSET: usize = 4 * 1024;
-        const SLOT_OFFSET: usize = 16 * 1024;
+        const SLOT_OFFSET: usize = 32 * 1024;
         const RECORD_OFFSET: usize = 45_056;
         const CLEAN_TAIL: u64 = 49_152;
 
@@ -605,7 +685,7 @@ mod tests {
         let minimum_record_bytes = disk.format.minimum_record_bytes() as usize;
         assert_eq!(last_sequence_point, None);
         let slot = writer
-            .append("db/object", b"r1", b"body", point(17))
+            .append("db/object", b"r1", b"body", point(17), Some(point(19)))
             .await
             .unwrap();
         assert_eq!(slot.record_offset, RECORD_OFFSET as u64);
@@ -647,13 +727,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(last_sequence_point, Some(point(17)));
+        assert_eq!(last_sequence_point, Some(point(19)));
         let record = disk.lookup("db/object").await.unwrap().unwrap();
         assert_eq!(record.revision, b"r1");
         assert_eq!(record.body, b"body");
         assert_eq!(record.current_after, point(17));
+        assert_eq!(record.start, Some(point(19)));
         let resumed = writer
-            .append("db/next", b"r2", b"next", point(18))
+            .append("db/next", b"r2", b"next", point(20), None)
             .await
             .unwrap();
         assert_eq!(resumed.record_offset, CLEAN_TAIL);
@@ -674,6 +755,236 @@ mod tests {
         assert_eq!(opened.last_sequence_point, Some(point(34)));
         let reopened = opened.cache;
         reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn record_keeps_its_start() {
+        let dir = TempDir::new().unwrap();
+        let cache = open(&dir, id(1)).await;
+        publish_with_start(
+            &cache,
+            "db/observed",
+            b"r1",
+            b"a",
+            point(17),
+            Some(point(19)),
+        );
+        publish_at(&cache, "db/unknown", b"r2", b"b", point(18));
+
+        let observed = cache.lookup(Arc::from("db/observed")).await.unwrap();
+        assert_eq!(observed.current_after, point(17));
+        assert_eq!(observed.start, Some(point(19)));
+        let unknown = cache.lookup(Arc::from("db/unknown")).await.unwrap();
+        assert_eq!(unknown.start, None);
+        cache.shutdown().await;
+    }
+
+    fn advance(cache: &PersistentCache, path: &str, revision: &[u8], current_after: SequencePoint) {
+        assert!(cache.advance_watermark(
+            Arc::from(path),
+            Arc::new(PathChanges::default()),
+            revision.to_vec(),
+            current_after,
+        ));
+    }
+
+    #[tokio::test]
+    async fn advance_updates_the_slot_watermark() {
+        let dir = TempDir::new().unwrap();
+        let cache = open(&dir, id(1)).await;
+        publish_with_start(&cache, "db/object", b"r1", b"a", point(8), Some(point(10)));
+        advance(&cache, "db/object", b"r1", point(30));
+
+        let record = cache.lookup(Arc::from("db/object")).await.unwrap();
+        assert_eq!(record.body, b"a");
+        assert_eq!(record.current_after, point(30));
+        assert_eq!(record.start, Some(point(10)));
+
+        // An older watermark never lowers the slot.
+        advance(&cache, "db/object", b"r1", point(20));
+        let record = cache.lookup(Arc::from("db/object")).await.unwrap();
+        assert_eq!(record.current_after, point(30));
+        cache.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_advances_need_no_optional_reservation() {
+        let dir = TempDir::new().unwrap();
+        let cache = open(&dir, id(1)).await;
+        publish_with_start(&cache, "db/object", b"r1", b"a", point(8), Some(point(10)));
+        let inner = cache.inner.as_ref().unwrap();
+        // Hold every optional reservation, as a large shutdown flush of single
+        // advances would.
+        let held =
+            std::iter::from_fn(|| inner.shared.admission.reserve_optional()).collect::<Vec<_>>();
+        assert!(!cache.advance_watermark(
+            Arc::from("db/object"),
+            Arc::new(PathChanges::default()),
+            b"r1".to_vec(),
+            point(30),
+        ));
+        assert!(cache.advance_watermarks([(
+            Arc::<str>::from("db/object"),
+            Arc::new(PathChanges::default()) as Arc<dyn PathChangeOwner>,
+            b"r1".to_vec(),
+            point(30),
+        )]));
+        drop(held);
+
+        let record = cache.lookup(Arc::from("db/object")).await.unwrap();
+        assert_eq!(record.current_after, point(30));
+        cache.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn advance_for_another_revision_is_ignored() {
+        let dir = TempDir::new().unwrap();
+        let cache = open(&dir, id(1)).await;
+        publish_with_start(&cache, "db/object", b"r2", b"a", point(8), Some(point(10)));
+        advance(&cache, "db/object", b"r1", point(30));
+        advance(&cache, "db/other", b"r2", point(30));
+
+        let record = cache.lookup(Arc::from("db/object")).await.unwrap();
+        assert_eq!(record.revision, b"r2");
+        assert_eq!(record.current_after, point(8));
+        assert!(cache.lookup(Arc::from("db/other")).await.is_none());
+        cache.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn advance_during_a_path_change_is_ignored() {
+        let dir = TempDir::new().unwrap();
+        let cache = open(&dir, id(1)).await;
+        publish_at(&cache, "db/object", b"r1", b"a", point(8));
+        let path = Arc::<str>::from("db/object");
+
+        // A change starts after the advance is queued.
+        let owner = Arc::new(PathChanges::default());
+        assert!(cache.advance_watermark(path.clone(), owner.clone(), b"r1".to_vec(), point(30)));
+        let later = cache.begin_change(owner.clone()).unwrap();
+        assert_eq!(
+            cache.lookup(path.clone()).await.unwrap().current_after,
+            point(8)
+        );
+        drop(later);
+
+        // A change is still pending when the worker takes the advance.
+        let owner = Arc::new(PathChanges::default());
+        let pending = cache.begin_change(owner.clone()).unwrap();
+        assert!(cache.advance_watermark(path.clone(), owner.clone(), b"r1".to_vec(), point(40)));
+        assert_eq!(
+            cache.lookup(path.clone()).await.unwrap().current_after,
+            point(8)
+        );
+        drop(pending);
+        cache.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn advance_after_a_queued_replace_of_the_same_state_applies() {
+        let dir = TempDir::new().unwrap();
+        let cache = open(&dir, id(1)).await;
+        let path = Arc::<str>::from("db/object");
+        let owner = Arc::new(PathChanges::default());
+        let change = cache.begin_change(owner.clone()).unwrap();
+        cache.replace(
+            path.clone(),
+            b"r1".to_vec(),
+            b"a".to_vec(),
+            point(8),
+            None,
+            change,
+        );
+        assert!(cache.advance_watermark(path.clone(), owner, b"r1".to_vec(), point(30)));
+        assert_eq!(cache.lookup(path).await.unwrap().current_after, point(30));
+        cache.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_slot_watermark_is_a_miss() {
+        let dir = TempDir::new().unwrap();
+        let cache = open(&dir, id(1)).await;
+        publish_at(&cache, "db/object", b"r1", b"a", point(8));
+        advance(&cache, "db/object", b"r1", point(30));
+        assert_eq!(
+            cache
+                .lookup(Arc::from("db/object"))
+                .await
+                .unwrap()
+                .current_after,
+            point(30)
+        );
+
+        let disk = &cache.inner.as_ref().unwrap().shared.disk;
+        let slot = disk.current_slot("db/object").await.unwrap().unwrap();
+        let encoded = disk.format.encode_slot(slot);
+        let bucket = slot.fingerprint % disk.format.bucket_count();
+        let bucket_offset = disk.format.metadata_bytes() + bucket * disk.format.block_bytes();
+        let mut bytes = vec![0; disk.format.block_bytes() as usize];
+        disk.file
+            .read_exact_at(&mut bytes, bucket_offset)
+            .await
+            .unwrap();
+        let slot_offset = bucket_offset
+            + bytes
+                .windows(encoded.len())
+                .position(|window| window == encoded)
+                .unwrap() as u64;
+        // Claim a larger watermark than the advance wrote.
+        let forged = Slot {
+            current_after: point(1000),
+            ..slot
+        };
+        disk.file
+            .write_all_at(&disk.format.encode_slot(forged), slot_offset)
+            .await
+            .unwrap();
+
+        assert!(cache.lookup(Arc::from("db/object")).await.is_none());
+        advance(&cache, "db/object", b"r1", point(2000));
+        assert!(cache.lookup(Arc::from("db/object")).await.is_none());
+        cache.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reopen_maximum_covers_an_advanced_watermark() {
+        let dir = TempDir::new().unwrap();
+        let database_id = id(1);
+        let cache = open(&dir, database_id).await;
+        publish_with_start(&cache, "db/object", b"r1", b"a", point(8), Some(point(10)));
+        publish_at(&cache, "db/high", b"r2", b"b", point(34));
+        advance(&cache, "db/object", b"r1", point(50));
+        cache.shutdown().await;
+        drop(cache);
+
+        let opened = open_result(&dir, database_id).await;
+        assert_eq!(opened.last_sequence_point, Some(point(50)));
+        let record = opened.cache.lookup(Arc::from("db/object")).await.unwrap();
+        assert_eq!(record.current_after, point(50));
+        assert_eq!(record.start, Some(point(10)));
+        opened.cache.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reopen_maximum_covers_a_start_after_the_watermark() {
+        let dir = TempDir::new().unwrap();
+        let database_id = id(1);
+        let cache = open(&dir, database_id).await;
+        publish_with_start(
+            &cache,
+            "db/observed",
+            b"r1",
+            b"a",
+            point(8),
+            Some(point(40)),
+        );
+        publish_at(&cache, "db/high", b"r2", b"b", point(34));
+        cache.shutdown().await;
+        drop(cache);
+
+        let opened = open_result(&dir, database_id).await;
+        assert_eq!(opened.last_sequence_point, Some(point(40)));
+        opened.cache.shutdown().await;
     }
 
     #[tokio::test]
@@ -1070,6 +1381,7 @@ mod tests {
             b"r1".to_vec(),
             b"old".to_vec(),
             point(1),
+            None,
             older,
         );
         cache.replace(
@@ -1077,6 +1389,7 @@ mod tests {
             b"r2".to_vec(),
             b"new".to_vec(),
             point(2),
+            None,
             newer,
         );
 
@@ -1104,7 +1417,7 @@ mod tests {
         .await
         .unwrap();
         let old_slot = writer
-            .append("db/object", b"r1", b"body", point(1))
+            .append("db/object", b"r1", b"body", point(1), None)
             .await
             .unwrap();
         writer.sync().await.unwrap();
@@ -1130,7 +1443,7 @@ mod tests {
         );
         assert_eq!(recovered.active_segment, None);
         let recovered_slot = recovered
-            .append("db/new", b"r2", b"new", point(2))
+            .append("db/new", b"r2", b"new", point(2), None)
             .await
             .unwrap();
         assert_ne!(recovered.active_segment, Some(old_segment));

@@ -21,7 +21,7 @@ use crate::diagnostics::Diagnostics;
 use crate::error::Error;
 use crate::limits::TransactionLimits;
 use crate::stats::{Stats, TransactionStats};
-use crate::tx::{CreateMode, Transaction};
+use crate::tx::{CreateMode, ReadTransaction, Transaction};
 use crate::version::check_or_create_db_meta;
 
 /// Builds and opens a [`Database`], tweaking optional settings before opening.
@@ -384,6 +384,35 @@ impl Database {
         self.inner.tx(f).await
     }
 
+    /// Runs `f` as a stale read-only transaction and returns its result.
+    ///
+    /// The body sees the state of the database at one instant, its cut point.
+    /// The cut point is at most `max_staleness` old on the clock of this
+    /// instance, and `Duration::MAX` accepts any age. The result is
+    /// serializable, and it contains every write that this instance
+    /// committed before the call. A stale read-only transaction of this
+    /// instance never sees an earlier state than a previous one.
+    ///
+    /// With a warm cache, a stale read-only transaction can finish with no
+    /// backend operation. When the cache cannot supply a cut point, it
+    /// validates its reads like [`Database::tx`]. The body can run more than
+    /// once, as in [`Database::tx`].
+    ///
+    /// A `read_tx` that follows a [`Database::tx`] of the same instance can
+    /// miss a write of another instance that the `tx` saw. Use
+    /// [`Database::tx`] when the reads must follow everything that this
+    /// instance observed.
+    pub async fn read_tx<T, F, Fut>(&self, max_staleness: Duration, mut f: F) -> Result<T, Error>
+    where
+        F: FnMut(ReadTransaction) -> Fut + Send,
+        Fut: Future<Output = Result<T, Error>> + Send,
+        T: Send,
+    {
+        self.inner
+            .tx_with(Some(max_staleness), |tx| f(ReadTransaction::new(tx)))
+            .await
+    }
+
     /// Runs one full GC and returns when it is complete.
     ///
     /// A full GC lists every transaction record of the database once and checks
@@ -556,6 +585,19 @@ impl DbInner {
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
+        self.tx_with(None, f).await
+    }
+
+    pub(crate) async fn tx_with<T, F, Fut>(
+        self: &Arc<Self>,
+        max_staleness: Option<Duration>,
+        f: F,
+    ) -> Result<T, Error>
+    where
+        F: FnMut(Transaction) -> Fut + Send,
+        Fut: Future<Output = Result<T, Error>> + Send,
+        T: Send,
+    {
         let _guard = self.admit_operation()?;
 
         let mut stats = TransactionStats {
@@ -563,7 +605,7 @@ impl DbInner {
             ..Default::default()
         };
         let begin = rt::Instant::now();
-        let res = self.tx_impl(f, &mut stats).await;
+        let res = self.tx_impl(max_staleness, f, &mut stats).await;
         stats.elapsed = begin.elapsed();
         self.update_transaction_stats(stats);
         res
@@ -576,6 +618,7 @@ impl DbInner {
 
     async fn tx_impl<T, F, Fut>(
         self: &Arc<Self>,
+        max_staleness: Option<Duration>,
         mut f: F,
         stats: &mut TransactionStats,
     ) -> Result<T, Error>
@@ -584,7 +627,7 @@ impl DbInner {
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
-        let mut driver = TransactionDriver::new(&self.engine);
+        let mut driver = TransactionDriver::new(&self.engine, max_staleness);
 
         let result: Result<T, Error> = loop {
             let tx = Transaction::new(
@@ -642,11 +685,12 @@ struct TransactionDriver<'a> {
 }
 
 impl<'a> TransactionDriver<'a> {
-    fn new(engine: &'a Engine) -> Self {
-        Self {
-            engine,
-            handle: engine.begin_transaction(AccessSet::default(), CatalogAccesses::default()),
-        }
+    fn new(engine: &'a Engine, max_staleness: Option<Duration>) -> Self {
+        let handle = match max_staleness {
+            Some(max_staleness) => engine.begin_stale_transaction(max_staleness),
+            None => engine.begin_transaction(AccessSet::default(), CatalogAccesses::default()),
+        };
+        Self { engine, handle }
     }
 
     /// Installs the accesses collected from the latest transaction-body

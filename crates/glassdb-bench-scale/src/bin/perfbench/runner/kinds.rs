@@ -97,6 +97,28 @@ struct ReadModifyWrite {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub(crate) struct Read {
     keys: usize,
+    /// Run a stale read-only transaction with this bound (ADR-097), in place
+    /// of `Database::tx`.
+    #[serde(default, deserialize_with = "optional_duration")]
+    staleness: Option<std::time::Duration>,
+    /// Sleep this long after each transaction, so that a transaction with no
+    /// backend operation still advances virtual time.
+    #[serde(default, deserialize_with = "optional_duration")]
+    pause: Option<std::time::Duration>,
+}
+
+/// Keeps the values of a read from being optimized away.
+fn consume(values: Vec<Result<Option<Vec<u8>>, GError>>) -> Result<(), GError> {
+    for value in values {
+        std::hint::black_box(value?);
+    }
+    Ok(())
+}
+
+fn optional_duration<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<std::time::Duration>, D::Error> {
+    super::config::duration(deserializer).map(Some)
 }
 
 /// Writes one key without a read.
@@ -183,15 +205,26 @@ impl Kind for Read {
 
     async fn run(&self, op: &Op<'_>) -> Result<(), GError> {
         let collection = &op.collections[0];
-        op.db
-            .tx(|tx| async move {
-                let values = join_all(op.keys.iter().map(|key| tx.read(collection, key))).await;
-                for value in values {
-                    std::hint::black_box(value?);
-                }
-                Ok(())
-            })
-            .await
+        let result = match self.staleness {
+            Some(staleness) => {
+                op.db
+                    .read_tx(staleness, |tx| async move {
+                        consume(join_all(op.keys.iter().map(|key| tx.read(collection, key))).await)
+                    })
+                    .await
+            }
+            None => {
+                op.db
+                    .tx(|tx| async move {
+                        consume(join_all(op.keys.iter().map(|key| tx.read(collection, key))).await)
+                    })
+                    .await
+            }
+        };
+        if let Some(pause) = self.pause {
+            glassdb_concurr::rt::sleep(pause).await;
+        }
+        result
     }
 }
 

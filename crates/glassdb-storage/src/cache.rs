@@ -69,9 +69,9 @@ impl<V: Weighable + Clone> Inner<V> {
         overflowed
     }
 
-    fn remove_oldest(&mut self, mut overflowed: bool) {
+    fn remove_oldest(&mut self, mut overflowed: bool, evicted: &mut Vec<(String, V)>) {
         while overflowed || self.curr_size > self.max_size {
-            let Some((_, v)) = self.map.pop_front() else {
+            let Some((k, v)) = self.map.pop_front() else {
                 return;
             };
             if overflowed {
@@ -83,6 +83,7 @@ impl<V: Weighable + Clone> Inner<V> {
                 self.curr_size = replacement.size;
                 overflowed = replacement.overflowed;
             }
+            evicted.push((k, v));
         }
     }
 }
@@ -112,10 +113,12 @@ impl<V: Weighable + Clone> CacheShard<V> {
         inner.map.to_back(key).cloned()
     }
 
+    #[cfg(test)]
     fn set(&self, key: &str, val: V) {
         self.update(key, |_| Some(val));
     }
 
+    #[cfg(test)]
     fn update<F>(&self, key: &str, f: F)
     where
         F: FnOnce(Option<V>) -> Option<V>,
@@ -123,11 +126,22 @@ impl<V: Weighable + Clone> CacheShard<V> {
         self.update_with_result(key, |old| (f(old), ()));
     }
 
+    #[cfg(test)]
     fn update_with_result<F, R>(&self, key: &str, f: F) -> R
     where
         F: FnOnce(Option<V>) -> (Option<V>, R),
     {
+        self.update_evicting(key, f).0
+    }
+
+    /// Updates `key` and returns the entries that the update evicted for
+    /// capacity, including a new value that does not fit.
+    fn update_evicting<F, R>(&self, key: &str, f: F) -> (R, Vec<(String, V)>)
+    where
+        F: FnOnce(Option<V>) -> (Option<V>, R),
+    {
         let mut inner = self.inner.lock().unwrap();
+        let mut evicted = Vec::new();
         let old = inner.map.get(key).cloned();
         let old_size = old.as_ref().map_or(0, Weighable::size);
         let (new, result) = f(old);
@@ -141,17 +155,18 @@ impl<V: Weighable + Clone> CacheShard<V> {
                 if inner.max_size == 0 || new_size > inner.max_size {
                     // Keeping an old value here could hide a completed mutation.
                     inner.delete_entry(key);
-                    return result;
+                    evicted.push((key.to_string(), newv));
+                    return (result, evicted);
                 }
                 let replacement = replace_weight(inner.curr_size, old_size, new_size);
                 inner.curr_size = replacement.size;
                 // `insert` appends at the back (most-recently-used) and, for an
                 // existing key, moves it there while replacing the value.
                 inner.map.insert(key.to_string(), newv);
-                inner.remove_oldest(replacement.overflowed);
+                inner.remove_oldest(replacement.overflowed, &mut evicted);
             }
         }
-        result
+        (result, evicted)
     }
 
     fn delete(&self, key: &str) {
@@ -162,22 +177,48 @@ impl<V: Weighable + Clone> CacheShard<V> {
     fn size(&self) -> usize {
         self.inner.lock().unwrap().curr_size
     }
+
+    fn entries(&self) -> Vec<(String, V)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .map
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
 }
+
+/// Receives each entry that the cache evicts for capacity. The cache calls it
+/// after it releases the shard lock.
+pub type EvictionHook<V> = Box<dyn Fn(&str, V) + Send + Sync>;
 
 /// A thread-safe LRU cache that evicts the least-recently-used entries once the
 /// total size exceeds the configured maximum. It is partitioned into
 /// independent shards, each with its own lock and byte budget.
 pub struct Cache<V> {
     sh: Sharded<CacheShard<V>>,
+    on_evict: Option<EvictionHook<V>>,
 }
 
 impl<V: Weighable + Clone> Cache<V> {
     /// Creates a cache with the given maximum size in bytes. The budget is split
     /// evenly across shards to reduce lock contention. Zero disables retention.
     pub fn new(max_size: usize) -> Self {
+        Self::build(max_size, None)
+    }
+
+    /// Creates a cache like [`Self::new`] that passes each entry it evicts for
+    /// capacity to `on_evict`. A new value that does not fit its shard's
+    /// budget counts as evicted. Explicit removals and replacements do not.
+    pub fn with_eviction(max_size: usize, on_evict: EvictionHook<V>) -> Self {
+        Self::build(max_size, Some(on_evict))
+    }
+
+    fn build(max_size: usize, on_evict: Option<EvictionHook<V>>) -> Self {
         let per = max_size / shard::count();
         Cache {
             sh: Sharded::new(move |_| CacheShard::new(per)),
+            on_evict,
         }
     }
 
@@ -188,7 +229,7 @@ impl<V: Weighable + Clone> Cache<V> {
 
     /// Stores `val` when it fits its shard's budget. Otherwise removes `key`.
     pub fn set(&self, key: &str, val: V) {
-        self.sh.for_key(key.as_bytes()).set(key, val);
+        self.update_with_result(key, |_| (Some(val), ()));
     }
 
     /// Updates the value under `key` while holding the lock. The closure
@@ -199,7 +240,7 @@ impl<V: Weighable + Clone> Cache<V> {
     where
         F: FnOnce(Option<V>) -> Option<V>,
     {
-        self.sh.for_key(key.as_bytes()).update(key, f);
+        self.update_with_result(key, |old| (f(old), ()));
     }
 
     /// Removes the entry for `key`.
@@ -214,13 +255,27 @@ impl<V: Weighable + Clone> Cache<V> {
         total
     }
 
+    /// Returns a copy of every entry. Each shard is copied under its own lock,
+    /// so the result is not one atomic snapshot of the whole cache.
+    pub fn entries(&self) -> Vec<(String, V)> {
+        let mut entries = Vec::new();
+        self.sh.each(|s| entries.extend(s.entries()));
+        entries
+    }
+
     /// Atomically updates `key` and returns an auxiliary result produced by the
     /// update closure.
     pub(crate) fn update_with_result<F, R>(&self, key: &str, f: F) -> R
     where
         F: FnOnce(Option<V>) -> (Option<V>, R),
     {
-        self.sh.for_key(key.as_bytes()).update_with_result(key, f)
+        let (result, evicted) = self.sh.for_key(key.as_bytes()).update_evicting(key, f);
+        if let Some(on_evict) = &self.on_evict {
+            for (key, value) in evicted {
+                on_evict(&key, value);
+            }
+        }
+        result
     }
 }
 
@@ -478,5 +533,40 @@ mod tests {
             c.get(&s1[0]).is_some(),
             "entry in shard 1 must be unaffected by shard 0 eviction"
         );
+    }
+
+    #[test]
+    fn eviction_hook_receives_capacity_evictions_only() {
+        let n = shard::count();
+        let evicted = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = evicted.clone();
+        let c = Cache::with_eviction(
+            6 * n,
+            Box::new(move |key: &str, value: TestEntry| {
+                sink.lock().unwrap().push((key.to_owned(), value));
+            }),
+        );
+        let keys = keys_for_shard(0, n, 4);
+        c.set(&keys[0], e("aaa"));
+        c.set(&keys[1], e("bbb"));
+        c.delete(&keys[1]);
+        c.set(&keys[1], e("bbb"));
+        c.update(&keys[1], |_| Some(e("ccc")));
+        assert!(evicted.lock().unwrap().is_empty());
+
+        c.set(&keys[2], e("ddd"));
+        c.set(&keys[3], e("too large"));
+        assert_eq!(
+            *evicted.lock().unwrap(),
+            vec![
+                (keys[0].clone(), e("aaa")),
+                (keys[3].clone(), e("too large"))
+            ]
+        );
+        let mut entries = c.entries();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected = vec![(keys[1].clone(), e("ccc")), (keys[2].clone(), e("ddd"))];
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(entries, expected);
     }
 }

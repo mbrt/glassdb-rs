@@ -3,13 +3,17 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::cache::{Cache, Weighable};
+use crate::cache::{Cache, EvictionHook, Weighable};
 use crate::error::StorageError;
-use crate::timeline::SequencePoint;
+use crate::timeline::{SequencePoint, Timeline};
 
 use super::{Codec, Evidence, ObjectKey, Observation, Requirement, Revision};
 
 type ErasedValue = Arc<dyn Any + Send + Sync>;
+
+/// Receives a present state whose watermark is newer than its persistent copy:
+/// its path, revision, and evidence.
+pub(super) type UnpersistedHook = Box<dyn Fn(&str, &Revision, &Evidence) + Send + Sync>;
 
 /// One entry in the shared decoded LRU: either a present decoded value or a
 /// confirmed absence. A missing object has no entry at all.
@@ -51,6 +55,19 @@ pub(super) struct FetchResult {
     value: Option<ErasedValue>,
     revision: Option<Revision>,
     evidence: Evidence,
+}
+
+impl FetchResult {
+    /// The start of the installed state's currentness interval, which the
+    /// persistent cache stores next to the watermark.
+    pub(super) fn start(&self) -> Option<SequencePoint> {
+        self.evidence.start()
+    }
+
+    /// Records that the persistent cache receives this state with watermark `t`.
+    pub(super) fn persisted_at(&self, t: SequencePoint) {
+        self.evidence.persisted_at(t);
+    }
 }
 
 /// Present knowledge retained for a revision-conditional backend read.
@@ -177,12 +194,52 @@ impl Expected {
 #[derive(Clone)]
 pub(super) struct Knowledge {
     cache: Arc<Cache<CacheEntry>>,
+    /// Marks the completion of the operations that observe a state, for the
+    /// start of its currentness interval (ADR-097).
+    timeline: Timeline,
 }
 
 impl Knowledge {
-    pub(super) fn new(max_size: usize) -> Self {
+    /// Creates the decoded cache. When `evicted` is set, the cache passes to it
+    /// each present state that it evicts for capacity while the persistent
+    /// cache has an older watermark for that state.
+    pub(super) fn new(
+        max_size: usize,
+        timeline: Timeline,
+        evicted: Option<UnpersistedHook>,
+    ) -> Self {
+        let cache = match evicted {
+            Some(evicted) => {
+                let hook: EvictionHook<CacheEntry> = Box::new(move |path, entry| {
+                    if let EntryState::Present {
+                        revision, evidence, ..
+                    } = entry.state
+                        && evidence.unpersisted_watermark().is_some()
+                    {
+                        evicted(path, &revision, &evidence);
+                    }
+                });
+                Cache::with_eviction(max_size, hook)
+            }
+            None => Cache::new(max_size),
+        };
         Self {
-            cache: Arc::new(Cache::new(max_size)),
+            cache: Arc::new(cache),
+            timeline,
+        }
+    }
+
+    /// Calls `f` for each cached present state whose watermark is newer than
+    /// its persistent copy.
+    pub(super) fn for_each_unpersisted(&self, mut f: impl FnMut(&str, &Revision, &Evidence)) {
+        for (path, entry) in self.cache.entries() {
+            if let EntryState::Present {
+                revision, evidence, ..
+            } = entry.state
+                && evidence.unpersisted_watermark().is_some()
+            {
+                f(&path, &revision, &evidence);
+            }
         }
     }
 
@@ -295,15 +352,25 @@ impl Knowledge {
         size: usize,
         revision: Revision,
         current_after: SequencePoint,
+        start: Option<SequencePoint>,
     ) -> PresentSeed {
         let erased: ErasedValue = value;
+        // The load is not an observation of this open, so it does not mark a
+        // start. The state keeps the start that an earlier observation gave it.
+        let incoming = Evidence::new(current_after);
+        if let Some(start) = start {
+            incoming.observed_by_completion(start);
+        }
+        incoming.persisted_at(current_after);
         let evidence = self.install_present(
             path,
             erased.clone(),
             size,
             revision.clone(),
-            Evidence::new(current_after),
+            incoming,
+            Observed::No,
         );
+        evidence.persisted_at(current_after);
         PresentSeed {
             value: erased,
             size,
@@ -327,6 +394,7 @@ impl Knowledge {
             size,
             revision.clone(),
             Evidence::new(current_after),
+            Observed::Yes,
         );
         FetchResult {
             value: Some(erased),
@@ -350,6 +418,7 @@ impl Knowledge {
             size,
             revision.clone(),
             Evidence::new(current_after),
+            Observed::Yes,
         );
         Observation {
             key,
@@ -398,6 +467,7 @@ impl Knowledge {
             seed.size,
             seed.revision.clone(),
             seed.evidence,
+            Observed::Yes,
         );
         FetchResult {
             value: Some(seed.value),
@@ -463,8 +533,9 @@ impl Knowledge {
         size: usize,
         revision: Revision,
         incoming: Evidence,
+        observed: Observed,
     ) -> Evidence {
-        self.cache.update_with_result(path, |old| match old {
+        let installed = self.cache.update_with_result(path, |old| match old {
             Some(CacheEntry {
                 state:
                     EntryState::Present {
@@ -502,13 +573,17 @@ impl Knowledge {
                     installed,
                 )
             }
-        })
+        });
+        if observed == Observed::Yes {
+            installed.observed_by_completion(self.timeline.now());
+        }
+        installed
     }
 
     /// Installs confirmed absence, merging evidence with an existing absence.
     fn install_absent(&self, path: &str, current_after: SequencePoint) -> Evidence {
         let incoming = Evidence::new(current_after);
-        self.cache.update_with_result(path, |old| match old {
+        let installed = self.cache.update_with_result(path, |old| match old {
             Some(CacheEntry {
                 state: EntryState::Absent { evidence },
             }) => {
@@ -530,8 +605,18 @@ impl Knowledge {
                     installed,
                 )
             }
-        })
+        });
+        installed.observed_by_completion(self.timeline.now());
+        installed
     }
+}
+
+/// Whether an installed state comes from an operation of this open, which
+/// starts its currentness interval, or only from the persistent cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Observed {
+    Yes,
+    No,
 }
 
 /// Downcasts a type-erased cached value to the codec's decoded type. A mismatch

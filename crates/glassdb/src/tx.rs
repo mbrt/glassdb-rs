@@ -12,6 +12,7 @@
 
 mod access_overlay;
 mod catalog;
+mod read;
 
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +22,7 @@ use glassdb_trans::{AccessSet, CatalogAccesses, CollectionReservations};
 use self::access_overlay::{AccessOverlay, OverlayRead};
 use self::catalog::CatalogOverlay;
 pub(crate) use self::catalog::CreateMode;
+pub use self::read::ReadTransaction;
 use crate::collection::{Collection, CollectionPath, collection_name};
 use crate::db::DbInner;
 use crate::error::Error;

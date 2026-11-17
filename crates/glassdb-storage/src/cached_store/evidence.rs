@@ -133,17 +133,43 @@ pub enum ObservationCheck<V> {
 /// state and that state's current cache entry hold clones of the same cell, so
 /// checking advances the evidence every holder sees. An `Arc` held by a caller
 /// outlives eviction of the corresponding cache entry.
-/// Keep the counter private so updates cannot bypass monotonic advancement.
+///
+/// The cell also keeps the start of the currentness interval of the state
+/// (ADR-097): the completion of the first operation that observed it. The state
+/// was current at every point from the start to the watermark. The persistent
+/// cache keeps the start, so it can come from an earlier open of the same
+/// cache. The start is unknown for a state that the persistent cache supplied
+/// without one.
+///
+/// The cell also keeps the newest watermark that the persistent cache has for
+/// this state, so that eviction and shutdown write only a newer one. It is not
+/// evidence: it only avoids useless persistent-cache work.
+/// Keep the counters private so updates cannot bypass monotonic advancement.
 #[derive(Debug, Clone)]
-pub(super) struct Evidence(Arc<AtomicU64>);
+pub(super) struct Evidence(Arc<EvidenceCell>);
+
+#[derive(Debug)]
+struct EvidenceCell {
+    watermark: AtomicU64,
+    start: AtomicU64,
+    persisted: AtomicU64,
+}
+
+const UNKNOWN_START: u64 = u64::MAX;
+// The timeline never allocates point 0.
+const NOT_PERSISTED: u64 = 0;
 
 impl Evidence {
     pub(super) fn new(t: SequencePoint) -> Self {
-        Evidence(Arc::new(AtomicU64::new(t.raw())))
+        Evidence(Arc::new(EvidenceCell {
+            watermark: AtomicU64::new(t.raw()),
+            start: AtomicU64::new(UNKNOWN_START),
+            persisted: AtomicU64::new(NOT_PERSISTED),
+        }))
     }
 
     pub(super) fn get(&self) -> SequencePoint {
-        SequencePoint::from_raw(self.0.load(Ordering::SeqCst))
+        SequencePoint::from_raw(self.0.watermark.load(Ordering::SeqCst))
     }
 
     /// Reports whether both handles share currentness updates.
@@ -153,7 +179,35 @@ impl Evidence {
 
     /// Advances the watermark to at least `t`, never regressing it.
     pub(super) fn advance(&self, t: SequencePoint) {
-        self.0.fetch_max(t.raw(), Ordering::SeqCst);
+        self.0.watermark.fetch_max(t.raw(), Ordering::SeqCst);
+    }
+
+    /// Records that an operation which observed this state completed at
+    /// `completed`. Only the earliest completion is the start.
+    pub(super) fn observed_by_completion(&self, completed: SequencePoint) {
+        self.0.start.fetch_min(completed.raw(), Ordering::SeqCst);
+    }
+
+    /// The start of the currentness interval, if an operation of this open
+    /// observed the state.
+    pub(super) fn start(&self) -> Option<SequencePoint> {
+        let start = self.0.start.load(Ordering::SeqCst);
+        (start != UNKNOWN_START).then(|| SequencePoint::from_raw(start))
+    }
+
+    /// Records that the persistent cache has a copy of this state with
+    /// watermark `t`, or that work to write `t` is queued.
+    pub(super) fn persisted_at(&self, t: SequencePoint) {
+        self.0.persisted.fetch_max(t.raw(), Ordering::SeqCst);
+    }
+
+    /// The watermark, when the persistent cache has a copy of this state with
+    /// an older watermark.
+    pub(super) fn unpersisted_watermark(&self) -> Option<SequencePoint> {
+        let persisted = self.0.persisted.load(Ordering::SeqCst);
+        let watermark = self.0.watermark.load(Ordering::SeqCst);
+        (persisted != NOT_PERSISTED && watermark > persisted)
+            .then(|| SequencePoint::from_raw(watermark))
     }
 }
 

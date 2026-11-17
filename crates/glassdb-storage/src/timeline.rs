@@ -105,6 +105,34 @@ impl Requirement {
     }
 }
 
+/// The earliest cut point that the next stale read-only transaction of a
+/// database instance can use (ADR-097).
+///
+/// It only rises. Use it only with the timeline of the database instance that
+/// owns it.
+#[derive(Debug, Clone, Default)]
+pub struct MonotonicFloor(Arc<AtomicU64>);
+
+impl MonotonicFloor {
+    /// Creates a floor that admits every cut point.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Raises the floor to a barrier captured after completed work.
+    pub fn raise_to_barrier(&self, barrier: CurrentnessBarrier) {
+        self.raise(barrier.point);
+    }
+
+    pub(crate) fn get(&self) -> SequencePoint {
+        SequencePoint(self.0.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn raise(&self, point: SequencePoint) {
+        self.0.fetch_max(point.0, Ordering::SeqCst);
+    }
+}
+
 pub(crate) trait TimeSource: Send + Sync {
     fn elapsed(&self) -> Duration;
 }
@@ -181,7 +209,7 @@ impl Timeline {
 
     /// Derives the approximate sequence cutoff used only by bounded-staleness
     /// reads.
-    fn approximate_cutoff(&self, max_staleness: Duration) -> SequencePoint {
+    pub(crate) fn approximate_cutoff(&self, max_staleness: Duration) -> SequencePoint {
         SequencePoint(
             self.now()
                 .raw()

@@ -5,6 +5,7 @@ mod lifecycle;
 use std::collections::BTreeSet;
 
 use glassdb_data::{CollectionAddress, CollectionId, CollectionName};
+use glassdb_storage::{CollectionRecord, Observation};
 
 use crate::access::AccessSet;
 
@@ -15,7 +16,16 @@ pub use lifecycle::{CollectionLifecycle, TopologySettler};
 pub struct DirectoryRead {
     pub parent: CollectionAddress,
     pub kind: DirectoryReadKind,
+    pub evidence: DirectoryEvidence,
 }
+
+/// The exact collection record behind a directory read, when no holder can
+/// change the bindings that the read found.
+///
+/// A stale read-only transaction uses it to place the read at a cut point
+/// (ADR-097). A read without it validates at a fresh barrier.
+#[derive(Debug, Clone, Default)]
+pub struct DirectoryEvidence(pub(crate) Option<Observation<CollectionRecord>>);
 
 /// The logical portion of a child directory that was observed.
 #[derive(Debug, Clone)]
@@ -134,6 +144,7 @@ impl DirectoryRead {
 pub struct DirectorySnapshot {
     pub children: Vec<(CollectionName, CollectionId)>,
     pub generation: u64,
+    pub evidence: DirectoryEvidence,
 }
 
 #[cfg(test)]
@@ -156,6 +167,7 @@ mod tests {
                 name: CollectionName::new(name).unwrap(),
                 collection: child.map(|byte| CollectionId::from_bytes([byte; 16])),
             },
+            evidence: DirectoryEvidence::default(),
         }
     }
 
@@ -185,6 +197,7 @@ mod tests {
                 DirectoryRead {
                     parent: address(2),
                     kind: DirectoryReadKind::Listing { generation: 0 },
+                    evidence: DirectoryEvidence::default(),
                 },
             ],
             changes: Vec::new(),
@@ -220,14 +233,17 @@ mod tests {
                         name: CollectionName::new("created").unwrap(),
                         collection: None,
                     },
+                    evidence: DirectoryEvidence::default(),
                 },
                 DirectoryRead {
                     parent: created.clone(),
                     kind: DirectoryReadKind::Listing { generation: 0 },
+                    evidence: DirectoryEvidence::default(),
                 },
                 DirectoryRead {
                     parent: durable.clone(),
                     kind: DirectoryReadKind::Listing { generation: 7 },
+                    evidence: DirectoryEvidence::default(),
                 },
             ],
             changes: vec![CollectionChange {

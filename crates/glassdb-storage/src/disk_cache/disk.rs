@@ -35,12 +35,36 @@ pub(super) struct Slot {
     pub(super) record_offset: u64,
     pub(super) record_bytes: u64,
     pub(super) current_after: SequencePoint,
+    pub(super) start: Option<SequencePoint>,
+    /// The truncated keyed digest that binds the fields above to the path and
+    /// to the record digest.
+    pub(super) check: u64,
 }
 
 pub(super) struct Record {
     pub(super) revision: Vec<u8>,
     pub(super) body: Vec<u8>,
+    /// The watermark of the slot that points to the record. It can be newer
+    /// than the watermark in the record, after an advance.
     pub(super) current_after: SequencePoint,
+    pub(super) start: Option<SequencePoint>,
+    pub(super) digest: [u8; 32],
+}
+
+/// The header and revision of a record, read without its body.
+pub(super) struct RecordPrefix<'a> {
+    pub(super) record_bytes: u64,
+    pub(super) current_after: SequencePoint,
+    pub(super) start: Option<SequencePoint>,
+    pub(super) digest: &'a [u8],
+    pub(super) revision: &'a [u8],
+}
+
+/// The index slot of the current record of one path and one revision.
+pub(super) struct SlotLocation {
+    offset: u64,
+    slot: Slot,
+    record_digest: [u8; 32],
 }
 
 impl Disk {
@@ -92,26 +116,94 @@ impl Disk {
         if self.segment_generations[segment].load(Ordering::Acquire) != slot.generation {
             return Ok(None);
         }
-        let record = self.format.decode_record(path, &bytes)?;
-        if record.current_after != slot.current_after {
+        let mut record = self.format.decode_record(path, &bytes)?;
+        // A slot is an untrusted hint: a torn or corrupt slot is a miss, and
+        // only an intact slot can claim a watermark newer than its record.
+        if !self.format.slot_is_sealed(path, slot, &record.digest) {
+            return Ok(None);
+        }
+        if record.current_after > slot.current_after || record.start != slot.start {
             return Err(CacheFormat::invalid_record());
         }
+        record.current_after = slot.current_after;
         Ok(Some(record))
     }
 
+    /// Finds the index slot of the current record of `path` when that record
+    /// holds `revision`. It reads only the record header and revision.
+    pub(super) async fn locate(
+        &self,
+        path: &str,
+        revision: &[u8],
+    ) -> io::Result<Option<SlotLocation>> {
+        let fingerprint = self.path_fingerprint(path);
+        let mut slots = self.matching_slots_at(fingerprint).await?;
+        slots.sort_unstable_by_key(|(_, slot)| std::cmp::Reverse(slot.generation));
+        let prefix_len = CacheFormat::record_prefix_bytes(revision.len());
+        let mut bytes = vec![0; prefix_len];
+        for (offset, slot) in slots {
+            let Some(segment) = self.slot_range(slot) else {
+                continue;
+            };
+            if slot.record_bytes < prefix_len as u64 {
+                continue;
+            }
+            self.read_exact_at(&mut bytes, slot.record_offset).await?;
+            if self.segment_generations[segment].load(Ordering::Acquire) != slot.generation {
+                continue;
+            }
+            let Some(prefix) = self.format.decode_record_prefix(&bytes) else {
+                continue;
+            };
+            if prefix.record_bytes != slot.record_bytes
+                || !self.format.slot_is_sealed(path, slot, prefix.digest)
+                || prefix.current_after > slot.current_after
+                || prefix.start != slot.start
+            {
+                continue;
+            }
+            // Publication keeps one slot per path, so the newest intact slot
+            // is the current record. Another revision means a newer state.
+            if prefix.revision != revision {
+                return Ok(None);
+            }
+            return Ok(Some(SlotLocation {
+                offset,
+                slot,
+                record_digest: prefix.digest.try_into().unwrap(),
+            }));
+        }
+        Ok(None)
+    }
+
     async fn matching_slots(&self, fingerprint: u64) -> io::Result<Vec<Slot>> {
+        Ok(self
+            .matching_slots_at(fingerprint)
+            .await?
+            .into_iter()
+            .map(|(_, slot)| slot)
+            .collect())
+    }
+
+    /// Returns the usable slots with `fingerprint` and their file offsets.
+    async fn matching_slots_at(&self, fingerprint: u64) -> io::Result<Vec<(u64, Slot)>> {
         let bucket = fingerprint % self.format.bucket_count();
         let offset = self.format.metadata_bytes() + bucket * self.format.block_bytes();
         let mut bytes = vec![0; self.format.block_bytes() as usize];
         self.read_exact_at(&mut bytes, offset).await?;
         let mut slots = Vec::new();
-        for raw in bytes.as_chunks::<{ CacheFormat::SLOT_BYTES as usize }>().0 {
+        for (index, raw) in bytes
+            .as_chunks::<{ CacheFormat::SLOT_BYTES as usize }>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let slot = self.format.decode_slot(raw);
             if slot.fingerprint == fingerprint
                 && slot.generation != 0
                 && self.slot_range(slot).is_some()
             {
-                slots.push(slot);
+                slots.push((offset + index as u64 * CacheFormat::SLOT_BYTES, slot));
             }
         }
         Ok(slots)
@@ -135,10 +227,13 @@ impl Disk {
                 for raw in bucket.as_chunks::<{ CacheFormat::SLOT_BYTES as usize }>().0 {
                     let slot = self.format.decode_slot(raw);
                     if slot.generation != 0 && self.slot_range(slot).is_some() {
+                        // A state observed only once has its start after its
+                        // watermark, so the maximum covers both points.
+                        let latest = slot
+                            .start
+                            .map_or(slot.current_after, |start| start.max(slot.current_after));
                         maximum = Some(
-                            maximum.map_or(slot.current_after, |current: SequencePoint| {
-                                current.max(slot.current_after)
-                            }),
+                            maximum.map_or(latest, |current: SequencePoint| current.max(latest)),
                         );
                     }
                 }
@@ -214,6 +309,7 @@ impl WriterState {
         revision: &[u8],
         body: &[u8],
         current_after: SequencePoint,
+        start: Option<SequencePoint>,
     ) -> io::Result<Slot> {
         let record_bytes = self
             .disk
@@ -226,7 +322,7 @@ impl WriterState {
         let record = self
             .disk
             .format
-            .encode_record(path, revision, body, current_after)?;
+            .encode_record(path, revision, body, current_after, start)?;
         debug_assert_eq!(record.len() as u64, record_bytes);
         let slot = Slot {
             fingerprint: self.disk.path_fingerprint(path),
@@ -234,7 +330,12 @@ impl WriterState {
             record_offset: self.append_offset,
             record_bytes,
             current_after,
+            start,
+            check: 0,
         };
+        let digest =
+            CacheFormat::stored_record_digest(&record).ok_or_else(CacheFormat::invalid_record)?;
+        let slot = self.disk.format.seal_slot(path, slot, digest);
         self.disk.write_all_at(&record, self.append_offset).await?;
         self.publish(slot).await?;
         self.append_offset += record_bytes;
@@ -242,6 +343,32 @@ impl WriterState {
             .dirty_bytes
             .saturating_add(record_bytes + CacheFormat::SLOT_BYTES);
         Ok(slot)
+    }
+
+    /// Rewrites the located slot with a newer watermark for the same record.
+    /// The record stays unchanged; the slot's check covers the new watermark.
+    pub(super) async fn advance(
+        &mut self,
+        path: &str,
+        location: SlotLocation,
+        current_after: SequencePoint,
+    ) -> io::Result<()> {
+        if location.slot.current_after >= current_after {
+            return Ok(());
+        }
+        let slot = self.disk.format.seal_slot(
+            path,
+            Slot {
+                current_after,
+                ..location.slot
+            },
+            &location.record_digest,
+        );
+        self.disk
+            .write_all_at(&self.disk.format.encode_slot(slot), location.offset)
+            .await?;
+        self.dirty_bytes = self.dirty_bytes.saturating_add(CacheFormat::SLOT_BYTES);
+        Ok(())
     }
 
     pub(super) async fn invalidate(&mut self, path: &str) -> io::Result<()> {

@@ -52,13 +52,16 @@ async fn lock_directory(
     id: &TxId,
     typ: LockType,
 ) {
-    use crate::collections::{CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind};
+    use crate::collections::{
+        CollectionChange, CollectionOp, DirectoryEvidence, DirectoryRead, DirectoryReadKind,
+    };
 
     let (reads, changes) = match typ {
         LockType::Read => (
             vec![DirectoryRead {
                 parent: parent.clone(),
                 kind: DirectoryReadKind::Listing { generation: 0 },
+                evidence: DirectoryEvidence::default(),
             }],
             Vec::new(),
         ),

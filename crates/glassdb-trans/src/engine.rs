@@ -280,6 +280,16 @@ impl Engine {
         EngineTransaction(self.algo.begin(accesses, catalog_accesses))
     }
 
+    /// Starts a stale read-only transaction that accepts a cut point no older
+    /// than `max_staleness` (ADR-097).
+    pub fn begin_stale_transaction(&self, max_staleness: Duration) -> EngineTransaction {
+        let mut handle = self
+            .algo
+            .begin(AccessSet::default(), CatalogAccesses::default());
+        handle.set_max_staleness(max_staleness);
+        EngineTransaction(handle)
+    }
+
     /// Replaces the logical accesses of an uncommitted transaction.
     pub fn reset_transaction(
         &self,
@@ -611,7 +621,7 @@ impl DormantEngine {
             transaction_leaf_parallelism,
         );
         let collection_lifecycle = CollectionLifecycle::new(
-            records,
+            records.clone(),
             nodes.clone(),
             monitor.clone(),
             retry.contention,
@@ -653,6 +663,8 @@ impl DormantEngine {
             inline_policy,
             restructurer.hint_sink(),
             restructurer.landed_splits(),
+            records,
+            transaction_leaf_parallelism,
         );
         let engine = Engine {
             backend,

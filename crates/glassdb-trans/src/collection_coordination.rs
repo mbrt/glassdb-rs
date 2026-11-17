@@ -545,7 +545,7 @@ mod tests {
     use glassdb_storage::transaction::TxRecord;
 
     use super::*;
-    use crate::collections::DirectoryReadKind;
+    use crate::collections::{DirectoryEvidence, DirectoryReadKind};
     use crate::monitor::{OwnerAbortOutcome, ProtocolTiming};
 
     fn tx_id(prefix: &[u8]) -> TxId {
@@ -600,6 +600,7 @@ mod tests {
         let read = DirectoryRead {
             parent: parent.clone(),
             kind: DirectoryReadKind::Listing { generation: 0 },
+            evidence: DirectoryEvidence::default(),
         };
         let change = CollectionChange {
             parent: parent.clone(),

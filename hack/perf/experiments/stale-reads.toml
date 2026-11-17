@@ -1,0 +1,19 @@
+# Stale read-only transactions (ADR-097) on the mixed low-conflict workload:
+# the `ro` shapes run `Database::read_tx` beside the `rw` shapes on the same
+# instances. The pause lets the transactions with no backend operation advance
+# virtual time. To compare with `Database::tx`, run `workers` with the same
+# pause: `--set 'shapes.ro-single.pause="0.5ms"' --set 'shapes.ro-multi.pause="0.5ms"'`.
+tags = ["extra", "area/read"]
+include = ["../configs/workers.toml"]
+
+[shapes.ro-single]
+staleness = "5s"
+pause = "0.5ms"
+
+[shapes.ro-multi]
+staleness = "5s"
+pause = "0.5ms"
+
+[[axes]]
+path = "cell.workers"
+values = [1, 50, 100, 200]

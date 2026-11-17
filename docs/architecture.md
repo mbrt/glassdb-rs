@@ -462,6 +462,26 @@ After a few failed checks, its replays use the locked commit
 A near miss then leaves no read lock, so it cannot push the writers of a hot
 leaf from direct commits to locked commits.
 
+**Stale read-only transactions** (`Database::read_tx`) validate at a cut point
+in the past instead of at a fresh barrier
+([ADR-097](adr/097-stale-read-only-transactions-choose-a-past-cut-point.md)).
+Each cached state knows its currentness interval: from the completion of the
+first operation that observed it to its currentness watermark. The cut point
+is a point inside the intervals of every leaf and collection record that the
+body read. These states do not change inside the common span, so every point
+of it gives the same result. The cut point must be within `max_staleness` and
+not before the monotonic floor of the instance. GlassDB targets the latest
+start among the states, raised to these bounds. Only the states whose interval
+ends before the target need a conditional read, in parallel. A changed state, or a read
+that depends on a holder, falls back to the validation of `Database::tx`.
+
+```text
+leaf A   [start ─────────── watermark]
+leaf B          [start ──────────────── watermark]
+record C     [start ──────── watermark]
+                ^ cut point: no backend operation
+```
+
 **Direct commit** applies when all point reads and point writes of a transaction
 route to one leaf. One leaf CAS validates every read and publishes every output,
 with no lock, transaction record, or write-back

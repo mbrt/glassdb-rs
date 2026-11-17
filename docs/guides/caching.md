@@ -150,7 +150,11 @@ is obsolete or in doubt, because that state is no longer discoverable.
 `within` converts a duration to a sequence-point cutoff. The conversion is
 approximate, and it is acceptable only as a cache policy for stale reads.
 Transaction validation, CAS receipts, and recovery use exact barriers and never
-do time arithmetic.
+do time arithmetic. A stale read-only transaction uses the same cutoff only to
+bound the age of its cut point. The cut point itself comes from the
+currentness intervals of the states, so its consistency does not depend on
+time
+([ADR-097](../adr/097-stale-read-only-transactions-choose-a-past-cut-point.md)).
 
 When the cached evidence is too old for `after` or `within`, `CachedStore`
 checks the backend. For a present state, it does a revision-conditional read,
