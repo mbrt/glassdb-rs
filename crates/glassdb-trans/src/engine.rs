@@ -241,13 +241,10 @@ impl Engine {
         Self::ensure_tree_root(backend, &root_path).await
     }
 
-    /// Reads one logical key with the requested staleness allowance.
-    pub async fn read(
-        &self,
-        key: &LogicalKey,
-        max_stale: Duration,
-    ) -> Result<ReadOutcome, StorageError> {
-        self.reader.read(key, max_stale).await
+    /// Reads one logical key from any usable cached state, for a transaction
+    /// body that validates the read later.
+    pub async fn read(&self, key: &LogicalKey) -> Result<ReadOutcome, StorageError> {
+        self.reader.read(key).await
     }
 
     /// Scans one logical key range and returns its validation evidence.

@@ -34,9 +34,7 @@ recoverable point.
 
 Only `Timeline` constructs a currentness barrier. Capture it after prerequisite
 work and before dependent operations. Requirements are constructed only as
-`ANY`, `after`, or `within`, and combining two requirements preserves the
-stronger one. `within` is an approximate cache policy, not proof that
-prerequisite work ended.
+`ANY` or `after`, and combining two requirements preserves the stronger one.
 
 Neither barriers nor requirements expose their point, including to other storage
 modules. Use predicates to check evidence. Do not add raw-point constructors,

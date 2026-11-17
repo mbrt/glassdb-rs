@@ -647,6 +647,10 @@ impl DbInner {
                 match driver.commit().await {
                     Ok(BodyDecision::ReturnOutcome) => break body_outcome,
                     Ok(BodyDecision::ReplayBody) => {}
+                    // A stale read-only transaction stages no change, so a
+                    // failed validation leaves nothing of the caller in doubt
+                    // (ADR-015).
+                    Err(e) if max_staleness.is_some() => break Err(Error::from_read_trans(e)),
                     Err(e) => break Err(e.into()),
                 }
             } else {

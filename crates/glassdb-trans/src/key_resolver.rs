@@ -510,7 +510,6 @@ mod tests {
 
     use std::collections::BTreeMap;
     use std::sync::Arc;
-    use std::time::Duration;
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
@@ -988,10 +987,7 @@ mod tests {
         let reader = Reader::new(resolver, timeline, RetrySchedule::default());
         log.lock().unwrap().clear();
 
-        let out = reader
-            .read(&logical_key(b"k"), Duration::MAX)
-            .await
-            .unwrap();
+        let out = reader.read(&logical_key(b"k")).await.unwrap();
         let value = out.value.expect("inline value is present");
         assert_eq!(value.value.as_ref(), b"hello");
         assert_eq!(value.writer, writer);
@@ -1220,10 +1216,7 @@ mod tests {
         let reader = Reader::new(resolver, timeline, RetrySchedule::default());
         log.lock().unwrap().clear();
 
-        let out = reader
-            .read(&logical_key(b"k"), Duration::MAX)
-            .await
-            .unwrap();
+        let out = reader.read(&logical_key(b"k")).await.unwrap();
         assert!(out.value.is_none());
         let (_, evidence) = out.into_parts();
         assert!(evidence.validates(Some(&writer), 0));
@@ -1249,10 +1242,7 @@ mod tests {
         seed_hold(&seed_store, b"k", &new).await;
 
         let reader = Reader::new(resolver, timeline, RetrySchedule::default());
-        let out = reader
-            .read(&logical_key(b"k"), Duration::MAX)
-            .await
-            .unwrap();
+        let out = reader.read(&logical_key(b"k")).await.unwrap();
         let value = out.value.expect("the holder committed a live value");
         // `commit_value` writes b"v"; the stale inline b"old-value" must not win.
         assert_eq!(value.value.as_ref(), b"v");
@@ -1266,20 +1256,19 @@ mod tests {
     async fn equal_inline_bytes_from_different_writers_are_distinct_values() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let seed_store = store_over(backend.clone()).await;
-        let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
+        let (resolver, _mon, timeline, _bg) = resolver_over(backend.clone()).await;
         let reader = Reader::new(resolver, timeline, RetrySchedule::default());
 
         let first = TxId::with_priority(1, b"first");
         seed_inline(&seed_store, b"k", &first, b"same").await;
-        let before = reader
-            .read(&logical_key(b"k"), Duration::MAX)
-            .await
-            .unwrap();
+        let before = reader.read(&logical_key(b"k")).await.unwrap();
 
         let second = TxId::with_priority(2, b"second");
         seed_inline(&seed_store, b"k", &second, b"same").await;
-        let after = reader
-            .read(&logical_key(b"k"), Duration::from_secs(0))
+        // A reader with an empty cache observes the second writer.
+        let (resolver, _mon, timeline, _bg) = resolver_over(backend).await;
+        let after = Reader::new(resolver, timeline, RetrySchedule::default())
+            .read(&logical_key(b"k"))
             .await
             .unwrap();
 

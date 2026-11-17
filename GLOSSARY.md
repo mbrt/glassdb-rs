@@ -357,7 +357,7 @@ The rule a read applies to decide whether an existing observation can serve it: 
 _Avoid_: Consistency level, staleness policy
 
 **Stale read**:
-A read outside a transaction that accepts a committed state known to be current within a stated age.
+A stale read-only transaction that reads only one key.
 
 **Currentness interval**:
 The span of sequence points over which one observed state of an object is known to be current: from the completion of the first operation that observed the state to its currentness watermark.

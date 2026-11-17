@@ -6,6 +6,9 @@ Accepted — implemented.
 
 Its non-persistence boundary is narrowed for the optional L2 by
 [ADR-045](045-optional-persistent-encoded-body-l2-cache.md).
+[ADR-098](098-a-stale-read-is-a-stale-read-only-transaction.md) gives
+`read_stale` the bounded-staleness guarantee of
+[ADR-097](097-stale-read-only-transactions-choose-a-past-cut-point.md).
 
 This depends on
 [ADR-042](042-conditional-only-backend-mutations.md), partially supersedes

@@ -187,8 +187,9 @@ async fn delete() {
             .is_none()
     );
 
+    // `read_stale` is a stale read-only transaction (ADR-098).
     let stats = db.stats();
-    assert_eq!(stats.transactions.completed, 4);
+    assert_eq!(stats.transactions.completed, 5);
     assert_eq!(stats.transactions.writes, 2);
     assert!(stats.transactions.replays <= 1);
 }
@@ -498,8 +499,9 @@ async fn read_stale() {
         tokio::time::sleep(sleep_time).await;
     }
 
+    // Each `read_stale` is a stale read-only transaction (ADR-098).
     let stats = db.stats();
-    assert_eq!(stats.transactions.completed, 31);
+    assert_eq!(stats.transactions.completed, 61);
     assert_eq!(stats.transactions.replays, 0);
 }
 #[tokio::test(start_paused = true)]

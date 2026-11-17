@@ -419,3 +419,54 @@ mod persistent {
         db.shutdown().await;
     }
 }
+
+/// `Collection::read_stale` is a stale read-only transaction with one read
+/// (ADR-098), so the monotonic floor orders it with `read_tx` in both
+/// directions.
+#[tokio::test(start_paused = true)]
+async fn read_stale_and_read_tx_share_the_monotonic_floor() {
+    for read_stale_first in [false, true] {
+        let backend = mem();
+        let reader = Database::open("example", backend.clone()).await.unwrap();
+        let (x, z) = cache_then_write_both(&reader, backend).await;
+
+        let (first, second) = if read_stale_first {
+            let first = x.read_stale(b"k", Duration::ZERO).await.unwrap().unwrap();
+            let second = read_tx_all(&reader, Duration::MAX, &[z]).await.remove(0);
+            (first, second)
+        } else {
+            let first = read_tx_all(&reader, Duration::ZERO, &[x]).await.remove(0);
+            let second = z.read_stale(b"k", Duration::MAX).await.unwrap().unwrap();
+            (first, second)
+        };
+        assert_eq!((first, second), (b"new".to_vec(), b"new".to_vec()));
+    }
+}
+
+/// ADR-047 lets a stale read return data from before a drop of its collection
+/// while its bound allows. A cut point before the drop keeps that rule, and a
+/// check that observes the drop fails.
+#[tokio::test(start_paused = true)]
+async fn read_stale_returns_pre_drop_data_only_within_its_bound() {
+    let backend = mem();
+    let reader = Database::open("example", backend.clone()).await.unwrap();
+    let c = create_top(&reader, b"c").await;
+    c.write(b"k", b"v").await.unwrap();
+    // The second read gives the cached states an interval.
+    for _ in 0..2 {
+        c.read_stale(b"k", Duration::MAX).await.unwrap();
+    }
+    let writer = Database::open("example", backend).await.unwrap();
+    open_top(&writer, b"c")
+        .await
+        .drop_collection()
+        .await
+        .unwrap();
+
+    let before = reader.stats();
+    let value = c.read_stale(b"k", STALENESS).await.unwrap();
+    assert_eq!(value.as_deref(), Some(b"v".as_slice()));
+    assert_eq!(backend_ops(&reader, &before), (0, 0, 0));
+    let err = c.read_stale(b"k", Duration::ZERO).await.unwrap_err();
+    assert!(matches!(err, Error::StaleCollection), "{err:?}");
+}

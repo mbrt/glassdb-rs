@@ -115,16 +115,16 @@ impl Error {
         }
     }
 
-    /// Maps a transaction-layer error raised by an operation that puts no
-    /// mutation of the caller's transaction in question: a collection directory
-    /// read from a transaction body, or the validation of the reads behind a
-    /// body's error outcome.
+    /// Maps a transaction-layer error raised by an operation that stages no
+    /// change of the caller. Examples are a collection directory read from a
+    /// transaction body, the validation of the reads behind a body's error
+    /// outcome, and the commit of a stale read-only transaction.
     ///
-    /// Neither leaves the caller's staged changes in doubt, so it applies the
-    /// same rule as [`Error::from_read`] to the storage error it carries. Such
-    /// an operation can still write while it helps a foreign transaction
-    /// identity reach its final status; that mutation belongs to the foreign
-    /// transaction.
+    /// Such an operation leaves no change of the caller in doubt, so it
+    /// applies the same rule as [`Error::from_read`] to the storage error it
+    /// carries. It can still write: it can help a foreign transaction identity
+    /// reach its final status, and locked validation writes read locks of the
+    /// caller's identity (ADR-091). Neither write is a change of the caller.
     pub(crate) fn from_read_trans(e: TransError) -> Self {
         match e {
             TransError::Storage(s) => Error::from_read(s),

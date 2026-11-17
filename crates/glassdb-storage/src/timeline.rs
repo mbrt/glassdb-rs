@@ -67,7 +67,7 @@ impl CurrentnessBarrier {
 
 /// The freshness requirement a cached entry must satisfy before it is served.
 ///
-/// Construct requirements explicitly with `ANY`, `after`, or `within`. Do not
+/// Construct requirements explicitly with `ANY` or `after`. Do not
 /// add constructors from observations, receipts, or raw sequence points, nor
 /// expose the stored bound. An invocation point cannot establish a barrier
 /// after completed work. Requirements cannot be converted back into barriers.
@@ -88,16 +88,6 @@ impl Requirement {
     /// Returns the stronger of two requirements.
     pub fn stricter(self, other: Self) -> Self {
         Self(self.0.max(other.0))
-    }
-
-    /// Accepts evidence within the approximate bounded-staleness cutoff.
-    pub fn within(timeline: &Timeline, max_staleness: Duration) -> Self {
-        if max_staleness == Duration::MAX {
-            Self::ANY
-        } else {
-            // This cutoff is a cache policy, not a barrier after completed work.
-            Self(Some(timeline.approximate_cutoff(max_staleness)))
-        }
     }
 
     pub(crate) fn is_satisfied_by(self, current_after: SequencePoint) -> bool {
@@ -207,8 +197,8 @@ impl Timeline {
         Self::from_source(source, None)
     }
 
-    /// Derives the approximate sequence cutoff used only by bounded-staleness
-    /// reads.
+    /// Derives the approximate sequence cutoff used only to bound the age of
+    /// a cut point (ADR-097).
     pub(crate) fn approximate_cutoff(&self, max_staleness: Duration) -> SequencePoint {
         SequencePoint(
             self.now()
@@ -316,18 +306,5 @@ mod tests {
         assert!(Requirement(Some(earlier)).is_satisfied_by(earlier));
         assert!(Requirement(Some(earlier)).is_satisfied_by(later));
         assert!(!Requirement(Some(later)).is_satisfied_by(earlier));
-    }
-
-    #[test]
-    fn duration_requirement_uses_the_timeline() {
-        let timeline = Timeline::with_source(Arc::new(FixedSource(Duration::from_secs(10))));
-        assert_eq!(
-            Requirement::within(&timeline, Duration::from_secs(3)),
-            Requirement(Some(SequencePoint::from_raw(7_000_000_000)))
-        );
-        assert_eq!(
-            Requirement::within(&timeline, Duration::MAX),
-            Requirement::ANY
-        );
     }
 }

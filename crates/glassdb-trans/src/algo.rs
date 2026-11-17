@@ -1725,7 +1725,7 @@ mod tests {
             tctx.timeline.clone(),
             RetrySchedule::default(),
         );
-        match reader.read(key, Duration::MAX).await {
+        match reader.read(key).await {
             Ok(outcome) => outcome,
             Err(e) => panic!("reading {key:?}: {e:?}"),
         }
@@ -2929,7 +2929,7 @@ mod tests {
             .expect("serial fallback commits after contention clears");
         assert_eq!(outcome, BodyDecision::ReturnOutcome);
         assert_ne!(*h.id(), id_before);
-        let status_objects = CachedStore::new(status_backend, 1024, Timeline::new(), None);
+        let status_objects = CachedStore::new(status_backend.clone(), 1024, Timeline::new(), None);
         let status_records = TxRecordStore::new(status_objects.clone(), test_db_prefix());
         let old_status = status_records
             .commit_status_at(&id_before, Requirement::ANY)
@@ -2963,10 +2963,20 @@ mod tests {
             );
         }
         // It still committed: the nodes point at our writer with no live lock.
+        // An engine with an empty cache reads them from the backend.
+        let observer = Engine::open(
+            TEST_DB,
+            DatabaseId::from_bytes([8; 16]),
+            Arc::new(StatsBackend::new(status_backend)),
+            EngineConfig::default(),
+        )
+        .await
+        .unwrap();
         for key in [&keyp, &keyp2] {
-            let read = engine.read(key, Duration::ZERO).await.unwrap();
+            let read = observer.read(key).await.unwrap();
             assert_eq!(read.value.unwrap().value.as_ref(), b"v2");
         }
+        observer.shutdown().await;
         engine.shutdown().await;
         status_objects.shutdown().await;
     }

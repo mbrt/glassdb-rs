@@ -81,7 +81,7 @@ impl Transaction {
             }
         }
 
-        match self.db.engine.read(&key, std::time::Duration::MAX).await {
+        match self.db.engine.read(&key).await {
             Ok(outcome) => {
                 let (value, evidence) = outcome.into_parts();
                 match value {

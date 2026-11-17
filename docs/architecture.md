@@ -474,6 +474,8 @@ not before the monotonic floor of the instance. GlassDB targets the latest
 start among the states, raised to these bounds. Only the states whose interval
 ends before the target need a conditional read, in parallel. A changed state, or a read
 that depends on a holder, falls back to the validation of `Database::tx`.
+`Collection::read_stale` is a stale read-only transaction with one read
+([ADR-098](adr/098-a-stale-read-is-a-stale-read-only-transaction.md)).
 
 ```text
 leaf A   [start ─────────── watermark]
@@ -870,7 +872,6 @@ A caller states the evidence that it needs as a freshness requirement:
 | Requirement | Accepts |
 | --- | --- |
 | `ANY` | any usable entry |
-| `within(timeline, age)` | evidence newer than an approximate age |
 | `after(barrier)` | evidence that reaches a currentness barrier |
 
 An `ANY` decision needs a separate proof, such as later validation or a

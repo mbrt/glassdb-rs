@@ -190,7 +190,7 @@ async fn read_ring_snapshot(
 
 /// Snapshots the ring in a stale read-only transaction (ADR-097). Its cut
 /// point is a committed state too, so the snapshot must also be a valid ring.
-async fn read_stale_ring_snapshot(
+async fn read_tx_ring_snapshot(
     db: &Database,
     coll: &Collection,
     node_count: usize,
@@ -305,8 +305,8 @@ impl SimWorkload for CycleWorkload {
                 // cached cut point or that must check every state.
                 let snapshot = match read % 3 {
                     0 => read_ring_snapshot(&db, &coll, node_count).await,
-                    1 => read_stale_ring_snapshot(&db, &coll, node_count, Duration::MAX).await,
-                    _ => read_stale_ring_snapshot(&db, &coll, node_count, Duration::ZERO).await,
+                    1 => read_tx_ring_snapshot(&db, &coll, node_count, Duration::MAX).await,
+                    _ => read_tx_ring_snapshot(&db, &coll, node_count, Duration::ZERO).await,
                 };
                 match snapshot {
                     Ok(snap) => assert_ring(&snap),

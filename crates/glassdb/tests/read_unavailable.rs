@@ -329,26 +329,43 @@ async fn read_retry_budget_applies_to_each_point_read() {
         .unwrap();
 
     faults.fail_reads_forever();
-    for stale in [false, true] {
-        let reads_before = faults.reads();
-        let result = if stale {
-            coll.read_stale(b"k", Duration::ZERO).await
-        } else {
-            coll.read(b"k").await
-        };
-        assert!(matches!(result, Err(Error::Unavailable(_))));
-        assert_eq!(faults.reads() - reads_before, 6);
-    }
-
-    faults.fail_next_reads(5);
     let reads_before = faults.reads();
-    let value = coll
-        .read_stale(b"k", Duration::ZERO)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(read_int(&value), 10);
+    let result = coll.read(b"k").await;
+    assert!(matches!(result, Err(Error::Unavailable(_))));
     assert_eq!(faults.reads() - reads_before, 6);
+
+    // The sixth attempt of the point read succeeds.
+    faults.fail_next_reads(5);
+    let value = coll.read(b"k").await.unwrap().unwrap();
+    assert_eq!(read_int(&value), 10);
+    db.shutdown().await;
+}
+
+/// A stale read whose leaf is cached reads it in the body with no backend
+/// operation. The outage then fails the check of its cut, which stages no
+/// change, so it is a read outage.
+#[tokio::test(start_paused = true)]
+async fn an_outage_in_the_cut_check_is_a_read_outage() {
+    let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    seed_shared(memory.clone(), b"k", 10).await;
+    let (backend, faults) = ReadFaults::wrap(memory, FaultTarget::Leaf);
+    let db = Database::builder("example", backend)
+        .retry_timing(RetryTiming {
+            contention: no_delay(),
+            wait: no_delay(),
+        })
+        .open()
+        .await
+        .unwrap();
+    let coll = db
+        .open_collection(&CollectionPath::new(b"c").unwrap())
+        .await
+        .unwrap();
+    coll.read(b"k").await.unwrap();
+
+    faults.fail_reads_forever();
+    let result = coll.read_stale(b"k", Duration::ZERO).await;
+    assert!(matches!(result, Err(Error::Unavailable(_))), "{result:?}");
     db.shutdown().await;
 }
 

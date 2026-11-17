@@ -4,6 +4,9 @@
 
 Accepted.
 
+[ADR-098](098-a-stale-read-is-a-stale-read-only-transaction.md) makes
+`Collection::read_stale` a stale read-only transaction with one read.
+
 Refines [ADR-036](036-decoded-object-cache-with-bounded-freshness.md): a
 cached state also records where its currentness interval starts. Refines
 [ADR-045](045-optional-persistent-encoded-body-l2-cache.md): the persistent
