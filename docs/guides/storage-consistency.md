@@ -105,7 +105,9 @@ check, and the reopened timeline follows it too.
 
 A cut search reads the starts and the watermarks only inside the cached-store
 module. A planned target is the latest start among several states, raised to
-the staleness cutoff and to the monotonic floor. One state needs no start.
+the staleness cutoff and to the monotonic floor. The transaction captures the
+staleness cutoff when it starts, and it is not a barrier. One state needs no
+start.
 A state whose watermark is before the target is checked against the barrier
 that the plan captures after the target. That barrier follows the target, so
 the target never becomes a requirement. The plan runs after the body, so the

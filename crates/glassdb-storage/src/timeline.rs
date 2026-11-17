@@ -95,6 +95,23 @@ impl Requirement {
     }
 }
 
+/// The oldest cut point that a stale read-only transaction accepts (ADR-097).
+///
+/// The transaction captures it when it starts, so its staleness bound is
+/// measured from the start of the call. It converts a duration to a sequence
+/// point by approximation, so it is not a currentness barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StalenessCutoff(SequencePoint);
+
+impl StalenessCutoff {
+    /// Accepts a cut point of any age, also from a previous open.
+    pub const ANY: Self = Self(SequencePoint(0));
+
+    pub(crate) fn point(self) -> SequencePoint {
+        self.0
+    }
+}
+
 /// The earliest cut point that the next stale read-only transaction of a
 /// database instance can use (ADR-097).
 ///
@@ -197,9 +214,19 @@ impl Timeline {
         Self::from_source(source, None)
     }
 
+    /// Captures the staleness cutoff of a stale read-only transaction that
+    /// starts now and accepts a cut point no older than `max_staleness`.
+    pub fn staleness_cutoff(&self, max_staleness: Duration) -> StalenessCutoff {
+        if max_staleness == Duration::MAX {
+            StalenessCutoff::ANY
+        } else {
+            StalenessCutoff(self.approximate_cutoff(max_staleness))
+        }
+    }
+
     /// Derives the approximate sequence cutoff used only to bound the age of
     /// a cut point (ADR-097).
-    pub(crate) fn approximate_cutoff(&self, max_staleness: Duration) -> SequencePoint {
+    fn approximate_cutoff(&self, max_staleness: Duration) -> SequencePoint {
         SequencePoint(
             self.now()
                 .raw()

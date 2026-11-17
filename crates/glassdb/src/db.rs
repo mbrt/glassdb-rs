@@ -387,11 +387,11 @@ impl Database {
     /// Runs `f` as a stale read-only transaction and returns its result.
     ///
     /// The body sees the state of the database at one instant, its cut point.
-    /// The cut point is at most `max_staleness` old on the clock of this
-    /// instance, and `Duration::MAX` accepts any age. The result is
-    /// serializable, and it contains every write that this instance
-    /// committed before the call. A stale read-only transaction of this
-    /// instance never sees an earlier state than a previous one.
+    /// The cut point is at most `max_staleness` older than the start of this
+    /// call, on the clock of this instance, and `Duration::MAX` accepts any
+    /// age. The result is serializable, and it contains every write that this
+    /// instance committed before the call. A stale read-only transaction of
+    /// this instance never sees an earlier state than a previous one.
     ///
     /// With a warm cache, a stale read-only transaction can finish with no
     /// backend operation. When the cache cannot supply a cut point, it

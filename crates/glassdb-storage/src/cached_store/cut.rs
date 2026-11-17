@@ -5,12 +5,13 @@
 //! `docs/guides/storage-consistency.md` (E5).
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use glassdb_data::ObjectPath;
 
 use super::Observation;
-use crate::timeline::{CurrentnessBarrier, MonotonicFloor, SequencePoint, Timeline};
+use crate::timeline::{
+    CurrentnessBarrier, MonotonicFloor, SequencePoint, StalenessCutoff, Timeline,
+};
 
 /// The currentness intervals of the states that one stale read-only
 /// transaction depends on.
@@ -67,8 +68,8 @@ impl CutSearch {
         }
     }
 
-    /// Plans a cut point no older than `max_staleness` and not before
-    /// `floor`, or returns `None` when no state can supply one.
+    /// Plans a cut point not before `cutoff` and not before `floor`, or
+    /// returns `None` when no state can supply one.
     ///
     /// Call it after the body completes: its barrier is also the validation
     /// barrier when the target does not become a cut point, so it must follow
@@ -77,14 +78,11 @@ impl CutSearch {
     /// Several states need a point inside every interval, so the target is
     /// at or after their latest start. One state needs no interval: it was
     /// current when its read took effect, which is after its watermark.
-    pub fn plan(&self, max_staleness: Duration, floor: &MonotonicFloor) -> Option<CutTarget> {
+    pub fn plan(&self, cutoff: StalenessCutoff, floor: &MonotonicFloor) -> Option<CutTarget> {
         if self.unknown_start {
             return None;
         }
-        let mut bound = floor.get();
-        if max_staleness != Duration::MAX {
-            bound = bound.max(self.timeline.approximate_cutoff(max_staleness));
-        }
+        let bound = floor.get().max(cutoff.point());
         let target = if self.states > 1 {
             bound.max(self.latest_start)
         } else {

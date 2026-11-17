@@ -443,6 +443,26 @@ async fn read_stale_and_read_tx_share_the_monotonic_floor() {
     }
 }
 
+/// The staleness bound is measured from the start of the call, so the fetch
+/// of an uncached state in the body already reaches a zero bound.
+#[tokio::test(start_paused = true)]
+async fn a_zero_bound_read_of_an_uncached_key_fetches_it_once() {
+    let backend = mem();
+    let writer = Database::open("example", backend.clone()).await.unwrap();
+    create_top(&writer, b"c")
+        .await
+        .write(b"k", b"v")
+        .await
+        .unwrap();
+    let reader = Database::open("example", backend).await.unwrap();
+    let c = open_top(&reader, b"c").await;
+
+    let before = reader.stats();
+    let value = c.read_stale(b"k", Duration::ZERO).await.unwrap();
+    assert_eq!(value.as_deref(), Some(b"v".as_slice()));
+    assert_eq!(backend_ops(&reader, &before), (1, 0, 0));
+}
+
 /// ADR-047 lets a stale read return data from before a drop of its collection
 /// while its bound allows. A cut point before the drop keeps that rule, and a
 /// check that observes the drop fails.

@@ -59,5 +59,7 @@ pub use structural_intent::{
     MergeTarget, StructuralChange, StructuralIntent, StructuralIntentPhase,
 };
 pub use structural_intent_store::{StructuralIntentPage, StructuralIntentStore};
-pub use timeline::{CurrentnessBarrier, MonotonicFloor, Requirement, SequencePoint, Timeline};
+pub use timeline::{
+    CurrentnessBarrier, MonotonicFloor, Requirement, SequencePoint, StalenessCutoff, Timeline,
+};
 pub use tree_router::{RoutedLeaf, RoutedLeafGroup, TreeRouter};

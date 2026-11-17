@@ -278,13 +278,9 @@ impl Engine {
     }
 
     /// Starts a stale read-only transaction that accepts a cut point no older
-    /// than `max_staleness` (ADR-097).
+    /// than `max_staleness` before this call (ADR-097).
     pub fn begin_stale_transaction(&self, max_staleness: Duration) -> EngineTransaction {
-        let mut handle = self
-            .algo
-            .begin(AccessSet::default(), CatalogAccesses::default());
-        handle.set_max_staleness(max_staleness);
-        EngineTransaction(handle)
+        EngineTransaction(self.algo.begin_stale(max_staleness))
     }
 
     /// Replaces the logical accesses of an uncommitted transaction.

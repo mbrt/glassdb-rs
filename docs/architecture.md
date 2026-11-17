@@ -469,11 +469,12 @@ Each cached state knows its currentness interval: from the completion of the
 first operation that observed it to its currentness watermark. The cut point
 is a point inside the intervals of every leaf and collection record that the
 body read. These states do not change inside the common span, so every point
-of it gives the same result. The cut point must be within `max_staleness` and
-not before the monotonic floor of the instance. GlassDB targets the latest
-start among the states, raised to these bounds. Only the states whose interval
-ends before the target need a conditional read, in parallel. A changed state, or a read
-that depends on a holder, falls back to the validation of `Database::tx`.
+of it gives the same result. The cut point must be at most `max_staleness`
+older than the start of the call, and not before the monotonic floor of the
+instance. GlassDB targets the latest start among the states, raised to these
+bounds. Only the states whose interval ends before the target need a
+conditional read, in parallel. A changed state, or a read that depends on a
+holder, falls back to the validation of `Database::tx`.
 `Collection::read_stale` is a stale read-only transaction with one read
 ([ADR-098](adr/098-a-stale-read-is-a-stale-read-only-transaction.md)).
 

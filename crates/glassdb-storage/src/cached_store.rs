@@ -4028,9 +4028,17 @@ mod tests {
         typed
             .add_to_cut(&mut search, std::slice::from_ref(&present))
             .unwrap();
-        assert!(search.plan(Duration::MAX, &floor).is_some());
+        assert!(
+            search
+                .plan(crate::timeline::StalenessCutoff::ANY, &floor)
+                .is_some()
+        );
         typed.add_to_cut(&mut search, &[absent]).unwrap();
-        assert!(search.plan(Duration::MAX, &floor).is_none());
+        assert!(
+            search
+                .plan(crate::timeline::StalenessCutoff::ANY, &floor)
+                .is_none()
+        );
     }
 
     #[tokio::test]

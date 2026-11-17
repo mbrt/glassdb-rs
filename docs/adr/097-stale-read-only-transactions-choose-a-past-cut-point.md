@@ -73,10 +73,20 @@ scan coverage, and the collection records of the directory reads. GlassDB
 takes the latest such point. The point must also satisfy two bounds:
 
 - It is not older than `max_staleness`, measured on the timeline of the
-  database instance. `Duration::MAX` accepts any age.
+  database instance from the start of the call. `Duration::MAX` accepts any
+  age.
 - It is not before the monotonic floor of the database instance.
 
 If a cut point exists, the transaction does no backend operation.
+
+The transaction captures the staleness cutoff once, when the call starts, and
+replays of the body keep it. Spanner and CockroachDB also measure bounded
+staleness from the start of the read. A cutoff that is computed after the body
+would be later than the fetches that the body made. Then a read of one state
+that the cache does not have would need a second check with a zero bound,
+because its fetch was invoked before that cutoff. The cutoff converts a
+duration to a sequence point by approximation. It is not a currentness
+barrier, so a zero bound does not make the transaction strict serializable.
 
 The caller gets the state of the database at the cut point. Every transaction
 whose commit point is before the cut point is visible, and no later

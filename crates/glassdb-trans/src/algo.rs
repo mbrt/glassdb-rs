@@ -35,7 +35,7 @@ use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord, TxWrite};
 use glassdb_storage::{
     CollectionRecord, CollectionStore, CurrentnessBarrier, InlinePolicy, LeafObservation,
     LeafObservationCheck, LockType, MonotonicFloor, NodeSizePolicy, NodeStore, Observation,
-    Requirement, StorageError, Timeline, TreeRouter,
+    Requirement, StalenessCutoff, StorageError, Timeline, TreeRouter,
 };
 
 use crate::access::{AccessSet, LeafCoverage, ReadAccess, WriteOp};
@@ -236,16 +236,12 @@ pub struct Handle {
     /// The directory locks that this identity holds. The identity keeps them
     /// until it commits or ends (ADR-090).
     directory_locks: DirectoryLocks,
-    /// The staleness bound of a stale read-only transaction (ADR-097).
-    max_staleness: Option<Duration>,
+    /// The staleness cutoff of a stale read-only transaction, captured when
+    /// it starts (ADR-097).
+    staleness_cutoff: Option<StalenessCutoff>,
 }
 
 impl Handle {
-    /// Makes this a stale read-only transaction (ADR-097).
-    pub(crate) fn set_max_staleness(&mut self, max_staleness: Duration) {
-        self.max_staleness = Some(max_staleness);
-    }
-
     /// The transaction's ID.
     pub fn id(&self) -> &TxId {
         &self.id
@@ -548,6 +544,15 @@ impl Algo {
         self.direct_commit.stats_and_reset()
     }
 
+    /// Starts a stale read-only transaction that accepts a cut point no older
+    /// than `max_staleness` before this call (ADR-097). Replays of its body
+    /// keep the same cutoff.
+    pub fn begin_stale(&self, max_staleness: Duration) -> Handle {
+        let mut tx = self.begin(AccessSet::default(), CatalogAccesses::default());
+        tx.staleness_cutoff = Some(self.timeline.staleness_cutoff(max_staleness));
+        tx
+    }
+
     /// Starts a new transaction with its key and collection-management accesses.
     /// The id's random prefix and timestamp are deterministic under `--cfg sim`.
     pub fn begin(&self, accesses: AccessSet, catalog_accesses: CatalogAccesses) -> Handle {
@@ -563,7 +568,7 @@ impl Algo {
             id,
             backoff: self.acquisition_retry.backoff(),
             directory_locks: DirectoryLocks::default(),
-            max_staleness: None,
+            staleness_cutoff: None,
         }
     }
 
@@ -626,7 +631,7 @@ impl Algo {
                 self.timeline.currentness_barrier(),
             ))
         };
-        let Some(max_staleness) = tx.max_staleness else {
+        let Some(cutoff) = tx.staleness_cutoff else {
             return fresh();
         };
         let Some(states) = CutStates::collect(&tx.accesses, tx.collections.accesses())? else {
@@ -636,7 +641,7 @@ impl Algo {
         self.nodes.add_leaves_to_cut(&mut search, &states.leaves)?;
         self.records
             .add_records_to_cut(&mut search, &states.records)?;
-        let Some(target) = search.plan(max_staleness, &self.floor) else {
+        let Some(target) = search.plan(cutoff, &self.floor) else {
             return fresh();
         };
         let (leaves, records) = futures::future::join(
@@ -655,7 +660,7 @@ impl Algo {
     /// Raises the monotonic floor after a stale read-only transaction
     /// validated its reads at `barrier` (ADR-097).
     fn raise_floor_after_validation(&self, tx: &Handle, barrier: CurrentnessBarrier) {
-        if tx.max_staleness.is_some() {
+        if tx.staleness_cutoff.is_some() {
             self.floor.raise_to_barrier(barrier);
         }
     }

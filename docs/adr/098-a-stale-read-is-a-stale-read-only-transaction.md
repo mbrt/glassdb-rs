@@ -39,9 +39,10 @@ stale read-only transactions of the instance.
 ## Consequences
 
 - One stale read costs no backend operation when the leaf state reaches the
-  floor and the staleness cutoff. Otherwise the cut checks the leaf once. With
-  `Duration::ZERO`, a read that fetches the leaf therefore costs one more
-  conditional read than before, because the cutoff is after that fetch.
+  floor and the staleness cutoff. Otherwise the cut checks the leaf once. A
+  read that fetches the leaf costs only that fetch, also with
+  `Duration::ZERO`, because the cutoff is captured at the start of the call
+  (ADR-097).
 - A stale read that depends on a holder uses the validation of
   `Database::tx`. After repeated failures it can use locked validation
   ([ADR-091](091-read-only-validation-locks-after-repeated-failures.md)),
