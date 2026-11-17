@@ -305,6 +305,7 @@ async fn run_cell(
         until: until.clone(),
         breakdown: storage.breakdown.clone(),
         boundary: Mutex::new(None),
+        transaction_cpu: execution.transaction_cpu,
     });
     let max = spec.params.measure.max_duration;
     let own = Arc::new(OwnInstances::default());

@@ -43,6 +43,9 @@ pub(crate) struct Shared {
     /// The start of the pass that ended the measurement, when the end
     /// condition leaves that pass out.
     pub(crate) boundary: Mutex<Option<Boundary>>,
+    /// The model time that a worker spends after each transaction, in place
+    /// of its CPU work. It is in the measured latency.
+    pub(crate) transaction_cpu: Duration,
 }
 
 /// The state at the start of the pass that ended the measurement.
@@ -299,6 +302,16 @@ impl Worker {
         Ok(())
     }
 
+    /// Runs one transaction of the shape, then spends the model time that
+    /// stands for its CPU work.
+    async fn run_kind(&self, op: &Op<'_>) -> Result<(), GError> {
+        let result = self.shape.kind.run(op).await;
+        if !self.shared.transaction_cpu.is_zero() {
+            rt::sleep(self.shared.transaction_cpu).await;
+        }
+        result
+    }
+
     async fn once(
         &self,
         bench: &Bench,
@@ -318,7 +331,7 @@ impl Worker {
                     pool: &self.shape.pool,
                     round,
                 };
-                bench.measure(|| self.shape.kind.run(&op)).await
+                bench.measure(|| self.run_kind(&op)).await
             }
             Target::Fresh { opener, own } => {
                 let start = opener.breakdown.snapshot();
@@ -340,7 +353,7 @@ impl Worker {
                     round,
                 };
                 let before = Window::now(&db, &opener.breakdown);
-                let result = bench.measure(|| self.shape.kind.run(&op)).await;
+                let result = bench.measure(|| self.run_kind(&op)).await;
                 let after = Window::now(&db, &opener.breakdown);
                 drop(selected);
                 drop(collections);

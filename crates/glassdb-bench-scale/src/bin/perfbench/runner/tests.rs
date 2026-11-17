@@ -48,6 +48,7 @@ fn run_resolved(resolved: &Resolved) -> Result<Vec<serde_json::Value>, Box<dyn E
         runs: 1,
         run_cooldown: Duration::ZERO,
         drain_timeout: Duration::from_secs(10),
+        transaction_cpu: Duration::ZERO,
     };
     let runs: Vec<RunResult> = super::run(&runtime, &factory(), resolved, execution)?;
     let json = serde_json::to_value(&runs)?;

@@ -101,10 +101,6 @@ pub(crate) struct Read {
     /// of `Database::tx`.
     #[serde(default, deserialize_with = "optional_duration")]
     staleness: Option<std::time::Duration>,
-    /// Sleep this long after each transaction, so that a transaction with no
-    /// backend operation still advances virtual time.
-    #[serde(default, deserialize_with = "optional_duration")]
-    pause: Option<std::time::Duration>,
 }
 
 /// Keeps the values of a read from being optimized away.
@@ -205,7 +201,7 @@ impl Kind for Read {
 
     async fn run(&self, op: &Op<'_>) -> Result<(), GError> {
         let collection = &op.collections[0];
-        let result = match self.staleness {
+        match self.staleness {
             Some(staleness) => {
                 op.db
                     .read_tx(staleness, |tx| async move {
@@ -220,11 +216,7 @@ impl Kind for Read {
                     })
                     .await
             }
-        };
-        if let Some(pause) = self.pause {
-            glassdb_concurr::rt::sleep(pause).await;
         }
-        result
     }
 }
 
