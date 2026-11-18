@@ -63,7 +63,8 @@ async fn handled_size_error_does_not_replace_a_staged_value() {
 
 #[tokio::test(start_paused = true)]
 async fn size_error_based_on_an_invalidated_read_replays_the_body() {
-    let db = Database::builder("limits", MemoryBackend::new())
+    let backend = Arc::new(MemoryBackend::new());
+    let db = Database::builder("limits", backend.clone())
         .transaction_limits(TransactionLimits {
             max_value_bytes: 1,
             max_operations: 2,
@@ -75,11 +76,15 @@ async fn size_error_based_on_an_invalidated_read_replays_the_body() {
         .unwrap();
     let c = &db.root_collection();
     c.write(b"k", b"0").await.unwrap();
+    // Another instance changes `k`, so that no cut point after the start of
+    // the transaction covers the cached state that the body read.
+    let other = Database::open("limits", backend).await.unwrap();
+    let other_root = &other.root_collection();
 
     db.tx(|tx| async move {
         let value = tx.read(c, b"k").await?.ok_or(Error::NotFound)?;
         if value == b"0" {
-            c.write(b"k", b"1").await?;
+            other_root.write(b"k", b"1").await?;
             return tx.write(c, b"k", b"too long");
         }
         tx.write(c, b"k", b"2")

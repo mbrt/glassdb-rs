@@ -296,6 +296,12 @@ async fn panicking_locked_replay_records_its_prepared_collection_for_recovery() 
     db.shutdown().await;
 }
 
+/// The name of a collection that the transaction first reads in its body
+/// execution `execution`.
+fn cold_name(execution: usize) -> String {
+    format!("cold{execution}")
+}
+
 /// If ordinary finalization fails, the body outcome still wins and the armed
 /// guard transfers the held identity to managed retirement.
 #[tokio::test(start_paused = true)]
@@ -312,6 +318,16 @@ async fn failed_finalization_keeps_the_retirement_guard_armed() {
         .await
         .unwrap();
     setup_coll.write(b"guard", b"old").await.unwrap();
+    for execution in 0..LOCKED_READS_AFTER {
+        setup
+            .root_collection()
+            .create_collection_if_absent(cold_name(execution))
+            .await
+            .unwrap()
+            .write(b"k", b"v")
+            .await
+            .unwrap();
+    }
     setup.shutdown().await;
 
     let db = Database::open("example", retirement.backend())
@@ -345,6 +361,15 @@ async fn failed_finalization_keeps_the_retirement_guard_armed() {
                     invalidator.shutdown().await;
                 } else {
                     retirement.arm();
+                }
+                // A state fetched after the write starts after it, so no cut
+                // point covers both that state and the state of `guard` that
+                // the body read before the write.
+                if execution < LOCKED_READS_AFTER {
+                    let cold = tx
+                        .open_collection(&tx.root_collection(), cold_name(execution))
+                        .await?;
+                    tx.read(&cold, b"k").await?;
                 }
                 Err::<(), _>(Error::InvalidInput("body outcome".into()))
             }

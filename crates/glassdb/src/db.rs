@@ -337,6 +337,10 @@ impl Database {
     /// as `|tx| async move { ... }`. The framework owns body replay and may
     /// invoke `f` multiple times, so `f` must be `FnMut`.
     ///
+    /// When `f` only reads, the transaction takes effect at one point after
+    /// the start of this call. It sees every transaction that committed before
+    /// the call started.
+    ///
     /// # Error outcomes
     ///
     /// When `f` returns an error outcome, the writes of that execution are
@@ -394,12 +398,11 @@ impl Database {
     /// validates its reads like [`Database::tx`]. The body can run more than
     /// once, as in [`Database::tx`].
     ///
-    /// With `Duration::ZERO`, the cut point is after the start of the call.
-    /// The result then contains every transaction of any instance that
-    /// committed before the call started, as the result of a read-only
-    /// [`Database::tx`] does. The body still reads the cache, and the cut
-    /// checks the states that are older than the cut point. The cost is at
-    /// most the validation cost of [`Database::tx`].
+    /// With `Duration::ZERO`, the result and the cost are the same as those of
+    /// a read-only [`Database::tx`]. The result contains every transaction of
+    /// any instance that committed before the call started. A later stale
+    /// read-only transaction of this instance sees what a `read_tx` saw, but
+    /// it can miss what a read-only [`Database::tx`] saw.
     ///
     /// With a bound above zero, a `read_tx` that follows a [`Database::tx`] of
     /// the same instance can miss a write of another instance that the `tx`

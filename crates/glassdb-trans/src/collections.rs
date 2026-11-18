@@ -22,8 +22,8 @@ pub struct DirectoryRead {
 /// The exact collection record behind a directory read, when no holder can
 /// change the bindings that the read found.
 ///
-/// A stale read-only transaction uses it to place the read at a cut point
-/// (ADR-097). A read without it validates at a fresh barrier.
+/// A read-only transaction uses it to place the read at a cut point
+/// (ADR-097, ADR-099). A read without it validates at a fresh barrier.
 #[derive(Debug, Clone, Default)]
 pub struct DirectoryEvidence(pub(crate) Option<Observation<CollectionRecord>>);
 
@@ -63,8 +63,8 @@ pub struct CatalogAccesses {
     pub changes: Vec<CollectionChange>,
     /// Whether the body found that a collection it used was missing.
     ///
-    /// The absence has no currentness interval, so a stale read-only
-    /// transaction validates at a fresh barrier (ADR-097).
+    /// The absence has no currentness interval, so a read-only transaction
+    /// validates at a fresh barrier (ADR-097).
     pub missing_collection: bool,
 }
 

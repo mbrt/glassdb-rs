@@ -364,11 +364,11 @@ The span of sequence points over which one observed state of an object is known 
 _Avoid_: Validity window, version lifetime
 
 **Stale read-only transaction**:
-A read-only transaction that accepts the state of the database at one cut point within a stated age, instead of the state at a fresh validation barrier.
+A read-only transaction that accepts the state of the database at one cut point within a stated age, instead of a cut point after the start of the call.
 _Avoid_: Snapshot transaction, follower read
 
 **Cut point**:
-The one sequence point at which every state that a stale read-only transaction depends on was current.
+The one sequence point at which every state that a read-only transaction depends on was current.
 _Avoid_: Snapshot timestamp, read version
 
 **Monotonic floor**:

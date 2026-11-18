@@ -235,9 +235,12 @@ pub struct Handle {
     /// The directory locks that this identity holds. The identity keeps them
     /// until it commits or ends (ADR-090).
     directory_locks: DirectoryLocks,
-    /// The staleness cutoff of a stale read-only transaction, captured when
-    /// it starts (ADR-097).
-    staleness_cutoff: Option<StalenessCutoff>,
+    /// The staleness cutoff of the cut point of a read-only pass, captured
+    /// when the transaction starts (ADR-097, ADR-099).
+    staleness_cutoff: StalenessCutoff,
+    /// Whether a certified read-only pass raises the monotonic floor. Only a
+    /// stale read-only transaction does (ADR-099).
+    raises_floor: bool,
 }
 
 impl Handle {
@@ -389,7 +392,7 @@ enum ReadCertification {
     ValidateAt(CurrentnessBarrier),
 }
 
-/// The observed states that the reads of a stale read-only transaction
+/// The observed states that the reads of a read-only pass
 /// depend on, when no holder can change what the reads found (ADR-097).
 struct CutStates {
     leaves: Vec<LeafObservation>,
@@ -550,12 +553,16 @@ impl Algo {
     /// keep the same cutoff.
     pub fn begin_stale(&self, max_staleness: Duration) -> Handle {
         let mut tx = self.begin(AccessSet::default(), CatalogAccesses::default());
-        tx.staleness_cutoff = Some(self.timeline.staleness_cutoff(max_staleness));
+        tx.staleness_cutoff = self.timeline.staleness_cutoff(max_staleness);
+        tx.raises_floor = true;
         tx
     }
 
     /// Starts a new transaction with its key and collection-management accesses.
     /// The id's random prefix and timestamp are deterministic under `--cfg sim`.
+    ///
+    /// A read-only pass of the transaction can use a cut point that follows
+    /// the start of this call (ADR-099).
     pub fn begin(&self, accesses: AccessSet, catalog_accesses: CatalogAccesses) -> Handle {
         let id = TxId::new_at(rt::system_now());
         Handle {
@@ -569,7 +576,8 @@ impl Algo {
             id,
             backoff: self.acquisition_retry.backoff(),
             directory_locks: DirectoryLocks::default(),
-            staleness_cutoff: None,
+            staleness_cutoff: self.timeline.staleness_cutoff(Duration::ZERO),
+            raises_floor: false,
         }
     }
 
@@ -621,19 +629,16 @@ impl Algo {
     }
 
     /// Certifies the reads of a read-only pass at a cut point, or returns the
-    /// barrier for optimistic validation (ADR-097).
+    /// barrier for optimistic validation (ADR-097, ADR-099).
     ///
-    /// A stale read-only transaction validates at the barrier of its planned
-    /// cut, so the states that the cut search already checked need no second
-    /// check.
+    /// A pass whose planned cut finds a changed state validates at the barrier
+    /// of that cut, so the states that the cut search already checked need no
+    /// second check.
     async fn certify_at_cut(&self, tx: &Handle) -> Result<ReadCertification, TransError> {
         let fresh = || {
             Ok(ReadCertification::ValidateAt(
                 self.timeline.currentness_barrier(),
             ))
-        };
-        let Some(cutoff) = tx.staleness_cutoff else {
-            return fresh();
         };
         let Some(states) = CutStates::collect(&tx.accesses, tx.collections.accesses())? else {
             return fresh();
@@ -642,7 +647,7 @@ impl Algo {
         self.nodes.add_leaves_to_cut(&mut search, &states.leaves)?;
         self.records
             .add_records_to_cut(&mut search, &states.records)?;
-        let Some(target) = search.plan(cutoff, &self.floor) else {
+        let Some(target) = search.plan(tx.staleness_cutoff, &self.floor) else {
             return fresh();
         };
         let (leaves, records) = futures::future::join(
@@ -654,14 +659,16 @@ impl Algo {
         if !(leaves? && records?) {
             return Ok(ReadCertification::ValidateAt(target.barrier()));
         }
-        target.raise_floor(&self.floor);
+        if tx.raises_floor {
+            target.raise_floor(&self.floor);
+        }
         Ok(ReadCertification::AtCutPoint)
     }
 
     /// Raises the monotonic floor after a stale read-only transaction
     /// validated its reads at `barrier` (ADR-097).
     fn raise_floor_after_validation(&self, tx: &Handle, barrier: CurrentnessBarrier) {
-        if tx.staleness_cutoff.is_some() {
+        if tx.raises_floor {
             self.floor.raise_to_barrier(barrier);
         }
     }

@@ -505,41 +505,46 @@ mod tests {
 
     use crate::{Backend, CollectionPath, Database, KeyScan, memory::MemoryBackend};
 
-    // ADR-031 phantom prevention, the in-flight case: when a key is created
-    // *while* a listing transaction is running — after it scanned the leaf but
-    // before it validated — the create rewrites the covered leaf, which gives it
-    // a new revision. The listing's commit validation detects the changed
-    // snapshot and replays the body; the replay re-scans a current leaf
-    // observation and includes the racing key. A create is never silently dropped from a listing
-    // it raced.
+    // ADR-031 phantom prevention, the in-flight case: when another instance
+    // creates a key *while* a listing transaction is running — after it scanned
+    // a leaf state cached before the call, but before it validated — the
+    // create rewrites the covered leaf, which gives it a new revision. No cut
+    // point after the start of the call covers the scanned state, so the
+    // listing's validation detects the changed snapshot and replays the body.
+    // The replay re-scans a current leaf observation and includes the racing
+    // key. A create is never silently dropped from a listing it raced.
     #[tokio::test]
     async fn listing_replays_to_include_a_key_added_during_the_scan() {
         let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        let db = Database::open("example", backend).await.unwrap();
+        let db = Database::open("example", backend.clone()).await.unwrap();
         let path = CollectionPath::new(b"phantom-replay").unwrap();
         let coll = db.create_collection(&path).await.unwrap();
+        let writer = Database::open("example", backend.clone()).await.unwrap();
+        let writer_coll = writer.open_collection(&path).await.unwrap();
 
         let seed: Vec<Vec<u8>> = (0u32..5).map(|i| i.to_be_bytes().to_vec()).collect();
         for k in &seed {
             coll.write(k, b"v").await.unwrap();
         }
+        coll.scan_keys(KeyScan::all()).await.unwrap();
 
         let extra = 999u32.to_be_bytes().to_vec();
         let first_execution = AtomicBool::new(true);
 
-        // The listing runs in a read-only transaction. On its first body execution a
-        // concurrent transaction commits a new key *after* the scan recorded the
+        // The listing runs in a read-only transaction. On its first body execution
+        // the other instance commits a new key *after* the scan recorded the
         // leaf observation revision, modeling a create that lands mid-listing. That
         // invalidates the recorded snapshot, forcing a body replay.
         let listed = db
             .tx(|tx| {
                 let coll = coll.clone();
+                let writer_coll = writer_coll.clone();
                 let extra = extra.clone();
                 let first_execution = &first_execution;
                 async move {
                     let keys = tx.scan_keys(&coll, KeyScan::all()).await?.into_keys();
                     if first_execution.swap(false, Ordering::SeqCst) {
-                        coll.write(&extra, b"v").await?;
+                        writer_coll.write(&extra, b"v").await?;
                     }
                     Ok(keys)
                 }

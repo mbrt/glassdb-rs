@@ -453,17 +453,22 @@ the identity and the status
 ### Fast paths
 
 **Read-only transactions** use optimistic validation. After the last read, the
-transaction checks that every writer is still current and that no read key has
-a write lock. If the check passes, the transaction returns with no locks and no
-writes. Each key costs one leaf read, plus one record read if the value is not
-inline. If the check fails, the transaction replays its body and checks again.
+transaction looks for a cut point that is not before the start of the call, as
+a stale read-only transaction with a zero bound does
+([ADR-099](adr/099-read-only-transactions-certify-at-a-zero-staleness-cut-point.md)).
+A body that reads only one state and fetched it in the call needs no check.
+When no such cut point exists, the transaction checks that every writer is
+still current and that no read key has a write lock. If the check passes, the
+transaction returns with no locks and no writes. Each checked key costs one
+leaf read, plus one record read if the value is not inline. If the check fails,
+the transaction replays its body and checks again.
 After a few failed checks, its replays use the locked commit
 ([ADR-091](adr/091-read-only-validation-locks-after-repeated-failures.md)).
 A near miss then leaves no read lock, so it cannot push the writers of a hot
 leaf from direct commits to locked commits.
 
 **Stale read-only transactions** (`Database::read_tx`) validate at a cut point
-in the past instead of at a fresh barrier
+that can be in the past
 ([ADR-097](adr/097-stale-read-only-transactions-choose-a-past-cut-point.md)).
 Each cached state knows its currentness interval: from the completion of the
 first operation that observed it to its currentness watermark. The cut point

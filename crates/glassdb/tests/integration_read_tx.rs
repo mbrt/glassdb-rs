@@ -1,4 +1,5 @@
-//! Stale read-only transactions (ADR-097).
+//! Stale read-only transactions (ADR-097) and the cut points of read-only
+//! `Database::tx` calls (ADR-099).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -319,40 +320,6 @@ async fn read_tx_checks_the_record_of_a_collection_that_it_opens() {
     assert_eq!(backend_ops(&db, &before), (1, 0, 0));
 }
 
-/// When a state changed, the fallback validates at the barrier of the cut, so
-/// the states that the cut already checked are not checked again.
-#[tokio::test(start_paused = true)]
-async fn a_changed_state_costs_read_tx_no_more_than_tx() {
-    let mut costs = Vec::new();
-    for stale in [false, true] {
-        let backend = mem();
-        let reader = Database::open("example", backend.clone()).await.unwrap();
-        let collections = collections_with_one_key(&reader).await;
-        tx_read_all(&reader, &collections).await;
-        let writer = Database::open("example", backend).await.unwrap();
-        open_top(&writer, b"c0")
-            .await
-            .write(b"k", b"w")
-            .await
-            .unwrap();
-
-        let before = reader.stats();
-        let values = if stale {
-            read_tx_all(&reader, Duration::ZERO, &collections).await
-        } else {
-            tx_read_all(&reader, &collections).await
-        };
-        assert_eq!(values[0], b"w");
-        costs.push(backend_ops(&reader, &before).0);
-    }
-    assert!(
-        costs[1] <= costs[0],
-        "read_tx {} > tx {}",
-        costs[1],
-        costs[0]
-    );
-}
-
 /// After a fallback to the validation of `Database::tx`, the floor rises to
 /// that validation barrier, so the states that it checked can form the next
 /// cut with no backend operation.
@@ -525,6 +492,63 @@ async fn a_zero_bound_read_of_an_uncached_key_fetches_it_once() {
     let value = c.stale(Duration::ZERO).read(b"k").await.unwrap();
     assert_eq!(value.as_deref(), Some(b"v".as_slice()));
     assert_eq!(backend_ops(&reader, &before), (1, 0, 0));
+}
+
+/// A read-only `Database::tx` measures its zero staleness bound from the start
+/// of the call too, so the fetch of an uncached state needs no check.
+#[tokio::test(start_paused = true)]
+async fn a_read_only_tx_of_an_uncached_key_fetches_it_once() {
+    let backend = mem();
+    let writer = Database::open("example", backend.clone()).await.unwrap();
+    create_top(&writer, b"c")
+        .await
+        .write(b"k", b"v")
+        .await
+        .unwrap();
+    let reader = Database::open("example", backend).await.unwrap();
+    let c = open_top(&reader, b"c").await;
+
+    let before = reader.stats();
+    let values = tx_read_all(&reader, std::slice::from_ref(&c)).await;
+    assert_eq!(values, [b"v"]);
+    assert_eq!(backend_ops(&reader, &before), (1, 0, 0));
+}
+
+/// A read-only execution whose cut finds a changed state replays. A replay
+/// that writes commits through the commit path, which does not use the
+/// staleness cutoff of the call.
+#[tokio::test(start_paused = true)]
+async fn a_replay_that_writes_after_a_read_only_execution_commits() {
+    let backend = mem();
+    let reader = Database::open("example", backend.clone()).await.unwrap();
+    let c = create_top(&reader, b"c").await;
+    c.write(b"k", b"old").await.unwrap();
+    let writer = Database::open("example", backend).await.unwrap();
+    let w = open_top(&writer, b"c").await;
+
+    let before = reader.stats();
+    let first = AtomicBool::new(true);
+    let copied = reader
+        .tx(|tx| {
+            let (c, w, first) = (c.clone(), w.clone(), &first);
+            async move {
+                let value = tx.read(&c, b"k").await?.unwrap_or_default();
+                if first.swap(false, Ordering::SeqCst) {
+                    // The cached state of `k` precedes the call, and another
+                    // instance replaces it before the certification.
+                    w.write(b"k", b"new").await?;
+                    return Ok(value);
+                }
+                tx.write(&c, b"copy", &value)?;
+                Ok(value)
+            }
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(copied, b"new");
+    assert_eq!(c.read(b"copy").await.unwrap().as_deref(), Some(&b"new"[..]));
+    assert_eq!((reader.stats() - before).transactions.replays, 1);
 }
 
 /// ADR-047 lets a stale read return data from before a drop of its collection

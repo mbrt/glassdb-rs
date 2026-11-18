@@ -199,6 +199,10 @@ async fn error_outcome_does_not_escape_failed_validation() {
         .await
         .unwrap();
 
+    // The cached state of `k` precedes the transaction, so its validation
+    // must check it. A state that the body fetched would need no check.
+    coll.read(b"k").await.unwrap();
+
     // The body reads through a healthy transport and derives an error from the
     // value; the outage starts only once the body has returned, so it hits
     // read validation alone.
@@ -244,6 +248,9 @@ async fn explicit_abort_does_not_escape_failed_validation() {
         .open_collection(&CollectionPath::new(b"c").unwrap())
         .await
         .unwrap();
+    // The cached state of `k` precedes the transaction, so its validation
+    // must check it.
+    coll.read(b"k").await.unwrap();
 
     let bodies = Arc::new(AtomicUsize::new(0));
     let coll = &coll;
@@ -438,6 +445,9 @@ async fn an_outage_in_read_only_commit_validation_is_a_read_outage() {
         .open_collection(&CollectionPath::new(b"c").unwrap())
         .await
         .unwrap();
+    // The cached state of `k` precedes the transaction, so its validation
+    // must check it.
+    coll.read(b"k").await.unwrap();
 
     let bodies = Arc::new(AtomicUsize::new(0));
     let coll = &coll;
@@ -471,11 +481,21 @@ async fn a_replay_that_only_reads_is_a_read_outage() {
     let db = Database::open("example", backend.clone()).await.unwrap();
     let path = CollectionPath::new(b"c").unwrap();
     let coll = db.open_collection(&path).await.unwrap();
+    // A key in another tree, cached before the transaction. The replay reads
+    // `k` from a state fetched after the start of the transaction, so only
+    // this older state makes its validation check a leaf.
+    let other = db
+        .root_collection()
+        .create_collection_if_absent(b"d")
+        .await
+        .unwrap();
+    other.write(b"j", &write_int(1)).await.unwrap();
     let peer = Database::open("example", mem).await.unwrap();
     let peer_coll = peer.open_collection(&path).await.unwrap();
 
     let bodies = Arc::new(AtomicUsize::new(0));
     let coll = &coll;
+    let other = &other;
     let peer_coll = &peer_coll;
     let faults = &faults;
     let result = db
@@ -490,6 +510,7 @@ async fn a_replay_that_only_reads_is_a_read_outage() {
                     peer_coll.write(b"k", &write_int(11)).await?;
                     tx.write(coll, b"k2", &write_int(1))?;
                 } else {
+                    tx.read(other, b"j").await?;
                     faults.fail_reads_forever();
                 }
                 Ok(value)
