@@ -22,7 +22,8 @@
 //!   lifecycle, nested paths, and aborts.
 //! - [`HistoryWorkload`] checks complete point/group-read, write, and
 //!   membership-scan and shared collection histories against an
-//!   implementation-independent sequential specification. Its clients continue
+//!   implementation-independent sequential specification. Programs with no
+//!   writes can run as stale read-only transactions. Its clients continue
 //!   after admissible public errors while retaining in-doubt outcomes.
 //!
 //! [`Covered`] runs a workload and also requires splits or merges, so that
@@ -44,15 +45,17 @@ pub use cycle::CycleWorkload;
 pub use glassdb_storage::sim::{MediaFaultProfile, MediaPause, SimMedia};
 use glassdb_storage::{NodeSizePolicy, PersistentCacheConfig};
 pub use harness::{
-    FaultConfig, SimWorkload, run_and_assert, run_and_assert_with_faults, run_and_record,
-    run_and_record_with_faults,
+    FaultConfig, InstanceId, SimWorkload, run_and_assert, run_and_assert_with_faults,
+    run_and_record, run_and_record_with_faults,
 };
 #[cfg(sim)]
 pub use harness::{
     PCT_DEFAULT_DEPTH, PCT_DEFAULT_SEEDS, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep,
     record_input, replay_input,
 };
-pub use history::{HistoryCollectionOp, HistoryInstruction, HistoryTransaction, HistoryWorkload};
+pub use history::{
+    HistoryCollectionOp, HistoryInstruction, HistoryMode, HistoryTransaction, HistoryWorkload,
+};
 pub use membership::{MembOp, MembershipAcct, MembershipWorkload, MergingMembershipWorkload};
 pub use rmw::{RMW_KEY_COUNT, RmwAcct, RmwOp, RmwWorkload};
 

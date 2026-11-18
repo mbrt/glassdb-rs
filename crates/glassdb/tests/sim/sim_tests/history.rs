@@ -1,19 +1,31 @@
 //! Deterministic-simulation checks for exact transaction histories.
 //!
 //! This workload records point and concurrent-group reads, writes, and
-//! normalized bounded membership scans.
+//! normalized bounded membership scans, in transactions and in stale read-only
+//! transactions.
 use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{
-    Covered, FaultConfig, HistoryCollectionOp as C, HistoryInstruction as I, HistoryTransaction,
-    HistoryWorkload, StructuralCoverage, pct_sweep, run_and_assert, run_and_assert_with_faults,
+    Covered, FaultConfig, HistoryCollectionOp as C, HistoryInstruction as I, HistoryMode,
+    HistoryTransaction, HistoryWorkload, StructuralCoverage, pct_sweep, run_and_assert,
+    run_and_assert_with_faults,
 };
 
 use crate::sim_support::{assert_slow_mutation_modes, fault_tape, tape};
 
 fn transaction(op_id: u64, client_id: usize, instructions: Vec<I>) -> HistoryTransaction {
+    in_mode(op_id, client_id, HistoryMode::Strict, instructions)
+}
+
+fn in_mode(
+    op_id: u64,
+    client_id: usize,
+    mode: HistoryMode,
+    instructions: Vec<I>,
+) -> HistoryTransaction {
     HistoryTransaction {
         op_id,
         client_id,
+        mode,
         instructions,
     }
 }
@@ -146,6 +158,170 @@ fn exact_history_holds_with_guided_faults() {
             run_and_assert_with_faults(workload, FaultConfig::failures(9), seed, faults_tape).await
         });
     }
+}
+
+/// Stale read-only transactions with both bounds, around increments, writes,
+/// and deletes of both instances.
+fn stale_history() -> HistoryWorkload {
+    use HistoryMode::{StaleMax, StaleZero, Strict};
+    let increment = |key| {
+        vec![
+            I::Read { key, register: 0 },
+            I::Yield,
+            I::WriteIncremented { key, register: 0 },
+        ]
+    };
+    let group = |first, second| I::ReadGroup {
+        reads: vec![(first, 0), (second, 1)],
+    };
+    let scan = |limit| I::Scan {
+        start: 0,
+        end: 3,
+        after: None,
+        limit,
+    };
+    HistoryWorkload {
+        clients: vec![
+            vec![
+                in_mode(0, 0, Strict, increment(0)),
+                in_mode(1, 0, StaleMax, vec![group(0, 1)]),
+                in_mode(2, 0, StaleZero, vec![scan(3), I::Yield, group(0, 2)]),
+            ],
+            vec![
+                in_mode(
+                    3,
+                    1,
+                    StaleMax,
+                    vec![I::Read {
+                        key: 0,
+                        register: 0,
+                    }],
+                ),
+                in_mode(4, 1, Strict, vec![I::WriteLiteral { key: 1, value: 9 }]),
+                in_mode(5, 1, StaleMax, vec![group(1, 2), scan(2)]),
+            ],
+            vec![
+                in_mode(6, 2, Strict, increment(1)),
+                in_mode(7, 2, StaleMax, vec![group(1, 2)]),
+            ],
+            vec![
+                in_mode(8, 3, Strict, vec![I::Delete { key: 2 }]),
+                in_mode(
+                    9,
+                    3,
+                    StaleZero,
+                    vec![I::Read {
+                        key: 0,
+                        register: 0,
+                    }],
+                ),
+                in_mode(
+                    10,
+                    3,
+                    StaleMax,
+                    vec![
+                        scan(2),
+                        I::Read {
+                            key: 0,
+                            register: 0,
+                        },
+                    ],
+                ),
+            ],
+        ],
+    }
+}
+
+#[test]
+fn stale_history_holds_under_tape_schedules() {
+    for seed in [0u64, 3, 99, 2024] {
+        let workload = stale_history();
+        block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+            run_and_assert(workload).await
+        });
+    }
+}
+
+#[test]
+fn stale_history_holds_with_guided_faults() {
+    for seed in [0u64, 3, 99] {
+        let workload = stale_history();
+        let faults_tape = fault_tape(seed);
+        block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
+            run_and_assert_with_faults(workload, FaultConfig::failures(9), seed, faults_tape).await
+        });
+    }
+}
+
+#[test]
+fn pct_seed_breadth_holds_stale_history() {
+    pct_sweep(&stale_history(), FaultConfig::failures(7));
+}
+
+/// One instance caches the values of two shared collections, and the other
+/// updates both values in one transaction. Each value has its own leaf, and an
+/// update does not change a binding. So a strict read of the first collection
+/// refreshes only its own leaf, and a stale read can then see its new value.
+/// Without the monotonic floor, a later stale read of the second collection
+/// could still use its old leaf.
+fn floor_history() -> HistoryWorkload {
+    use HistoryMode::{StaleMax, Strict};
+    let collection = |slot, operation| I::Collection { slot, operation };
+    let read = |slot| collection(slot, C::Read);
+    HistoryWorkload {
+        clients: vec![
+            vec![
+                in_mode(
+                    0,
+                    0,
+                    Strict,
+                    vec![collection(0, C::Write(1)), collection(1, C::Write(1))],
+                ),
+                in_mode(1, 0, StaleMax, vec![read(0), read(1)]),
+                in_mode(2, 0, StaleMax, vec![read(0), read(1)]),
+                in_mode(3, 0, Strict, vec![read(0)]),
+                in_mode(4, 0, StaleMax, vec![read(0)]),
+                in_mode(5, 0, StaleMax, vec![read(1)]),
+            ],
+            vec![
+                in_mode(6, 1, StaleMax, vec![I::Yield, read(1)]),
+                in_mode(7, 1, StaleMax, vec![I::Yield, read(1)]),
+            ],
+            update_after(8, 2, 2, 2),
+            update_after(11, 3, 4, 3),
+        ],
+    }
+}
+
+/// Runs `fillers` strict reads on `client` to delay an update of both shared
+/// collections to `value`.
+fn update_after(first_id: u64, client: usize, fillers: u64, value: u8) -> Vec<HistoryTransaction> {
+    let update = |slot| I::Collection {
+        slot,
+        operation: C::Update(value),
+    };
+    (first_id..first_id + fillers)
+        .map(|id| {
+            transaction(
+                id,
+                client,
+                vec![I::Read {
+                    key: 0,
+                    register: 0,
+                }],
+            )
+        })
+        .chain(std::iter::once(transaction(
+            first_id + fillers,
+            client,
+            vec![update(0), update(1)],
+        )))
+        .collect()
+}
+
+#[test]
+fn pct_seed_breadth_holds_floor_history() {
+    pct_sweep(&floor_history(), FaultConfig::none());
 }
 
 fn shared_collection_history() -> HistoryWorkload {

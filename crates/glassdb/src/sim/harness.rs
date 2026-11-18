@@ -42,6 +42,13 @@ const CACHE_MEDIA_SEED: u64 = 0xCA43_5EED_D15C_0048;
 /// leases of live transactions.
 const FAULTLESS_MAX_DELAY: Duration = Duration::from_millis(10);
 
+/// Identifies one database instance of a simulation run.
+///
+/// Each open of a client database creates a new instance, so a restart after a
+/// crash gets a new identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceId(pub(super) u64);
+
 /// Controls transport failures, instance crashes, and slow backend mutations in
 /// the deterministic simulation harness. The instance transports also add
 /// latency without failures, so that the timers of background work elapse while
@@ -315,8 +322,10 @@ pub trait SimWorkload: Clone + Default + 'static {
     /// Runs one op in its own transaction, updating `state`. Returns the op's
     /// public result so the client loop can apply its error policy. The workload
     /// must record that result before returning, including any unknown outcome.
+    /// `instance` identifies the database instance that `db` belongs to.
     fn run_op(
         db: &Database,
+        instance: InstanceId,
         op: &Self::Op,
         state: &Self::State,
     ) -> impl Future<Output = Result<(), Error>>;
@@ -656,7 +665,12 @@ mod sim_tests {
 
         async fn seed(&self, _db: &Database) {}
 
-        async fn run_op(db: &Database, client: &usize, state: &Self::State) -> Result<(), Error> {
+        async fn run_op(
+            db: &Database,
+            _instance: InstanceId,
+            client: &usize,
+            state: &Self::State,
+        ) -> Result<(), Error> {
             state.starting.wait().await;
             let key = super::super::key_name(*client);
             let key = &key;
@@ -773,7 +787,12 @@ mod sim_tests {
 
         async fn seed(&self, _db: &Database) {}
 
-        async fn run_op(_db: &Database, _op: &Self::Op, _state: &Self::State) -> Result<(), Error> {
+        async fn run_op(
+            _db: &Database,
+            _instance: InstanceId,
+            _op: &Self::Op,
+            _state: &Self::State,
+        ) -> Result<(), Error> {
             panic!("intentional workload panic")
         }
 

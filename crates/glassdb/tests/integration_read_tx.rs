@@ -193,7 +193,7 @@ async fn cache_then_write_both(
 }
 
 #[tokio::test(start_paused = true)]
-async fn read_tx_never_sees_an_earlier_state_than_a_previous_read_tx() {
+async fn read_tx_sees_every_transaction_whose_effect_a_previous_read_tx_saw() {
     let backend = mem();
     let reader = Database::open("example", backend.clone()).await.unwrap();
     let (x, z) = cache_then_write_both(&reader, backend).await;

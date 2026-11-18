@@ -1,7 +1,7 @@
 //! Client streams and shared database-instance lifetimes for simulation.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use glassdb_backend::Backend;
@@ -12,7 +12,7 @@ use crate::sim::SimMedia;
 use crate::{Database, Error};
 
 use super::super::CLIENTS_PER_INSTANCE;
-use super::{FaultConfig, RunMedia, SimWorkload, client_error_is_admissible};
+use super::{FaultConfig, InstanceId, RunMedia, SimWorkload, client_error_is_admissible};
 
 // A stalled request must not prevent checks of completed and in-doubt work.
 // This bounds foreground execution only; final consistency verification still
@@ -46,6 +46,7 @@ impl ClientRunner {
             client_ops.len().div_ceil(CLIENTS_PER_INSTANCE)
         );
         let mut clients = client_ops.into_iter();
+        let next_instance = Arc::new(AtomicU64::new(0));
         let mut handles = Vec::with_capacity(instance_backends.len());
         let mut signals = Vec::with_capacity(instance_backends.len());
         for (instance, backend) in instance_backends.into_iter().enumerate() {
@@ -70,6 +71,7 @@ impl ClientRunner {
                     state: state.clone(),
                     media: run_media.map(|media| media.instances[instance].clone()),
                     faults,
+                    next_instance: next_instance.clone(),
                 }
                 .run(),
             ));
@@ -112,6 +114,9 @@ struct InstanceTask<W: SimWorkload> {
     state: Arc<W::State>,
     media: Option<SimMedia>,
     faults: FaultConfig,
+    /// Shared by every instance task of the run, so each open gets a new
+    /// identifier.
+    next_instance: Arc<AtomicU64>,
 }
 
 impl<W: SimWorkload> InstanceTask<W> {
@@ -146,6 +151,7 @@ impl<W: SimWorkload> InstanceTask<W> {
                 return InstanceExit::Finished;
             }
         };
+        let instance = InstanceId(self.next_instance.fetch_add(1, Ordering::SeqCst));
         let mut handles = Vec::with_capacity(self.clients.len());
         for client in &self.clients {
             if !client.has_remaining() {
@@ -160,7 +166,7 @@ impl<W: SimWorkload> InstanceTask<W> {
                 tokio::select! {
                     biased;
                     _ = signal.cancelled() => {}
-                    _ = Self::run_operations(&db, &client, &state, faults) => {}
+                    _ = Self::run_operations(&db, instance, &client, &state, faults) => {}
                 }
             }));
         }
@@ -192,6 +198,7 @@ impl<W: SimWorkload> InstanceTask<W> {
     /// Runs a client's remaining request stream in order.
     async fn run_operations(
         db: &Database,
+        instance: InstanceId,
         client: &ClientStream<W::Op>,
         state: &W::State,
         faults: FaultConfig,
@@ -201,7 +208,7 @@ impl<W: SimWorkload> InstanceTask<W> {
             // Publish consumption before invocation so cancellation cannot replay
             // an operation that may already have changed storage.
             client.consumed.store(operation + 1, Ordering::SeqCst);
-            if let Err(error) = W::run_op(db, op, state).await {
+            if let Err(error) = W::run_op(db, instance, op, state).await {
                 Self::assert_admissible_error(faults, "running client operation", error);
                 if !W::CONTINUE_AFTER_ADMISSIBLE_ERROR {
                     client.stopped.store(true, Ordering::SeqCst);
@@ -236,7 +243,8 @@ mod sim_tests {
     use super::*;
     use crate::sim::key_name;
     use crate::sim::{
-        HistoryCollectionOp as C, HistoryInstruction as I, HistoryTransaction, HistoryWorkload,
+        HistoryCollectionOp as C, HistoryInstruction as I, HistoryMode, HistoryTransaction,
+        HistoryWorkload,
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -301,7 +309,12 @@ mod sim_tests {
 
         async fn seed(&self, _db: &Database) {}
 
-        async fn run_op(db: &Database, step: &Step, state: &Self::State) -> Result<(), Error> {
+        async fn run_op(
+            db: &Database,
+            _instance: InstanceId,
+            step: &Step,
+            state: &Self::State,
+        ) -> Result<(), Error> {
             state.calls.lock().unwrap().push(step.clone());
             match *step {
                 Step::Wait(client) => {
@@ -607,7 +620,12 @@ mod sim_tests {
             self.history.seed(db).await;
         }
 
-        async fn run_op(db: &Database, op: &Self::Op, state: &Self::State) -> Result<(), Error> {
+        async fn run_op(
+            db: &Database,
+            instance: InstanceId,
+            op: &Self::Op,
+            state: &Self::State,
+        ) -> Result<(), Error> {
             if op.op_id == 3 {
                 state.failed_operation_returned.cancelled().await;
             }
@@ -620,7 +638,7 @@ mod sim_tests {
                     .await
                     .map(|_| ())
             } else {
-                HistoryWorkload::run_op(db, op, &state.history).await
+                HistoryWorkload::run_op(db, instance, op, &state.history).await
             };
             if op.op_id == 0 {
                 // Let the preceding write-back finish before selecting a
@@ -696,6 +714,7 @@ mod sim_tests {
                             .map(|(id, operation)| HistoryTransaction {
                                 op_id: id as u64,
                                 client_id: 0,
+                                mode: HistoryMode::Strict,
                                 instructions: vec![
                                     I::Collection { slot: 0, operation },
                                     I::WriteLiteral {
@@ -708,6 +727,7 @@ mod sim_tests {
                         workload.history.clients[peer] = vec![HistoryTransaction {
                             op_id: 3,
                             client_id: peer,
+                            mode: HistoryMode::Strict,
                             instructions: vec![I::Collection {
                                 slot: 0,
                                 operation: C::Read,

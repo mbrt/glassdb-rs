@@ -1,6 +1,6 @@
 //! Public collection operations and their independent sequential specification.
 
-use super::HistoryAction;
+use super::{HistoryAction, HistoryTx};
 use crate::{Collection, Error, Transaction};
 
 pub(super) const COLLECTION_SLOTS: usize = 2;
@@ -193,7 +193,7 @@ impl HistoryCollectionOp {
     }
 }
 
-pub(super) async fn inspect_catalog(tx: &Transaction) -> Result<Catalog, Error> {
+pub(super) async fn inspect_catalog(tx: &HistoryTx) -> Result<Catalog, Error> {
     let mut catalog = Catalog::default();
     let mut listings = Vec::new();
     for (slot, state) in catalog.iter_mut().enumerate() {
@@ -210,7 +210,7 @@ pub(super) async fn inspect_catalog(tx: &Transaction) -> Result<Catalog, Error> 
 }
 
 pub(super) async fn execute(
-    tx: &Transaction,
+    tx: &HistoryTx,
     slot: u8,
     operation: HistoryCollectionOp,
 ) -> Result<HistoryAction, Error> {
@@ -224,7 +224,10 @@ pub(super) async fn execute(
         }));
     }
     let (before, members_before) = inspect(tx, slot).await?;
-    let result = execute_operation(tx, slot, operation).await;
+    let result = match operation {
+        HistoryCollectionOp::Read => Ok(CollectionOutcome::Applied),
+        _ => execute_change(tx.writer()?, slot, operation).await,
+    };
     let outcome = match result {
         Ok(outcome) => outcome,
         Err(Error::AlreadyExists) => CollectionOutcome::AlreadyExists,
@@ -247,7 +250,7 @@ pub(super) async fn execute(
 /// Writes `value` to the collection of an update and returns the value that
 /// it replaced, or `None` if the collection does not exist.
 async fn update(
-    tx: &Transaction,
+    tx: &HistoryTx,
     slot: u8,
     operation: HistoryCollectionOp,
     value: u8,
@@ -266,7 +269,7 @@ async fn update(
         };
     }
     let before = read_value(tx, &collection).await?;
-    tx.write(&collection, VALUE_KEY, &[value])?;
+    tx.writer()?.write(&collection, VALUE_KEY, &[value])?;
     Ok(Some(before))
 }
 
@@ -282,7 +285,7 @@ fn membership(catalog: &Catalog) -> Vec<u8> {
         .collect()
 }
 
-async fn read_value(tx: &Transaction, collection: &Collection) -> Result<Option<u8>, Error> {
+async fn read_value(tx: &HistoryTx, collection: &Collection) -> Result<Option<u8>, Error> {
     match tx.read(collection, VALUE_KEY).await? {
         Some(value) if value.len() == 1 => Ok(Some(value[0])),
         None => Ok(None),
@@ -292,7 +295,7 @@ async fn read_value(tx: &Transaction, collection: &Collection) -> Result<Option<
     }
 }
 
-async fn inspect(tx: &Transaction, slot: u8) -> Result<(Option<CollectionState>, Vec<u8>), Error> {
+async fn inspect(tx: &HistoryTx, slot: u8) -> Result<(Option<CollectionState>, Vec<u8>), Error> {
     let root = tx.root_collection();
     let name = collection_name(slot);
     let collection = match tx.open_collection(&root, &name).await {
@@ -336,7 +339,7 @@ async fn inspect(tx: &Transaction, slot: u8) -> Result<(Option<CollectionState>,
     Ok((Some(CollectionState { value, child }), members))
 }
 
-async fn execute_operation(
+async fn execute_change(
     tx: &Transaction,
     slot: u8,
     operation: HistoryCollectionOp,
@@ -345,9 +348,10 @@ async fn execute_operation(
     let root = tx.root_collection();
     let name = collection_name(slot);
     match operation {
-        C::Read => {}
-        C::Update(_) | C::UpdateNested(_) => {
-            return Err(Error::internal("an update is not a collection step"));
+        C::Read | C::Update(_) | C::UpdateNested(_) => {
+            return Err(Error::internal(
+                "a read or an update is not a collection change",
+            ));
         }
         C::Create => {
             tx.create_collection(&root, &name).await?;

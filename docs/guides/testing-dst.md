@@ -105,6 +105,16 @@ unless a crash interrupts it, and the failed operation stays consumed: an
 in-doubt operation may commit once or not at all, and later public observations
 constrain that choice.
 
+A history program with no writes can also run as a stale read-only transaction
+with a zero or an unbounded staleness. With a zero bound, the checker places it
+as a transaction. With an unbounded staleness, it can take a past position: it
+follows only the earlier stale read-only transactions of its database instance
+and the earlier commits of the instance that wrote what it observes. A restart
+opens a new instance, so these orders do not cross a crash. A stale read-only
+transaction with a zero bound also counts as one with an unbounded staleness for
+the later ones, because the monotonic floor rises only to the states that it
+used. Finite bounds above zero depend on time and are not generated.
+
 ## The four approaches in one paragraph each
 
 - **Current — in-repo `DetExecutor` (ADR-011).** A single-threaded executor with
