@@ -49,7 +49,7 @@ use crate::monitor::{Monitor, ProtocolTiming};
 use crate::structural::TopologyMembership;
 use crate::tlocker::Locker;
 use budget::WriteBudget;
-use pipeline::CheckPipeline;
+use pipeline::{CheckPipeline, EPOCH_WAIT};
 use scan::{GcScan, PAGE_SIZE};
 
 // The candidate capacities when the budget is small. A scan needs room for two
@@ -1118,20 +1118,30 @@ impl Scheduler {
             .store(self.concurrency as u64, Ordering::Relaxed);
     }
 
+    /// Reports whether a scan can start a LIST. A LIST waits until the check
+    /// pipeline has taken each listed candidate. A listed record that waits
+    /// for a check is often reclaimed in the meantime by a hint or by the scan
+    /// of another instance, and its check then finds it missing.
     fn can_list(&self) -> bool {
         self.scan.is_some()
             && self.scanned.is_empty()
+            && self.candidates.scans.ready.is_empty()
             && self.candidates.scans.count + PAGE_SIZE <= self.candidates.scan_capacity
     }
 
     fn deadline(&self, now: rt::Instant) -> rt::Instant {
-        let refill = (self.candidates.ready_len() > 0)
+        let ready = self.candidates.ready_len() > 0;
+        let refill = ready
             .then(|| self.budget.refill_at(self.retry_delay * 40))
             .flatten();
+        // The pipeline does not report when its queued candidates start, so
+        // GC gives it more of them after the longest wait of a forming epoch.
+        let feed = ready.then_some(now + EPOCH_WAIT);
         self.candidates
             .next_due()
             .into_iter()
             .chain(refill)
+            .chain(feed)
             .chain(self.can_list().then_some(self.next_scan))
             .min()
             .unwrap_or(now + self.retry_delay * 40)

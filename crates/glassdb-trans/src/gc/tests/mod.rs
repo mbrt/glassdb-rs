@@ -3985,6 +3985,36 @@ async fn only_a_hint_during_a_check_requests_a_delayed_follow_up() {
     assert_eq!(scheduler.candidates.take_ready(), Some(id));
 }
 
+// A LIST waits until the check pipeline has taken the listed candidates.
+// Records that wait for a check are often reclaimed in the meantime by hints or
+// by the scans of other instances, so their checks find nothing.
+#[tokio::test(start_paused = true)]
+async fn a_list_waits_until_the_pipeline_takes_listed_candidates() {
+    let ctx = new_ctx().await;
+    let mut scheduler = Scheduler::new(&ctx.gc);
+    let now = rt::Instant::now();
+    assert!(scheduler.can_list());
+
+    let id = tx(22);
+    scheduler.candidates.admit(id, true, now);
+    assert!(!scheduler.can_list(), "a ready scan candidate waits");
+    assert_eq!(scheduler.candidates.take_ready(), Some(id));
+    assert!(scheduler.can_list(), "a taken scan candidate does not wait");
+}
+
+// The pipeline does not report when its queued candidates start. While ready
+// candidates wait, GC must still wake up to give them to the pipeline, also
+// when no LIST, hint, or completion wakes it.
+#[tokio::test(start_paused = true)]
+async fn ready_candidates_wake_gc_within_an_epoch_wait() {
+    let ctx = new_ctx().await;
+    let mut scheduler = Scheduler::new(&ctx.gc);
+    let now = rt::Instant::now();
+    scheduler.candidates.admit(tx(23), true, now);
+    assert!(!scheduler.can_list());
+    assert_eq!(scheduler.deadline(now), now + pipeline::EPOCH_WAIT);
+}
+
 #[test]
 fn scan_admission_does_not_advance_a_hint_deadline() {
     let now = rt::Instant::now();

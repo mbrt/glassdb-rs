@@ -1094,6 +1094,7 @@ use it to start a measurement with no garbage from the warm-up.
 GC scans are a backup for dropped hints. Each scan turn does at most one LIST.
 Database instances scan shuffled prefixes independently, with no reservations,
 leases, or coordination writes. LIST is not a snapshot, so scans must repeat.
+A LIST waits until the check pipeline has taken each listed record.
 
 Each instance scans at one depth: the transaction root, 64 prefixes, or 4,096
 prefixes. A traversal that still has a cursor after enough pages makes the depth
