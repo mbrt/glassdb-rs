@@ -4,12 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use glassdb_data::{CollectionAddress, CollectionId, TxId};
 use glassdb_storage::{
-    CollectionRecord, CurrentnessBarrier, NodeSizePolicy, Requirement, StorageError,
+    CollectionRecord, CurrentnessBarrier, LockType, NodeSizePolicy, Requirement, StorageError,
 };
 
 use crate::collection_coordination::{CollectionStateResolver, PendingHolders};
 use crate::collections::{
-    CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind, DirectorySnapshot,
+    CollectionChange, CollectionOp, DirectoryEvidence, DirectoryRead, DirectoryReadKind,
+    DirectorySnapshot,
 };
 use crate::error::TransError;
 
@@ -43,16 +44,23 @@ impl CollectionCatalog {
         // Callers retain directory reads and mutation preconditions as semantic
         // dependencies. Validation checks them after the body before accepting
         // its outcome, so this snapshot can use cached contents.
-        let (record, _) = self
+        let (record, observed) = self
             .state
             .load_resolved(parent, Some(own), Requirement::ANY, PendingHolders::Skip)
             .await?;
+        // A topology freeze or a directory writer can change the bindings
+        // without a new record state, so only a record without them is exact
+        // evidence for a cut point.
+        let without_holders = record.topology_freeze().is_none()
+            && (record.directory_lock().lock_type() == LockType::Read
+                || record.directory_lock().holders().is_empty());
         Ok(DirectorySnapshot {
             children: record
                 .children()
                 .map(|(name, id)| (name.clone(), id))
                 .collect(),
             generation: record.directory_generation(),
+            evidence: DirectoryEvidence(without_holders.then_some(observed)),
         })
     }
 
@@ -199,7 +207,7 @@ mod tests {
             timeline.clone(),
             None,
         );
-        let records = CollectionStore::new(objects.clone());
+        let records = CollectionStore::new(objects.clone(), std::num::NonZeroUsize::MIN);
         let background = Arc::new(Background::new());
         let transactions = TxRecordStore::new(objects, DbPrefix::try_from("db").unwrap());
         let monitor = Monitor::with_config(
@@ -351,6 +359,7 @@ mod tests {
         reads.push(DirectoryRead {
             parent: child,
             kind: DirectoryReadKind::Listing { generation: 0 },
+            evidence: DirectoryEvidence::default(),
         });
         catalog
             .validate(
@@ -373,6 +382,7 @@ mod tests {
                     name: CollectionName::new("child").unwrap(),
                     collection: Some(CollectionId::from_bytes([1; 16])),
                 },
+                evidence: DirectoryEvidence::default(),
             }]
         })
         .await;
@@ -386,6 +396,7 @@ mod tests {
             vec![DirectoryRead {
                 parent: CollectionAddress::root("db"),
                 kind: DirectoryReadKind::Listing { generation },
+                evidence: DirectoryEvidence::default(),
             }]
         })
         .await;

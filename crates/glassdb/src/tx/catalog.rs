@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use glassdb_data::{CollectionAddress, CollectionId, CollectionName};
 use glassdb_trans::{
-    CatalogAccesses, CollectionChange, CollectionOp, CollectionReservations, DirectoryRead,
-    DirectoryReadKind, DirectorySnapshot,
+    CatalogAccesses, CollectionChange, CollectionOp, CollectionReservations, DirectoryEvidence,
+    DirectoryRead, DirectoryReadKind, DirectorySnapshot,
 };
 
 use crate::error::Error;
@@ -32,6 +32,8 @@ struct DirectoryState {
     base: BTreeMap<CollectionName, CollectionId>,
     current: BTreeMap<CollectionName, CollectionId>,
     generation: u64,
+    /// The record behind `base`, for the reads of this directory.
+    evidence: DirectoryEvidence,
 }
 
 impl CatalogOverlay {
@@ -78,6 +80,7 @@ impl CatalogOverlay {
                 name: name.clone(),
                 collection: base,
             },
+            evidence: state.evidence.clone(),
         });
         Ok(current)
     }
@@ -103,6 +106,7 @@ impl CatalogOverlay {
         self.reads.push(DirectoryRead {
             parent: parent.clone(),
             kind: DirectoryReadKind::Listing { generation },
+            evidence: state.evidence.clone(),
         });
         Ok(current)
     }
@@ -130,6 +134,7 @@ impl CatalogOverlay {
                 name: name.clone(),
                 collection: base,
             },
+            evidence: state.evidence.clone(),
         });
         if let Some(id) = existing {
             if matches!(mode, CreateMode::Strict) {
@@ -197,6 +202,7 @@ impl CatalogOverlay {
                 name: name.clone(),
                 collection: expected,
             },
+            evidence: parent_state.evidence.clone(),
         });
         if current != Some(collection.id()) {
             return Err(Error::StaleCollection);
@@ -212,6 +218,7 @@ impl CatalogOverlay {
             kind: DirectoryReadKind::Listing {
                 generation: target_generation,
             },
+            evidence: target.evidence.clone(),
         });
         if target_not_empty {
             return Err(Error::NotEmpty);
@@ -265,6 +272,7 @@ impl CatalogOverlay {
                     base: BTreeMap::new(),
                     current: BTreeMap::new(),
                     generation: 0,
+                    evidence: DirectoryEvidence::default(),
                 },
             );
             return Ok(false);
@@ -285,6 +293,7 @@ impl CatalogOverlay {
                 base: children.clone(),
                 current: children,
                 generation: snapshot.generation,
+                evidence: snapshot.evidence,
             });
     }
 

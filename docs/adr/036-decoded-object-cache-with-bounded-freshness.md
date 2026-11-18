@@ -9,6 +9,9 @@ The operation-order and cache-publication rules are partially superseded by
 observation, and bounded-validation decisions remain authoritative.
 Its non-persistence consequence is narrowed for the optional L2 by
 [ADR-045](045-optional-persistent-encoded-body-l2-cache.md).
+`read_stale` is refined by
+[ADR-098](098-a-stale-read-is-a-stale-read-only-transaction.md): it is a
+stale read-only transaction with one read.
 
 This supersedes
 [ADR-030](030-seed-shard-loads.md)'s `Latest` / `AllowStale` cache-freshness API

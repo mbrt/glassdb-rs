@@ -67,7 +67,7 @@ impl CurrentnessBarrier {
 
 /// The freshness requirement a cached entry must satisfy before it is served.
 ///
-/// Construct requirements explicitly with `ANY`, `after`, or `within`. Do not
+/// Construct requirements explicitly with `ANY` or `after`. Do not
 /// add constructors from observations, receipts, or raw sequence points, nor
 /// expose the stored bound. An invocation point cannot establish a barrier
 /// after completed work. Requirements cannot be converted back into barriers.
@@ -90,18 +90,53 @@ impl Requirement {
         Self(self.0.max(other.0))
     }
 
-    /// Accepts evidence within the approximate bounded-staleness cutoff.
-    pub fn within(timeline: &Timeline, max_staleness: Duration) -> Self {
-        if max_staleness == Duration::MAX {
-            Self::ANY
-        } else {
-            // This cutoff is a cache policy, not a barrier after completed work.
-            Self(Some(timeline.approximate_cutoff(max_staleness)))
-        }
-    }
-
     pub(crate) fn is_satisfied_by(self, current_after: SequencePoint) -> bool {
         self.0.is_none_or(|bound| current_after >= bound)
+    }
+}
+
+/// The oldest cut point that a stale read-only transaction accepts (ADR-097).
+///
+/// The transaction captures it when it starts, so its staleness bound is
+/// measured from the start of the call. It converts a duration to a sequence
+/// point by approximation, so it is not a currentness barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StalenessCutoff(SequencePoint);
+
+impl StalenessCutoff {
+    /// Accepts a cut point of any age, also from a previous open.
+    pub const ANY: Self = Self(SequencePoint(0));
+
+    pub(crate) fn point(self) -> SequencePoint {
+        self.0
+    }
+}
+
+/// The earliest cut point that the next stale read-only transaction of a
+/// database instance can use (ADR-097).
+///
+/// It only rises. Use it only with the timeline of the database instance that
+/// owns it.
+#[derive(Debug, Clone, Default)]
+pub struct MonotonicFloor(Arc<AtomicU64>);
+
+impl MonotonicFloor {
+    /// Creates a floor that admits every cut point.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Raises the floor to a barrier captured after completed work.
+    pub fn raise_to_barrier(&self, barrier: CurrentnessBarrier) {
+        self.raise(barrier.point);
+    }
+
+    pub(crate) fn get(&self) -> SequencePoint {
+        SequencePoint(self.0.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn raise(&self, point: SequencePoint) {
+        self.0.fetch_max(point.0, Ordering::SeqCst);
     }
 }
 
@@ -179,8 +214,23 @@ impl Timeline {
         Self::from_source(source, None)
     }
 
-    /// Derives the approximate sequence cutoff used only by bounded-staleness
-    /// reads.
+    /// Captures the staleness cutoff of a stale read-only transaction that
+    /// starts now and accepts a cut point no older than `max_staleness`.
+    ///
+    /// A zero bound subtracts nothing, so its cutoff is a point allocated
+    /// now, as a currentness barrier is. A stale read-only transaction with a
+    /// zero bound relies on this to follow every operation that completed
+    /// before it started.
+    pub fn staleness_cutoff(&self, max_staleness: Duration) -> StalenessCutoff {
+        if max_staleness == Duration::MAX {
+            StalenessCutoff::ANY
+        } else {
+            StalenessCutoff(self.approximate_cutoff(max_staleness))
+        }
+    }
+
+    /// Derives the approximate sequence cutoff used only to bound the age of
+    /// a cut point (ADR-097).
     fn approximate_cutoff(&self, max_staleness: Duration) -> SequencePoint {
         SequencePoint(
             self.now()
@@ -241,6 +291,13 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_staleness_cutoff_follows_every_earlier_point() {
+        let timeline = Timeline::with_source(Arc::new(FixedSource(Duration::from_secs(2))));
+        let earlier = timeline.now();
+        assert!(timeline.staleness_cutoff(Duration::ZERO).point() > earlier);
+    }
+
+    #[test]
     fn elapsed_time_is_a_floor_for_sequence_points() {
         let timeline = Timeline::with_source(Arc::new(FixedSource(Duration::from_secs(2))));
         assert!(timeline.now().raw() >= 2_000_000_000);
@@ -288,18 +345,5 @@ mod tests {
         assert!(Requirement(Some(earlier)).is_satisfied_by(earlier));
         assert!(Requirement(Some(earlier)).is_satisfied_by(later));
         assert!(!Requirement(Some(later)).is_satisfied_by(earlier));
-    }
-
-    #[test]
-    fn duration_requirement_uses_the_timeline() {
-        let timeline = Timeline::with_source(Arc::new(FixedSource(Duration::from_secs(10))));
-        assert_eq!(
-            Requirement::within(&timeline, Duration::from_secs(3)),
-            Requirement(Some(SequencePoint::from_raw(7_000_000_000)))
-        );
-        assert_eq!(
-            Requirement::within(&timeline, Duration::MAX),
-            Requirement::ANY
-        );
     }
 }

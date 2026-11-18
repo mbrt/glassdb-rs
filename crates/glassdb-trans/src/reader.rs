@@ -8,7 +8,6 @@
 //! the [`Monitor`].
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use glassdb_concurr::{RetrySchedule, rt};
 use glassdb_data::{LogicalKey, TxId};
@@ -71,42 +70,25 @@ impl Reader {
         }
     }
 
-    /// Reads `key`, accepting cached outcomes up to `max_stale` and returning
-    /// `None` when the key is absent or deleted.
+    /// Reads `key` from any usable cached state, returning `None` when the key
+    /// is absent or deleted. The transaction validates the read later.
     ///
     /// A read is idempotent, so a transient in-doubt (`Unavailable`) outcome is
     /// retried in place with exponential backoff up to five times.
     /// A persistent outage surfaces the last `Unavailable` error for the caller
     /// to classify; the caller cancels by
     /// dropping the future at any `.await` (e.g. via `tokio::time::timeout`).
-    pub async fn read(
-        &self,
-        key: &LogicalKey,
-        max_stale: Duration,
-    ) -> Result<ReadOutcome, StorageError> {
+    pub async fn read(&self, key: &LogicalKey) -> Result<ReadOutcome, StorageError> {
         let mut backoff = self.retry.backoff();
         for _ in 0..READ_UNAVAILABLE_RETRIES {
-            match self.read_once(key, max_stale).await {
+            match self.resolve_value(key, Requirement::ANY).await {
                 Err(StorageError::Unavailable(_)) => rt::sleep(backoff.next_delay()).await,
                 other => return other,
             }
         }
         // Final attempt: surface whatever it returns, including a persistent
         // `Unavailable` that the caller maps to `Error::Unavailable`.
-        self.read_once(key, max_stale).await
-    }
-
-    /// A single read attempt: local cache then leaf resolution. Wrapped by
-    /// [`Reader::read`] for in-place retries.
-    async fn read_once(
-        &self,
-        key: &LogicalKey,
-        max_stale: Duration,
-    ) -> Result<ReadOutcome, StorageError> {
-        // Bounded-staleness reads are the one foreground operation that owns a
-        // freshness policy rather than inheriting a transaction/CAS watermark.
-        self.resolve_value(key, Requirement::within(&self.timeline, max_stale))
-            .await
+        self.resolve_value(key, Requirement::ANY).await
     }
 
     /// Resolves `key` to its effective writer (via the [`KeyResolver`]), then
@@ -257,7 +239,7 @@ mod tests {
                 local.timeline.clone(),
                 RetrySchedule::default(),
             );
-            let (value, _) = reader.read(&key, Duration::MAX).await.unwrap().into_parts();
+            let (value, _) = reader.read(&key).await.unwrap().into_parts();
             assert_eq!(value.unwrap().value.as_ref(), b"old");
             let (_, root) = peer
                 .nodes
@@ -286,7 +268,7 @@ mod tests {
             ));
             match operation {
                 0 => {
-                    let (value, _) = reader.read(&key, Duration::MAX).await.unwrap().into_parts();
+                    let (value, _) = reader.read(&key).await.unwrap().into_parts();
                     assert_eq!(value.unwrap().value.as_ref(), b"new");
                 }
                 1 => {

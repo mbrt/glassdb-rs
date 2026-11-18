@@ -357,7 +357,23 @@ The rule a read applies to decide whether an existing observation can serve it: 
 _Avoid_: Consistency level, staleness policy
 
 **Stale read**:
-A read outside a transaction that accepts a committed state known to be current within a stated age.
+A stale read-only transaction that reads only one key.
+
+**Currentness interval**:
+The span of sequence points over which one observed state of an object is known to be current: from the completion of the first operation that observed the state to its currentness watermark.
+_Avoid_: Validity window, version lifetime
+
+**Stale read-only transaction**:
+A read-only transaction that accepts the state of the database at one cut point within a stated age, instead of the state at a fresh validation barrier.
+_Avoid_: Snapshot transaction, follower read
+
+**Cut point**:
+The one sequence point at which every state that a stale read-only transaction depends on was current.
+_Avoid_: Snapshot timestamp, read version
+
+**Monotonic floor**:
+The earliest cut point that the next stale read-only transaction of a database instance can use.
+_Avoid_: Session watermark, read floor
 
 ## Point routing
 

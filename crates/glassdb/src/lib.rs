@@ -42,7 +42,7 @@ pub use iter::{CollectionEntry, CollectionIter, KeyIter};
 pub use limits::TransactionLimits;
 pub use scan::{KeyPage, KeyScan};
 pub use stats::{Stats, TransactionStats};
-pub use tx::Transaction;
+pub use tx::{ReadTransaction, Transaction};
 
 /// Returns an error from a transaction body when `condition` is false.
 ///

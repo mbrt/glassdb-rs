@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use glassdb_data::{CollectionAddress, CollectionName, DatabaseId, LogicalKey};
+use glassdb_data::{CollectionAddress, CollectionName, DatabaseId};
 
 use crate::db::DbInner;
 use crate::error::Error;
@@ -94,21 +94,22 @@ impl Collection {
             .await
     }
 
-    /// Reads the value for `key` allowing stale results up to `max_staleness`,
-    /// returning `None` when the key is absent.
+    /// Reads the value for `key` in a stale read-only transaction with the
+    /// bound `max_staleness`, returning `None` when the key is absent.
+    ///
+    /// It is the same as a [`Database::read_tx`](crate::Database::read_tx)
+    /// whose body reads only `key`, with the same guarantees.
     pub async fn read_stale(
         &self,
         key: &[u8],
         max_staleness: Duration,
     ) -> Result<Option<Vec<u8>>, Error> {
-        let _guard = self.db.admit_operation()?;
-        // Do not check key size limit, as we should support keys created before
-        // the current limit was introduced.
-        let key = LogicalKey::new(self.address.clone(), key);
-        match self.db.engine.read(&key, max_staleness).await {
-            Ok(outcome) => Ok(outcome.value.map(|rv| rv.value.to_vec())),
-            Err(e) => Err(Error::from_read(e)),
-        }
+        self.db
+            .tx_with(
+                Some(max_staleness),
+                |tx| async move { tx.read(self, key).await },
+            )
+            .await
     }
 
     /// Writes `value` for `key` within a transaction.

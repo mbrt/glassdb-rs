@@ -5,13 +5,16 @@
 //! `{prefix}/_r`, so data-path mutations cannot conflict with this record.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use glassdb_data::{CollectionAddress, CollectionId, CollectionName, ObjectPath, TxId};
 use glassdb_proto as pb;
 use prost::Message;
 
-use crate::cached_store::{CachedStore, CasResult, Codec, Observation, Requirement};
+use crate::cached_store::{
+    CachedStore, CasResult, Codec, CutSearch, CutTarget, Observation, Requirement,
+};
 use crate::error::StorageError;
 use crate::lock::SharedExclusiveLock;
 use crate::wire_id::{decode_id, decode_optional_id};
@@ -280,14 +283,38 @@ impl Codec for CollectionRecord {
 #[derive(Clone)]
 pub struct CollectionStore {
     records: crate::cached_store::TypedCachedStore<CollectionRecord>,
+    /// The bound on the parallel checks of one batch of records.
+    parallelism: NonZeroUsize,
 }
 
 impl CollectionStore {
-    /// Creates a collection store over the shared decoded-object cache.
-    pub fn new(objects: CachedStore) -> Self {
+    /// Creates a collection store over the shared decoded-object cache. A
+    /// batch of record checks runs at most `parallelism` checks at a time.
+    pub fn new(objects: CachedStore, parallelism: NonZeroUsize) -> Self {
         CollectionStore {
             records: objects.typed(),
+            parallelism,
         }
+    }
+
+    /// Adds retained record observations to a cut search (ADR-097).
+    pub fn add_records_to_cut(
+        &self,
+        search: &mut CutSearch,
+        observations: &[Observation<CollectionRecord>],
+    ) -> Result<(), StorageError> {
+        self.records.add_to_cut(search, observations)
+    }
+
+    /// Checks the record observations that do not reach a cut target.
+    pub async fn refresh_records_for_cut(
+        &self,
+        observations: &[Observation<CollectionRecord>],
+        target: &CutTarget,
+    ) -> Result<bool, StorageError> {
+        self.records
+            .refresh_for_cut(observations, target, self.parallelism)
+            .await
     }
 
     /// Loads a collection record, or returns [`StorageError::NotFound`].
@@ -604,7 +631,7 @@ mod tests {
             timeline.clone(),
             None,
         );
-        let records = CollectionStore::new(objects.clone());
+        let records = CollectionStore::new(objects.clone(), std::num::NonZeroUsize::MIN);
         let nodes = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
         let collection = CollectionAddress::new("db", collection_id(9));
 

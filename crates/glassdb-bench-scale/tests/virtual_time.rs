@@ -351,3 +351,45 @@ fn failed_experiment_keeps_the_experiments_before_it(jobs: &str) {
     assert_eq!(names, ["read-warm"]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A cached stale read-only transaction does no backend operation, so only the
+/// wait after each transaction advances model time. Without it, the run spins
+/// and never ends.
+#[test]
+fn transactions_with_no_backend_operation_advance_virtual_time() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_perfbench"))
+        .args(MEMORY_MODEL)
+        .args([
+            "--time=virtual",
+            "--jobs=1",
+            &format!("--experiment={EXPERIMENTS}/stale-reads.toml"),
+            "--set=cell.workers=1",
+            "--set=pools.wide.keys=200",
+            "--set=seed.quiet-period=\"0s\"",
+            "--set=cell.gc=false",
+            "--set=cell.warm-up.timeout=\"0s\"",
+            "--set=cell.measure.until=\"duration\"",
+            "--set=cell.measure.duration=\"2s\"",
+            "--set=cell.measure.max-duration=\"5s\"",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("virtual time did not advance");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let shapes = report["experiments"][0]["runs"][0]["cells"][0]["shapes"]
+        .as_array()
+        .unwrap();
+    let ro = shapes.iter().find(|s| s["shape"] == "ro-single").unwrap();
+    assert!(ro["committed"].as_u64().unwrap() > 0, "{ro}");
+}

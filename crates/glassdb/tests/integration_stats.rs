@@ -210,21 +210,6 @@ async fn stats_report_cache_owner_activity() {
     assert!(warm.monitor.hits > 0);
     assert_eq!(warm.monitor.misses, 0);
 
-    let before_stale = reader_db.stats();
-    assert_eq!(
-        reader
-            .read_stale(key, std::time::Duration::MAX)
-            .await
-            .unwrap()
-            .unwrap(),
-        value
-    );
-    let stale = reader_db.stats() - before_stale;
-    assert_eq!(stale.transactions.reads, 0);
-    assert!(stale.cache.l1_hits > 0);
-    assert!(stale.monitor.hits > 0);
-    assert_eq!(stale.backend.reads, 0);
-
     reader.delete(key).await.unwrap();
     let before_deleted = reader_db.stats();
     assert!(reader.read(key).await.unwrap().is_none());

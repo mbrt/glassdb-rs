@@ -139,7 +139,6 @@ A read states the minimum evidence it needs as a freshness requirement:
 | Requirement | Accepted cache state |
 | --- | --- |
 | `ANY` | Any discoverable present or absent state. |
-| `within(timeline, age)` | A state whose evidence reaches an approximate age cutoff. |
 | `after(barrier)` | A state whose evidence reaches the currentness barrier. |
 
 `ANY` accepts stale data on purpose. A transaction body or an idempotent CAS
@@ -147,12 +146,15 @@ loop can start from a stale state, because the worst result is an invalidated
 read or a rejected CAS. `ANY` cannot return a state that the cache knows
 is obsolete or in doubt, because that state is no longer discoverable.
 
-`within` converts a duration to a sequence-point cutoff. The conversion is
-approximate, and it is acceptable only as a cache policy for stale reads.
 Transaction validation, CAS receipts, and recovery use exact barriers and never
-do time arithmetic.
+do time arithmetic. Only a stale read-only transaction converts a duration to
+an approximate sequence-point cutoff, and only to bound the age of its cut
+point. The cut point itself comes from the
+currentness intervals of the states, so its consistency does not depend on
+time
+([ADR-097](../adr/097-stale-read-only-transactions-choose-a-past-cut-point.md)).
 
-When the cached evidence is too old for `after` or `within`, `CachedStore`
+When the cached evidence is too old for `after`, `CachedStore`
 checks the backend. For a present state, it does a revision-conditional read,
 which transfers no body if the revision is unchanged. An absent state has no
 revision to send, so its check is an ordinary read.
@@ -227,8 +229,7 @@ whether `ANY` would make the result false. If it would, take a barrier. If any
 caller can correctly pass `ANY`, take a requirement.
 
 The two types state different things. A requirement states which evidence a
-read accepts. It can be `ANY`, which has no bound, or `within`, whose bound is
-approximate. A barrier states that an ordering point exists after some
+read accepts. It can be `ANY`, which has no bound. A barrier states that an ordering point exists after some
 prerequisite work finished. For this reason a requirement can never become a
 barrier.
 
@@ -251,9 +252,7 @@ so each conversion is still a decision that review must check.
 A barrier does not make older evidence current. A read that starts before the
 barrier and finishes after it still carries its older invocation point, because
 completion time cannot upgrade a read. A copy of a barrier keeps the original
-bound, so it cannot start a new validation attempt. `within` is not a
-substitute for a barrier, because it does not prove that the prerequisite work
-finished.
+bound, so it cannot start a new validation attempt.
 
 An observation must not become the requirement for reads of other objects. Its
 watermark describes one state of one object. A structural gate acquisition

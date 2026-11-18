@@ -150,6 +150,8 @@ struct Execution {
     runs: usize,
     run_cooldown: Duration,
     drain_timeout: Duration,
+    /// The model time that a worker spends after each transaction.
+    transaction_cpu: Duration,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -170,6 +172,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         runs: cli.runs,
         run_cooldown: cli.run_cooldown,
         drain_timeout: cli.drain_timeout,
+        transaction_cpu: cli.time.transaction_cpu(),
     };
     let chains = parallel::chains(&resolved, cli.runs)?;
     // The process of a chain has the same arguments, so it filters its own log.

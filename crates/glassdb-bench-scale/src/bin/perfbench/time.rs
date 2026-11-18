@@ -1,6 +1,7 @@
 //! How the benchmark process advances model time.
 
 use std::error::Error;
+use std::time::Duration;
 
 use clap::ValueEnum;
 use glassdb_concurr::rt;
@@ -19,7 +20,27 @@ pub(crate) enum TimeMode {
     Virtual,
 }
 
+/// The model time that each transaction spends in virtual time, in place of
+/// its CPU work. It is close to the mean CPU time of a transaction of the
+/// `stale-reads` grid with the memory backend: about 0.2 ms, measured as the
+/// wall time of a measurement in virtual time over its transactions. A kind
+/// with more CPU work, such as a scan of a whole collection, takes longer in
+/// real time. It need not be exact,
+/// only not zero, so that a transaction with no backend operation still
+/// advances model time.
+const VIRTUAL_TRANSACTION_CPU: Duration = Duration::from_micros(200);
+
 impl TimeMode {
+    /// Returns the model time that a worker spends after each transaction, in
+    /// place of the CPU work that takes no model time. Real time measures the
+    /// CPU work itself, so it adds none.
+    pub(crate) fn transaction_cpu(self) -> Duration {
+        match self {
+            Self::Real => Duration::ZERO,
+            Self::Virtual => VIRTUAL_TRANSACTION_CPU,
+        }
+    }
+
     /// Returns the name that the result records.
     pub(crate) fn label(self) -> &'static str {
         match self {

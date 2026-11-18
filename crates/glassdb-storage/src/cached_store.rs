@@ -39,16 +39,18 @@ use glassdb_backend::{self as backend, Backend, BackendError};
 use glassdb_concurr::map_all_bounded;
 use glassdb_data::{ObjectPath, PathError};
 
+mod cut;
 mod evidence;
 mod knowledge;
 mod mutation;
 mod path_lane;
 mod persistent_bridge;
 
+pub use cut::{CutSearch, CutTarget};
 use evidence::Evidence;
 pub use evidence::{CasReceipt, CasResult, Observation, ObservationCheck, Revision};
 
-use knowledge::{FetchResult, Knowledge, PresentSeed};
+use knowledge::{EvictionSink, FetchResult, Knowledge, PresentSeed};
 use mutation::{MutationOutcome, MutationRound};
 use path_lane::{FlightOutcome, PathCoordinator, PathState, ReadAdmission};
 use persistent_bridge::PersistentBridge;
@@ -177,18 +179,27 @@ impl CachedStore {
         timeline: Timeline,
         persistent: Option<PersistentCache>,
     ) -> Self {
-        let persistent = PersistentBridge::new(persistent);
+        let coordinator = PathCoordinator::new();
+        let persistent = PersistentBridge::new(persistent, coordinator.clone());
         let metrics = persistent
             .metrics()
             .unwrap_or_else(|| Arc::new(CacheMetrics::new()));
+        let sink = persistent
+            .is_configured()
+            .then(|| Arc::new(persistent.clone()) as Arc<dyn EvictionSink>);
         CachedStore {
             backend,
-            knowledge: Knowledge::new(max_size),
+            knowledge: Knowledge::new(max_size, timeline.clone(), sink),
             timeline,
-            coordinator: PathCoordinator::new(),
+            coordinator,
             metrics,
             persistent,
         }
+    }
+
+    /// Starts a cut search on the timeline of this cache (ADR-097).
+    pub fn cut_search(&self) -> CutSearch {
+        CutSearch::new(self.timeline.clone())
     }
 
     /// Returns cache activity since the previous sample.
@@ -196,8 +207,17 @@ impl CachedStore {
         self.metrics.snapshot_and_reset()
     }
 
-    /// Drains and syncs the persistent cache, when configured.
+    /// Drains and syncs the persistent cache, when configured. Before the
+    /// drain, it queues the newer watermarks of the states that L1 still has.
     pub async fn shutdown(&self) {
+        if self.persistent.is_configured() {
+            let states = self.knowledge.present_states();
+            self.persistent.persist_watermarks(
+                states
+                    .iter()
+                    .map(|(path, revision, evidence)| (path.as_str(), revision, evidence)),
+            );
+        }
         self.persistent.shutdown().await;
     }
 
@@ -563,7 +583,15 @@ impl CachedStore {
             revision.clone(),
             invoked,
         );
-        change.replace(key.encoded().clone(), &revision, bytes, invoked);
+        if change.replace(
+            key.encoded().clone(),
+            &revision,
+            bytes,
+            invoked,
+            fetched.start(),
+        ) {
+            fetched.persisted_at(invoked);
+        }
         Ok(fetched)
     }
 
@@ -744,6 +772,52 @@ impl<C: Codec> TypedCachedStore<C> {
             .into_iter()
             .map(|result| result.expect("every observation is checked"))
             .collect()
+    }
+
+    /// Starts a cut search on the timeline of the shared cache.
+    pub(crate) fn cut_search(&self) -> CutSearch {
+        self.store.cut_search()
+    }
+
+    /// Adds the states of `observations` to a cut search (ADR-097).
+    pub(crate) fn add_to_cut(
+        &self,
+        search: &mut CutSearch,
+        observations: &[Observation<C::Value>],
+    ) -> Result<(), StorageError> {
+        for observation in observations {
+            Self::check_path(&observation.key)?;
+        }
+        search.add(observations);
+        Ok(())
+    }
+
+    /// Checks the states of `observations` that do not reach `target`, with
+    /// bounded parallel work. Reports whether every state is still current,
+    /// so that `target` is a cut point for them.
+    pub(crate) async fn refresh_for_cut(
+        &self,
+        observations: &[Observation<C::Value>],
+        target: &CutTarget,
+        parallelism: NonZeroUsize,
+    ) -> Result<bool, StorageError>
+    where
+        C::Value: Clone,
+    {
+        let lagging = observations
+            .iter()
+            .filter(|observation| !target.is_reached_by(observation))
+            .cloned()
+            .collect::<Vec<_>>();
+        let checks = self
+            .check_many_current(&lagging, Requirement::after(target.barrier()), parallelism)
+            .await;
+        for check in checks {
+            if !matches!(check?, ObservationCheck::Current) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Creates a decoded object if it is absent.
@@ -999,6 +1073,15 @@ mod tests {
         directory: &TempDir,
         backend: Arc<dyn Backend>,
     ) -> (CachedStore, Timeline) {
+        let (store, timeline, _) = persistent_store_sized(directory, backend, 1 << 20).await;
+        (store, timeline)
+    }
+
+    async fn persistent_store_sized(
+        directory: &TempDir,
+        backend: Arc<dyn Backend>,
+        max_size: usize,
+    ) -> (CachedStore, Timeline, PersistentCache) {
         let opened = PersistentCache::open_with_test_geometry(
             PersistentCacheConfig {
                 directory: directory.path().to_path_buf(),
@@ -1011,8 +1094,9 @@ mod tests {
         )
         .await;
         let timeline = Timeline::starting_after(opened.last_sequence_point);
-        let store = CachedStore::new(backend, 1 << 20, timeline.clone(), Some(opened.cache));
-        (store, timeline)
+        let cache = opened.cache.clone();
+        let store = CachedStore::new(backend, max_size, timeline.clone(), Some(opened.cache));
+        (store, timeline, cache)
     }
 
     async fn simulated_persistent_store(
@@ -1132,6 +1216,7 @@ mod tests {
                     vec![0xff],
                     b"untrusted".to_vec(),
                     SequencePoint::from_raw(1),
+                    None,
                     change,
                 );
 
@@ -3819,6 +3904,170 @@ mod tests {
 
         drop(typed);
         reopened.shutdown().await;
+    }
+
+    #[test]
+    fn eviction_reports_each_evicted_present_state() {
+        struct Recorder(Mutex<Vec<(String, SequencePoint)>>);
+        impl EvictionSink for Recorder {
+            fn evicted(&self, path: &str, _: &Revision, evidence: &Evidence) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((path.to_owned(), evidence.get()));
+            }
+        }
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        // A zero budget evicts each state as soon as it is installed.
+        let knowledge = Knowledge::new(0, Timeline::new(), Some(recorder.clone()));
+        let revision = Revision::from_backend(backend::Revision::new("r1".to_owned()));
+        let point = SequencePoint::from_raw;
+
+        knowledge.install_fetched::<Bytes>("fetched", v(b"a"), 1, revision.clone(), point(3));
+        knowledge.install_persistent::<Bytes>("loaded", v(b"a"), 1, revision, point(5), None);
+        knowledge.install_absent_result("gone", point(7));
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            vec![
+                ("fetched".to_owned(), point(3)),
+                ("loaded".to_owned(), point(5))
+            ]
+        );
+    }
+
+    #[test]
+    fn only_watermarks_newer_than_the_persistent_copy_are_unpersisted() {
+        let knowledge = Knowledge::new(1 << 20, Timeline::new(), None);
+        let revision = Revision::from_backend(backend::Revision::new("r1".to_owned()));
+        let point = SequencePoint::from_raw;
+        let advanced = knowledge.install_persistent::<Bytes>(
+            "advanced",
+            v(b"a"),
+            1,
+            revision.clone(),
+            point(5),
+            None,
+        );
+        knowledge.install_persistent::<Bytes>("same", v(b"a"), 1, revision.clone(), point(5), None);
+        // The persistent cache has no copy of a fetched state until its
+        // publication.
+        knowledge.install_fetched::<Bytes>("fetched", v(b"a"), 1, revision.clone(), point(7));
+        knowledge.confirm_unchanged("advanced", advanced, point(9));
+
+        let unpersisted: BTreeMap<_, _> = knowledge
+            .present_states()
+            .into_iter()
+            .map(|(path, _, evidence)| (path, evidence))
+            .collect();
+        assert_eq!(
+            unpersisted["advanced"].unpersisted_watermark(),
+            Some(point(9))
+        );
+        assert_eq!(unpersisted["same"].unpersisted_watermark(), None);
+        assert_eq!(unpersisted["fetched"].unpersisted_watermark(), None);
+        // A queued write of the newer watermark brings the copy up to date.
+        unpersisted["advanced"].persisted_at(point(9));
+        assert_eq!(unpersisted["advanced"].unpersisted_watermark(), None);
+    }
+
+    async fn recorded_backend_with_p() -> (Arc<dyn Backend>, OpLog) {
+        let backend = Arc::new(MemoryBackend::new());
+        backend
+            .write_if_not_exists("p", b"one".to_vec())
+            .await
+            .unwrap();
+        let recorded = Arc::new(RecordingBackend::new(backend));
+        let log = recorded.log();
+        (recorded, log)
+    }
+
+    #[tokio::test]
+    async fn an_absence_never_joins_a_cut() {
+        let typed = bytes_store(Arc::new(MemoryBackend::new()));
+        typed
+            .store
+            .backend
+            .write_if_not_exists("present", b"v".to_vec())
+            .await
+            .unwrap();
+        let present = typed.read("present", Requirement::ANY).await.unwrap();
+        let absent = typed.read("absent", Requirement::ANY).await.unwrap();
+        assert!(absent.is_absent());
+        let floor = crate::timeline::MonotonicFloor::new();
+
+        let mut search = typed.cut_search();
+        typed
+            .add_to_cut(&mut search, std::slice::from_ref(&present))
+            .unwrap();
+        assert!(
+            search
+                .plan(crate::timeline::StalenessCutoff::ANY, &floor)
+                .is_some()
+        );
+        typed.add_to_cut(&mut search, &[absent]).unwrap();
+        assert!(
+            search
+                .plan(crate::timeline::StalenessCutoff::ANY, &floor)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_persists_a_newer_watermark() {
+        let directory = TempDir::new().unwrap();
+        let (erased, log) = recorded_backend_with_p().await;
+
+        let (first, timeline) = persistent_store(&directory, erased.clone()).await;
+        let typed: TypedCachedStore<Bytes> = first.typed();
+        let loaded = typed
+            .read("p", Requirement::ANY)
+            .await
+            .unwrap()
+            .current_after();
+        let bound = timeline.currentness_barrier();
+        let checked = typed.read("p", Requirement::after(bound)).await.unwrap();
+        assert!(checked.current_after() > loaded);
+        let watermark = checked.current_after();
+        drop(typed);
+        first.shutdown().await;
+        drop(first);
+        clear(&log);
+
+        let (reopened, _) = persistent_store(&directory, erased).await;
+        let typed: TypedCachedStore<Bytes> = reopened.typed();
+        let restored = typed.read("p", Requirement::ANY).await.unwrap();
+        assert_eq!(restored.current_after(), watermark);
+        assert!(log.lock().unwrap().is_empty());
+        drop(typed);
+        reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn eviction_persists_a_newer_watermark() {
+        let directory = TempDir::new().unwrap();
+        let (erased, log) = recorded_backend_with_p().await;
+
+        // An L1 too small to keep the state.
+        let (store, timeline, cache) = persistent_store_sized(&directory, erased, 1).await;
+        let typed: TypedCachedStore<Bytes> = store.typed();
+        let loaded = typed
+            .read("p", Requirement::ANY)
+            .await
+            .unwrap()
+            .current_after();
+        // L2 serves the path after the worker publishes it.
+        assert!(cache.lookup(Arc::from("p")).await.is_some());
+        let bound = timeline.currentness_barrier();
+        let checked = typed.read("p", Requirement::after(bound)).await.unwrap();
+        assert!(checked.current_after() > loaded);
+        assert_eq!(count(&log, "read_if_modified"), 1);
+        clear(&log);
+
+        let restored = typed.read("p", Requirement::ANY).await.unwrap();
+        assert_eq!(restored.current_after(), checked.current_after());
+        assert!(log.lock().unwrap().is_empty());
+        drop(typed);
+        store.shutdown().await;
     }
 
     #[tokio::test]

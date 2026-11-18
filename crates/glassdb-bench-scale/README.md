@@ -141,7 +141,12 @@ runs of the same revision give nearly the same result: the engine randomizes
 the cadence of its background tasks, so a window that holds a pass of the
 garbage collector can count one listing more or less, and records with a
 timestamp can change their size by a byte with the start time of the process.
-This moves the latency of large writes by under 1%. It needs `--backend=memory`:
+This moves the latency of large writes by under 1%. CPU work takes no model
+time, so after each transaction a worker waits a fixed 0.2 ms of model time in
+its place. That is close to the mean CPU time of a transaction of the
+`stale-reads` grid with the memory backend, not the CPU time of each kind, and
+it is in the measured latency. A transaction with no backend
+operation then still advances model time. It needs `--backend=memory`:
 a paused clock also jumps while a task waits for the operating system, as for
 the socket of `fakes3`. Latencies are lower than in real time, where CPU work
 takes model time and each wait can end up to a millisecond late, so a
@@ -151,8 +156,8 @@ effects and the results repeat. Use it also for fast checks and for a first look
 at the shape of a sweep. These effects make it unfit for the canonical plots and
 for the absolute value of a metric:
 
-- CPU and allocation costs take no model time, so a run shows no saturation of
-  the host.
+- CPU and allocation costs take no model time, apart from the fixed wait after
+  each transaction, so a run shows no saturation of the host.
 - The watchdogs use virtual time, so only a wall-time limit on the process
   stops a CPU livelock.
 
@@ -205,7 +210,7 @@ The built-in kinds:
 | Kind | Parameters | Transaction |
 | --- | --- | --- |
 | `read-modify-write` | `keys`, `value-bytes`, `collections`, `open-in-body` | Reads `keys` keys and writes each of them. With `collections` > 1, it uses the same keys in that many collections of the pool, from the home collection on. With `open-in-body`, the body first opens each of its collections by name, so the transaction also reads the directory of the root collection. |
-| `read` | `keys` | Serializable read of `keys` keys. |
+| `read` | `keys`, `staleness` | Serializable read of `keys` keys. With `staleness`, it runs a stale read-only transaction (`Database::read_tx`) with that bound. |
 | `write` | `value-bytes` | Writes one key without a read. A single-key write commits direct. |
 | `scan` | `span` | Scans `span` keys from the selected key. `span = "all"` scans the whole collection. |
 | `create-delete` | `value-bytes`, `locked` | Creates the selected key, and deletes it in the next transaction of the worker. With `locked = true`, the transaction first scans the whole collection, so it cannot commit direct and takes the membership lock. |

@@ -241,13 +241,10 @@ impl Engine {
         Self::ensure_tree_root(backend, &root_path).await
     }
 
-    /// Reads one logical key with the requested staleness allowance.
-    pub async fn read(
-        &self,
-        key: &LogicalKey,
-        max_stale: Duration,
-    ) -> Result<ReadOutcome, StorageError> {
-        self.reader.read(key, max_stale).await
+    /// Reads one logical key from any usable cached state, for a transaction
+    /// body that validates the read later.
+    pub async fn read(&self, key: &LogicalKey) -> Result<ReadOutcome, StorageError> {
+        self.reader.read(key).await
     }
 
     /// Scans one logical key range and returns its validation evidence.
@@ -278,6 +275,12 @@ impl Engine {
         catalog_accesses: CatalogAccesses,
     ) -> EngineTransaction {
         EngineTransaction(self.algo.begin(accesses, catalog_accesses))
+    }
+
+    /// Starts a stale read-only transaction that accepts a cut point no older
+    /// than `max_staleness` before this call (ADR-097).
+    pub fn begin_stale_transaction(&self, max_staleness: Duration) -> EngineTransaction {
+        EngineTransaction(self.algo.begin_stale(max_staleness))
     }
 
     /// Replaces the logical accesses of an uncommitted transaction.
@@ -409,7 +412,7 @@ impl AssemblyFoundation {
         let dyn_backend: Arc<dyn Backend> = backend.clone();
         let objects =
             CachedStore::new(dyn_backend, config.cache_size, timeline.clone(), persistent);
-        let records = CollectionStore::new(objects.clone());
+        let records = CollectionStore::new(objects.clone(), config.transaction_leaf_parallelism);
         let nodes = NodeStore::new(objects.clone(), config.transaction_leaf_parallelism);
         let structural_intents = StructuralIntentStore::new(objects.clone());
         let tx_records = TxRecordStore::new(objects.clone(), db_prefix);
@@ -611,7 +614,7 @@ impl DormantEngine {
             transaction_leaf_parallelism,
         );
         let collection_lifecycle = CollectionLifecycle::new(
-            records,
+            records.clone(),
             nodes.clone(),
             monitor.clone(),
             retry.contention,
@@ -653,6 +656,7 @@ impl DormantEngine {
             inline_policy,
             restructurer.hint_sink(),
             restructurer.landed_splits(),
+            records,
         );
         let engine = Engine {
             backend,

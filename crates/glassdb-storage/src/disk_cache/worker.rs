@@ -162,6 +162,18 @@ impl CacheInner {
         }
     }
 
+    /// Queues work that holds no reservation. Returns whether it was queued;
+    /// a full queue drops it.
+    pub(super) fn enqueue_unreserved(&self, work: Work) -> bool {
+        let _gate = self.enqueue_gate.lock().unwrap();
+        if self.shared.shutdown_requested.load(Ordering::Acquire)
+            || !self.shared.enabled.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.sender.try_send(work).is_ok()
+    }
+
     pub(super) fn enqueue_optional(
         &self,
         build_work: impl FnOnce(OptionalReservation) -> Work,
@@ -333,6 +345,7 @@ pub(super) enum Work {
         revision: Vec<u8>,
         body: Vec<u8>,
         current_after: SequencePoint,
+        start: Option<SequencePoint>,
         // Drop ends the path change only after publication finishes.
         change: PendingChange,
         payload: PayloadReservation,
@@ -348,7 +361,27 @@ pub(super) enum Work {
         optional: OptionalReservation,
         promotion: PromotionReservation,
     },
+    Advance {
+        path: Arc<str>,
+        owner: Arc<dyn PathChangeOwner>,
+        latest: u64,
+        revision: Vec<u8>,
+        current_after: SequencePoint,
+        optional: OptionalReservation,
+    },
+    /// The advances of a clean shutdown, as one item so that they do not
+    /// compete for optional reservations.
+    AdvanceBatch(Vec<WatermarkAdvance>),
     Shutdown,
+}
+
+/// One newer watermark for the persistent copy of one state.
+pub(crate) struct WatermarkAdvance {
+    pub(crate) path: Arc<str>,
+    pub(crate) owner: Arc<dyn PathChangeOwner>,
+    pub(crate) latest: u64,
+    pub(crate) revision: Vec<u8>,
+    pub(crate) current_after: SequencePoint,
 }
 
 async fn lookup(shared: &Shared, path: &str) -> Option<EncodedBody> {
@@ -362,6 +395,7 @@ async fn lookup(shared: &Shared, path: &str) -> Option<EncodedBody> {
                 revision: record.revision,
                 body: record.body,
                 current_after: record.current_after,
+                start: record.start,
             })
         }
         Ok(None) => {
@@ -423,6 +457,7 @@ async fn handle_work(shared: &Shared, writer: &mut WriterState, work: Work) -> C
             revision,
             body,
             current_after,
+            start,
             change,
             payload,
         } => {
@@ -433,6 +468,7 @@ async fn handle_work(shared: &Shared, writer: &mut WriterState, work: Work) -> C
                 revision,
                 body,
                 current_after,
+                start,
                 change,
                 payload,
             )
@@ -445,6 +481,52 @@ async fn handle_work(shared: &Shared, writer: &mut WriterState, work: Work) -> C
             optional,
             promotion,
         } => handle_promote(shared, writer, owner, latest, optional, promotion).await,
+        Work::Advance {
+            path,
+            owner,
+            latest,
+            revision,
+            current_after,
+            optional,
+        } => {
+            // Queue pressure excludes work once its handler starts running.
+            drop(optional);
+            let result = if shared.enabled.load(Ordering::Acquire) {
+                advance(
+                    shared,
+                    writer,
+                    &path,
+                    owner.path_changes(),
+                    latest,
+                    &revision,
+                    current_after,
+                )
+                .await
+            } else {
+                Ok(())
+            };
+            disable_after_work_error(shared, &result);
+            ControlFlow::Continue(())
+        }
+        Work::AdvanceBatch(advances) => {
+            for item in advances {
+                if !shared.enabled.load(Ordering::Acquire) {
+                    break;
+                }
+                let result = advance(
+                    shared,
+                    writer,
+                    &item.path,
+                    item.owner.path_changes(),
+                    item.latest,
+                    &item.revision,
+                    item.current_after,
+                )
+                .await;
+                disable_after_work_error(shared, &result);
+            }
+            ControlFlow::Continue(())
+        }
         Work::Shutdown => handle_shutdown(shared, writer).await,
     }
 }
@@ -469,13 +551,16 @@ async fn handle_replace(
     revision: Vec<u8>,
     body: Vec<u8>,
     current_after: SequencePoint,
+    start: Option<SequencePoint>,
     change: PendingChange,
     payload: PayloadReservation,
 ) -> ControlFlow<()> {
     // Payload pressure bounds queued bytes, not the worker's active append.
     drop(payload);
     let result = if shared.enabled.load(Ordering::Acquire) && change.is_latest() {
-        let result = writer.append(&path, &revision, &body, current_after).await;
+        let result = writer
+            .append(&path, &revision, &body, current_after, start)
+            .await;
         if let Ok(slot) = result {
             let earned = slot.record_bytes / PROMOTION_EARN_DIVISOR;
             let cap = writer.disk.format.maximum_record_bytes() / PROMOTION_CAP_DIVISOR;
@@ -621,10 +706,40 @@ async fn promote(
         return Ok(());
     }
     let promoted = writer
-        .append(path, &record.revision, &record.body, record.current_after)
+        .append(
+            path,
+            &record.revision,
+            &record.body,
+            record.current_after,
+            record.start,
+        )
         .await?;
     writer.promotion_tokens -= promoted.record_bytes;
     Ok(())
+}
+
+/// Writes a newer watermark into the slot of the current record of `path`,
+/// when that record holds `revision` and no path change started since the
+/// work was queued.
+async fn advance(
+    shared: &Shared,
+    writer: &mut WriterState,
+    path: &str,
+    path_changes: &PathChanges,
+    latest: u64,
+    revision: &[u8],
+    current_after: SequencePoint,
+) -> io::Result<()> {
+    if path_changes.snapshot() != (latest, false) {
+        return Ok(());
+    }
+    let Some(location) = shared.disk.locate(path, revision).await? else {
+        return Ok(());
+    };
+    if path_changes.snapshot() != (latest, false) {
+        return Ok(());
+    }
+    writer.advance(path, location, current_after).await
 }
 
 #[cfg(test)]
@@ -748,6 +863,7 @@ mod tests {
             revision: b"r1".to_vec(),
             body: b"body".to_vec(),
             current_after: point(1),
+            start: None,
             change,
             payload,
         });
@@ -788,6 +904,7 @@ mod tests {
                     revision: b"r1".to_vec(),
                     body: b"body".to_vec(),
                     current_after: point(1),
+                    start: None,
                     change,
                     payload,
                 },
@@ -874,6 +991,7 @@ mod tests {
                 revision: b"r1".to_vec(),
                 body: b"body".to_vec(),
                 current_after: point(1),
+                start: None,
                 change,
                 payload,
             },
@@ -938,6 +1056,7 @@ mod tests {
             revision: b"r1".to_vec(),
             body: b"body".to_vec(),
             current_after: point(1),
+            start: None,
             change: active_change,
             payload: active_payload,
         });
@@ -964,6 +1083,7 @@ mod tests {
             revision: b"r2".to_vec(),
             body: b"queued".to_vec(),
             current_after: point(2),
+            start: None,
             change: replace_change,
             payload: replace_payload,
         });

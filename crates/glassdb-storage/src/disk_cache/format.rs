@@ -7,10 +7,13 @@ use sha2::{Digest, Sha256};
 
 use crate::timeline::SequencePoint;
 
-use super::disk::{Record, Slot};
+use super::disk::{Record, RecordPrefix, Slot};
 
-const SLOT_BYTES: u64 = 40;
-const RECORD_HEADER_BYTES: u64 = 48;
+const SLOT_BYTES: u64 = 56;
+// The slot fields before its integrity check.
+const SLOT_FIELD_BYTES: usize = 48;
+const RECORD_DIGEST: std::ops::Range<usize> = 24..56;
+const RECORD_HEADER_BYTES: u64 = 56;
 const RECORD_ALIGNMENT: u64 = 8;
 
 #[derive(Clone, Copy)]
@@ -27,37 +30,40 @@ pub(super) struct CacheGeometry {
     marker_domain: &'static [u8],
     path_domain: &'static [u8],
     record_domain: &'static [u8],
+    slot_domain: &'static [u8],
 }
 
 pub(super) const PRODUCTION_GEOMETRY: CacheGeometry = CacheGeometry {
     magic: *b"GLDBL2\0\0",
-    format_version: 1,
+    format_version: 3,
     block_bytes: 4 * 1024,
     minimum_record_bytes: 4 * 1024,
     segment_bytes: 64 * 1024 * 1024,
     index_divisor: 64,
     minimum_segments: 2,
-    identity_domain: b"glassdb-l2-identity-v1",
-    header_domain: b"glassdb-l2-header-v1",
-    marker_domain: b"glassdb-l2-clean-tail-v1",
-    path_domain: b"glassdb-l2-path-v1",
-    record_domain: b"glassdb-l2-record-v1",
+    identity_domain: b"glassdb-l2-identity-v3",
+    header_domain: b"glassdb-l2-header-v3",
+    marker_domain: b"glassdb-l2-clean-tail-v3",
+    path_domain: b"glassdb-l2-path-v3",
+    record_domain: b"glassdb-l2-record-v3",
+    slot_domain: b"glassdb-l2-slot-v3",
 };
 
 #[cfg(any(test, feature = "sim"))]
 pub(super) const COMPACT_GEOMETRY: CacheGeometry = CacheGeometry {
     magic: *b"GL2TEST\0",
-    format_version: 1,
+    format_version: 3,
     block_bytes: 4 * 1024,
     minimum_record_bytes: 4 * 1024,
     segment_bytes: 256 * 1024,
     index_divisor: 64,
     minimum_segments: 2,
-    identity_domain: b"glassdb-l2-identity-test-v1",
-    header_domain: b"glassdb-l2-header-test-v1",
-    marker_domain: b"glassdb-l2-clean-tail-test-v1",
-    path_domain: b"glassdb-l2-path-test-v1",
-    record_domain: b"glassdb-l2-record-test-v1",
+    identity_domain: b"glassdb-l2-identity-test-v3",
+    header_domain: b"glassdb-l2-header-test-v3",
+    marker_domain: b"glassdb-l2-clean-tail-test-v3",
+    path_domain: b"glassdb-l2-path-test-v3",
+    record_domain: b"glassdb-l2-record-test-v3",
+    slot_domain: b"glassdb-l2-slot-test-v3",
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -289,6 +295,7 @@ impl CacheFormat {
         revision: &[u8],
         body: &[u8],
         current_after: SequencePoint,
+        start: Option<SequencePoint>,
     ) -> io::Result<Vec<u8>> {
         let record_bytes = self
             .record_bytes(revision.len(), body.len())
@@ -297,8 +304,9 @@ impl CacheFormat {
         record[0..4].copy_from_slice(&(revision.len() as u32).to_le_bytes());
         record[4..8].copy_from_slice(&(body.len() as u32).to_le_bytes());
         record[8..16].copy_from_slice(&current_after.raw().to_le_bytes());
-        let digest = self.record_digest(path, &record[..16], revision, body)?;
-        record[16..48].copy_from_slice(&digest);
+        record[16..24].copy_from_slice(&encode_start(start).to_le_bytes());
+        let digest = self.record_digest(path, &record[..24], revision, body)?;
+        record[RECORD_DIGEST].copy_from_slice(&digest);
         let revision_end = RECORD_HEADER_BYTES as usize + revision.len();
         record[RECORD_HEADER_BYTES as usize..revision_end].copy_from_slice(revision);
         record[revision_end..revision_end + body.len()].copy_from_slice(body);
@@ -313,6 +321,7 @@ impl CacheFormat {
         let body_bytes = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
         let current_after =
             SequencePoint::from_raw(u64::from_le_bytes(bytes[8..16].try_into().unwrap()));
+        let start = decode_start(u64::from_le_bytes(bytes[16..24].try_into().unwrap()));
         let expected_record_bytes = self
             .record_bytes(revision_bytes, body_bytes)
             .ok_or_else(Self::invalid_record)?;
@@ -327,24 +336,23 @@ impl CacheFormat {
         let revision_end = RECORD_HEADER_BYTES as usize + revision_bytes;
         let revision = &bytes[RECORD_HEADER_BYTES as usize..revision_end];
         let body = &bytes[revision_end..content_end];
-        let expected_digest = self.record_digest(path, &bytes[..16], revision, body)?;
-        if bytes[16..48] != expected_digest {
+        let expected_digest = self.record_digest(path, &bytes[..24], revision, body)?;
+        if bytes[RECORD_DIGEST] != expected_digest {
             return Err(Self::invalid_record());
         }
         Ok(Record {
             revision: revision.to_vec(),
             body: body.to_vec(),
             current_after,
+            start,
+            digest: expected_digest,
         })
     }
 
     pub(super) fn encode_slot(&self, slot: Slot) -> [u8; SLOT_BYTES as usize] {
         let mut bytes = [0; SLOT_BYTES as usize];
-        bytes[0..8].copy_from_slice(&slot.fingerprint.to_le_bytes());
-        bytes[8..16].copy_from_slice(&slot.generation.to_le_bytes());
-        bytes[16..24].copy_from_slice(&slot.record_offset.to_le_bytes());
-        bytes[24..32].copy_from_slice(&slot.record_bytes.to_le_bytes());
-        bytes[32..40].copy_from_slice(&slot.current_after.raw().to_le_bytes());
+        bytes[..SLOT_FIELD_BYTES].copy_from_slice(&Self::encode_slot_fields(slot));
+        bytes[SLOT_FIELD_BYTES..].copy_from_slice(&slot.check.to_le_bytes());
         bytes
     }
 
@@ -357,7 +365,51 @@ impl CacheFormat {
             current_after: SequencePoint::from_raw(u64::from_le_bytes(
                 bytes[32..40].try_into().unwrap(),
             )),
+            start: decode_start(u64::from_le_bytes(bytes[40..48].try_into().unwrap())),
+            check: u64::from_le_bytes(bytes[48..56].try_into().unwrap()),
         }
+    }
+
+    /// Returns `slot` with the integrity check that binds its fields to the
+    /// path and to the digest of the record it points to.
+    pub(super) fn seal_slot(&self, path: &str, mut slot: Slot, record_digest: &[u8]) -> Slot {
+        slot.check = self.slot_check(path, slot, record_digest);
+        slot
+    }
+
+    /// Reports whether the slot fields are intact for `path` and the record
+    /// with `record_digest`.
+    pub(super) fn slot_is_sealed(&self, path: &str, slot: Slot, record_digest: &[u8]) -> bool {
+        slot.check == self.slot_check(path, slot, record_digest)
+    }
+
+    /// Returns the record digest stored in an encoded record header.
+    pub(super) fn stored_record_digest(header: &[u8]) -> Option<&[u8]> {
+        header.get(RECORD_DIGEST)
+    }
+
+    /// Decodes the fixed header and the revision at the start of a record,
+    /// without the body. The record digest is not verified.
+    pub(super) fn decode_record_prefix<'a>(&self, bytes: &'a [u8]) -> Option<RecordPrefix<'a>> {
+        let header = bytes.get(..RECORD_HEADER_BYTES as usize)?;
+        let revision_bytes = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+        let body_bytes = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let record_bytes = self.record_bytes(revision_bytes, body_bytes)?;
+        let revision_end = (RECORD_HEADER_BYTES as usize).checked_add(revision_bytes)?;
+        Some(RecordPrefix {
+            record_bytes,
+            current_after: SequencePoint::from_raw(u64::from_le_bytes(
+                header[8..16].try_into().unwrap(),
+            )),
+            start: decode_start(u64::from_le_bytes(header[16..24].try_into().unwrap())),
+            digest: &header[RECORD_DIGEST],
+            revision: bytes.get(RECORD_HEADER_BYTES as usize..revision_end)?,
+        })
+    }
+
+    /// The bytes that hold a record header and a revision of `revision_bytes`.
+    pub(super) fn record_prefix_bytes(revision_bytes: usize) -> usize {
+        RECORD_HEADER_BYTES as usize + revision_bytes
     }
 
     pub(super) fn overflow() -> io::Error {
@@ -429,6 +481,31 @@ impl CacheFormat {
         Ok(digest.finalize().into())
     }
 
+    fn encode_slot_fields(slot: Slot) -> [u8; SLOT_FIELD_BYTES] {
+        let mut bytes = [0; SLOT_FIELD_BYTES];
+        bytes[0..8].copy_from_slice(&slot.fingerprint.to_le_bytes());
+        bytes[8..16].copy_from_slice(&slot.generation.to_le_bytes());
+        bytes[16..24].copy_from_slice(&slot.record_offset.to_le_bytes());
+        bytes[24..32].copy_from_slice(&slot.record_bytes.to_le_bytes());
+        bytes[32..40].copy_from_slice(&slot.current_after.raw().to_le_bytes());
+        bytes[40..48].copy_from_slice(&encode_start(slot.start).to_le_bytes());
+        bytes
+    }
+
+    // A truncated keyed digest is enough: the check detects torn or corrupt
+    // slots, and the record digest still authenticates the record contents.
+    fn slot_check(&self, path: &str, slot: Slot, record_digest: &[u8]) -> u64 {
+        let mut digest = Sha256::new();
+        digest.update(self.geometry.slot_domain);
+        digest.update(self.identity);
+        digest.update((path.len() as u32).to_le_bytes());
+        digest.update(path.as_bytes());
+        digest.update(Self::encode_slot_fields(slot));
+        digest.update(record_digest);
+        let digest = digest.finalize();
+        u64::from_le_bytes(digest[..8].try_into().unwrap())
+    }
+
     fn align_up(value: u64, alignment: u64) -> Option<u64> {
         value
             .checked_add(alignment.checked_sub(1)?)
@@ -438,6 +515,16 @@ impl CacheFormat {
     fn floor_to(value: u64, alignment: u64) -> u64 {
         value / alignment * alignment
     }
+}
+
+// The timeline never allocates point 0, so 0 can stand for a state whose start
+// this open did not observe.
+fn encode_start(start: Option<SequencePoint>) -> u64 {
+    start.map_or(0, SequencePoint::raw)
+}
+
+fn decode_start(raw: u64) -> Option<SequencePoint> {
+    (raw != 0).then(|| SequencePoint::from_raw(raw))
 }
 
 #[cfg(test)]
@@ -467,6 +554,6 @@ mod tests {
     fn record_size_is_charged_and_aligned() {
         let format = CacheFormat::new(COMPACT_GEOMETRY, 2 * 1024 * 1024, "db", id(1)).unwrap();
         assert_eq!(format.record_bytes(2, 4), Some(4096));
-        assert_eq!(format.record_bytes(2, 4097), Some(4152));
+        assert_eq!(format.record_bytes(2, 4097), Some(4160));
     }
 }

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
@@ -92,10 +93,20 @@ impl<'a> Arbitrary<'a> for CycleWorkload {
 
 /// Reads node `idx`'s next-pointer within `tx`.
 async fn read_next(tx: &crate::Transaction, coll: &Collection, idx: usize) -> Result<usize, Error> {
-    let value = tx
-        .read(coll, &key_name(idx))
-        .await?
-        .ok_or(Error::NotFound)?;
+    decode_next(idx, tx.read(coll, &key_name(idx)).await?)
+}
+
+/// Reads node `idx`'s next-pointer in a stale read-only transaction.
+async fn read_next_stale(
+    tx: &crate::ReadTransaction,
+    coll: &Collection,
+    idx: usize,
+) -> Result<usize, Error> {
+    decode_next(idx, tx.read(coll, &key_name(idx)).await?)
+}
+
+fn decode_next(idx: usize, value: Option<Vec<u8>>) -> Result<usize, Error> {
+    let value = value.ok_or(Error::NotFound)?;
     try_read_int(&value)
         .and_then(|next| usize::try_from(next).ok())
         .ok_or_else(|| {
@@ -173,6 +184,20 @@ async fn read_ring_snapshot(
 ) -> Result<Vec<usize>, Error> {
     db.tx(|tx| async move {
         futures::future::try_join_all((0..node_count).map(|k| read_next(&tx, coll, k))).await
+    })
+    .await
+}
+
+/// Snapshots the ring in a stale read-only transaction (ADR-097). Its cut
+/// point is a committed state too, so the snapshot must also be a valid ring.
+async fn read_tx_ring_snapshot(
+    db: &Database,
+    coll: &Collection,
+    node_count: usize,
+    max_staleness: Duration,
+) -> Result<Vec<usize>, Error> {
+    db.read_tx(max_staleness, |tx| async move {
+        futures::future::try_join_all((0..node_count).map(|k| read_next_stale(&tx, coll, k))).await
     })
     .await
 }
@@ -273,10 +298,17 @@ impl SimWorkload for CycleWorkload {
                 .open_collection(&CollectionPath::new(CYCLE_COLLECTION).unwrap())
                 .await
                 .expect("open cycle observer collection");
-            for _ in 0..snapshot_reads {
+            for read in 0..snapshot_reads {
                 rt::yield_now().await;
                 state.fetch_add(1, Ordering::SeqCst);
-                match read_ring_snapshot(&db, &coll, node_count).await {
+                // Alternate fresh snapshots with stale ones that accept any
+                // cached cut point or that must check every state.
+                let snapshot = match read % 3 {
+                    0 => read_ring_snapshot(&db, &coll, node_count).await,
+                    1 => read_tx_ring_snapshot(&db, &coll, node_count, Duration::MAX).await,
+                    _ => read_tx_ring_snapshot(&db, &coll, node_count, Duration::ZERO).await,
+                };
+                match snapshot {
                     Ok(snap) => assert_ring(&snap),
                     Err(error) => panic!("cycle observer read failed: {error}"),
                 }

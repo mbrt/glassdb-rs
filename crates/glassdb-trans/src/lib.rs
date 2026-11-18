@@ -27,8 +27,8 @@ pub use access::{
 pub use algo::{BodyDecision, DirectCommitStats, LOCKED_READS_AFTER};
 pub use collection_commit::{CollectionReservationLimitExceeded, CollectionReservations};
 pub use collections::{
-    CatalogAccesses, CollectionChange, CollectionOp, DirectoryRead, DirectoryReadKind,
-    DirectorySnapshot,
+    CatalogAccesses, CollectionChange, CollectionOp, DirectoryEvidence, DirectoryRead,
+    DirectoryReadKind, DirectorySnapshot,
 };
 pub use engine::{Engine, EngineConfig, EngineDiagnostics, EngineStats, EngineTransaction};
 pub use error::TransError;

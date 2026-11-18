@@ -6,9 +6,9 @@ use std::time::Duration;
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
 
-use super::knowledge::{Knowledge, PresentSeed};
-use super::path_lane::PathState;
-use super::{Codec, ObjectKey, Revision};
+use super::knowledge::{EvictionSink, Knowledge, PresentSeed};
+use super::path_lane::{PathCoordinator, PathState};
+use super::{Codec, Evidence, ObjectKey, Revision};
 use crate::cache_stats::CacheMetrics;
 use crate::disk_cache::{
     EncodedBody, PathChangeOwner, PathChanges, PendingChange, PersistentCache,
@@ -27,11 +27,14 @@ pub(super) struct PersistentPath {
 #[derive(Clone)]
 pub(super) struct PersistentBridge {
     cache: Option<PersistentCache>,
+    /// The path lane of the cached store, for the changes that eviction and
+    /// shutdown queue.
+    coordinator: PathCoordinator,
 }
 
 impl PersistentBridge {
-    pub(super) fn new(cache: Option<PersistentCache>) -> Self {
-        Self { cache }
+    pub(super) fn new(cache: Option<PersistentCache>, coordinator: PathCoordinator) -> Self {
+        Self { cache, coordinator }
     }
 
     pub(super) fn metrics(&self) -> Option<Arc<CacheMetrics>> {
@@ -60,6 +63,40 @@ impl PersistentBridge {
             return;
         };
         cache.record_present_hit(path, PathOwner::shared(state));
+    }
+
+    /// Queues the newer watermarks of the present states that L1 still has,
+    /// as one work item, for a clean shutdown. Each state is a path, its
+    /// revision, and its evidence. One work item for all states keeps a large
+    /// L1 from exhausting the reservations for optional work.
+    pub(super) fn persist_watermarks<'a>(
+        &self,
+        states: impl IntoIterator<Item = (&'a str, &'a Revision, &'a Evidence)>,
+    ) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        let mut queued = Vec::new();
+        let mut advances = Vec::new();
+        for (path, revision, evidence) in states {
+            let Some(watermark) = evidence.unpersisted_watermark() else {
+                continue;
+            };
+            let path = Arc::<str>::from(path);
+            let owner: Arc<dyn PathChangeOwner> = PathOwner::shared(&self.coordinator.state(&path));
+            advances.push((
+                path,
+                owner,
+                revision.serialize().as_bytes().to_vec(),
+                watermark,
+            ));
+            queued.push((evidence, watermark));
+        }
+        if cache.advance_watermarks(advances) {
+            for (evidence, watermark) in queued {
+                evidence.persisted_at(watermark);
+            }
+        }
     }
 
     /// Restores and decodes one usable persistent candidate into L1 knowledge.
@@ -130,9 +167,35 @@ impl PersistentBridge {
             size,
             revision,
             encoded.current_after,
+            encoded.start,
         );
         cache.record_present_hit(key.encoded(), owner);
         Some(seed)
+    }
+}
+
+/// A state that leaves L1 keeps its newest watermark in L2 (ADR-097).
+impl EvictionSink for PersistentBridge {
+    /// Queues the watermark of an evicted state for its persistent copy, when
+    /// the watermark is newer than the one that the copy has. The persistent
+    /// cache writes it only if its current record of `path` is this revision.
+    fn evicted(&self, path: &str, revision: &Revision, evidence: &Evidence) {
+        let Some(cache) = &self.cache else {
+            return;
+        };
+        let Some(watermark) = evidence.unpersisted_watermark() else {
+            return;
+        };
+        let path = Arc::<str>::from(path);
+        let state = self.coordinator.state(&path);
+        if cache.advance_watermark(
+            path,
+            PathOwner::shared(&state),
+            revision.serialize().as_bytes().to_vec(),
+            watermark,
+        ) {
+            evidence.persisted_at(watermark);
+        }
     }
 }
 
@@ -167,23 +230,27 @@ pub(super) struct PersistentChange {
 
 impl PersistentChange {
     /// Publishes a backend-read body as the result of this path change.
+    /// Returns whether the body went to the persistent cache.
     pub(super) fn replace(
         mut self,
         path: Arc<str>,
         revision: &Revision,
         body: Vec<u8>,
         current_after: SequencePoint,
-    ) {
+        start: Option<SequencePoint>,
+    ) -> bool {
         let Some(active) = self.active.take() else {
-            return;
+            return false;
         };
         active.cache.replace(
             path,
             revision.serialize().as_bytes().to_vec(),
             body,
             current_after,
+            start,
             active.change,
         );
+        true
     }
 
     /// Clears every persistent candidate for the changed path.

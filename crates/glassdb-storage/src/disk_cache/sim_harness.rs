@@ -43,6 +43,7 @@ struct KnownRecord {
     revision: Vec<u8>,
     body: Vec<u8>,
     sequence_point: u64,
+    start: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,7 +153,9 @@ impl HarnessState {
                     .iter()
                     .any(|((known_identity, _), records)| {
                         *known_identity == self.identity
-                            && records.iter().any(|record| record.sequence_point == point)
+                            && records.iter().any(|record| {
+                                record.sequence_point == point || record.start == Some(point)
+                            })
                     }),
                 "cache recovered a sequence point that was never admitted"
             );
@@ -170,7 +173,10 @@ impl HarnessState {
             && let Some(change) = current.begin_change(Arc::new(PathChanges::default()))
         {
             let sequence_point = self.next_sequence_point;
-            self.next_sequence_point = self.next_sequence_point.saturating_add(1);
+            // An odd pattern models a state observed once: its start comes
+            // after its watermark. An even pattern models an unknown start.
+            let start = (command.pattern & 1 == 1).then(|| sequence_point.saturating_add(1));
+            self.next_sequence_point = start.unwrap_or(sequence_point).saturating_add(1);
             let path = path(command.path);
             let revision = revision(sequence_point, command.pattern);
             let body = body(command.argument, command.pattern);
@@ -181,12 +187,14 @@ impl HarnessState {
                     revision: revision.clone(),
                     body: body.clone(),
                     sequence_point,
+                    start,
                 });
             current.replace(
                 path,
                 revision,
                 body,
                 SequencePoint::from_raw(sequence_point),
+                start.map(SequencePoint::from_raw),
                 change,
             );
         }
@@ -214,10 +222,16 @@ impl HarnessState {
                         known.revision == record.revision
                             && known.body == record.body
                             && known.sequence_point == record.current_after.raw()
+                            && known.start == record.start.map(SequencePoint::raw)
                     })
                 });
             assert!(valid, "cache returned a fabricated or mixed record");
-            digest_record(&record.revision, &record.body, record.current_after.raw())
+            digest_record(
+                &record.revision,
+                &record.body,
+                record.current_after.raw(),
+                record.start.map_or(0, SequencePoint::raw),
+            )
         });
         self.events.push(DiskCacheEvent::Lookup {
             identity: self.identity,
@@ -390,13 +404,14 @@ fn body(argument: u16, pattern: u8) -> Vec<u8> {
         .collect()
 }
 
-fn digest_record(revision: &[u8], body: &[u8], sequence_point: u64) -> [u8; 32] {
+fn digest_record(revision: &[u8], body: &[u8], sequence_point: u64, start: u64) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update((revision.len() as u64).to_le_bytes());
     digest.update(revision);
     digest.update((body.len() as u64).to_le_bytes());
     digest.update(body);
     digest.update(sequence_point.to_le_bytes());
+    digest.update(start.to_le_bytes());
     digest.finalize().into()
 }
 
