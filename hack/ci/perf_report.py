@@ -35,9 +35,9 @@ EXTENDED_TAG = "ci/extended"
 
 # The latency metrics of every shape of every cell.
 LATENCY_METRICS = (
-    ("p50Ms", "model ms/tx", "time"),
-    ("p90Ms", "model ms/tx", "time"),
-    ("txPerSec", "tx/model s", "rate"),
+    ("p50Ms", "ms/tx", "time"),
+    ("p90Ms", "ms/tx", "time"),
+    ("txPerSec", "tx/s", "rate"),
 )
 # The smallest timing change that the report shows. The floor of a metric is
 # also at least the spread of one of its runs: a smaller change is not
@@ -548,7 +548,7 @@ def summarize(directory: Path) -> str:
     lines = [
         f"## Latency (median of {runs} runs, ± the spread of one run)",
         "",
-        "| Case | p50 (model ms) | p90 (model ms) | Throughput (tx/model s) |",
+        "| Case | p50 (ms) | p90 (ms) | Throughput (tx/s) |",
         "| --- | ---: | ---: | ---: |",
     ]
     for case, row in sorted(latency.items()):
