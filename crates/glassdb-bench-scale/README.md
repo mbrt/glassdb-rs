@@ -146,7 +146,10 @@ time, so after each transaction a worker waits a fixed 0.2 ms of model time in
 its place. That is close to the mean CPU time of a transaction of the
 `stale-reads` grid with the memory backend, not the CPU time of each kind, and
 it is in the measured latency. A transaction with no backend
-operation then still advances model time. It needs `--backend=memory`:
+operation then still advances model time. A task that runs in a loop at one
+model instant, such as a livelock, still stops model time. If model time does
+not advance for 60 s of wall time while a cell runs, the run fails with an error
+that names the cell and its shapes. Virtual time needs `--backend=memory`:
 a paused clock also jumps while a task waits for the operating system, as for
 the socket of `fakes3`. Latencies are lower than in real time, where CPU work
 takes model time and each wait can end up to a millisecond late, so a
