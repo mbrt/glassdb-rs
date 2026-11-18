@@ -4,6 +4,9 @@
 
 Accepted — implemented.
 
+[ADR-101](101-hints-wait-while-the-write-budget-limits-gc.md) changes the
+candidate capacities: the hint capacity no longer follows the write budget.
+
 [ADR-079](079-gc-safety-does-not-depend-on-time.md) renames the safety horizon
 to retention period, and sets the rule for barriers that several GC checks
 share.

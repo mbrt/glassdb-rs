@@ -3863,7 +3863,7 @@ fn hint_producers_share_capacity_and_keep_the_latest_reports() {
 
 #[test]
 fn candidate_capacity_is_preserved_across_deferrals_and_completion() {
-    for capacity in [1, 3, MIN_HINT_CAPACITY] {
+    for capacity in [1, 3, 4096] {
         let now = rt::Instant::now();
         let counters = Arc::new(Counters::default());
         let mut candidates = Candidates::new(
@@ -4030,42 +4030,81 @@ fn scan_admission_does_not_advance_a_hint_deadline() {
 }
 
 #[test]
-fn candidate_capacities_follow_the_spend_limit() {
+fn scan_capacity_follows_the_spend_limit() {
     let delay = Duration::from_secs(45);
     let mut candidates = Candidates::new(delay, GcLimits::default(), Arc::default());
-    // A small budget keeps the lower capacities.
-    candidates.set_capacities(10.0, Duration::from_secs(15));
-    assert_eq!(
-        (candidates.hint_capacity, candidates.scan_capacity),
-        (MIN_HINT_CAPACITY, MIN_SCAN_CAPACITY)
-    );
-    // 500 writes in each second check about 22,500 hints in a retention period
-    // and 30,000 scan candidates in a retention period and a progress delay.
-    candidates.set_capacities(500.0, Duration::from_secs(15));
-    assert_eq!(
-        (candidates.hint_capacity, candidates.scan_capacity),
-        (22_500, 30_000)
-    );
-    // The limits cap a large budget.
-    candidates.set_capacities(1e9, Duration::from_secs(15));
-    assert_eq!(
-        (candidates.hint_capacity, candidates.scan_capacity),
-        (MAX_CANDIDATES, MAX_CANDIDATES)
-    );
+    // A small budget keeps the lower capacity.
+    candidates.set_scan_capacity(10.0, Duration::from_secs(15));
+    assert_eq!(candidates.scan_capacity, MIN_SCAN_CAPACITY);
+    // 500 writes in each second check about 30,000 scan candidates in a
+    // retention period and a progress delay.
+    candidates.set_scan_capacity(500.0, Duration::from_secs(15));
+    assert_eq!(candidates.scan_capacity, 30_000);
+    // The limit caps a large budget.
+    candidates.set_scan_capacity(1e9, Duration::from_secs(15));
+    assert_eq!(candidates.scan_capacity, MAX_CANDIDATES);
     // A scan always has room for two pages, even with a lower limit.
     let mut small = Candidates::new(
         delay,
         GcLimits {
-            max_hint_candidates: 10,
             max_scan_candidates: 10,
             ..GcLimits::default()
         },
         Arc::default(),
     );
-    small.set_capacities(1e9, Duration::from_secs(15));
-    assert_eq!(
-        (small.hint_capacity, small.scan_capacity),
-        (10, MIN_SCAN_CAPACITY)
+    small.set_scan_capacity(1e9, Duration::from_secs(15));
+    assert_eq!(small.scan_capacity, MIN_SCAN_CAPACITY);
+}
+
+// While the write budget limits GC, hints wait instead of being dropped. A
+// dropped hint leaves its record to a scan, which reads more for the same
+// record (ADR-101).
+#[tokio::test(start_paused = true)]
+async fn a_small_budget_does_not_drop_hints() {
+    let ctx = new_ctx().await;
+    let mut scheduler = Scheduler::new(&ctx.gc);
+    let now = rt::Instant::now();
+    // The budget sizes the candidate queues when GC starts checks.
+    scheduler.start_checks(&ctx.gc, now);
+    for i in 0..10_000u64 {
+        let id = TxId::with_priority(0, &i.to_be_bytes());
+        scheduler.candidates.admit(id, false, now);
+    }
+    assert_eq!(ctx.gc.stats_and_reset().dropped_candidates, 0);
+}
+
+// Scans slow down when few of their checks make progress, for example when
+// other instances reclaim the same records first.
+#[tokio::test(start_paused = true)]
+async fn scans_slow_down_when_few_scan_checks_make_progress() {
+    let mut delays = Vec::new();
+    for progress in [10u8, 1] {
+        let ctx = new_ctx().await;
+        let mut scheduler = Scheduler::new(&ctx.gc);
+        for turn in 0..8u8 {
+            for i in 0..10u8 {
+                let id = TxId::with_priority(0, &[turn, i]);
+                scheduler.candidates.admit(id, true, rt::Instant::now());
+                assert_eq!(scheduler.candidates.take_ready(), Some(id));
+                let outcome = if i < progress {
+                    GcOutcome::Reclaimed
+                } else {
+                    GcOutcome::Missing
+                };
+                scheduler.complete_check(id, Ok(outcome));
+            }
+            let scan = scheduler.scan.take().unwrap();
+            scheduler.complete_listing(scan, Ok(Some(Vec::new())));
+        }
+        delays.push(
+            scheduler
+                .next_scan
+                .saturating_duration_since(rt::Instant::now()),
+        );
+    }
+    assert!(
+        delays[1] > delays[0] * 4,
+        "scans with 1 progress in 10 checks did not slow down: {delays:?}"
     );
 }
 

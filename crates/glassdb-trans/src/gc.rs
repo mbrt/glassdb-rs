@@ -52,9 +52,8 @@ use budget::WriteBudget;
 use pipeline::{CheckPipeline, EPOCH_WAIT};
 use scan::{GcScan, PAGE_SIZE};
 
-// The candidate capacities when the budget is small. A scan needs room for two
-// pages, so that a LIST can always start.
-const MIN_HINT_CAPACITY: usize = 4096;
+// The scan capacity when the budget is small. A scan needs room for two pages,
+// so that a LIST can always start.
 const MIN_SCAN_CAPACITY: usize = 2 * PAGE_SIZE;
 // About 10 MB of candidates of each kind (ADR-078).
 const MAX_CANDIDATES: usize = 65_536;
@@ -78,11 +77,10 @@ pub struct GcLimits {
     /// At capacity, a new report replaces the oldest. Zero drops every report.
     pub max_pending_hints: usize,
     /// Maximum retained candidates from hints, including ready, deferred, and
-    /// running checks. Defaults to 65,536. GC retains fewer while its write
-    /// budget is small: about the hints that it can check within one
-    /// retention period, and at least 4,096 or this maximum if it is lower. At
-    /// capacity, new candidates are discarded; existing candidates keep their
-    /// place. Zero rejects all new candidates from hints.
+    /// running checks. Defaults to 65,536. While the write budget limits GC,
+    /// hints wait here instead of being discarded (ADR-101). At capacity, new
+    /// candidates are discarded; existing candidates keep their place. Zero
+    /// rejects all new candidates from hints.
     pub max_hint_candidates: usize,
     /// Maximum retained candidates from GC scans. Defaults to 65,536. GC
     /// retains fewer while its write budget is small, and at least two LIST
@@ -188,7 +186,6 @@ struct Candidates {
     entries: BTreeMap<TxId, Candidate>,
     limits: GcLimits,
     counters: Arc<Counters>,
-    hint_capacity: usize,
     scan_capacity: usize,
     hint_delay: Duration,
     hints: CandidateQueue,
@@ -209,37 +206,27 @@ impl Candidates {
             entries: BTreeMap::new(),
             limits,
             counters,
-            hint_capacity: 0,
             scan_capacity: 0,
             hint_delay,
             hints: CandidateQueue::default(),
             scans: CandidateQueue::default(),
             deferred: BTreeSet::new(),
         };
-        candidates.set_capacities(0.0, Duration::ZERO);
+        candidates.set_scan_capacity(0.0, Duration::ZERO);
         candidates
     }
 
-    /// Sizes the candidate queues to about the checks that `spend_limit`
-    /// allows while a candidate holds its slot: the hint delay for hints, and
-    /// also the deferral after progress for scans. Most checks make about one
-    /// write. Candidates above a lower capacity keep their place.
-    fn set_capacities(&mut self, spend_limit: f64, progress_delay: Duration) {
+    /// Sizes the scan queue to about the checks that `spend_limit` allows
+    /// while a scan candidate holds its slot: the hint delay and the deferral
+    /// after progress. Most checks make about one write. Candidates above a
+    /// lower capacity keep their place. The hint capacity does not follow the
+    /// budget: a dropped hint leaves its record to a scan, which reads more
+    /// for the same record (ADR-101).
+    fn set_scan_capacity(&mut self, spend_limit: f64, progress_delay: Duration) {
+        let max = self.limits.max_scan_candidates.max(MIN_SCAN_CAPACITY);
         // A NaN or negative product casts to zero, and a huge one saturates.
-        let sized = |hold: Duration, min: usize, max: usize| {
-            let wanted = (spend_limit * hold.as_secs_f64()) as usize;
-            wanted.clamp(min.min(max), max)
-        };
-        self.hint_capacity = sized(
-            self.hint_delay,
-            MIN_HINT_CAPACITY,
-            self.limits.max_hint_candidates,
-        );
-        self.scan_capacity = sized(
-            self.hint_delay + progress_delay,
-            MIN_SCAN_CAPACITY,
-            self.limits.max_scan_candidates.max(MIN_SCAN_CAPACITY),
-        );
+        let wanted = (spend_limit * (self.hint_delay + progress_delay).as_secs_f64()) as usize;
+        self.scan_capacity = wanted.clamp(MIN_SCAN_CAPACITY, max);
     }
 
     fn admit(&mut self, tid: TxId, from_scan: bool, now: rt::Instant) {
@@ -266,7 +253,7 @@ impl Candidates {
         let capacity = if from_scan {
             self.scan_capacity
         } else {
-            self.hint_capacity
+            self.limits.max_hint_candidates
         };
         let queue = self.queue_mut(from_scan);
         if queue.count >= capacity {
@@ -984,7 +971,10 @@ struct Scheduler {
     listing: OptionFuture<Listing>,
     cadence: ScanCadence,
     next_scan: rt::Instant,
-    scan_useful: bool,
+    // The scan checks that completed since the last LIST, and those of them
+    // that made progress.
+    scan_checks: u64,
+    scan_progress: u64,
     scan_failed: bool,
     retry_delay: Duration,
     counters: Arc<Counters>,
@@ -1021,7 +1011,8 @@ impl Scheduler {
                 retry_delay * 40,
             ),
             next_scan: rt::Instant::now() + retry_delay,
-            scan_useful: false,
+            scan_checks: 0,
+            scan_progress: 0,
             scan_failed: false,
             retry_delay,
             budget: WriteBudget::new(
@@ -1064,7 +1055,7 @@ impl Scheduler {
             .unwrap_or_default();
         self.budget.refresh(now);
         self.candidates
-            .set_capacities(self.budget.spend_limit(), self.retry_delay);
+            .set_scan_capacity(self.budget.spend_limit(), self.retry_delay);
         let backlog = ready > self.concurrency || oldest >= self.retry_delay / 16;
         if ready == 0 && self.checks.is_idle() {
             self.concurrency = 1;
@@ -1169,14 +1160,23 @@ impl Scheduler {
             Ok(Some(ids)) => {
                 // A dropped hint names a record that can have GC work that GC
                 // does not know about, so scans must not slow down while hints
-                // are dropped (ADR-078).
+                // are dropped (ADR-078). Otherwise scans slow down when most of
+                // their checks find nothing to do, for example because other
+                // instances reclaim the same records first.
                 let dropped_hints = self.counters.dropped_hints.load(Ordering::Relaxed);
-                self.scan_useful |= dropped_hints > self.dropped_hints;
+                let useful = if dropped_hints > self.dropped_hints {
+                    1.0
+                } else if self.scan_checks == 0 {
+                    0.0
+                } else {
+                    self.scan_progress as f64 / self.scan_checks as f64
+                };
                 self.dropped_hints = dropped_hints;
                 if !self.scan_failed {
-                    self.cadence.observe(self.scan_useful);
+                    self.cadence.observe(useful);
                 }
-                self.scan_useful = false;
+                self.scan_checks = 0;
+                self.scan_progress = 0;
                 self.scan_failed = false;
                 self.scanned.extend(ids);
                 let delay = self.cadence.delay();
@@ -1205,16 +1205,21 @@ impl Scheduler {
         self.budget.release_check();
         self.round_checks += 1;
         let mut candidate = self.candidates.complete(&tid);
+        if candidate.from_scan {
+            self.scan_checks += 1;
+            self.scan_progress += u64::from(matches!(
+                result,
+                Ok(GcOutcome::Reclaimed | GcOutcome::Progress)
+            ));
+        }
         let retry = match result {
             Ok(GcOutcome::Reclaimed) => {
                 self.counters.progress.fetch_add(1, Ordering::Relaxed);
-                self.scan_useful |= candidate.from_scan;
                 self.round_writes += 1;
                 None
             }
             Ok(GcOutcome::Progress) => {
                 self.counters.progress.fetch_add(1, Ordering::Relaxed);
-                self.scan_useful |= candidate.from_scan;
                 self.round_writes += 1;
                 Some(self.retry_delay)
             }
