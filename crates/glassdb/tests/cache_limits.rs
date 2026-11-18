@@ -19,7 +19,8 @@ async fn zero_cache_budget_preserves_reads_and_writes_without_retaining_entries(
             assert_eq!(coll.read(b"key").await.unwrap().as_deref(), Some(value));
             for _ in 0..2 {
                 assert_eq!(
-                    coll.read_stale(b"key", Duration::from_secs(60))
+                    coll.stale(Duration::from_secs(60))
+                        .read(b"key")
                         .await
                         .unwrap()
                         .as_deref(),

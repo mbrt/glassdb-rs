@@ -634,7 +634,8 @@ mod sim_tests {
                 // A public point read exposes Unavailable without an in-doubt
                 // mutation. It makes no change to the history's modeled state.
                 db.root_collection()
-                    .read_stale(b"unavailable-probe", Duration::ZERO)
+                    .stale(Duration::ZERO)
+                    .read(b"unavailable-probe")
                     .await
                     .map(|_| ())
             } else {

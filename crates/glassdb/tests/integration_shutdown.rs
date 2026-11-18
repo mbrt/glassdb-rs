@@ -43,7 +43,7 @@ async fn shutdown_rejects_every_public_async_entry_point() {
 
     assert!(matches!(coll.read(b"key").await, Err(Error::ShuttingDown)));
     assert!(matches!(
-        coll.read_stale(b"key", std::time::Duration::ZERO).await,
+        coll.stale(std::time::Duration::ZERO).read(b"key").await,
         Err(Error::ShuttingDown)
     ));
     assert!(matches!(

@@ -142,7 +142,7 @@ async fn smaller_write_key_limits_allow_reads_and_deletes_of_existing_keys() {
             Some(b"existing".as_slice())
         );
         assert_eq!(
-            c.read_stale(&key, Duration::ZERO).await.unwrap().as_deref(),
+            c.stale(Duration::ZERO).read(&key).await.unwrap().as_deref(),
             Some(b"existing".as_slice())
         );
         expect_limit(

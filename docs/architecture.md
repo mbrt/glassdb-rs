@@ -476,7 +476,9 @@ bounds. Only the states whose interval ends before the target need a
 conditional read, in parallel. A changed state, a read that depends on a
 holder, or a read that finds a missing collection falls back to the validation
 of `Database::tx`.
-`Collection::read_stale` is a stale read-only transaction with one read
+`Collection::stale` and `Database::stale` return views whose read helpers each
+run one stale read-only transaction with the body of the strong helper. A
+stale read, `stale(max_staleness).read(key)`, is the helper with one read
 ([ADR-098](adr/098-a-stale-read-is-a-stale-read-only-transaction.md)).
 
 ```text

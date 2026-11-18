@@ -34,8 +34,8 @@ mod stats;
 mod tx;
 mod version;
 
-pub use collection::{Collection, CollectionPath};
-pub use db::{Database, DatabaseBuilder};
+pub use collection::{Collection, CollectionPath, StaleCollectionView};
+pub use db::{Database, DatabaseBuilder, StaleDatabaseView};
 pub use diagnostics::Diagnostics;
 pub use error::Error;
 pub use iter::{CollectionEntry, CollectionIter, KeyIter};
