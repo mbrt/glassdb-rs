@@ -9,7 +9,7 @@ use glassdb_concurr::rt;
 
 use crate::{CollectionPath, Database, Error, KeyScan};
 
-use super::harness::{SimWorkload, open_det_db};
+use super::harness::{InstanceId, SimWorkload, open_det_db};
 use super::{
     CLIENT_COUNT, MAX_OPS_PER_CLIENT, SimMedia, assert_valid_listing, key_name,
     merging_node_size_policy, tiny_node_size_policy,
@@ -225,6 +225,7 @@ impl SimWorkload for MembershipWorkload {
 
     async fn run_op(
         db: &Database,
+        _instance: InstanceId,
         op: &MembOp,
         state: &Mutex<MembershipAcct>,
     ) -> Result<(), Error> {
@@ -357,10 +358,11 @@ impl SimWorkload for MergingMembershipWorkload {
 
     async fn run_op(
         db: &Database,
+        instance: InstanceId,
         op: &MembOp,
         state: &Mutex<MembershipAcct>,
     ) -> Result<(), Error> {
-        MembershipWorkload::run_op(db, op, state).await
+        MembershipWorkload::run_op(db, instance, op, state).await
     }
 
     async fn verify(&self, db: &Database, state: &Mutex<MembershipAcct>, allow_in_doubt: bool) {

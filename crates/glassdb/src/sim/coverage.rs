@@ -9,7 +9,7 @@ use glassdb_concurr::rt;
 use crate::{Database, Error};
 
 use super::SimMedia;
-use super::harness::{FaultConfig, SimWorkload, pct_sweep};
+use super::harness::{FaultConfig, InstanceId, SimWorkload, pct_sweep};
 
 /// The percentage of the checked runs of a [`Covered::pct_sweep`] that must
 /// make each required structural change. A schedule can delay a change past
@@ -132,10 +132,11 @@ impl<W: SimWorkload> SimWorkload for Covered<W> {
 
     async fn run_op(
         db: &Database,
+        instance: InstanceId,
         op: &W::Op,
         state: &CoveredState<W::State>,
     ) -> Result<(), Error> {
-        let result = W::run_op(db, op, &state.inner).await;
+        let result = W::run_op(db, instance, op, &state.inner).await;
         let stats = db.stats().topology;
         if stats.splits.completed > 0 {
             state.split.store(true, Ordering::Relaxed);

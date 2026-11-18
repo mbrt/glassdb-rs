@@ -6,7 +6,9 @@
 //! both cache modes. Programs include point and concurrent-group reads plus
 //! normalized bounded membership scans, and shared collection lifecycle
 //! operations. Collection creation, deletion, nested children, and values are
-//! checked atomically with key effects. Long-lived snapshot reads are not generated.
+//! checked atomically with key effects. Programs with no writes can run as stale
+//! read-only transactions with a zero or an unbounded staleness, which the
+//! checker places at a past cut point. Long-lived snapshot reads are not generated.
 //!
 //! Four client tasks each run up to three transactions; empty programs are allowed.
 //! Adjacent pairs share a database instance, its caches and transport, and its

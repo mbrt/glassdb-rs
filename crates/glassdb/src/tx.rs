@@ -100,7 +100,7 @@ impl Transaction {
             // A read is side-effect-free; `from_read` centralizes the mapping
             // (notably a sustained outage becomes the retry-safe
             // `Error::Unavailable` rather than `InDoubt`).
-            Err(e) => Err(Error::from_read(e)),
+            Err(e) => Err(self.observe_error(Error::from_read(e))),
         }
     }
 
@@ -136,7 +136,7 @@ impl Transaction {
             .engine
             .scan(c.address(), &range, &overlay)
             .await
-            .map_err(Error::from_read)?;
+            .map_err(|e| self.observe_error(Error::from_read(e)))?;
         let keys = result.keys().to_vec();
         let access = result.into_access(c.address().clone(), range, overlay);
         self.inner.lock().unwrap().accesses.record_scan(access);
@@ -421,10 +421,25 @@ impl Transaction {
             .engine
             .collection_snapshot(parent, &self.identity)
             .await
-            .map_err(Error::from_read_trans)?;
+            .map_err(|e| self.observe_error(Error::from_read_trans(e)))?;
         let mut inner = self.inner.lock().unwrap();
         inner.catalog.install_snapshot(parent.clone(), snapshot);
         Ok(())
+    }
+
+    /// Records what a failed engine read observed, and returns its error.
+    ///
+    /// A missing collection is an observation without a currentness interval
+    /// (ADR-097).
+    fn observe_error(&self, error: Error) -> Error {
+        if matches!(error, Error::StaleCollection) {
+            self.inner
+                .lock()
+                .unwrap()
+                .catalog
+                .record_missing_collection();
+        }
+        error
     }
 
     fn admit_key_access(&self, key: &[u8]) -> Result<(), Error> {

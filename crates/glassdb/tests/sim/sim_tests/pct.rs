@@ -3,7 +3,7 @@
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 
-use glassdb::sim::{FaultConfig, SimWorkload, pct_assert};
+use glassdb::sim::{FaultConfig, InstanceId, SimWorkload, pct_assert};
 use glassdb::{Database, Error};
 
 /// The signal of an abort.
@@ -51,7 +51,12 @@ impl SimWorkload for AbortingWorkload {
 
     async fn seed(&self, _db: &Database) {}
 
-    async fn run_op(_db: &Database, _op: &(), _state: &()) -> Result<(), Error> {
+    async fn run_op(
+        _db: &Database,
+        _instance: InstanceId,
+        _op: &(),
+        _state: &(),
+    ) -> Result<(), Error> {
         let _destructor = PanicDuringUnwind;
         panic!("the operation fails");
     }

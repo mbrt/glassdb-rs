@@ -61,6 +61,11 @@ pub enum CollectionOp {
 pub struct CatalogAccesses {
     pub reads: Vec<DirectoryRead>,
     pub changes: Vec<CollectionChange>,
+    /// Whether the body found that a collection it used was missing.
+    ///
+    /// The absence has no currentness interval, so a stale read-only
+    /// transaction validates at a fresh barrier (ADR-097).
+    pub missing_collection: bool,
 }
 
 impl CatalogAccesses {
@@ -116,6 +121,7 @@ impl CatalogAccesses {
                 .map(|(read, _)| read.clone())
                 .collect(),
             changes: self.changes.clone(),
+            missing_collection: self.missing_collection,
         }
     }
 }
@@ -201,6 +207,7 @@ mod tests {
                 },
             ],
             changes: Vec::new(),
+            missing_collection: false,
         };
         let keys = AccessSet::new(
             Vec::new(),
@@ -253,6 +260,7 @@ mod tests {
                 expected: None,
                 op: CollectionOp::Create,
             }],
+            missing_collection: false,
         };
 
         let read_only = accesses.into_read_only();

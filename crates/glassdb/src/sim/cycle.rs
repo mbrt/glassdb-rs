@@ -10,7 +10,7 @@ use glassdb_concurr::rt;
 
 use crate::{Collection, CollectionPath, Database, Error};
 
-use super::harness::SimWorkload;
+use super::harness::{InstanceId, SimWorkload};
 use super::{
     CLIENT_COUNT, MAX_OPS_PER_CLIENT, SimMedia, key_name, read_int, try_read_int, write_int,
 };
@@ -233,7 +233,12 @@ impl SimWorkload for CycleWorkload {
         .expect("seed ring");
     }
 
-    async fn run_op(db: &Database, op: &usize, _state: &AtomicUsize) -> Result<(), Error> {
+    async fn run_op(
+        db: &Database,
+        _instance: InstanceId,
+        op: &usize,
+        _state: &AtomicUsize,
+    ) -> Result<(), Error> {
         let coll = db
             .open_collection(&CollectionPath::new(CYCLE_COLLECTION)?)
             .await?;

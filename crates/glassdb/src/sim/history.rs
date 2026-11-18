@@ -2,6 +2,9 @@
 //!
 //! This module models public point and concurrent-group reads, writes, deletes,
 //! normalized key membership scans, and shared collection lifecycle operations.
+//! Programs with no writes can also run as stale read-only transactions, with a
+//! zero or an unbounded staleness. The checker places these at a past cut point
+//! with the rules of ADR-097.
 //! It does not inspect transaction records, cached objects, or other implementation
 //! state, so the oracle cannot accidentally reproduce the protocol it checks.
 
@@ -9,14 +12,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arbitrary::{Arbitrary, Unstructured};
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
 
-use crate::{Collection, CollectionPath, Database, Error, InlinePolicy, KeyScan, Transaction};
+use crate::{
+    Collection, CollectionIter, CollectionPath, Database, Error, InlinePolicy, KeyPage, KeyScan,
+    ReadTransaction, Transaction,
+};
 
-use super::harness::{SimWorkload, open_det_db};
+use super::harness::{InstanceId, SimWorkload, open_det_db};
 use super::{CLIENT_COUNT, SimMedia, key_name, tiny_node_size_policy};
 
 mod collections;
@@ -125,6 +132,10 @@ struct PublicOp {
     op_id: u64,
     /// Client that invoked the operation.
     client_id: usize,
+    /// How the operation ran.
+    mode: HistoryMode,
+    /// Database instance that ran the operation, absent for the final read.
+    instance: Option<InstanceId>,
     /// Checker-owned event point at invocation.
     invocation_point: u64,
     /// Body executions in execution order.
@@ -141,7 +152,8 @@ struct CheckStats {
     /// Candidate placements examined by the exact search.
     explored_branches: usize,
     /// Operation IDs in one accepted serialization; omitted optional operations
-    /// are absent.
+    /// are absent. The ID of a stale read-only transaction with a zero bound
+    /// appears twice, because its floor copy is a separate entry.
     serialization: Vec<u64>,
 }
 
@@ -167,13 +179,131 @@ impl fmt::Display for CheckError {
 
 impl std::error::Error for CheckError {}
 
+/// Where the serial order can place a logical operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Between its invocation and its notification.
+    Current,
+    /// At a past cut point: before its notification, and after only the
+    /// operations that the rules of its database instance require.
+    Past,
+}
+
 #[derive(Clone)]
 struct LogicalOp<'a> {
     public: &'a PublicOp,
     trace: &'a BodyTrace,
     mutates: bool,
     optional: bool,
+    placement: Placement,
     predecessors: u64,
+}
+
+/// Keys and collection slots of one body execution.
+#[derive(Debug, Default)]
+struct Footprint {
+    keys: BTreeSet<u8>,
+    slots: BTreeSet<u8>,
+    /// Whether the body execution listed the shared collections, or changed
+    /// which ones exist.
+    membership: bool,
+}
+
+impl Footprint {
+    /// The objects whose state the body execution observed.
+    ///
+    /// A scan that returns `limit` keys observes the range only up to its last
+    /// key.
+    fn observed(trace: &BodyTrace) -> Self {
+        let mut footprint = Self::default();
+        for action in &trace.ordered_actions {
+            match action {
+                HistoryAction::Read { key, .. } => {
+                    footprint.keys.insert(*key);
+                }
+                HistoryAction::ReadGroup { observations } => {
+                    footprint.keys.extend(observations.keys());
+                }
+                HistoryAction::Scan {
+                    start,
+                    start_exclusive,
+                    end,
+                    limit,
+                    keys,
+                } => {
+                    let complete = keys.len() < *limit as usize;
+                    footprint
+                        .keys
+                        .extend((0..HISTORY_KEY_COUNT as u8).filter(|key| {
+                            in_scan_range(*key, *start, *start_exclusive, *end)
+                                && (complete || keys.last().is_some_and(|last| key <= last))
+                        }));
+                }
+                HistoryAction::Collection(step) => {
+                    footprint.slots.insert(step.slot);
+                    footprint.membership = true;
+                }
+                HistoryAction::CollectionUpdate(update) => {
+                    footprint.slots.insert(update.slot);
+                }
+                HistoryAction::CatalogRead(_)
+                | HistoryAction::Write { .. }
+                | HistoryAction::Delete { .. } => {}
+            }
+        }
+        footprint
+    }
+
+    /// The objects whose state the body execution changed.
+    fn written(trace: &BodyTrace) -> Self {
+        let mut footprint = Self {
+            keys: trace.final_mutations.keys().copied().collect(),
+            ..Self::default()
+        };
+        for action in &trace.ordered_actions {
+            match action {
+                HistoryAction::Collection(step)
+                    if step.before != step.after || step.members_before != step.members_after =>
+                {
+                    footprint.slots.insert(step.slot);
+                    footprint.membership |= step.members_before != step.members_after;
+                }
+                HistoryAction::CollectionUpdate(update) if update.before.is_some() => {
+                    footprint.slots.insert(update.slot);
+                }
+                _ => {}
+            }
+        }
+        footprint
+    }
+
+    fn intersects(&self, other: &Self) -> bool {
+        !self.keys.is_disjoint(&other.keys)
+            || !self.slots.is_disjoint(&other.slots)
+            || self.membership && other.membership
+    }
+}
+
+/// Reports whether `before`, which completed before `after` started, must
+/// come before `after` in the serial order.
+///
+/// An operation at a past cut point follows only what ADR-097 promises within
+/// its database instance: the earlier stale read-only transactions, through
+/// the monotonic floor, and the writes that it observes. A write that it does
+/// not observe gives no order: that write can follow a foreign commit that the
+/// cut point comes before.
+fn orders(before: &LogicalOp<'_>, after: &LogicalOp<'_>) -> bool {
+    match after.placement {
+        Placement::Current => true,
+        Placement::Past => {
+            before.public.instance.is_some()
+                && before.public.instance == after.public.instance
+                && (before.placement == Placement::Past
+                    || before.mutates
+                        && Footprint::written(before.trace)
+                            .intersects(&Footprint::observed(after.trace)))
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -254,6 +384,14 @@ fn validate_trace(op_id: u64, trace: &BodyTrace) -> Result<(), CheckError> {
     Ok(())
 }
 
+fn in_scan_range(key: u8, start: u8, start_exclusive: bool, end: u8) -> bool {
+    (if start_exclusive {
+        key > start
+    } else {
+        key >= start
+    }) && key < end
+}
+
 fn scanned_keys(
     state: &AbstractState,
     overlay: &BTreeMap<u8, Option<u8>>,
@@ -274,13 +412,7 @@ fn scanned_keys(
     visible
         .into_iter()
         .filter_map(|(key, present)| present.then_some(key))
-        .filter(|key| {
-            (if start_exclusive {
-                *key > start
-            } else {
-                *key >= start
-            }) && *key < end
-        })
+        .filter(|key| in_scan_range(*key, start, start_exclusive, end))
         .take(limit as usize)
         .collect()
 }
@@ -420,6 +552,8 @@ impl Search<'_> {
 /// interrupted transactions may appear zero or one time. The
 /// search is exact within its explicit branch budget and respects real-time
 /// order between definitively completed operations and later invocations.
+/// Stale read-only transactions with an unbounded staleness respect only the
+/// order that [`orders`] gives.
 fn check_history(
     initial_state: &AbstractState,
     history: &[PublicOp],
@@ -492,13 +626,31 @@ fn check_history(
     let mut ops = Vec::new();
     for public in history {
         if let Some((trace, mutates, optional)) = selected_trace(public)? {
-            ops.push(LogicalOp {
+            let op = LogicalOp {
                 public,
                 trace,
                 mutates,
                 optional,
+                placement: match public.mode {
+                    HistoryMode::StaleMax => Placement::Past,
+                    HistoryMode::Strict | HistoryMode::StaleZero => Placement::Current,
+                },
                 predecessors: 0,
-            });
+            };
+            // A stale read-only transaction with a zero bound raises the floor
+            // only to the latest start of its states, not to its cut point. So
+            // a later one with an unbounded staleness can come before it in the
+            // serial order. Its floor copy makes the same observations at a
+            // past placement, and orders the later stale read-only transactions
+            // of the instance in its place.
+            if public.mode == HistoryMode::StaleZero && !optional {
+                ops.push(LogicalOp {
+                    mutates: false,
+                    placement: Placement::Past,
+                    ..op.clone()
+                });
+            }
+            ops.push(op);
         }
     }
     ops.sort_by_key(|op| op.public.op_id);
@@ -517,7 +669,9 @@ fn check_history(
             let Some(response) = ops[predecessor].public.notification_point else {
                 continue;
             };
-            if response < ops[current].public.invocation_point {
+            if response < ops[current].public.invocation_point
+                && orders(&ops[predecessor], &ops[current])
+            {
                 ops[current].predecessors |= 1u64 << predecessor;
             }
         }
@@ -610,6 +764,17 @@ pub enum HistoryInstruction {
     Yield,
 }
 
+/// How a history program runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryMode {
+    /// As [`Database::tx`].
+    Strict,
+    /// As [`Database::read_tx`] with `Duration::ZERO`.
+    StaleZero,
+    /// As [`Database::read_tx`] with `Duration::MAX`.
+    StaleMax,
+}
+
 /// A bounded key and collection transaction run by one simulated client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryTransaction {
@@ -617,6 +782,8 @@ pub struct HistoryTransaction {
     pub op_id: u64,
     /// Owning client.
     pub client_id: usize,
+    /// How the program runs. A stale program has no write.
+    pub mode: HistoryMode,
     /// Instructions interpreted in order on every body execution.
     pub instructions: Vec<HistoryInstruction>,
 }
@@ -644,24 +811,101 @@ fn arbitrary_register(u: &mut Unstructured<'_>) -> arbitrary::Result<u8> {
     Ok(u.arbitrary::<u8>()? % HISTORY_REGISTER_COUNT as u8)
 }
 
+fn arbitrary_mode(u: &mut Unstructured<'_>) -> arbitrary::Result<HistoryMode> {
+    // A zero byte, also from an exhausted input, keeps the strict mode.
+    Ok(match u.arbitrary::<u8>()? % 4 {
+        1 => HistoryMode::StaleZero,
+        2 => HistoryMode::StaleMax,
+        _ => HistoryMode::Strict,
+    })
+}
+
+/// Returns the partner of `key` in a read group.
+fn arbitrary_other_key(u: &mut Unstructured<'_>, key: u8) -> arbitrary::Result<u8> {
+    Ok((key + 1 + u.arbitrary::<u8>()? % (HISTORY_KEY_COUNT as u8 - 1)) % HISTORY_KEY_COUNT as u8)
+}
+
+fn read_group(key: u8, other: u8, register: u8) -> HistoryInstruction {
+    HistoryInstruction::ReadGroup {
+        reads: vec![
+            (key, register),
+            (other, (register + 1) % HISTORY_REGISTER_COUNT as u8),
+        ],
+    }
+}
+
+fn arbitrary_scan(u: &mut Unstructured<'_>, key: u8) -> arbitrary::Result<HistoryInstruction> {
+    let other = arbitrary_key(u)?;
+    let start = key.min(other);
+    let end = key.max(other) + 1;
+    let after = if u.arbitrary::<u8>()? % 3 == 0 {
+        None
+    } else {
+        Some(u.arbitrary::<u8>()? % (HISTORY_KEY_COUNT as u8 + 1))
+    };
+    Ok(HistoryInstruction::Scan {
+        start,
+        end,
+        after,
+        limit: u.arbitrary::<u8>()? % (HISTORY_KEY_COUNT as u8 + 2),
+    })
+}
+
+fn arbitrary_instructions(
+    u: &mut Unstructured<'_>,
+    mode: HistoryMode,
+) -> arbitrary::Result<Vec<HistoryInstruction>> {
+    let mut instructions = match mode {
+        HistoryMode::Strict => arbitrary_program(u)?,
+        HistoryMode::StaleZero | HistoryMode::StaleMax => arbitrary_stale_program(u)?,
+    };
+    if u.arbitrary::<u8>()? % 3 == 0 {
+        let at = u.arbitrary::<u8>()? as usize % (instructions.len() + 1);
+        instructions.insert(at, HistoryInstruction::Yield);
+    }
+    Ok(instructions)
+}
+
+/// Generates one or two reads, so that a cut point can need the currentness
+/// intervals of several states, and an optional error outcome.
+fn arbitrary_stale_program(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<HistoryInstruction>> {
+    let mut instructions = Vec::new();
+    for _ in 0..=u.arbitrary::<u8>()? % 2 {
+        let key = arbitrary_key(u)?;
+        let register = arbitrary_register(u)?;
+        instructions.push(match u.arbitrary::<u8>()? % 4 {
+            0 => HistoryInstruction::Read { key, register },
+            1 => read_group(key, arbitrary_other_key(u, key)?, register),
+            2 => arbitrary_scan(u, key)?,
+            _ => HistoryInstruction::Collection {
+                slot: u.arbitrary::<u8>()? % collections::COLLECTION_SLOTS as u8,
+                operation: HistoryCollectionOp::Read,
+            },
+        });
+    }
+    match u.arbitrary::<u8>()? % 4 {
+        0 => instructions.push(HistoryInstruction::RequireEqual {
+            register: arbitrary_register(u)?,
+            expected: Some(u.arbitrary()?),
+        }),
+        1 => instructions.push(HistoryInstruction::Abort),
+        _ => {}
+    }
+    Ok(instructions)
+}
+
 fn arbitrary_program(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<HistoryInstruction>> {
     let key = arbitrary_key(u)?;
     let register = arbitrary_register(u)?;
-    let mut instructions = match u.arbitrary::<u8>()? % 10 {
+    Ok(match u.arbitrary::<u8>()? % 10 {
         0 => vec![
             HistoryInstruction::Read { key, register },
             HistoryInstruction::WriteIncremented { key, register },
         ],
         1 => {
-            let other = (key + 1 + u.arbitrary::<u8>()? % (HISTORY_KEY_COUNT as u8 - 1))
-                % HISTORY_KEY_COUNT as u8;
+            let other = arbitrary_other_key(u, key)?;
             vec![
-                HistoryInstruction::ReadGroup {
-                    reads: vec![
-                        (key, register),
-                        (other, (register + 1) % HISTORY_REGISTER_COUNT as u8),
-                    ],
-                },
+                read_group(key, other, register),
                 HistoryInstruction::WriteIncremented { key, register },
                 HistoryInstruction::WriteIncremented {
                     key: other,
@@ -685,21 +929,8 @@ fn arbitrary_program(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<HistoryI
         ],
         4 => vec![HistoryInstruction::Delete { key }],
         5 => {
-            let other = arbitrary_key(u)?;
-            let start = key.min(other);
-            let end = key.max(other) + 1;
-            let after = if u.arbitrary::<u8>()? % 3 == 0 {
-                None
-            } else {
-                Some(u.arbitrary::<u8>()? % (HISTORY_KEY_COUNT as u8 + 1))
-            };
             vec![
-                HistoryInstruction::Scan {
-                    start,
-                    end,
-                    after,
-                    limit: u.arbitrary::<u8>()? % (HISTORY_KEY_COUNT as u8 + 2),
-                },
+                arbitrary_scan(u, key)?,
                 // Pair the membership observation with a mutation so two
                 // concurrent scan programs can form a phantom-sensitive cycle.
                 HistoryInstruction::Delete { key },
@@ -746,12 +977,7 @@ fn arbitrary_program(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<HistoryI
             }
             program
         }
-    };
-    if u.arbitrary::<u8>()? % 3 == 0 {
-        let at = u.arbitrary::<u8>()? as usize % (instructions.len() + 1);
-        instructions.insert(at, HistoryInstruction::Yield);
-    }
-    Ok(instructions)
+    })
 }
 
 impl<'a> Arbitrary<'a> for HistoryWorkload {
@@ -762,10 +988,12 @@ impl<'a> Arbitrary<'a> for HistoryWorkload {
             let count = u.arbitrary::<u8>()? as usize % (MAX_HISTORY_TXS_PER_CLIENT + 1);
             let mut client = Vec::with_capacity(count);
             for _ in 0..count {
+                let mode = arbitrary_mode(u)?;
                 client.push(HistoryTransaction {
                     op_id: next_id,
                     client_id,
-                    instructions: arbitrary_program(u)?,
+                    mode,
+                    instructions: arbitrary_instructions(u, mode)?,
                 });
                 next_id += 1;
             }
@@ -778,6 +1006,8 @@ impl<'a> Arbitrary<'a> for HistoryWorkload {
 struct PendingOp {
     op_id: u64,
     client_id: usize,
+    mode: HistoryMode,
+    instance: Option<InstanceId>,
     invocation_point: u64,
     body_executions: Vec<BodyTrace>,
     notification_point: Option<u64>,
@@ -824,7 +1054,7 @@ impl HistoryRecorder {
         }
     }
 
-    fn begin(&self, program: &HistoryTransaction) {
+    fn begin(&self, program: &HistoryTransaction, instance: InstanceId) {
         let mut inner = self.inner.lock().unwrap();
         let point = inner.next_point;
         inner.next_point += 1;
@@ -833,6 +1063,8 @@ impl HistoryRecorder {
             PendingOp {
                 op_id: program.op_id,
                 client_id: program.client_id,
+                mode: program.mode,
+                instance: Some(instance),
                 invocation_point: point,
                 body_executions: Vec::new(),
                 notification_point: None,
@@ -902,6 +1134,8 @@ impl HistoryRecorder {
             PendingOp {
                 op_id: self.final_op_id,
                 client_id: usize::MAX,
+                mode: HistoryMode::Strict,
+                instance: None,
                 invocation_point: invocation,
                 body_executions: vec![BodyTrace {
                     body_number: 0,
@@ -932,6 +1166,8 @@ impl HistoryRecorder {
             .map(|operation| PublicOp {
                 op_id: operation.op_id,
                 client_id: operation.client_id,
+                mode: operation.mode,
+                instance: operation.instance,
                 invocation_point: operation.invocation_point,
                 body_executions: operation.body_executions.clone(),
                 notification_point: operation.notification_point,
@@ -965,8 +1201,71 @@ fn history_key(key: &[u8]) -> Result<u8, Error> {
         .ok_or_else(|| Error::internal(format!("history scan returned unknown key {key:?}")))
 }
 
+/// The transaction handle of one body execution.
+enum HistoryTx {
+    Strict(Transaction),
+    Stale(ReadTransaction),
+}
+
+impl HistoryTx {
+    async fn read(&self, c: &Collection, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        match self {
+            Self::Strict(tx) => tx.read(c, key).await,
+            Self::Stale(tx) => tx.read(c, key).await,
+        }
+    }
+
+    async fn scan_keys(&self, c: &Collection, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
+        match self {
+            Self::Strict(tx) => tx.scan_keys(c, scan).await,
+            Self::Stale(tx) => tx.scan_keys(c, scan).await,
+        }
+    }
+
+    fn root_collection(&self) -> Collection {
+        match self {
+            Self::Strict(tx) => tx.root_collection(),
+            Self::Stale(tx) => tx.root_collection(),
+        }
+    }
+
+    async fn open_collection(
+        &self,
+        parent: &Collection,
+        name: impl AsRef<[u8]>,
+    ) -> Result<Collection, Error> {
+        match self {
+            Self::Strict(tx) => tx.open_collection(parent, name).await,
+            Self::Stale(tx) => tx.open_collection(parent, name).await,
+        }
+    }
+
+    async fn iter_collections(&self, parent: &Collection) -> Result<CollectionIter, Error> {
+        match self {
+            Self::Strict(tx) => tx.iter_collections(parent).await,
+            Self::Stale(tx) => tx.iter_collections(parent).await,
+        }
+    }
+
+    fn abort(&self) -> Result<(), Error> {
+        match self {
+            Self::Strict(tx) => tx.abort(),
+            Self::Stale(tx) => tx.abort(),
+        }
+    }
+
+    /// Returns the handle that can write. The generator gives a stale program
+    /// no write.
+    fn writer(&self) -> Result<&Transaction, Error> {
+        match self {
+            Self::Strict(tx) => Ok(tx),
+            Self::Stale(_) => Err(Error::internal("a stale history program cannot write")),
+        }
+    }
+}
+
 async fn interpret_body(
-    tx: Transaction,
+    tx: HistoryTx,
     collection: &Collection,
     program: &HistoryTransaction,
     recorder: &HistoryRecorder,
@@ -1046,7 +1345,8 @@ async fn interpret_body(
                 }
             }
             HistoryInstruction::WriteLiteral { key, value } => tx
-                .write(collection, &key_name(*key as usize), &[*value])
+                .writer()
+                .and_then(|tx| tx.write(collection, &key_name(*key as usize), &[*value]))
                 .map(|()| {
                     actions.push(HistoryAction::Write {
                         key: *key,
@@ -1057,7 +1357,8 @@ async fn interpret_body(
             HistoryInstruction::WriteRegister { key, register } => {
                 match registers[*register as usize] {
                     Some(Some(value)) => tx
-                        .write(collection, &key_name(*key as usize), &[value])
+                        .writer()
+                        .and_then(|tx| tx.write(collection, &key_name(*key as usize), &[value]))
                         .map(|()| {
                             actions.push(HistoryAction::Write { key: *key, value });
                             mutations.insert(*key, Some(value));
@@ -1073,7 +1374,8 @@ async fn interpret_body(
                     .and_then(|value| value.checked_add(1))
                 {
                     Some(value) => tx
-                        .write(collection, &key_name(*key as usize), &[value])
+                        .writer()
+                        .and_then(|tx| tx.write(collection, &key_name(*key as usize), &[value]))
                         .map(|()| {
                             actions.push(HistoryAction::Write { key: *key, value });
                             mutations.insert(*key, Some(value));
@@ -1083,12 +1385,13 @@ async fn interpret_body(
                     ))),
                 }
             }
-            HistoryInstruction::Delete { key } => {
-                tx.delete(collection, &key_name(*key as usize)).map(|()| {
+            HistoryInstruction::Delete { key } => tx
+                .writer()
+                .and_then(|tx| tx.delete(collection, &key_name(*key as usize)))
+                .map(|()| {
                     actions.push(HistoryAction::Delete { key: *key });
                     mutations.insert(*key, None);
-                })
-            }
+                }),
             HistoryInstruction::Scan {
                 start,
                 end,
@@ -1165,16 +1468,27 @@ async fn interpret_body(
 
 async fn run_program(
     db: &Database,
+    instance: InstanceId,
     program: &HistoryTransaction,
     recorder: &HistoryRecorder,
 ) -> Result<(), Error> {
     let collection = db
         .open_collection(&CollectionPath::new(HISTORY_COLLECTION)?)
         .await?;
-    recorder.begin(program);
-    let result = db
-        .tx(|tx| interpret_body(tx, &collection, program, recorder))
-        .await;
+    recorder.begin(program, instance);
+    let stale = |max_staleness| {
+        db.read_tx(max_staleness, |tx| {
+            interpret_body(HistoryTx::Stale(tx), &collection, program, recorder)
+        })
+    };
+    let result = match program.mode {
+        HistoryMode::Strict => {
+            db.tx(|tx| interpret_body(HistoryTx::Strict(tx), &collection, program, recorder))
+                .await
+        }
+        HistoryMode::StaleZero => stale(Duration::ZERO).await,
+        HistoryMode::StaleMax => stale(Duration::MAX).await,
+    };
 
     match result {
         Ok(()) => {
@@ -1253,8 +1567,13 @@ impl SimWorkload for HistoryWorkload {
         .expect("seed history keys");
     }
 
-    async fn run_op(db: &Database, op: &Self::Op, state: &Self::State) -> Result<(), Error> {
-        run_program(db, op, state).await
+    async fn run_op(
+        db: &Database,
+        instance: InstanceId,
+        op: &Self::Op,
+        state: &Self::State,
+    ) -> Result<(), Error> {
+        run_program(db, instance, op, state).await
     }
 
     async fn verify(&self, db: &Database, state: &Self::State, _failures_enabled: bool) {
@@ -1274,7 +1593,7 @@ impl SimWorkload for HistoryWorkload {
                         values.keys.insert(key, value);
                     }
                 }
-                values.collections = collections::inspect_catalog(&tx).await?;
+                values.collections = collections::inspect_catalog(&HistoryTx::Strict(tx)).await?;
                 Ok(values)
             })
             .await
@@ -1354,6 +1673,8 @@ mod sim_tests {
         PublicOp {
             op_id: id,
             client_id: id as usize,
+            mode: HistoryMode::Strict,
+            instance: None,
             invocation_point: invocation,
             body_executions: vec![trace],
             notification_point: notification,
@@ -1775,6 +2096,7 @@ mod sim_tests {
                         trace,
                         mutates,
                         optional,
+                        placement: Placement::Current,
                         predecessors: 0,
                     })
             })
@@ -2131,7 +2453,7 @@ mod sim_tests {
 
     #[test]
     fn fuzz_program_decoder_reaches_bounded_scans() {
-        let mut input = Unstructured::new(&[1, 0, 0, 5, 2, 0, 4, 1, 0, 0, 0]);
+        let mut input = Unstructured::new(&[1, 0, 0, 0, 5, 2, 0, 4, 1, 0, 0, 0]);
         let workload = HistoryWorkload::arbitrary(&mut input).unwrap();
         assert!(matches!(
             workload.clients[0][0].instructions.as_slice(),
@@ -2168,7 +2490,7 @@ mod sim_tests {
                 for abort in [false, true] {
                     let mut data = Vec::new();
                     for _ in 0..CLIENT_COUNT {
-                        data.extend([1, 0, 0, 8, slot, code as u8]);
+                        data.extend([1, 0, 0, 0, 8, slot, code as u8]);
                         if matches!(
                             operation,
                             HistoryCollectionOp::Write(_)
@@ -2225,6 +2547,220 @@ mod sim_tests {
                 },
             ] if reads == &[(0, 0), (1, 1)]
         ));
+    }
+
+    /// A committed transaction that runs `actions` on `instance` between the
+    /// two event points.
+    fn on_instance(
+        id: u64,
+        points: (u64, u64),
+        mode: HistoryMode,
+        instance: u64,
+        actions: Vec<HistoryAction>,
+    ) -> PublicOp {
+        PublicOp {
+            mode,
+            instance: Some(InstanceId(instance)),
+            ..op(
+                id,
+                points.0,
+                Some(points.1),
+                HistoryOutcome::SnapshotTransparent,
+                trace(actions, BodyState::CommitOutcome),
+            )
+        }
+    }
+
+    fn write(key: u8, value: u8) -> HistoryAction {
+        HistoryAction::Write { key, value }
+    }
+
+    fn read(key: u8, value: u8) -> HistoryAction {
+        HistoryAction::Read {
+            key,
+            value: Some(value),
+        }
+    }
+
+    #[test]
+    fn unbounded_stale_read_can_miss_a_finished_foreign_commit() {
+        let initial = state(&[(0, 0)]);
+        let committed = state(&[(0, 1)]);
+        let writer = on_instance(0, (0, 1), HistoryMode::Strict, 0, vec![write(0, 1)]);
+        let stale = |mode, instance| on_instance(1, (2, 3), mode, instance, vec![read(0, 0)]);
+        check_history(
+            &initial,
+            &[writer.clone(), stale(HistoryMode::StaleMax, 1)],
+            &committed,
+        )
+        .unwrap();
+        // A zero bound and a write of the same instance both order the read
+        // after the commit.
+        for (mode, instance) in [(HistoryMode::StaleZero, 1), (HistoryMode::StaleMax, 0)] {
+            assert!(
+                check_history(
+                    &initial,
+                    &[writer.clone(), stale(mode, instance)],
+                    &committed
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn unbounded_stale_read_follows_only_the_own_writes_that_it_observes() {
+        let initial = state(&[(0, 0), (1, 0)]);
+        let committed = state(&[(0, 1), (1, 1)]);
+        let foreign = on_instance(0, (0, 1), HistoryMode::Strict, 1, vec![write(1, 1)]);
+        let own = on_instance(1, (2, 3), HistoryMode::Strict, 0, vec![write(0, 1)]);
+        let stale = |actions| on_instance(2, (4, 5), HistoryMode::StaleMax, 0, actions);
+        // The own write follows the foreign one, but the read does not observe
+        // it, so the read can come before both.
+        check_history(
+            &initial,
+            &[foreign.clone(), own.clone(), stale(vec![read(1, 0)])],
+            &committed,
+        )
+        .unwrap();
+        assert!(
+            check_history(
+                &initial,
+                &[foreign, own, stale(vec![read(0, 1), read(1, 0)])],
+                &committed,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn scan_that_reaches_its_limit_does_not_observe_the_rest_of_its_range() {
+        let initial = state(&[(0, 0), (1, 0), (2, 0)]);
+        let committed = state(&[(0, 5), (1, 0)]);
+        let foreign = on_instance(0, (0, 1), HistoryMode::Strict, 1, vec![write(0, 5)]);
+        let own = on_instance(
+            1,
+            (2, 3),
+            HistoryMode::Strict,
+            0,
+            vec![HistoryAction::Delete { key: 2 }],
+        );
+        let stale = |limit| {
+            on_instance(
+                2,
+                (4, 5),
+                HistoryMode::StaleMax,
+                0,
+                vec![
+                    read(0, 0),
+                    HistoryAction::Scan {
+                        start: 0,
+                        start_exclusive: false,
+                        end: 3,
+                        limit,
+                        keys: vec![0, 1],
+                    },
+                ],
+            )
+        };
+        check_history(
+            &initial,
+            &[foreign.clone(), own.clone(), stale(2)],
+            &committed,
+        )
+        .unwrap();
+        // With a higher limit the scan observes the delete, so it follows the
+        // foreign write too.
+        assert!(check_history(&initial, &[foreign, own, stale(3)], &committed).is_err());
+    }
+
+    #[test]
+    fn unbounded_stale_listing_observes_the_own_membership_changes() {
+        let initial = state(&[]);
+        let mut committed = state(&[]);
+        committed.collections[1] = Some(CollectionState::default());
+        let step = |slot, operation, after: Option<CollectionState>, members_after| {
+            HistoryAction::Collection(CollectionStep {
+                slot,
+                operation,
+                before: None,
+                after,
+                members_before: Vec::new(),
+                members_after,
+                outcome: CollectionOutcome::Applied,
+            })
+        };
+        let create = on_instance(
+            0,
+            (0, 1),
+            HistoryMode::Strict,
+            0,
+            vec![step(
+                1,
+                HistoryCollectionOp::Create,
+                Some(CollectionState::default()),
+                vec![1],
+            )],
+        );
+        // The read of slot 0 lists the root, so it observes the creation of
+        // slot 1 by its own instance.
+        let listing = |instance| {
+            on_instance(
+                1,
+                (2, 3),
+                HistoryMode::StaleMax,
+                instance,
+                vec![step(0, HistoryCollectionOp::Read, None, Vec::new())],
+            )
+        };
+        assert!(check_history(&initial, &[create.clone(), listing(0)], &committed).is_err());
+        check_history(&initial, &[create, listing(1)], &committed).unwrap();
+    }
+
+    #[test]
+    fn stale_reads_of_one_instance_are_monotonic() {
+        let initial = state(&[(0, 0)]);
+        let committed = state(&[(0, 1)]);
+        let foreign = on_instance(0, (0, 1), HistoryMode::Strict, 1, vec![write(0, 1)]);
+        let first = on_instance(1, (2, 3), HistoryMode::StaleMax, 0, vec![read(0, 1)]);
+        let second =
+            |instance| on_instance(2, (4, 5), HistoryMode::StaleMax, instance, vec![read(0, 0)]);
+        assert!(
+            check_history(
+                &initial,
+                &[foreign.clone(), first.clone(), second(0)],
+                &committed
+            )
+            .is_err()
+        );
+        // The floor does not order stale reads of another instance, which
+        // includes the instance of a later open.
+        check_history(&initial, &[foreign, first, second(2)], &committed).unwrap();
+    }
+
+    #[test]
+    fn zero_bound_stale_read_orders_later_stale_reads_by_what_it_observed() {
+        let initial = state(&[(0, 0), (1, 0)]);
+        let committed = state(&[(0, 0), (1, 1)]);
+        let foreign = on_instance(0, (0, 1), HistoryMode::Strict, 1, vec![write(1, 1)]);
+        let zero = |actions| on_instance(1, (2, 3), HistoryMode::StaleZero, 0, actions);
+        let unbounded = on_instance(2, (4, 5), HistoryMode::StaleMax, 0, vec![read(1, 0)]);
+        // The floor rises only to the states that the first read used, so the
+        // second one can come before the foreign write that the first follows.
+        check_history(
+            &initial,
+            &[foreign.clone(), zero(vec![read(0, 0)]), unbounded.clone()],
+            &committed,
+        )
+        .unwrap();
+        assert!(
+            check_history(
+                &initial,
+                &[foreign, zero(vec![read(1, 1)]), unbounded],
+                &committed
+            )
+            .is_err()
+        );
     }
 
     #[test]

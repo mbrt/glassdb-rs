@@ -388,6 +388,7 @@ mod tests {
             CatalogAccesses {
                 reads: Vec::new(),
                 changes: vec![create_change(collection.clone())],
+                missing_collection: false,
             },
             1,
         );
@@ -435,6 +436,7 @@ mod tests {
             CatalogAccesses {
                 reads: Vec::new(),
                 changes: vec![create_change(active.clone())],
+                missing_collection: false,
             },
             0,
         );

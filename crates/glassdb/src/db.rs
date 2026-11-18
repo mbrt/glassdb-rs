@@ -391,7 +391,9 @@ impl Database {
     /// call, on the clock of this instance, and `Duration::MAX` accepts any
     /// age. The result is serializable, and it contains every write that this
     /// instance committed before the call. A stale read-only transaction of
-    /// this instance never sees an earlier state than a previous one.
+    /// this instance sees every transaction whose effect a previous one saw.
+    /// It can still have an earlier cut point than a previous one, for example
+    /// one with a zero bound that saw no effect of a recent transaction.
     ///
     /// With a warm cache, a stale read-only transaction can finish with no
     /// backend operation. When the cache cannot supply a cut point, it

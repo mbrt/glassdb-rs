@@ -5,7 +5,7 @@
 
 use std::process::{Command, Output};
 
-use glassdb::sim::{Covered, FaultConfig, SimWorkload, StructuralCoverage};
+use glassdb::sim::{Covered, FaultConfig, InstanceId, SimWorkload, StructuralCoverage};
 use glassdb::{Database, Error};
 
 /// Set in the child processes of these tests, which run the sweeps.
@@ -48,7 +48,12 @@ impl SimWorkload for IdleWorkload {
 
     async fn seed(&self, _db: &Database) {}
 
-    async fn run_op(_db: &Database, _op: &(), _state: &()) -> Result<(), Error> {
+    async fn run_op(
+        _db: &Database,
+        _instance: InstanceId,
+        _op: &(),
+        _state: &(),
+    ) -> Result<(), Error> {
         Ok(())
     }
 

@@ -163,6 +163,7 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
             CatalogAccesses {
                 reads: Vec::new(),
                 changes,
+                missing_collection: false,
             },
         );
         let old_id = *handle.id();

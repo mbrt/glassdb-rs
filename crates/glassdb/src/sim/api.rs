@@ -17,7 +17,7 @@ mod oracle;
 
 pub use model::ApiAcct;
 
-use super::harness::{SimWorkload, open_det_db};
+use super::harness::{InstanceId, SimWorkload, open_det_db};
 use super::{CLIENT_COUNT, SimMedia, tiny_node_size_policy};
 use executor::StepResult;
 // ===========================================================================
@@ -166,6 +166,7 @@ impl SimWorkload for ApiWorkload {
 
     async fn run_op(
         db: &Database,
+        _instance: InstanceId,
         op: &ApiTransaction,
         state: &Mutex<ApiAcct>,
     ) -> Result<(), Error> {

@@ -397,14 +397,20 @@ struct CutStates {
 }
 
 impl CutStates {
-    /// Returns `None` when a read depends on a holder, which needs a fresh
-    /// barrier. Every directory read needs its record, also a binding read
-    /// that a key access covers: that coverage needs a lock or a CAS
-    /// (ADR-092), and a cut has neither.
+    /// Returns `None` when a read depends on a holder or found a missing
+    /// collection, which needs a fresh barrier. Every directory read needs its
+    /// record, also a binding read that a key access covers: that coverage
+    /// needs a lock or a CAS (ADR-092), and a cut has neither.
     fn collect(
         accesses: &AccessSet,
         catalog: &CatalogAccesses,
     ) -> Result<Option<Self>, TransError> {
+        // The body can read a binding at a past cut point and then find that
+        // the bound collection is missing now. The cut point does not explain
+        // that absence, so only a fresh barrier can certify it.
+        if catalog.missing_collection {
+            return Ok(None);
+        }
         let mut leaves = Vec::new();
         for read in accesses.point_reads() {
             if read_observation_has_exclusive_holder(read)? {
@@ -1914,6 +1920,7 @@ mod tests {
                 expected: None,
                 op: CollectionOp::Create,
             }],
+            missing_collection: false,
         };
         let active_accesses = CatalogAccesses {
             reads: Vec::new(),
@@ -1924,6 +1931,7 @@ mod tests {
                 expected: None,
                 op: CollectionOp::Create,
             }],
+            missing_collection: false,
         };
         let mut handle = tm.begin(AccessSet::default(), earlier_accesses);
         tm.collection_commit
@@ -1964,6 +1972,7 @@ mod tests {
                     expected: None,
                     op: CollectionOp::Create,
                 }],
+                missing_collection: false,
             },
         );
         let id = *handle.id();
@@ -2010,6 +2019,7 @@ mod tests {
                     expected: None,
                     op: CollectionOp::Create,
                 }],
+                missing_collection: false,
             },
         );
         tm.collection_commit
@@ -2062,6 +2072,7 @@ mod tests {
                     expected: Some(dropped.id()),
                     op: CollectionOp::Drop,
                 }],
+                missing_collection: false,
             },
         );
         let id = *handle.id();
@@ -2238,6 +2249,7 @@ mod tests {
         let catalog = || CatalogAccesses {
             reads: vec![directory_read(test_collection())],
             changes: Vec::new(),
+            missing_collection: false,
         };
 
         let mut h = tm.begin(
@@ -2292,6 +2304,7 @@ mod tests {
             CatalogAccesses {
                 reads: vec![directory_read(test_collection())],
                 changes: Vec::new(),
+                missing_collection: false,
             },
         );
         let first = *h.id();
@@ -2307,6 +2320,7 @@ mod tests {
                     directory_read(other.clone()),
                 ],
                 changes: Vec::new(),
+                missing_collection: false,
             },
         );
         assert_eq!(
@@ -2487,6 +2501,7 @@ mod tests {
                     expected: None,
                     op: CollectionOp::Create,
                 }],
+                missing_collection: false,
             },
         );
         tm.collection_commit
@@ -2561,6 +2576,7 @@ mod tests {
                     expected: Some(dropped.id()),
                     op: CollectionOp::Drop,
                 }],
+                missing_collection: false,
             },
         );
         let old_id = *handle.id();

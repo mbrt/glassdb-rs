@@ -10,7 +10,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use crate::{Collection, CollectionPath, Database, Error, InlinePolicy, NodeSizePolicy};
 
 use super::SimMedia;
-use super::harness::{SimWorkload, open_det_db};
+use super::harness::{InstanceId, SimWorkload, open_det_db};
 use super::{CLIENT_COUNT, MAX_OPS_PER_CLIENT, key_name, read_int, try_read_int, write_int};
 /// Number of distinct keys the workload operates on.
 pub const RMW_KEY_COUNT: usize = 4;
@@ -269,7 +269,12 @@ impl SimWorkload for RmwWorkload {
         .expect("seed keys");
     }
 
-    async fn run_op(db: &Database, op: &RmwOp, state: &Mutex<RmwAcct>) -> Result<(), Error> {
+    async fn run_op(
+        db: &Database,
+        _instance: InstanceId,
+        op: &RmwOp,
+        state: &Mutex<RmwAcct>,
+    ) -> Result<(), Error> {
         let coll = db
             .open_collection(&CollectionPath::new(INCREMENT_COLLECTION)?)
             .await?;

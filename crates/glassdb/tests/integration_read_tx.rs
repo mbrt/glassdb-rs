@@ -1,8 +1,11 @@
 //! Stale read-only transactions (ADR-097).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use glassdb::{Collection, Database, Error, KeyScan, ReadTransaction, Stats, Transaction};
+use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
+use glassdb::{Backend, Collection, Database, Error, KeyScan, ReadTransaction, Stats, Transaction};
 
 pub mod integration_support;
 
@@ -190,7 +193,7 @@ async fn cache_then_write_both(
 }
 
 #[tokio::test(start_paused = true)]
-async fn read_tx_never_sees_an_earlier_state_than_a_previous_read_tx() {
+async fn read_tx_sees_every_transaction_whose_effect_a_previous_read_tx_saw() {
     let backend = mem();
     let reader = Database::open("example", backend.clone()).await.unwrap();
     let (x, z) = cache_then_write_both(&reader, backend).await;
@@ -471,6 +474,87 @@ async fn a_zero_bound_read_of_an_uncached_key_fetches_it_once() {
 /// ADR-047 lets a stale read return data from before a drop of its collection
 /// while its bound allows. A cut point before the drop keeps that rule, and a
 /// check that observes the drop fails.
+/// Returns a backend over `inner` that holds every operation after the first
+/// transaction record that it commits, and the flag that reports that commit.
+fn hold_after_commit(inner: Arc<dyn Backend>) -> (Arc<dyn Backend>, Arc<AtomicBool>) {
+    let committed = Arc::new(AtomicBool::new(false));
+    let backend = HookBackend::new(inner);
+    backend.set_before({
+        let committed = committed.clone();
+        move |_| {
+            let hold = committed.load(Ordering::SeqCst);
+            let future: HookFuture = Box::pin(async move {
+                if hold {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            });
+            future
+        }
+    });
+    backend.set_after({
+        let committed = committed.clone();
+        move |op, outcome| {
+            if outcome.is_success()
+                && matches!(op, BackendOp::WriteIf { path, .. } if path.contains("/_t/"))
+            {
+                committed.store(true, Ordering::SeqCst);
+            }
+            let future: HookFuture = Box::pin(async { Ok(()) });
+            future
+        }
+    });
+    (backend, committed)
+}
+
+/// A body opens a collection through a cached binding while another instance
+/// drops it. The drop has committed, but it has not updated the records yet,
+/// so a lookup in the collection finds the committed drop. No cut point
+/// explains that absence, so the body replays and sees the drop instead of
+/// returning `StaleCollection`.
+#[tokio::test(start_paused = true)]
+async fn read_tx_replays_when_its_body_finds_a_committed_drop() {
+    let backend = mem();
+    let setup = Database::open("example", backend.clone()).await.unwrap();
+    create_top(&setup, b"c")
+        .await
+        .write(b"k", b"v")
+        .await
+        .unwrap();
+    let reader = Database::open("example", backend.clone()).await.unwrap();
+    // The second run gives the cached binding and leaf an interval.
+    for _ in 0..2 {
+        reader
+            .read_tx(Duration::MAX, |tx: ReadTransaction| async move {
+                let c = tx.open_collection(&tx.root_collection(), b"c").await?;
+                tx.read(&c, b"k").await
+            })
+            .await
+            .unwrap();
+    }
+    let (held, committed) = hold_after_commit(backend);
+    let writer = Database::open("example", held).await.unwrap();
+    let c = open_top(&writer, b"c").await;
+    let drop = tokio::spawn(async move { c.drop_collection().await });
+    while !committed.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+
+    let child = reader
+        .read_tx(Duration::MAX, |tx: ReadTransaction| async move {
+            let c = match tx.open_collection(&tx.root_collection(), b"c").await {
+                Ok(c) => c,
+                Err(Error::NotFound) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            tx.read(&c, b"k").await?;
+            Ok(Some(tx.collection_exists(&c, b"child").await?))
+        })
+        .await;
+    assert!(matches!(child, Ok(None)), "{child:?}");
+    drop.abort();
+}
+
 #[tokio::test(start_paused = true)]
 async fn read_stale_returns_pre_drop_data_only_within_its_bound() {
     let backend = mem();
