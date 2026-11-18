@@ -9,6 +9,46 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-11-18: backend operations on the collection record
+
+Status: the collection record (`_i`) has at most 1.8% of the backend
+operations of a measure window, so a merge of `_i` into the tree root (`_r`)
+saves little.
+[ADR-100](../../docs/adr/100-reject-merging-the-collection-record-into-the-tree-root.md)
+rejects the merge.
+
+perfbench emits only the totals of `BackendBreakdown`
+(`crates/glassdb-bench-scale/src/backend_breakdown.rs`). A temporary patch on
+`c85bebf5c` emitted the counts of each `ObjectRole` for each phase of a cell:
+seed, open, warm-up, measure window, and shutdown. It also counted the failed
+conditional writes. The measure window has the same totals as the `costs` of
+the cell. All runs used `--time=virtual`. The `ci/counters` experiments used
+the options of `make bench`.
+
+Share of the collection record in the operations of the measure window:
+
+| Experiment | Share of `_i` |
+| --- | --- |
+| All `ci/counters` experiments | 0% |
+| `membership-churn` | 0.03% |
+| `split-merge-fight` | 0% to 0.11% |
+| `load-shift` | 0% to 0.04% |
+| `open-in-body` | 0% to 1.8% |
+
+- The highest share, 1.8%, is in the `open-in-body` cell with 5 database
+  instances, 4 keys, and a pool of 1,000 keys. Its measure window has 14
+  splits, and 212 of its 402 record writes failed.
+- Record writes occur in the seeds and in the windows with splits. The one
+  exception is the `open-in-body` cell with 5 database instances, 4 keys, and
+  a pool of 100 keys: its window has 48 record writes, 18 of them failed, and
+  no splits. The cause of these writes is not known. They are part of the 0.1%
+  share of the cell.
+- Failed record writes occur only with more than one database instance.
+- No phase of any cell had a merge.
+- In the `ci/counters` experiments, each database instance open reads
+  collection records two times: the record of the root collection, and the
+  binding of the collection in it.
+
 ## 2026-11-08: all experiments run in virtual time
 
 Status: with ADR-091, each experiment that ran in both time modes shows the

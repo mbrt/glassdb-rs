@@ -4,6 +4,9 @@
 
 Accepted — implemented.
 
+[ADR-100](100-reject-merging-the-collection-record-into-the-tree-root.md)
+measures the alternative "Keep the combined `_i`" and rejects it again.
+
 This supersedes the ADR-031 and ADR-046 clauses that make `_i`
 both the collection record and the B-link tree root. The B-link topology,
 fixed-address root split, transactional collection semantics, and all-node
