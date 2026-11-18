@@ -7,7 +7,7 @@ use clap::ValueEnum;
 use glassdb_concurr::rt;
 use tokio::runtime::{Builder, Runtime};
 
-use crate::backend;
+use crate::{backend, stall};
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum TimeMode {
@@ -71,6 +71,16 @@ impl TimeMode {
         match self {
             Self::Real => Ok(()),
             Self::Virtual => backend.check_virtual_time(),
+        }
+    }
+
+    /// Starts the watchdog of `runtime` in virtual time, where a task that
+    /// runs in a loop stops model time. It calls `report` with the error
+    /// before it ends the process. In real time, model time is wall time, so
+    /// the maximum duration of a measurement ends such a loop.
+    pub(crate) fn watch(self, runtime: &Runtime, report: impl Fn(&str) + Send + 'static) {
+        if self == Self::Virtual {
+            stall::watch(runtime.handle().clone(), report);
         }
     }
 

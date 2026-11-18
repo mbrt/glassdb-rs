@@ -29,7 +29,7 @@ use indexmap::IndexMap;
 use serde_json::{Map, Value as Json};
 
 use super::backend::Factory;
-use super::{Execution, cooldown, progress};
+use super::{Execution, cooldown, progress, stall};
 use config::{CellPoint, Resolved, Start};
 use model::CellSpec;
 use progress::Stage;
@@ -187,6 +187,7 @@ fn run_cells(
     execution: Execution,
 ) -> Result<Vec<CellResult>, Box<dyn Error>> {
     let run = chain.run;
+    let _watched = stall::watch_chain();
     let mut carry: Option<Carry> = None;
     let mut cells = Vec::with_capacity(chain.cells.len());
     for index in chain.cells.clone() {
@@ -199,6 +200,12 @@ fn run_cells(
         let next_continues =
             chain.cells.contains(&(index + 1)) && points[index + 1].start == Start::Previous;
         progress::start_cell();
+        stall::enter_cell(format!(
+            "{}: run={run} {} with the shapes {}",
+            resolved.name,
+            describe(point),
+            shape_names(&specs[index])
+        ));
         // The log names a cell only before its notes, so the error names it.
         let (cell, next) = runtime
             .block_on(run_cell(
@@ -735,6 +742,16 @@ async fn close(
     let databases: Vec<Database> = instances.into_iter().map(|i| i.db).collect();
     shutdown_databases_until(&databases, rt::Instant::now() + drain_timeout).await?;
     Ok(())
+}
+
+/// Returns the names of the shapes of `spec`, in the order of its groups.
+fn shape_names(spec: &CellSpec) -> String {
+    spec.groups
+        .iter()
+        .flat_map(|group| &group.shapes)
+        .map(|shape| shape.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn describe(point: &CellPoint) -> String {

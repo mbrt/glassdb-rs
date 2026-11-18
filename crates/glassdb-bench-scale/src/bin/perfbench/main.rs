@@ -8,6 +8,7 @@ mod parallel;
 mod progress;
 mod runner;
 mod scenarios;
+mod stall;
 mod time;
 
 #[cfg(target_env = "musl")]
@@ -206,6 +207,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         cli.time.install(&cli.backend)?;
         let runtime = cli.time.runtime()?;
+        cli.time.watch(&runtime, |message| {
+            progress::finish();
+            eprintln!("Error: {message}");
+        });
         let factory = runtime.block_on(cli.backend.initialize())?;
         run_all(&runtime, &factory, &resolved, execution, &mut experiments)
     };
@@ -276,6 +281,9 @@ fn chain_cells(
 ) -> Result<Vec<runner::result::CellResult>, Box<dyn Error>> {
     cli.time.install(&cli.backend)?;
     let runtime = cli.time.runtime()?;
+    cli.time.watch(&runtime, |message| {
+        let _ = parallel::emit(&parallel::Event::Error { message });
+    });
     let factory = runtime.block_on(cli.backend.initialize())?;
     runner::run_chain(&runtime, &factory, experiment, chain, id, execution)
 }
