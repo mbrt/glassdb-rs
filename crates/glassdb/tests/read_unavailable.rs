@@ -424,3 +424,81 @@ async fn directory_read_outage_is_unavailable_inside_the_body() {
         "a directory read outage must reach the body as Unavailable, got {observed:?}"
     );
 }
+
+/// A read-only `tx` whose body succeeds stages no change. An outage during
+/// the validation of its reads leaves nothing of the caller in doubt.
+#[tokio::test(start_paused = true)]
+async fn an_outage_in_read_only_commit_validation_is_a_read_outage() {
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    seed_shared(mem.clone(), b"k", 10).await;
+
+    let (backend, faults) = ReadFaults::wrap(mem.clone(), FaultTarget::Leaf);
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let coll = db
+        .open_collection(&CollectionPath::new(b"c").unwrap())
+        .await
+        .unwrap();
+
+    let bodies = Arc::new(AtomicUsize::new(0));
+    let coll = &coll;
+    let faults = &faults;
+    let result = db
+        .tx(|tx| {
+            let bodies = bodies.clone();
+            async move {
+                bodies.fetch_add(1, Ordering::SeqCst);
+                let value = tx.read(coll, b"k").await?;
+                faults.fail_reads_forever();
+                Ok(value)
+            }
+        })
+        .await;
+
+    assert!(matches!(result, Err(Error::Unavailable(_))), "{result:?}");
+    assert_eq!(bodies.load(Ordering::SeqCst), 1);
+    db.shutdown().await;
+}
+
+/// Only the latest body execution is committed. A write that an earlier
+/// execution staged puts nothing of the caller in doubt when a later
+/// execution only reads.
+#[tokio::test(start_paused = true)]
+async fn a_replay_that_only_reads_is_a_read_outage() {
+    let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    seed_shared(mem.clone(), b"k", 10).await;
+
+    let (backend, faults) = ReadFaults::wrap(mem.clone(), FaultTarget::Leaf);
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let path = CollectionPath::new(b"c").unwrap();
+    let coll = db.open_collection(&path).await.unwrap();
+    let peer = Database::open("example", mem).await.unwrap();
+    let peer_coll = peer.open_collection(&path).await.unwrap();
+
+    let bodies = Arc::new(AtomicUsize::new(0));
+    let coll = &coll;
+    let peer_coll = &peer_coll;
+    let faults = &faults;
+    let result = db
+        .tx(|tx| {
+            let bodies = bodies.clone();
+            async move {
+                let first = bodies.fetch_add(1, Ordering::SeqCst) == 0;
+                let value = tx.read(coll, b"k").await?;
+                if first {
+                    // The peer write invalidates the read, so the body
+                    // executes again.
+                    peer_coll.write(b"k", &write_int(11)).await?;
+                    tx.write(coll, b"k2", &write_int(1))?;
+                } else {
+                    faults.fail_reads_forever();
+                }
+                Ok(value)
+            }
+        })
+        .await;
+
+    assert!(matches!(result, Err(Error::Unavailable(_))), "{result:?}");
+    assert_eq!(bodies.load(Ordering::SeqCst), 2);
+    db.shutdown().await;
+    peer.shutdown().await;
+}

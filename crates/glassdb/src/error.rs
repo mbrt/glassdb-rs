@@ -118,7 +118,7 @@ impl Error {
     /// Maps a transaction-layer error raised by an operation that stages no
     /// change of the caller. Examples are a collection directory read from a
     /// transaction body, the validation of the reads behind a body's error
-    /// outcome, and the commit of a stale read-only transaction.
+    /// outcome, and the commit of a transaction body that staged no change.
     ///
     /// Such an operation leaves no change of the caller in doubt, so it
     /// applies the same rule as [`Error::from_read`] to the storage error it

@@ -652,14 +652,17 @@ impl DbInner {
             stats.writes += accesses.write_count() as u64;
 
             if body_outcome.is_ok() {
+                // Only the accesses of the latest body execution are
+                // committed, so only they can put a change of the caller in
+                // doubt.
+                let stages_change = accesses.write_count() > 0 || catalog_accesses.has_writes();
                 driver.install_accesses(accesses, catalog_accesses);
                 match driver.commit().await {
                     Ok(BodyDecision::ReturnOutcome) => break body_outcome,
                     Ok(BodyDecision::ReplayBody) => {}
-                    // A stale read-only transaction stages no change, so a
-                    // failed validation leaves nothing of the caller in doubt
-                    // (ADR-015).
-                    Err(e) if max_staleness.is_some() => break Err(Error::from_read_trans(e)),
+                    // A body that staged no change leaves nothing of the
+                    // caller in doubt when its commit fails (ADR-015).
+                    Err(e) if !stages_change => break Err(Error::from_read_trans(e)),
                     Err(e) => break Err(e.into()),
                 }
             } else {
