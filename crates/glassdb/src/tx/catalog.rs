@@ -26,6 +26,7 @@ pub(super) struct CatalogOverlay {
     dropped: HashSet<CollectionAddress>,
     dropped_bindings: HashSet<(CollectionAddress, CollectionName)>,
     reservations: CollectionReservations,
+    missing_collection: bool,
 }
 
 struct DirectoryState {
@@ -46,6 +47,7 @@ impl CatalogOverlay {
             dropped: HashSet::new(),
             dropped_bindings: HashSet::new(),
             reservations,
+            missing_collection: false,
         }
     }
 
@@ -297,11 +299,17 @@ impl CatalogOverlay {
             });
     }
 
+    /// Records that the database had no collection that the body used.
+    pub(super) fn record_missing_collection(&mut self) {
+        self.missing_collection = true;
+    }
+
     /// Serializes the accumulated logical accesses for the commit engine.
     pub(super) fn accesses(&self) -> CatalogAccesses {
         CatalogAccesses {
             reads: self.reads.clone(),
             changes: self.changes.values().cloned().collect(),
+            missing_collection: self.missing_collection,
         }
     }
 }
