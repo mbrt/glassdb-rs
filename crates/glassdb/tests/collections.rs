@@ -649,11 +649,20 @@ async fn create_then_drop_without_data_collapses_to_noop() {
 
 #[tokio::test]
 async fn not_empty_is_revalidated_before_it_is_returned() {
-    let db = Database::open("example", MemoryBackend::new())
+    let backend = Arc::new(MemoryBackend::new());
+    let db = Database::open("example", backend.clone()).await.unwrap();
+    let parent = db.create_collection("parent").await.unwrap();
+    parent.create_collection("child").await.unwrap();
+    // Another instance drops the child, so that no cut point after the start
+    // of the transaction covers the directory state that the body observed.
+    let other = Database::open("example", backend).await.unwrap();
+    let child = other
+        .open_collection("parent")
+        .await
+        .unwrap()
+        .open_collection("child")
         .await
         .unwrap();
-    let parent = db.create_collection("parent").await.unwrap();
-    let child = parent.create_collection("child").await.unwrap();
     let first_attempt = Arc::new(AtomicBool::new(true));
 
     db.tx({

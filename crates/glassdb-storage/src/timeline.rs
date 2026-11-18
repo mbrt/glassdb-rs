@@ -95,10 +95,12 @@ impl Requirement {
     }
 }
 
-/// The oldest cut point that a stale read-only transaction accepts (ADR-097).
+/// The oldest cut point that a read-only transaction accepts (ADR-097,
+/// ADR-099).
 ///
 /// The transaction captures it when it starts, so its staleness bound is
-/// measured from the start of the call. It converts a duration to a sequence
+/// measured from the start of the call. A transaction that is not stale has a
+/// zero bound. It converts a duration to a sequence
 /// point by approximation, so it is not a currentness barrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StalenessCutoff(SequencePoint);
@@ -214,13 +216,13 @@ impl Timeline {
         Self::from_source(source, None)
     }
 
-    /// Captures the staleness cutoff of a stale read-only transaction that
-    /// starts now and accepts a cut point no older than `max_staleness`.
+    /// Captures the staleness cutoff of a transaction that starts now and
+    /// accepts a cut point no older than `max_staleness`.
     ///
     /// A zero bound subtracts nothing, so its cutoff is a point allocated
-    /// now, as a currentness barrier is. A stale read-only transaction with a
-    /// zero bound relies on this to follow every operation that completed
-    /// before it started.
+    /// now, as a currentness barrier is. Every transaction that is not stale,
+    /// and a stale read-only transaction with a zero bound, rely on this to
+    /// follow every operation that completed before they start (ADR-099).
     pub fn staleness_cutoff(&self, max_staleness: Duration) -> StalenessCutoff {
         if max_staleness == Duration::MAX {
             StalenessCutoff::ANY
