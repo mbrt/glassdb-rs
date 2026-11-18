@@ -265,7 +265,7 @@ impl Restructurer {
             loop {
                 let delay = match recovery.recover_structural_intents().await {
                     Ok(progress) => {
-                        cadence.observe(progress);
+                        cadence.observe(f64::from(progress));
                         if recovery.recovery.has_continuation() {
                             cadence.delay().min(minimum)
                         } else {

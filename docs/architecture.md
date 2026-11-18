@@ -1063,12 +1063,14 @@ the burst. Each check reserves a write before it starts, so a refill cannot
 start a burst of checks. The count needs no attribution in the write path, so
 it is rough: splits, merges, and lost CASes also add budget.
 
-The candidate capacities follow the budget: about the checks that the spend
-limit allows while a candidate holds its slot, between a floor and the maximum
-of `GcLimits`. Concurrency starts at one check. Below 8 it grows while ready
-work waits. Above 8 it grows only while most checks of a round write, so checks
-that only read, of records that stay live, keep it at 8. `gc_parallelism` is
-only a safety limit.
+The scan capacity follows the budget: about the checks that the spend limit
+allows while a candidate holds its slot, between a floor and the maximum of
+`GcLimits`. The hint capacity is the maximum of `GcLimits`, so that hints wait
+instead of being dropped while the budget limits GC
+([ADR-101](adr/101-hints-wait-while-the-write-budget-limits-gc.md)).
+Concurrency starts at one check. Below 8 it grows while ready work waits. Above
+8 it grows only while most checks of a round write, so checks that only read, of
+records that stay live, keep it at 8. `gc_parallelism` is only a safety limit.
 
 Checks run in a pipeline. Status reads run without pauses. A reclaimable record
 joins an epoch, which gets one currentness barrier when it is full, when it has
@@ -1094,6 +1096,7 @@ use it to start a measurement with no garbage from the warm-up.
 GC scans are a backup for dropped hints. Each scan turn does at most one LIST.
 Database instances scan shuffled prefixes independently, with no reservations,
 leases, or coordination writes. LIST is not a snapshot, so scans must repeat.
+A LIST waits until the check pipeline has taken each listed record.
 
 Each instance scans at one depth: the transaction root, 64 prefixes, or 4,096
 prefixes. A traversal that still has a cursor after enough pages makes the depth
@@ -1103,8 +1106,9 @@ change resets the samples and the schedule, but running traversals keep their
 prefixes. A prefix can have only one active traversal, which limits the number
 of held cursors.
 
-The delay between turns follows the recent useful progress of scan-origin
-checks, with random variation and a cap tied to the pending-transaction timeout.
+The delay between turns follows the recent share of scan-origin checks that
+made progress, with random variation and a cap tied to the pending-transaction
+timeout. So scans slow down when other instances reclaim their records first.
 A hint dropped since the last turn also counts as progress, because only a scan
 can find its record
 ([ADR-078](adr/078-full-gc-and-gc-write-budget.md)). Errors use separate

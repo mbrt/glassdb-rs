@@ -89,9 +89,10 @@ impl ScanCadence {
         }
     }
 
-    /// Updates the demand estimate from whether a scan made useful progress.
-    pub fn observe(&mut self, useful: bool) {
-        self.productive = 0.75 * self.productive + 0.25 * f64::from(useful);
+    /// Updates the demand estimate from the share of a scan's work that made
+    /// useful progress, from 0 to 1.
+    pub fn observe(&mut self, useful: f64) {
+        self.productive = 0.75 * self.productive + 0.25 * useful;
     }
 
     /// Returns an interval with random variation within the configured bounds.
@@ -187,7 +188,7 @@ mod tests {
         let maximum = Duration::from_secs(1);
         let mut cadence = ScanCadence::new(Duration::from_secs(2), maximum);
         assert_eq!(cadence.delay(), maximum);
-        cadence.observe(false);
+        cadence.observe(0.0);
         assert_eq!(cadence.delay(), maximum);
     }
 
@@ -201,7 +202,7 @@ mod tests {
             let mut cadence = ScanCadence::new(minimum, maximum);
             assert_eq!(cadence.delay(), Duration::ZERO);
             for _ in 0..2000 {
-                cadence.observe(false);
+                cadence.observe(0.0);
             }
             assert_eq!(cadence.delay(), Duration::ZERO);
         }
@@ -243,7 +244,7 @@ mod sim_tests {
                 (Duration::MAX, Duration::MAX),
             ] {
                 let mut cadence = ScanCadence::new(minimum, maximum);
-                for useful in [false, true] {
+                for useful in [0.0, 0.5, 1.0] {
                     for _ in 0..100 {
                         cadence.observe(useful);
                         assert!((minimum..=maximum).contains(&cadence.delay()));
