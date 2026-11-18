@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
-use glassdb::{Backend, Collection, Database, Error, KeyScan, ReadTransaction, Stats, Transaction};
+use glassdb::{
+    Backend, Collection, CollectionPath, Database, Error, KeyScan, ReadTransaction, Stats,
+    Transaction,
+};
 
 pub mod integration_support;
 
@@ -161,6 +164,59 @@ async fn warm_read_tx_collection_listing_needs_no_backend_operation() {
 
     let before = db.stats();
     assert_eq!(list(db.clone(), parent.clone()).await, (true, 2));
+    assert_eq!(backend_ops(&db, &before), (0, 0, 0));
+}
+
+/// Calls each read helper of a collection and of a database. `$c` and `$db`
+/// are the strong handles or their stale views, which have the same helpers.
+macro_rules! call_read_helpers {
+    ($c:expr, $db:expr) => {{
+        let top = CollectionPath::new(b"c").unwrap();
+        (
+            $c.read(b"k").await.unwrap(),
+            $c.read(b"missing").await.unwrap(),
+            $c.scan_keys(KeyScan::all()).await.unwrap().into_keys(),
+            $c.iter_keys().await.unwrap().collect::<Vec<_>>(),
+            $c.iter_collections()
+                .await
+                .unwrap()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            $c.open_collection(b"x")
+                .await
+                .unwrap()
+                .name()
+                .map(<[u8]>::to_vec),
+            $c.collection_exists(b"x").await.unwrap(),
+            $c.collection_exists(b"missing").await.unwrap(),
+            $db.open_collection(&top)
+                .await
+                .unwrap()
+                .name()
+                .map(<[u8]>::to_vec),
+            $db.collection_exists(&top.child(b"x").unwrap())
+                .await
+                .unwrap(),
+            $db.collection_exists("missing").await.unwrap(),
+        )
+    }};
+}
+
+/// Each helper of a stale view gives the result of its strong helper, and with
+/// a warm cache it needs no backend operation.
+#[tokio::test(start_paused = true)]
+async fn warm_stale_view_helpers_need_no_backend_operation() {
+    let db = Database::open("example", mem()).await.unwrap();
+    let c = create_top(&db, b"c").await;
+    c.write(b"k", b"v").await.unwrap();
+    c.create_collection(b"x").await.unwrap();
+
+    let strong = call_read_helpers!(c, db);
+    call_read_helpers!(c.stale(STALENESS), db.stale(STALENESS));
+
+    let before = db.stats();
+    let stale = call_read_helpers!(c.stale(STALENESS), db.stale(STALENESS));
+    assert_eq!(stale, strong);
     assert_eq!(backend_ops(&db, &before), (0, 0, 0));
 }
 
@@ -428,23 +484,23 @@ mod persistent {
     }
 }
 
-/// `Collection::read_stale` is a stale read-only transaction with one read
+/// A stale read is a stale read-only transaction with one read
 /// (ADR-098), so the monotonic floor orders it with `read_tx` in both
 /// directions.
 #[tokio::test(start_paused = true)]
-async fn read_stale_and_read_tx_share_the_monotonic_floor() {
-    for read_stale_first in [false, true] {
+async fn stale_read_and_read_tx_share_the_monotonic_floor() {
+    for stale_read_first in [false, true] {
         let backend = mem();
         let reader = Database::open("example", backend.clone()).await.unwrap();
         let (x, z) = cache_then_write_both(&reader, backend).await;
 
-        let (first, second) = if read_stale_first {
-            let first = x.read_stale(b"k", Duration::ZERO).await.unwrap().unwrap();
+        let (first, second) = if stale_read_first {
+            let first = x.stale(Duration::ZERO).read(b"k").await.unwrap().unwrap();
             let second = read_tx_all(&reader, Duration::MAX, &[z]).await.remove(0);
             (first, second)
         } else {
             let first = read_tx_all(&reader, Duration::ZERO, &[x]).await.remove(0);
-            let second = z.read_stale(b"k", Duration::MAX).await.unwrap().unwrap();
+            let second = z.stale(Duration::MAX).read(b"k").await.unwrap().unwrap();
             (first, second)
         };
         assert_eq!((first, second), (b"new".to_vec(), b"new".to_vec()));
@@ -466,7 +522,7 @@ async fn a_zero_bound_read_of_an_uncached_key_fetches_it_once() {
     let c = open_top(&reader, b"c").await;
 
     let before = reader.stats();
-    let value = c.read_stale(b"k", Duration::ZERO).await.unwrap();
+    let value = c.stale(Duration::ZERO).read(b"k").await.unwrap();
     assert_eq!(value.as_deref(), Some(b"v".as_slice()));
     assert_eq!(backend_ops(&reader, &before), (1, 0, 0));
 }
@@ -556,14 +612,14 @@ async fn read_tx_replays_when_its_body_finds_a_committed_drop() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn read_stale_returns_pre_drop_data_only_within_its_bound() {
+async fn stale_read_returns_pre_drop_data_only_within_its_bound() {
     let backend = mem();
     let reader = Database::open("example", backend.clone()).await.unwrap();
     let c = create_top(&reader, b"c").await;
     c.write(b"k", b"v").await.unwrap();
     // The second read gives the cached states an interval.
     for _ in 0..2 {
-        c.read_stale(b"k", Duration::MAX).await.unwrap();
+        c.stale(Duration::MAX).read(b"k").await.unwrap();
     }
     let writer = Database::open("example", backend).await.unwrap();
     open_top(&writer, b"c")
@@ -573,9 +629,9 @@ async fn read_stale_returns_pre_drop_data_only_within_its_bound() {
         .unwrap();
 
     let before = reader.stats();
-    let value = c.read_stale(b"k", STALENESS).await.unwrap();
+    let value = c.stale(STALENESS).read(b"k").await.unwrap();
     assert_eq!(value.as_deref(), Some(b"v".as_slice()));
     assert_eq!(backend_ops(&reader, &before), (0, 0, 0));
-    let err = c.read_stale(b"k", Duration::ZERO).await.unwrap_err();
+    let err = c.stale(Duration::ZERO).read(b"k").await.unwrap_err();
     assert!(matches!(err, Error::StaleCollection), "{err:?}");
 }

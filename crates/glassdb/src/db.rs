@@ -283,10 +283,7 @@ impl Database {
         P: TryInto<CollectionPath>,
         P::Error: Into<Error>,
     {
-        let path = path.try_into().map_err(Into::into)?;
-        self.inner
-            .tx(move |tx| open_path_in_transaction(tx, path.clone()))
-            .await
+        self.reads(None).open_collection(path).await
     }
 
     /// Reports whether every component of a logical collection path is bound.
@@ -298,10 +295,7 @@ impl Database {
         P: TryInto<CollectionPath>,
         P::Error: Into<Error>,
     {
-        let path = path.try_into().map_err(Into::into)?;
-        self.inner
-            .tx(move |tx| path_exists_in_transaction(tx, path.clone()))
-            .await
+        self.reads(None).collection_exists(path).await
     }
 
     /// Strictly creates the final component of `path`.
@@ -422,6 +416,15 @@ impl Database {
             .await
     }
 
+    /// Returns a view whose collection helpers each run one stale read-only
+    /// transaction with the bound `max_staleness`.
+    ///
+    /// Each helper is the same as a [`Database::read_tx`] whose body does the
+    /// work of the strong helper of this database, with the same guarantees.
+    pub fn stale(&self, max_staleness: Duration) -> StaleDatabaseView<'_> {
+        self.reads(Some(max_staleness))
+    }
+
     /// Runs one full GC and returns when it is complete.
     ///
     /// A full GC lists every transaction record of the database once and checks
@@ -491,9 +494,61 @@ impl Database {
             coordinator_dedup: engine.coordinator_dedup,
         }
     }
+
+    fn reads(&self, max_staleness: Option<Duration>) -> StaleDatabaseView<'_> {
+        StaleDatabaseView {
+            inner: &self.inner,
+            max_staleness,
+        }
+    }
 }
 
-/// Resolves `path` through one serializable transaction.
+/// The collection helpers of one database, each run as a stale read-only
+/// transaction. [`Database::stale`] returns it.
+pub struct StaleDatabaseView<'a> {
+    inner: &'a Arc<DbInner>,
+    /// `None` runs each helper as a strong transaction, so that the strong
+    /// helpers of [`Database`] share these bodies.
+    max_staleness: Option<Duration>,
+}
+
+impl StaleDatabaseView<'_> {
+    /// Resolves a logical path to its bound collection ID.
+    ///
+    /// A string names one top-level collection; use [`CollectionPath`] for a
+    /// nested path.
+    pub async fn open_collection<P>(&self, path: P) -> Result<Collection, Error>
+    where
+        P: TryInto<CollectionPath>,
+        P::Error: Into<Error>,
+    {
+        let path = path.try_into().map_err(Into::into)?;
+        self.inner
+            .tx_with(self.max_staleness, move |tx| {
+                open_path_in_transaction(tx, path.clone())
+            })
+            .await
+    }
+
+    /// Reports whether every component of a logical collection path is bound.
+    ///
+    /// A string names one top-level collection; use [`CollectionPath`] for a
+    /// nested path.
+    pub async fn collection_exists<P>(&self, path: P) -> Result<bool, Error>
+    where
+        P: TryInto<CollectionPath>,
+        P::Error: Into<Error>,
+    {
+        let path = path.try_into().map_err(Into::into)?;
+        self.inner
+            .tx_with(self.max_staleness, move |tx| {
+                path_exists_in_transaction(tx, path.clone())
+            })
+            .await
+    }
+}
+
+/// Resolves `path` through one transaction.
 async fn open_path_in_transaction(
     tx: Transaction,
     path: CollectionPath,
@@ -501,7 +556,7 @@ async fn open_path_in_transaction(
     tx.open_collection_path(&path).await
 }
 
-/// Checks every binding in `path` through one serializable transaction.
+/// Checks every binding in `path` through one transaction.
 async fn path_exists_in_transaction(tx: Transaction, path: CollectionPath) -> Result<bool, Error> {
     tx.collection_path_exists(&path).await
 }

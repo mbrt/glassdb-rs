@@ -181,13 +181,14 @@ async fn delete() {
 
     assert!(coll.read(key).await.unwrap().is_none());
     assert!(
-        coll.read_stale(key, std::time::Duration::MAX)
+        coll.stale(std::time::Duration::MAX)
+            .read(key)
             .await
             .unwrap()
             .is_none()
     );
 
-    // `read_stale` is a stale read-only transaction (ADR-098).
+    // A stale read is a stale read-only transaction (ADR-098).
     let stats = db.stats();
     assert_eq!(stats.transactions.completed, 5);
     assert_eq!(stats.transactions.writes, 2);
@@ -464,7 +465,7 @@ async fn concurrent_reads() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn read_stale() {
+async fn stale_read() {
     use std::time::Duration;
 
     let db = init_db(mem()).await;
@@ -489,7 +490,7 @@ async fn read_stale() {
         .await
         .unwrap();
 
-        let val = coll.read_stale(key, staleness).await.unwrap().unwrap();
+        let val = coll.stale(staleness).read(key).await.unwrap().unwrap();
         let read_num = read_int(&val);
         assert!(read_num <= i, "weak read {read_num} should be <= {i}");
         if i >= max_behind {
@@ -499,7 +500,7 @@ async fn read_stale() {
         tokio::time::sleep(sleep_time).await;
     }
 
-    // Each `read_stale` is a stale read-only transaction (ADR-098).
+    // Each stale read is a stale read-only transaction (ADR-098).
     let stats = db.stats();
     assert_eq!(stats.transactions.completed, 61);
     assert_eq!(stats.transactions.replays, 0);

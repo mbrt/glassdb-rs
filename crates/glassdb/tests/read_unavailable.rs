@@ -364,7 +364,7 @@ async fn an_outage_in_the_cut_check_is_a_read_outage() {
     coll.read(b"k").await.unwrap();
 
     faults.fail_reads_forever();
-    let result = coll.read_stale(b"k", Duration::ZERO).await;
+    let result = coll.stale(Duration::ZERO).read(b"k").await;
     assert!(matches!(result, Err(Error::Unavailable(_))), "{result:?}");
     db.shutdown().await;
 }
