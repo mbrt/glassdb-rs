@@ -287,6 +287,10 @@ pub trait SimWorkload: Clone + Default + 'static {
     ///
     /// [`verify`]: SimWorkload::verify
     type State: 'static;
+    /// The state of one database instance. The clients of the instance share
+    /// it, and the harness drops it with the database of the instance, before a
+    /// crash reopens the cache media. Use `()` when no state is needed.
+    type Instance: 'static;
 
     /// Whether the oracle supports later operations after an admissible public
     /// error. The operation stays consumed and its recorded outcome is unchanged.
@@ -317,6 +321,9 @@ pub trait SimWorkload: Clone + Default + 'static {
         )
     }
 
+    /// Creates the state of the instance `id`, which `db` opened.
+    fn open_instance(db: &Database, id: InstanceId) -> Self::Instance;
+
     /// Creates and seeds this workload's collection(s) before the clients start,
     /// over the faultless backbone (so setup cannot fail spuriously).
     fn seed(&self, db: &Database) -> impl Future<Output = ()>;
@@ -324,10 +331,10 @@ pub trait SimWorkload: Clone + Default + 'static {
     /// Runs one op in its own transaction, updating `state`. Returns the op's
     /// public result so the client loop can apply its error policy. The workload
     /// must record that result before returning, including any unknown outcome.
-    /// `instance` identifies the database instance that `db` belongs to.
+    /// `instance` is the state of the database instance that `db` belongs to.
     fn run_op(
         db: &Database,
-        instance: InstanceId,
+        instance: &Self::Instance,
         op: &Self::Op,
         state: &Self::State,
     ) -> impl Future<Output = Result<(), Error>>;
@@ -647,11 +654,14 @@ mod sim_tests {
         starting: Barrier,
         completed: Barrier,
         snapshots: Mutex<Vec<(usize, crate::Stats)>>,
+        /// The address of the instance state that each operation got.
+        instances: Mutex<Vec<usize>>,
     }
 
     impl SimWorkload for SharedInstanceWorkload {
         type Op = usize;
         type State = SharedInstanceState;
+        type Instance = InstanceId;
 
         fn clients(&self) -> &[Vec<Self::Op>] {
             &self.clients
@@ -662,17 +672,27 @@ mod sim_tests {
                 starting: Barrier::new(4),
                 completed: Barrier::new(4),
                 snapshots: Mutex::new(Vec::new()),
+                instances: Mutex::new(Vec::new()),
             }
         }
 
         async fn seed(&self, _db: &Database) {}
 
+        fn open_instance(_db: &Database, id: InstanceId) -> InstanceId {
+            id
+        }
+
         async fn run_op(
             db: &Database,
-            _instance: InstanceId,
+            instance: &InstanceId,
             client: &usize,
             state: &Self::State,
         ) -> Result<(), Error> {
+            state
+                .instances
+                .lock()
+                .unwrap()
+                .push(std::ptr::from_ref(instance) as usize);
             state.starting.wait().await;
             let key = super::super::key_name(*client);
             let key = &key;
@@ -696,6 +716,16 @@ mod sim_tests {
                     Some(b"value".to_vec()),
                 );
             }
+            // Two instances, each with one state that both of its clients get.
+            let mut uses = BTreeMap::<usize, usize>::new();
+            for address in state.instances.lock().unwrap().iter() {
+                *uses.entry(*address).or_default() += 1;
+            }
+            assert_eq!(
+                uses.values().copied().collect::<Vec<_>>(),
+                [2, 2],
+                "the clients of one instance share its state"
+            );
             let snapshots = state.snapshots.lock().unwrap();
             assert_eq!(snapshots.len(), 4);
             for (client, stats) in snapshots.iter() {
@@ -780,6 +810,7 @@ mod sim_tests {
     impl SimWorkload for PanickingWorkload {
         type Op = ();
         type State = ();
+        type Instance = ();
 
         fn clients(&self) -> &[Vec<Self::Op>] {
             &self.clients
@@ -789,9 +820,11 @@ mod sim_tests {
 
         async fn seed(&self, _db: &Database) {}
 
+        fn open_instance(_db: &Database, _id: InstanceId) {}
+
         async fn run_op(
             _db: &Database,
-            _instance: InstanceId,
+            _instance: &(),
             _op: &Self::Op,
             _state: &Self::State,
         ) -> Result<(), Error> {

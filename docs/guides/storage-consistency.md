@@ -105,7 +105,8 @@ check, and the reopened timeline follows it too.
 
 A cut search reads the starts and the watermarks only inside the cached-store
 module. A planned target is the latest start among several states, raised to
-the staleness cutoff and to the monotonic floor. The transaction captures the
+the staleness cutoff and to the monotonic floor of the stale view, if there is
+one. A read-only `Database::tx` has no floor. The transaction captures the
 staleness cutoff when it starts, and it is not a barrier. One state needs no
 start.
 A state whose watermark is before the target is checked against the barrier

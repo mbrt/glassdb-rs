@@ -115,10 +115,10 @@ impl StalenessCutoff {
 }
 
 /// The earliest cut point that the next stale read-only transaction of a
-/// database instance can use (ADR-097).
+/// stale view can use (ADR-097, ADR-102). Clones share one floor.
 ///
-/// It only rises. Use it only with the timeline of the database instance that
-/// owns it.
+/// It only rises. Use it only with the timeline of the database instance of
+/// its view.
 #[derive(Debug, Clone, Default)]
 pub struct MonotonicFloor(Arc<AtomicU64>);
 

@@ -207,6 +207,7 @@ async fn read_tx_ring_snapshot(
 impl SimWorkload for CycleWorkload {
     type Op = usize;
     type State = AtomicUsize;
+    type Instance = ();
 
     fn clients(&self) -> &[Vec<usize>] {
         &self.clients
@@ -235,9 +236,11 @@ impl SimWorkload for CycleWorkload {
         .expect("seed ring");
     }
 
+    fn open_instance(_db: &Database, _id: InstanceId) {}
+
     async fn run_op(
         db: &Database,
-        _instance: InstanceId,
+        _instance: &(),
         op: &usize,
         _state: &AtomicUsize,
     ) -> Result<(), Error> {

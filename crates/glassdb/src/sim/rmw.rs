@@ -222,6 +222,7 @@ fn assert_bounds(acct: &RmwAcct, finals: &[i64], expected: &[i64], failures_enab
 impl SimWorkload for RmwWorkload {
     type Op = RmwOp;
     type State = Mutex<RmwAcct>;
+    type Instance = ();
 
     fn clients(&self) -> &[Vec<RmwOp>] {
         &self.clients
@@ -269,9 +270,11 @@ impl SimWorkload for RmwWorkload {
         .expect("seed keys");
     }
 
+    fn open_instance(_db: &Database, _id: InstanceId) {}
+
     async fn run_op(
         db: &Database,
-        _instance: InstanceId,
+        _instance: &(),
         op: &RmwOp,
         state: &Mutex<RmwAcct>,
     ) -> Result<(), Error> {

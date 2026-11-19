@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use glassdb_data::{CollectionAddress, CollectionName, DatabaseId};
 
-use crate::db::DbInner;
+use crate::db::{DbInner, StaleViewState};
 use crate::error::Error;
 use crate::iter::CollectionIter;
 use crate::scan::{KeyPage, KeyScan};
@@ -89,7 +89,7 @@ impl Collection {
     /// Reads the value for `key` with strong (serializable) consistency,
     /// returning `None` when the key is absent.
     pub async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        self.reads(None).read(key).await
+        self.strong_reads().read(key).await
     }
 
     /// Writes `value` for `key` within a transaction.
@@ -134,12 +134,12 @@ impl Collection {
 
     /// Opens the direct child currently bound to `name`.
     pub async fn open_collection(&self, name: impl AsRef<[u8]>) -> Result<Collection, Error> {
-        self.reads(None).open_collection(name).await
+        self.strong_reads().open_collection(name).await
     }
 
     /// Reports whether a direct child is currently bound to `name`.
     pub async fn collection_exists(&self, name: impl AsRef<[u8]>) -> Result<bool, Error> {
-        self.reads(None).collection_exists(name).await
+        self.strong_reads().collection_exists(name).await
     }
 
     /// Strictly creates and binds a new direct child.
@@ -157,7 +157,7 @@ impl Collection {
 
     /// Materializes one serializable, sorted page of collection keys.
     pub async fn scan_keys(&self, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
-        self.reads(None).scan_keys(scan).await
+        self.strong_reads().scan_keys(scan).await
     }
 
     /// Returns an owned iterator over direct child bindings in raw-name order.
@@ -165,7 +165,7 @@ impl Collection {
     /// All I/O and serializable validation complete before the iterator is
     /// returned. Each yielded handle remains bound to the listed collection ID.
     pub async fn iter_collections(&self) -> Result<CollectionIter, Error> {
-        self.reads(None).iter_collections().await
+        self.strong_reads().iter_collections().await
     }
 
     /// Non-recursively drops this exact collection.
@@ -180,17 +180,19 @@ impl Collection {
         self.name.as_ref().map(CollectionName::as_bytes)
     }
 
-    /// Returns a view whose read helpers each run one stale read-only
+    /// Returns a new view whose read helpers each run one stale read-only
     /// transaction with the bound `max_staleness`.
     ///
-    /// Each helper is the same as a
+    /// Each call returns a view with its own order, as
+    /// [`Database::stale`](crate::Database::stale) does. Each helper is the
+    /// same as a
     /// [`StaleDatabaseView::read_tx`](crate::StaleDatabaseView::read_tx) with
     /// the same bound, whose body does the work of the strong helper of this
     /// collection, with the same guarantees.
     pub fn stale(&self, max_staleness: Duration) -> StaleCollectionView {
         StaleCollectionView {
             collection: self.clone(),
-            max_staleness,
+            state: StaleViewState::new(max_staleness),
         }
     }
 
@@ -231,10 +233,10 @@ impl Collection {
         self.db.database_id
     }
 
-    fn reads(&self, max_staleness: Option<Duration>) -> CollectionReads<'_> {
+    fn strong_reads(&self) -> CollectionReads<'_> {
         CollectionReads {
             collection: self,
-            max_staleness,
+            stale: None,
         }
     }
 
@@ -249,11 +251,11 @@ impl Collection {
 /// The read helpers of one collection, each run as a stale read-only
 /// transaction. [`Collection::stale`] returns it.
 ///
-/// A view is cheap to clone.
+/// A view is cheap to clone. Clones share the order of the view.
 #[derive(Clone)]
 pub struct StaleCollectionView {
     collection: Collection,
-    max_staleness: Duration,
+    state: StaleViewState,
 }
 
 impl StaleCollectionView {
@@ -287,7 +289,7 @@ impl StaleCollectionView {
     fn reads(&self) -> CollectionReads<'_> {
         CollectionReads {
             collection: &self.collection,
-            max_staleness: Some(self.max_staleness),
+            stale: Some(&self.state),
         }
     }
 }
@@ -298,32 +300,27 @@ struct CollectionReads<'a> {
     collection: &'a Collection,
     /// `None` runs each helper as a strong transaction, so that the strong
     /// helpers of [`Collection`] share these bodies.
-    max_staleness: Option<Duration>,
+    stale: Option<&'a StaleViewState>,
 }
 
 impl CollectionReads<'_> {
     async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let c = self.collection;
-        c.db.tx_with(
-            self.max_staleness,
-            |tx| async move { tx.read(c, key).await },
-        )
-        .await
+        c.db.tx_with(self.stale, |tx| async move { tx.read(c, key).await })
+            .await
     }
 
     async fn open_collection(&self, name: impl AsRef<[u8]>) -> Result<Collection, Error> {
         let c = self.collection;
         let name = &collection_name(name.as_ref())?;
-        c.db.tx_with(self.max_staleness, |tx| async move {
-            tx.open_child(c, name).await
-        })
-        .await
+        c.db.tx_with(self.stale, |tx| async move { tx.open_child(c, name).await })
+            .await
     }
 
     async fn collection_exists(&self, name: impl AsRef<[u8]>) -> Result<bool, Error> {
         let c = self.collection;
         let name = &collection_name(name.as_ref())?;
-        c.db.tx_with(self.max_staleness, |tx| async move {
+        c.db.tx_with(self.stale, |tx| async move {
             Ok(tx.resolve_child(c, name).await?.is_some())
         })
         .await
@@ -331,18 +328,14 @@ impl CollectionReads<'_> {
 
     async fn scan_keys(&self, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
         let c = self.collection;
-        c.db.tx_with(self.max_staleness, |tx| async move {
-            tx.scan_keys(c, scan).await
-        })
-        .await
+        c.db.tx_with(self.stale, |tx| async move { tx.scan_keys(c, scan).await })
+            .await
     }
 
     async fn iter_collections(&self) -> Result<CollectionIter, Error> {
         let c = self.collection;
-        c.db.tx_with(self.max_staleness, |tx| async move {
-            tx.iter_collections(c).await
-        })
-        .await
+        c.db.tx_with(self.stale, |tx| async move { tx.iter_collections(c).await })
+            .await
     }
 }
 

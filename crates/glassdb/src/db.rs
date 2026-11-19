@@ -9,7 +9,9 @@ use std::time::Duration;
 use glassdb_backend::Backend;
 use glassdb_concurr::rt;
 use glassdb_data::{DatabaseId, DbPrefix};
-use glassdb_storage::{InlinePolicy, NodeSizePolicy, PersistentCacheConfig, PersistentCacheMedia};
+use glassdb_storage::{
+    InlinePolicy, MonotonicFloor, NodeSizePolicy, PersistentCacheConfig, PersistentCacheMedia,
+};
 use glassdb_trans::{
     AccessSet, BodyDecision, CatalogAccesses, Engine, EngineConfig, EngineTransaction, GcLimits,
     GcReport, ProtocolTiming, RetryTiming, TopologyPolicy, TransError,
@@ -283,7 +285,7 @@ impl Database {
         P: TryInto<CollectionPath>,
         P::Error: Into<Error>,
     {
-        self.reads(None).open_collection(path).await
+        self.strong_reads().open_collection(path).await
     }
 
     /// Reports whether every component of a logical collection path is bound.
@@ -295,7 +297,7 @@ impl Database {
         P: TryInto<CollectionPath>,
         P::Error: Into<Error>,
     {
-        self.reads(None).collection_exists(path).await
+        self.strong_reads().collection_exists(path).await
     }
 
     /// Strictly creates the final component of `path`.
@@ -382,8 +384,12 @@ impl Database {
         self.inner.tx(f).await
     }
 
-    /// Returns a view that runs stale read-only transactions with the bound
-    /// `max_staleness`.
+    /// Returns a new view that runs stale read-only transactions with the
+    /// bound `max_staleness`.
+    ///
+    /// Each call returns a view with its own order, so the calls through two
+    /// views are not ordered with each other. See
+    /// [`StaleDatabaseView::read_tx`].
     ///
     /// Each collection helper of the view is the same as a
     /// [`StaleDatabaseView::read_tx`] whose body does the work of the strong
@@ -391,7 +397,7 @@ impl Database {
     pub fn stale(&self, max_staleness: Duration) -> StaleDatabaseView {
         StaleDatabaseView {
             inner: self.inner.clone(),
-            max_staleness,
+            state: StaleViewState::new(max_staleness),
         }
     }
 
@@ -465,10 +471,10 @@ impl Database {
         }
     }
 
-    fn reads(&self, max_staleness: Option<Duration>) -> DatabaseReads<'_> {
+    fn strong_reads(&self) -> DatabaseReads<'_> {
         DatabaseReads {
             inner: &self.inner,
-            max_staleness,
+            stale: None,
         }
     }
 }
@@ -476,11 +482,11 @@ impl Database {
 /// Runs stale read-only transactions of one database with one staleness
 /// bound. [`Database::stale`] returns it.
 ///
-/// A view is cheap to clone.
+/// A view is cheap to clone. Clones share the order of the view.
 #[derive(Clone)]
 pub struct StaleDatabaseView {
     inner: Arc<DbInner>,
-    max_staleness: Duration,
+    state: StaleViewState,
 }
 
 impl StaleDatabaseView {
@@ -490,11 +496,14 @@ impl StaleDatabaseView {
     /// The cut point is at most the bound of this view older than the start of
     /// this call, on the clock of this instance, and `Duration::MAX` accepts
     /// any age. The result is serializable, and it contains every write that
-    /// this instance committed before the call. A stale read-only transaction
-    /// of this instance sees every transaction whose effect a previous one
-    /// saw. It can still have an earlier cut point than a previous one, for
-    /// example one with a zero bound that saw no effect of a recent
-    /// transaction.
+    /// this instance committed before the call.
+    ///
+    /// The calls through this view and through its clones are ordered: a call
+    /// sees every transaction whose effect an earlier call saw. Calls through
+    /// two different views are not ordered. A call through a new view can
+    /// miss, on one key, a write that a call through another view saw on
+    /// another key. For each key, a call never returns an older state than an
+    /// earlier transaction of this instance saw.
     ///
     /// With a warm cache, a stale read-only transaction can finish with no
     /// backend operation. When the cache cannot supply a cut point, it
@@ -502,10 +511,9 @@ impl StaleDatabaseView {
     /// once, as in [`Database::tx`].
     ///
     /// With a view whose bound is `Duration::ZERO`, the result and the cost
-    /// are the same as those of a read-only [`Database::tx`]. The result contains every transaction of
-    /// any instance that committed before the call started. A later stale
-    /// read-only transaction of this instance sees what a `read_tx` saw, but
-    /// it can miss what a read-only [`Database::tx`] saw.
+    /// are the same as those of a read-only [`Database::tx`]. The result
+    /// contains every transaction of any instance that committed before the
+    /// call started.
     ///
     /// With a bound above zero, a `read_tx` that follows a [`Database::tx`] of
     /// the same instance can miss a write of another instance that the `tx`
@@ -518,7 +526,7 @@ impl StaleDatabaseView {
         T: Send,
     {
         self.inner
-            .tx_with(Some(self.max_staleness), |tx| f(ReadTransaction::new(tx)))
+            .tx_with(Some(&self.state), |tx| f(ReadTransaction::new(tx)))
             .await
     }
 
@@ -549,7 +557,24 @@ impl StaleDatabaseView {
     fn reads(&self) -> DatabaseReads<'_> {
         DatabaseReads {
             inner: &self.inner,
-            max_staleness: Some(self.max_staleness),
+            stale: Some(&self.state),
+        }
+    }
+}
+
+/// The staleness bound and the monotonic floor of one stale view. Clones
+/// share the floor, so they share the order of the view (ADR-102).
+#[derive(Clone)]
+pub(crate) struct StaleViewState {
+    max_staleness: Duration,
+    floor: MonotonicFloor,
+}
+
+impl StaleViewState {
+    pub(crate) fn new(max_staleness: Duration) -> Self {
+        Self {
+            max_staleness,
+            floor: MonotonicFloor::new(),
         }
     }
 }
@@ -560,7 +585,7 @@ struct DatabaseReads<'a> {
     inner: &'a Arc<DbInner>,
     /// `None` runs each helper as a strong transaction, so that the strong
     /// helpers of [`Database`] share these bodies.
-    max_staleness: Option<Duration>,
+    stale: Option<&'a StaleViewState>,
 }
 
 impl DatabaseReads<'_> {
@@ -571,7 +596,7 @@ impl DatabaseReads<'_> {
     {
         let path = path.try_into().map_err(Into::into)?;
         self.inner
-            .tx_with(self.max_staleness, move |tx| {
+            .tx_with(self.stale, move |tx| {
                 open_path_in_transaction(tx, path.clone())
             })
             .await
@@ -584,7 +609,7 @@ impl DatabaseReads<'_> {
     {
         let path = path.try_into().map_err(Into::into)?;
         self.inner
-            .tx_with(self.max_staleness, move |tx| {
+            .tx_with(self.stale, move |tx| {
                 path_exists_in_transaction(tx, path.clone())
             })
             .await
@@ -697,7 +722,7 @@ impl DbInner {
 
     pub(crate) async fn tx_with<T, F, Fut>(
         self: &Arc<Self>,
-        max_staleness: Option<Duration>,
+        stale: Option<&StaleViewState>,
         f: F,
     ) -> Result<T, Error>
     where
@@ -712,7 +737,7 @@ impl DbInner {
             ..Default::default()
         };
         let begin = rt::Instant::now();
-        let res = self.tx_impl(max_staleness, f, &mut stats).await;
+        let res = self.tx_impl(stale, f, &mut stats).await;
         stats.elapsed = begin.elapsed();
         self.update_transaction_stats(stats);
         res
@@ -725,7 +750,7 @@ impl DbInner {
 
     async fn tx_impl<T, F, Fut>(
         self: &Arc<Self>,
-        max_staleness: Option<Duration>,
+        stale: Option<&StaleViewState>,
         mut f: F,
         stats: &mut TransactionStats,
     ) -> Result<T, Error>
@@ -734,7 +759,7 @@ impl DbInner {
         Fut: Future<Output = Result<T, Error>> + Send,
         T: Send,
     {
-        let mut driver = TransactionDriver::new(&self.engine, max_staleness);
+        let mut driver = TransactionDriver::new(&self.engine, stale);
 
         let result: Result<T, Error> = loop {
             let tx = Transaction::new(
@@ -799,9 +824,9 @@ struct TransactionDriver<'a> {
 }
 
 impl<'a> TransactionDriver<'a> {
-    fn new(engine: &'a Engine, max_staleness: Option<Duration>) -> Self {
-        let handle = match max_staleness {
-            Some(max_staleness) => engine.begin_stale_transaction(max_staleness),
+    fn new(engine: &'a Engine, stale: Option<&StaleViewState>) -> Self {
+        let handle = match stale {
+            Some(stale) => engine.begin_stale_transaction(stale.max_staleness, stale.floor.clone()),
             None => engine.begin_transaction(AccessSet::default(), CatalogAccesses::default()),
         };
         Self { engine, handle }

@@ -151,7 +151,8 @@ impl<W: SimWorkload> InstanceTask<W> {
                 return InstanceExit::Finished;
             }
         };
-        let instance = InstanceId(self.next_instance.fetch_add(1, Ordering::SeqCst));
+        let id = InstanceId(self.next_instance.fetch_add(1, Ordering::SeqCst));
+        let instance = Arc::new(W::open_instance(&db, id));
         let mut handles = Vec::with_capacity(self.clients.len());
         for client in &self.clients {
             if !client.has_remaining() {
@@ -159,6 +160,7 @@ impl<W: SimWorkload> InstanceTask<W> {
             }
             let client = client.clone();
             let db = db.clone();
+            let instance = instance.clone();
             let state = self.state.clone();
             let signal = signal.clone();
             let faults = self.faults;
@@ -166,7 +168,7 @@ impl<W: SimWorkload> InstanceTask<W> {
                 tokio::select! {
                     biased;
                     _ = signal.cancelled() => {}
-                    _ = Self::run_operations(&db, instance, &client, &state, faults) => {}
+                    _ = Self::run_operations(&db, &instance, &client, &state, faults) => {}
                 }
             }));
         }
@@ -198,7 +200,7 @@ impl<W: SimWorkload> InstanceTask<W> {
     /// Runs a client's remaining request stream in order.
     async fn run_operations(
         db: &Database,
-        instance: InstanceId,
+        instance: &W::Instance,
         client: &ClientStream<W::Op>,
         state: &W::State,
         faults: FaultConfig,
@@ -263,6 +265,8 @@ mod sim_tests {
 
     struct RestartState {
         calls: Mutex<Vec<Step>>,
+        /// The instance of each step that started.
+        instances: Mutex<Vec<(Step, InstanceId)>>,
         entered: AtomicUsize,
         retired: AtomicUsize,
         written: AtomicUsize,
@@ -289,6 +293,7 @@ mod sim_tests {
     impl SimWorkload for RestartWorkload {
         type Op = Step;
         type State = RestartState;
+        type Instance = InstanceId;
 
         fn clients(&self) -> &[Vec<Self::Op>] {
             &self.clients
@@ -297,6 +302,7 @@ mod sim_tests {
         fn new_state(&self) -> Self::State {
             RestartState {
                 calls: Mutex::new(Vec::new()),
+                instances: Mutex::new(Vec::new()),
                 entered: AtomicUsize::new(0),
                 retired: AtomicUsize::new(0),
                 written: AtomicUsize::new(0),
@@ -309,13 +315,22 @@ mod sim_tests {
 
         async fn seed(&self, _db: &Database) {}
 
+        fn open_instance(_db: &Database, id: InstanceId) -> InstanceId {
+            id
+        }
+
         async fn run_op(
             db: &Database,
-            _instance: InstanceId,
+            instance: &InstanceId,
             step: &Step,
             state: &Self::State,
         ) -> Result<(), Error> {
             state.calls.lock().unwrap().push(step.clone());
+            state
+                .instances
+                .lock()
+                .unwrap()
+                .push((step.clone(), *instance));
             match *step {
                 Step::Wait(client) => {
                     let _pending = PendingCall { state, client };
@@ -407,6 +422,21 @@ mod sim_tests {
                     }
                 }
                 assert!(calls.is_empty(), "an operation was replayed: {calls:?}");
+                // Clients 0 and 1 share instance task 0. A restart gives it a
+                // new instance state, and the other task keeps its own.
+                let instances = state.instances.lock().unwrap().clone();
+                let instance = |step: Step| {
+                    instances
+                        .iter()
+                        .find(|(call, _)| *call == step)
+                        .map(|(_, instance)| *instance)
+                        .expect("missing client operation")
+                };
+                assert_eq!(instance(Step::Wait(0)), instance(Step::Wait(1)));
+                assert_ne!(instance(Step::Wait(0)), instance(Step::Write(0)));
+                assert_eq!(instance(Step::Write(0)), instance(Step::Write(1)));
+                assert_eq!(instance(Step::Wait(2)), instance(Step::Write(2)));
+                assert_ne!(instance(Step::Wait(0)), instance(Step::Wait(2)));
                 context.teardown(false).await;
             });
         }
@@ -591,6 +621,7 @@ mod sim_tests {
     impl SimWorkload for RecoveryWorkload {
         type Op = HistoryTransaction;
         type State = RecoveryState;
+        type Instance = <HistoryWorkload as SimWorkload>::Instance;
 
         const CONTINUE_AFTER_ADMISSIBLE_ERROR: bool =
             HistoryWorkload::CONTINUE_AFTER_ADMISSIBLE_ERROR;
@@ -620,9 +651,13 @@ mod sim_tests {
             self.history.seed(db).await;
         }
 
+        fn open_instance(db: &Database, id: InstanceId) -> Self::Instance {
+            HistoryWorkload::open_instance(db, id)
+        }
+
         async fn run_op(
             db: &Database,
-            instance: InstanceId,
+            instance: &Self::Instance,
             op: &Self::Op,
             state: &Self::State,
         ) -> Result<(), Error> {

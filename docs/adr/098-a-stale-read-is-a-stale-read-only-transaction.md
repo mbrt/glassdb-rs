@@ -11,6 +11,9 @@ what [ADR-043](043-causally-coordinated-backend-operations.md) expected of a
 later snapshot design: a stale read now has a bounded-staleness guarantee, not
 only an approximate cache policy.
 
+[ADR-102](102-a-stale-view-orders-its-stale-read-only-transactions.md) gives each stale view its own monotonic floor, so a stale read and
+a `read_tx` of two views do not share one.
+
 ## Context
 
 `Collection::read_stale(key, max_staleness)` reads one key outside a

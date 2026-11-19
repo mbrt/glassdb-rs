@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
 use glassdb::{
-    Backend, Collection, CollectionPath, Database, Error, KeyScan, ReadTransaction, Stats,
-    Transaction,
+    Backend, Collection, CollectionPath, Database, Error, KeyScan, ReadTransaction,
+    StaleDatabaseView, Stats, Transaction,
 };
 
 pub mod integration_support;
@@ -46,25 +46,30 @@ async fn tx_read_all(db: &Database, collections: &[Collection]) -> Vec<Vec<u8>> 
     .unwrap()
 }
 
+/// Reads key `k` of each collection through a new view of `db`.
 async fn read_tx_all(
     db: &Database,
     staleness: Duration,
     collections: &[Collection],
 ) -> Vec<Vec<u8>> {
+    view_read_all(&db.stale(staleness), collections).await
+}
+
+/// Reads key `k` of each collection in one call through `view`.
+async fn view_read_all(view: &StaleDatabaseView, collections: &[Collection]) -> Vec<Vec<u8>> {
     let collections = collections.to_vec();
-    db.stale(staleness)
-        .read_tx(move |tx: ReadTransaction| {
-            let collections = collections.clone();
-            async move {
-                let mut values = Vec::new();
-                for collection in &collections {
-                    values.push(tx.read(collection, b"k").await?.unwrap_or_default());
-                }
-                Ok(values)
+    view.read_tx(move |tx: ReadTransaction| {
+        let collections = collections.clone();
+        async move {
+            let mut values = Vec::new();
+            for collection in &collections {
+                values.push(tx.read(collection, b"k").await?.unwrap_or_default());
             }
-        })
-        .await
-        .unwrap()
+            Ok(values)
+        }
+    })
+    .await
+    .unwrap()
 }
 
 /// Returns the backend operations of `db` since `before`.
@@ -252,15 +257,47 @@ async fn cache_then_write_both(
 }
 
 #[tokio::test(start_paused = true)]
-async fn read_tx_sees_every_transaction_whose_effect_a_previous_read_tx_saw() {
+async fn calls_through_one_view_see_every_transaction_whose_effect_an_earlier_call_saw() {
+    let backend = mem();
+    let reader = Database::open("example", backend.clone()).await.unwrap();
+    let (x, z) = cache_then_write_both(&reader, backend).await;
+    // A strong read caches the new state of `x`, but does not order a view.
+    assert_eq!(
+        tx_read_all(&reader, std::slice::from_ref(&x)).await,
+        [b"new"]
+    );
+
+    let view = reader.stale(Duration::MAX);
+    assert_eq!(view_read_all(&view, &[x]).await, [b"new"]);
+    // Any age is accepted, but the floor of the view is after the commit
+    // that `x` showed, and a clone shares the floor.
+    assert_eq!(view_read_all(&view.clone(), &[z]).await, [b"new"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn calls_through_two_views_are_not_ordered() {
     let backend = mem();
     let reader = Database::open("example", backend.clone()).await.unwrap();
     let (x, z) = cache_then_write_both(&reader, backend).await;
 
     // A zero bound needs a check, so this read finds the new state of `x`.
     assert_eq!(read_tx_all(&reader, Duration::ZERO, &[x]).await, [b"new"]);
-    // Any age is accepted, but the floor is after the commit that `x` showed.
-    assert_eq!(read_tx_all(&reader, Duration::MAX, &[z]).await, [b"new"]);
+    // A new view has its own floor, so the cached state of `z` serves it.
+    assert_eq!(read_tx_all(&reader, Duration::MAX, &[z]).await, [b"old"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_view_never_reads_an_older_state_of_a_key() {
+    let backend = mem();
+    let reader = Database::open("example", backend.clone()).await.unwrap();
+    let (x, _) = cache_then_write_both(&reader, backend).await;
+
+    assert_eq!(
+        read_tx_all(&reader, Duration::ZERO, std::slice::from_ref(&x)).await,
+        [b"new"]
+    );
+    // The cache never goes back to an older state of an object.
+    assert_eq!(read_tx_all(&reader, Duration::MAX, &[x]).await, [b"new"]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -270,7 +307,7 @@ async fn read_tx_after_tx_can_miss_a_foreign_write_that_tx_saw() {
     let (x, z) = cache_then_write_both(&reader, backend).await;
 
     assert_eq!(tx_read_all(&reader, &[x]).await, [b"new"]);
-    // Only stale read-only transactions raise the floor.
+    // A strong transaction raises no floor.
     assert_eq!(
         read_tx_all(&reader, STALENESS, std::slice::from_ref(&z)).await,
         [b"old"]
@@ -324,9 +361,9 @@ async fn read_tx_checks_the_record_of_a_collection_that_it_opens() {
     assert_eq!(backend_ops(&db, &before), (1, 0, 0));
 }
 
-/// After a fallback to the validation of `Database::tx`, the floor rises to
-/// that validation barrier, so the states that it checked can form the next
-/// cut with no backend operation.
+/// After a fallback to the validation of `Database::tx`, the floor of the
+/// view rises to that validation barrier, so the states that it checked can
+/// form the next cut of the view with no backend operation.
 #[tokio::test(start_paused = true)]
 async fn read_tx_after_a_fallback_reuses_the_checked_states() {
     let inner = mem();
@@ -348,10 +385,11 @@ async fn read_tx_after_a_fallback_reuses_the_checked_states() {
     arrived.await.unwrap();
 
     // The read of `c0` depends on the holder, so it validates at a barrier.
-    let values = read_tx_all(&reader, Duration::ZERO, &collections).await;
+    let view = reader.stale(STALENESS);
+    let values = view_read_all(&view, &collections).await;
     assert_eq!(values[0], b"v");
     let before = reader.stats();
-    read_tx_all(&reader, STALENESS, &collections[1..]).await;
+    view_read_all(&view, &collections[1..]).await;
     assert_eq!(backend_ops(&reader, &before), (0, 0, 0));
 
     release.send(()).unwrap();
@@ -453,13 +491,41 @@ mod persistent {
         assert_eq!(measure(&db, STALENESS).await, (LEAVES as u64, 0));
         db.shutdown().await;
     }
+
+    /// A fetch of a newer state replaces the persistent copy, so a new view
+    /// that reloads the state does not read the older one again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_view_never_reloads_an_older_state_of_a_key() {
+        let (dir, backend) = seeded("view-order").await;
+        // An L1 too small to keep a leaf, so every read comes from L2.
+        let db = open(backend.clone(), &dir, 1).await;
+        let collections = open_collections(&db).await;
+        let (c0, others) = collections.split_at(1);
+        assert_eq!(read_tx_all(&db, Duration::MAX, c0).await, [b"v"]);
+
+        let writer = Database::open("example", backend).await.unwrap();
+        open_top(&writer, b"c0")
+            .await
+            .write(b"k", b"new")
+            .await
+            .unwrap();
+        assert_eq!(read_tx_all(&db, Duration::ZERO, c0).await, [b"new"]);
+        // The other leaves take the one L1 entry, so the next read of `c0`
+        // loads its state from L2.
+        read_tx_all(&db, Duration::MAX, others).await;
+        let before = db.stats();
+        assert_eq!(read_tx_all(&db, Duration::MAX, c0).await, [b"new"]);
+        assert_eq!(backend_ops(&db, &before), (0, 0, 0));
+        writer.shutdown().await;
+        db.shutdown().await;
+    }
 }
 
-/// A stale read is a stale read-only transaction with one read
-/// (ADR-098), so the monotonic floor orders it with `read_tx` in both
-/// directions.
+/// A stale read is a stale read-only transaction with one read (ADR-098)
+/// through a view of its collection. That view and a view of the database
+/// have their own floors, so they are not ordered, in either direction.
 #[tokio::test(start_paused = true)]
-async fn stale_read_and_read_tx_share_the_monotonic_floor() {
+async fn a_stale_read_and_a_read_tx_of_two_views_are_not_ordered() {
     for stale_read_first in [false, true] {
         let backend = mem();
         let reader = Database::open("example", backend.clone()).await.unwrap();
@@ -474,7 +540,7 @@ async fn stale_read_and_read_tx_share_the_monotonic_floor() {
             let second = z.stale(Duration::MAX).read(b"k").await.unwrap().unwrap();
             (first, second)
         };
-        assert_eq!((first, second), (b"new".to_vec(), b"new".to_vec()));
+        assert_eq!((first, second), (b"new".to_vec(), b"old".to_vec()));
     }
 }
 

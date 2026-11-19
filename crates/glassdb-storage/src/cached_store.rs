@@ -3993,21 +3993,19 @@ mod tests {
         let present = typed.read("present", Requirement::ANY).await.unwrap();
         let absent = typed.read("absent", Requirement::ANY).await.unwrap();
         assert!(absent.is_absent());
-        let floor = crate::timeline::MonotonicFloor::new();
-
         let mut search = typed.cut_search();
         typed
             .add_to_cut(&mut search, std::slice::from_ref(&present))
             .unwrap();
         assert!(
             search
-                .plan(crate::timeline::StalenessCutoff::ANY, &floor)
+                .plan(crate::timeline::StalenessCutoff::ANY, None)
                 .is_some()
         );
         typed.add_to_cut(&mut search, &[absent]).unwrap();
         assert!(
             search
-                .plan(crate::timeline::StalenessCutoff::ANY, &floor)
+                .plan(crate::timeline::StalenessCutoff::ANY, None)
                 .is_none()
         );
     }

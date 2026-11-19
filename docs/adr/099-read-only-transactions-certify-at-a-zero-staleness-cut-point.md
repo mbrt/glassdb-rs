@@ -8,6 +8,9 @@ Refines [ADR-097](097-stale-read-only-transactions-choose-a-past-cut-point.md):
 a read-only pass of `Database::tx` also uses the cut search, so `Database::tx`
 changes. The monotonic floor stays a mechanism of stale read-only transactions.
 
+[ADR-102](102-a-stale-view-orders-its-stale-read-only-transactions.md) moves the monotonic floor to a stale view, so a read-only
+`Database::tx` uses no floor.
+
 ## Context
 
 A read-only pass of `Database::tx` captures a fresh validation barrier after

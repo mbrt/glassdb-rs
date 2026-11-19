@@ -192,6 +192,7 @@ impl MembershipAcct {
 impl SimWorkload for MembershipWorkload {
     type Op = MembOp;
     type State = Mutex<MembershipAcct>;
+    type Instance = ();
 
     fn clients(&self) -> &[Vec<MembOp>] {
         &self.clients
@@ -223,9 +224,11 @@ impl SimWorkload for MembershipWorkload {
             .expect("create collection");
     }
 
+    fn open_instance(_db: &Database, _id: InstanceId) {}
+
     async fn run_op(
         db: &Database,
-        _instance: InstanceId,
+        _instance: &(),
         op: &MembOp,
         state: &Mutex<MembershipAcct>,
     ) -> Result<(), Error> {
@@ -334,6 +337,7 @@ pub struct MergingMembershipWorkload(pub MembershipWorkload);
 impl SimWorkload for MergingMembershipWorkload {
     type Op = MembOp;
     type State = Mutex<MembershipAcct>;
+    type Instance = <MembershipWorkload as SimWorkload>::Instance;
 
     fn clients(&self) -> &[Vec<MembOp>] {
         self.0.clients()
@@ -360,9 +364,13 @@ impl SimWorkload for MergingMembershipWorkload {
         self.0.seed(db).await;
     }
 
+    fn open_instance(db: &Database, id: InstanceId) -> Self::Instance {
+        MembershipWorkload::open_instance(db, id)
+    }
+
     async fn run_op(
         db: &Database,
-        instance: InstanceId,
+        instance: &Self::Instance,
         op: &MembOp,
         state: &Mutex<MembershipAcct>,
     ) -> Result<(), Error> {
