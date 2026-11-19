@@ -180,7 +180,6 @@ macro_rules! call_read_helpers {
             $c.read(b"k").await.unwrap(),
             $c.read(b"missing").await.unwrap(),
             $c.scan_keys(KeyScan::all()).await.unwrap().into_keys(),
-            $c.iter_keys().await.unwrap().collect::<Vec<_>>(),
             $c.iter_collections()
                 .await
                 .unwrap()

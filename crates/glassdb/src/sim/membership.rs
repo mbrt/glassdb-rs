@@ -252,7 +252,7 @@ impl SimWorkload for MembershipWorkload {
                 Ok(())
             }
             MembOp::List => {
-                let keys: Vec<Vec<u8>> = coll.iter_keys().await?.collect();
+                let keys = coll.scan_keys(KeyScan::all()).await?.into_keys();
                 assert_valid_listing(&keys, MEMBERSHIP_KEYS);
                 Ok(())
             }
@@ -291,7 +291,11 @@ impl SimWorkload for MembershipWorkload {
             .open_collection(&CollectionPath::new(MEMBERSHIP_COLLECTION).unwrap())
             .await
             .expect("open membership collection");
-        let keys: Vec<Vec<u8>> = coll.iter_keys().await.expect("final listing").collect();
+        let keys = coll
+            .scan_keys(KeyScan::all())
+            .await
+            .expect("final listing")
+            .into_keys();
         assert_valid_listing(&keys, MEMBERSHIP_KEYS);
 
         let acct = state.lock().unwrap();

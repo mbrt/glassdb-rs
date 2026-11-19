@@ -5,7 +5,7 @@ use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::RecordingBackend;
 use glassdb::backend::{Backend, ListLimit};
 use glassdb::{
-    Collection, CollectionPath, Database, Error, MAX_COLLECTION_NAME_BYTES, NodeSizePolicy,
+    Collection, CollectionPath, Database, Error, KeyScan, MAX_COLLECTION_NAME_BYTES, NodeSizePolicy,
 };
 
 #[tokio::test]
@@ -421,7 +421,7 @@ async fn missing_bound_tree_root_is_not_empty_or_recreated_by_data_operations() 
         "unexpected write result: {write:?}"
     );
     assert!(matches!(
-        child.iter_keys().await,
+        child.scan_keys(KeyScan::all()).await,
         Err(Error::StaleCollection)
     ));
     assert!(matches!(
@@ -868,7 +868,10 @@ async fn a_cached_handle_in_another_instance_observes_the_drop_intent() {
         old.collection_exists(b"nested").await,
         Err(Error::StaleCollection)
     ));
-    assert!(matches!(old.iter_keys().await, Err(Error::StaleCollection)));
+    assert!(matches!(
+        old.scan_keys(KeyScan::all()).await,
+        Err(Error::StaleCollection)
+    ));
     assert!(matches!(
         old.write(b"k", b"new").await,
         Err(Error::StaleCollection)

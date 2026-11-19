@@ -8,7 +8,7 @@ use glassdb_data::{CollectionAddress, CollectionName, DatabaseId};
 
 use crate::db::DbInner;
 use crate::error::Error;
-use crate::iter::{CollectionIter, KeyIter};
+use crate::iter::CollectionIter;
 use crate::scan::{KeyPage, KeyScan};
 use crate::tx::CreateMode;
 
@@ -155,15 +155,6 @@ impl Collection {
         self.create_child(name.as_ref(), CreateMode::IfAbsent).await
     }
 
-    /// Returns an owned iterator over the collection's materialized keys.
-    ///
-    /// The listing runs inside a read-only serializable transaction. All I/O
-    /// and validation complete before the iterator is returned, so iteration
-    /// itself cannot fail and yields sorted raw keys.
-    pub async fn iter_keys(&self) -> Result<KeyIter, Error> {
-        self.reads(None).iter_keys().await
-    }
-
     /// Materializes one serializable, sorted page of collection keys.
     pub async fn scan_keys(&self, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
         self.reads(None).scan_keys(scan).await
@@ -281,13 +272,6 @@ impl StaleCollectionView {
         self.reads().collection_exists(name).await
     }
 
-    /// Returns an owned iterator over the materialized keys of the collection.
-    ///
-    /// All I/O completes in one transaction before the iterator is returned.
-    pub async fn iter_keys(&self) -> Result<KeyIter, Error> {
-        self.reads().iter_keys().await
-    }
-
     /// Materializes one sorted page of collection keys.
     pub async fn scan_keys(&self, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
         self.reads().scan_keys(scan).await
@@ -343,12 +327,6 @@ impl CollectionReads<'_> {
             Ok(tx.resolve_child(c, name).await?.is_some())
         })
         .await
-    }
-
-    async fn iter_keys(&self) -> Result<KeyIter, Error> {
-        Ok(KeyIter::new(
-            self.scan_keys(KeyScan::all()).await?.into_keys(),
-        ))
     }
 
     async fn scan_keys(&self, scan: KeyScan<'_>) -> Result<KeyPage, Error> {

@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
-use crate::{CollectionPath, Database};
+use crate::{CollectionPath, Database, KeyScan};
 
 use super::model::{ApiAcct, ApiModel};
 use super::observation::{api_collection_name, inspect_collection, listed_collection_names};
@@ -16,11 +16,11 @@ pub(super) async fn verify_final_state(db: &Database, state: &Mutex<ApiAcct>, nc
         .open_collection(&CollectionPath::new(API_COLLECTION).unwrap())
         .await
         .expect("open API collection");
-    let listed: Vec<Vec<u8>> = collection
-        .iter_keys()
+    let listed = collection
+        .scan_keys(KeyScan::all())
         .await
         .expect("final API listing")
-        .collect();
+        .into_keys();
     assert_valid_listing(&listed, API_KEYS);
 
     let mut actual = vec![ApiModel::new(); nclients];
