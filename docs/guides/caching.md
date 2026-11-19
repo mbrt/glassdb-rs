@@ -213,6 +213,7 @@ knows its ordering, so the policy owns the capture point:
 | GC eligibility | Before the read of candidate status. |
 | GC checks | After the eligibility checks finish. The earlier status barrier cannot replace this one. |
 | Structural recovery | After all intents in a discovery batch are observed, before their sources and reachability are checked. Later discoveries need a new barrier. |
+| Split recovery link check | After a reachability descent that did not reach the created node, before that node is read. A merge can drain the node between an earlier read and the descent. |
 | Parent reconciliation | After the split or merge is observed, before routing and reading its child chain. The barrier stays in use for the whole reconciliation. |
 | Merge check | After the source is gated, before the read of the target for the final merge decision. |
 | Stale merge-target copy | After observing the route that reached a copy whose low key is above the key, before that node is read again. |

@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -1457,6 +1459,109 @@ async fn recovery_keeps_a_landed_sibling_that_a_merge_drained() {
             .unwrap()
             .is_empty()
     );
+}
+
+// L split at "t" into R. Right after recovery first reads the root, a merge
+// drains R into R2 and reconciles the parent, and another task of the
+// recovering instance reads the drained R. A check that read R before the
+// descent saw R live, and the descent then does not reach R. A read of R after
+// the descent shows the drain, which proves that the split linked R.
+#[tokio::test]
+async fn recovery_keeps_a_landed_sibling_that_a_merge_drains_during_the_check() {
+    let memory = Arc::new(MemoryBackend::new());
+    let hooks = HookBackend::new(memory.clone());
+    let local = store_with_backend(hooks.clone());
+    let peer = store_with_backend(memory);
+    peer.store_node(COLL, "L", &leaf_node(&[b"a"], Some(b"t"), Some("R")), None)
+        .await
+        .unwrap();
+    peer.store_node(
+        COLL,
+        "R",
+        &leaf_node(&[b"t"], Some(b"x"), Some("R2")).with_low_key(b"t".to_vec()),
+        None,
+    )
+    .await
+    .unwrap();
+    peer.store_node(
+        COLL,
+        "R2",
+        &leaf_node(&[b"x"], None, None).with_low_key(b"x".to_vec()),
+        None,
+    )
+    .await
+    .unwrap();
+    let root = Node::index(IndexNode::from_children([
+        (Vec::new(), test_node_id("L")),
+        (b"x".to_vec(), test_node_id("R2")),
+    ]));
+    peer.create_root(COLL, &root).await.unwrap();
+    peer.write_structural_intent("R", &nonroot_intent("L", "R", b"t"))
+        .await
+        .unwrap();
+
+    let merged = Arc::new(AtomicBool::new(false));
+    hooks.set_after({
+        let local = local.clone();
+        let peer = peer.clone();
+        let merged = merged.clone();
+        let path = root_path().to_string();
+        move |op, outcome| {
+            let merge = outcome.is_success()
+                && matches!(
+                    op,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                )
+                && op.path() == path
+                && !merged.swap(true, Ordering::SeqCst);
+            let local = local.clone();
+            let peer = peer.clone();
+            Box::pin(async move {
+                if merge {
+                    let (_, target) = peer.load_node(COLL, "R2", Requirement::ANY).await.unwrap();
+                    let absorbed = leaf_node(&[b"t", b"x"], None, None).with_low_key(b"t".to_vec());
+                    assert!(
+                        peer.store_node(COLL, "R2", &absorbed, Some(&target))
+                            .await
+                            .unwrap()
+                    );
+                    let (_, source) = peer.load_node(COLL, "R", Requirement::ANY).await.unwrap();
+                    let mut drained = leaf_node(&[], Some(b"x"), None).with_low_key(b"t".to_vec());
+                    drained.drain(test_node_id("R2"));
+                    assert!(
+                        peer.store_node(COLL, "R", &drained, Some(&source))
+                            .await
+                            .unwrap()
+                    );
+                    // The parent reconciliation of the merge names R2 for "t".
+                    let (_, parent) = peer.load_root(COLL, Requirement::ANY).await.unwrap();
+                    let reconciled = Node::index(IndexNode::from_children([
+                        (Vec::new(), test_node_id("L")),
+                        (b"t".to_vec(), test_node_id("R2")),
+                    ]));
+                    assert!(peer.store_root(COLL, &reconciled, &parent).await.unwrap());
+                    // Another task of the recovering instance reads the
+                    // drained R, so its cache holds the drained state.
+                    let fresh = Requirement::after(local.timeline.currentness_barrier());
+                    let (seen, _) = local.load_node(COLL, "R", fresh).await.unwrap();
+                    assert!(seen.is_drained());
+                }
+                Ok(())
+            })
+        }
+    });
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&local, &bg, tiny());
+
+    assert!(sp.recover_structural_intents().await.unwrap());
+
+    assert!(
+        merged.load(Ordering::SeqCst),
+        "the merge ran during recovery"
+    );
+    let fresh = Requirement::after(local.timeline.currentness_barrier());
+    let (kept, _) = local.load_node(COLL, "R", fresh).await.unwrap();
+    assert!(kept.is_drained(), "recovery never deletes a drained node");
 }
 
 // L split at "t" into R. Later L merged into R, and R split at "n" into S. R
