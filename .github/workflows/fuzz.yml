@@ -149,7 +149,8 @@ jobs:
 
   # PCT finds a race only on the seeds that it runs, and `make test` runs a
   # small number of seeds per sweep. This job runs many more seeds in each
-  # sweep, sized to take about as long as the fuzz job. A failure prints its
+  # sweep, sized to take about as long as the fuzz job. Each sweep starts at a
+  # random seed, so each run explores new schedules. A failure prints its
   # seed, and `pct_assert` with that seed reproduces it. The job skips the
   # corpus replay tests (`replays_committed_*`), because the seed count does
   # not change them and `make test` already runs them.

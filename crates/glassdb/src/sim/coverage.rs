@@ -9,7 +9,7 @@ use glassdb_concurr::rt;
 use crate::{Database, Error};
 
 use super::SimMedia;
-use super::harness::{FaultConfig, InstanceId, SimWorkload, pct_sweep};
+use super::harness::{FaultConfig, InstanceId, PctSeeds, SimWorkload};
 
 /// The percentage of the checked runs of a [`Covered::pct_sweep`] that must
 /// make each required structural change. A schedule can delay a change past
@@ -33,7 +33,7 @@ pub struct StructuralCoverage {
 ///
 /// A run under a fixed schedule must make each required change. A
 /// [`Covered::pct_sweep`] requires them only in a share of its runs. Sweep a
-/// covered workload only with it: in the plain [`pct_sweep`], each run checks
+/// covered workload only with it: in the plain [`pct_sweep`](crate::sim::pct_sweep), each run checks
 /// its own changes.
 #[derive(Debug, Clone, Default)]
 pub struct Covered<W> {
@@ -71,7 +71,7 @@ impl<W: SimWorkload> Covered<W> {
         }
     }
 
-    /// Runs a [`pct_sweep`] of the workload with `faults`. Each run checks
+    /// Runs a [`pct_sweep`](crate::sim::pct_sweep) of the workload with `faults`. Each run checks
     /// the invariant of the workload. Then the sweep checks that a share of
     /// its runs without faults that finish in time made each required
     /// structural change. A sweep
@@ -83,18 +83,21 @@ impl<W: SimWorkload> Covered<W> {
             requires: self.requires,
             sweep: Some(Arc::clone(&tally)),
         };
-        pct_sweep(&swept, faults);
+        let seeds = PctSeeds::from_env();
+        seeds.sweep(&swept, faults);
         let tally = tally.lock().unwrap();
         let min_runs = tally.runs * SWEEP_MIN_SHARE_PERCENT / 100;
         assert!(
             !self.requires.splits || tally.splits >= min_runs,
-            "only {} of {} runs split a node, and the sweep needs {min_runs}",
+            "only {} of {} runs split a node, and the sweep needs {min_runs}. \
+             {seeds} reproduces the sweep.",
             tally.splits,
             tally.runs,
         );
         assert!(
             !self.requires.merges || tally.merges >= min_runs,
-            "only {} of {} runs merged a node, and the sweep needs {min_runs}",
+            "only {} of {} runs merged a node, and the sweep needs {min_runs}. \
+             {seeds} reproduces the sweep.",
             tally.merges,
             tally.runs,
         );

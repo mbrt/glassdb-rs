@@ -24,6 +24,8 @@ use crate::{Database, Error, PersistentCacheConfig, ProtocolTiming};
 use self::client::ClientRunner;
 use self::nemesis::{FaultTransports, NemesisRunner};
 #[cfg(sim)]
+pub(crate) use self::scheduling::PctSeeds;
+#[cfg(sim)]
 pub use self::scheduling::{
     PCT_DEFAULT_DEPTH, PCT_DEFAULT_SEEDS, PCT_DEFAULT_STEPS, pct_assert, pct_record, pct_sweep,
     record_input, replay_input,
