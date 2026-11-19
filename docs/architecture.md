@@ -467,16 +467,16 @@ After a few failed checks, its replays use the locked commit
 A near miss then leaves no read lock, so it cannot push the writers of a hot
 leaf from direct commits to locked commits.
 
-**Stale read-only transactions** (`StaleDatabaseView::read_tx`) validate at a cut point
-that can be in the past
+**Stale read-only transactions** (`StaleDatabaseView::read_tx`) validate at a
+cut point that can be in the past
 ([ADR-097](adr/097-stale-read-only-transactions-choose-a-past-cut-point.md)).
 Each cached state knows its currentness interval: from the completion of the
 first operation that observed it to its currentness watermark. The cut point
 is a point inside the intervals of every leaf and collection record that the
 body read. These states do not change inside the common span, so every point
 of it gives the same result. The cut point must be at most `max_staleness`
-older than the start of the call, and not before the monotonic floor of the
-instance. GlassDB targets the latest start among the states, raised to these
+older than the start of the call, and not before the monotonic floor of its
+stale view. GlassDB targets the latest start among the states, raised to these
 bounds. Only the states whose interval ends before the target need a
 conditional read, in parallel. A changed state, a read that depends on a
 holder, or a read that finds a missing collection falls back to the validation
@@ -484,7 +484,10 @@ of `Database::tx`.
 `Collection::stale` and `Database::stale` return views whose read helpers each
 run one stale read-only transaction with the body of the strong helper. A
 stale read, `stale(max_staleness).read(key)`, is the helper with one read
-([ADR-098](adr/098-a-stale-read-is-a-stale-read-only-transaction.md)).
+([ADR-098](adr/098-a-stale-read-is-a-stale-read-only-transaction.md)). Each
+call returns a new view with its own floor, and clones of a view share it. So
+the calls through one view are ordered, and the calls through two views are
+not ([ADR-102](adr/102-a-stale-view-orders-its-stale-read-only-transactions.md)).
 
 ```text
 leaf A   [start ─────────── watermark]

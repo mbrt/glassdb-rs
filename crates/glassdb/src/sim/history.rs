@@ -3,8 +3,9 @@
 //! This module models public point and concurrent-group reads, writes, deletes,
 //! normalized key membership scans, and shared collection lifecycle operations.
 //! Programs with no writes can also run as stale read-only transactions, with a
-//! zero or an unbounded staleness. The checker places these at a past cut point
-//! with the rules of ADR-097.
+//! zero or an unbounded staleness. An unbounded one runs through the shared view
+//! of its database instance or through a new view. The checker places these at a
+//! past cut point with the rules of ADR-097 and ADR-102.
 //! It does not inspect transaction records, cached objects, or other implementation
 //! state, so the oracle cannot accidentally reproduce the protocol it checks.
 
@@ -20,7 +21,7 @@ use glassdb_concurr::rt;
 
 use crate::{
     Collection, CollectionIter, CollectionPath, Database, Error, InlinePolicy, KeyPage, KeyScan,
-    ReadTransaction, Transaction,
+    ReadTransaction, StaleDatabaseView, Transaction,
 };
 
 use super::harness::{InstanceId, SimWorkload, open_det_db};
@@ -152,8 +153,7 @@ struct CheckStats {
     /// Candidate placements examined by the exact search.
     explored_branches: usize,
     /// Operation IDs in one accepted serialization; omitted optional operations
-    /// are absent. The ID of a stale read-only transaction with a zero bound
-    /// appears twice, because its floor copy is a separate entry.
+    /// are absent.
     serialization: Vec<u64>,
 }
 
@@ -287,23 +287,31 @@ impl Footprint {
 /// Reports whether `before`, which completed before `after` started, must
 /// come before `after` in the serial order.
 ///
-/// An operation at a past cut point follows only what ADR-097 promises within
-/// its database instance: the earlier stale read-only transactions, through
-/// the monotonic floor, and the writes that it observes. A write that it does
-/// not observe gives no order: that write can follow a foreign commit that the
-/// cut point comes before.
+/// An operation at a past cut point follows only what ADR-097 and ADR-102
+/// promise within its database instance: the earlier stale read-only
+/// transactions of the same view, through the monotonic floor of the view, and
+/// the writes that it observes. A write that it does not observe gives no
+/// order: that write can follow a foreign commit that the cut point comes
+/// before.
 fn orders(before: &LogicalOp<'_>, after: &LogicalOp<'_>) -> bool {
     match after.placement {
         Placement::Current => true,
         Placement::Past => {
             before.public.instance.is_some()
                 && before.public.instance == after.public.instance
-                && (before.placement == Placement::Past
+                && (shares_view(before.public.mode, after.public.mode)
                     || before.mutates
                         && Footprint::written(before.trace)
                             .intersects(&Footprint::observed(after.trace)))
         }
     }
+}
+
+/// Reports whether two operations of one database instance ran through the
+/// same stale view. Only the shared view of an instance runs more than one.
+fn shares_view(before: HistoryMode, after: HistoryMode) -> bool {
+    let shared = HistoryMode::StaleMax(HistoryView::Shared);
+    before == shared && after == shared
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -632,24 +640,11 @@ fn check_history(
                 mutates,
                 optional,
                 placement: match public.mode {
-                    HistoryMode::StaleMax => Placement::Past,
+                    HistoryMode::StaleMax(_) => Placement::Past,
                     HistoryMode::Strict | HistoryMode::StaleZero => Placement::Current,
                 },
                 predecessors: 0,
             };
-            // A stale read-only transaction with a zero bound raises the floor
-            // only to the latest start of its states, not to its cut point. So
-            // a later one with an unbounded staleness can come before it in the
-            // serial order. Its floor copy makes the same observations at a
-            // past placement, and orders the later stale read-only transactions
-            // of the instance in its place.
-            if public.mode == HistoryMode::StaleZero && !optional {
-                ops.push(LogicalOp {
-                    mutates: false,
-                    placement: Placement::Past,
-                    ..op.clone()
-                });
-            }
             ops.push(op);
         }
     }
@@ -771,8 +766,18 @@ pub enum HistoryMode {
     Strict,
     /// As [`crate::StaleDatabaseView::read_tx`] with `Duration::ZERO`.
     StaleZero,
-    /// As [`crate::StaleDatabaseView::read_tx`] with `Duration::MAX`.
-    StaleMax,
+    /// As [`crate::StaleDatabaseView::read_tx`] with `Duration::MAX`, through
+    /// the view that it names.
+    StaleMax(HistoryView),
+}
+
+/// The stale view that runs a stale history program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryView {
+    /// The one view of its database instance, which orders its programs.
+    Shared,
+    /// A new view, which orders the program with no other one.
+    New,
 }
 
 /// A bounded key and collection transaction run by one simulated client.
@@ -815,8 +820,17 @@ fn arbitrary_mode(u: &mut Unstructured<'_>) -> arbitrary::Result<HistoryMode> {
     // A zero byte, also from an exhausted input, keeps the strict mode.
     Ok(match u.arbitrary::<u8>()? % 4 {
         1 => HistoryMode::StaleZero,
-        2 => HistoryMode::StaleMax,
+        2 => HistoryMode::StaleMax(arbitrary_view(u)?),
         _ => HistoryMode::Strict,
+    })
+}
+
+fn arbitrary_view(u: &mut Unstructured<'_>) -> arbitrary::Result<HistoryView> {
+    // A zero byte, also from an exhausted input, keeps the shared view.
+    Ok(if u.arbitrary::<u8>()? % 2 == 1 {
+        HistoryView::New
+    } else {
+        HistoryView::Shared
     })
 }
 
@@ -857,7 +871,7 @@ fn arbitrary_instructions(
 ) -> arbitrary::Result<Vec<HistoryInstruction>> {
     let mut instructions = match mode {
         HistoryMode::Strict => arbitrary_program(u)?,
-        HistoryMode::StaleZero | HistoryMode::StaleMax => arbitrary_stale_program(u)?,
+        HistoryMode::StaleZero | HistoryMode::StaleMax(_) => arbitrary_stale_program(u)?,
     };
     if u.arbitrary::<u8>()? % 3 == 0 {
         let at = u.arbitrary::<u8>()? as usize % (instructions.len() + 1);
@@ -1468,18 +1482,17 @@ async fn interpret_body(
 
 async fn run_program(
     db: &Database,
-    instance: InstanceId,
+    instance: &HistoryInstance,
     program: &HistoryTransaction,
     recorder: &HistoryRecorder,
 ) -> Result<(), Error> {
     let collection = db
         .open_collection(&CollectionPath::new(HISTORY_COLLECTION)?)
         .await?;
-    recorder.begin(program, instance);
+    recorder.begin(program, instance.id);
     let collection = &collection;
-    let stale = |max_staleness| async move {
-        db.stale(max_staleness)
-            .read_tx(|tx| interpret_body(HistoryTx::Stale(tx), collection, program, recorder))
+    let stale = |view: StaleDatabaseView| async move {
+        view.read_tx(|tx| interpret_body(HistoryTx::Stale(tx), collection, program, recorder))
             .await
     };
     let result = match program.mode {
@@ -1487,8 +1500,10 @@ async fn run_program(
             db.tx(|tx| interpret_body(HistoryTx::Strict(tx), collection, program, recorder))
                 .await
         }
-        HistoryMode::StaleZero => stale(Duration::ZERO).await,
-        HistoryMode::StaleMax => stale(Duration::MAX).await,
+        HistoryMode::StaleZero => stale(db.stale(Duration::ZERO)).await,
+        HistoryMode::StaleMax(HistoryView::New) => stale(db.stale(Duration::MAX)).await,
+        // A clone shares the floor of the view.
+        HistoryMode::StaleMax(HistoryView::Shared) => stale(instance.shared_view.clone()).await,
     };
 
     match result {
@@ -1522,9 +1537,17 @@ fn initial_state() -> AbstractState {
     }
 }
 
+/// One database instance of a [`HistoryWorkload`] run.
+pub struct HistoryInstance {
+    id: InstanceId,
+    /// The view of the programs that use [`HistoryView::Shared`].
+    shared_view: StaleDatabaseView,
+}
+
 impl SimWorkload for HistoryWorkload {
     type Op = HistoryTransaction;
     type State = HistoryRecorder;
+    type Instance = HistoryInstance;
 
     const CONTINUE_AFTER_ADMISSIBLE_ERROR: bool = true;
 
@@ -1568,9 +1591,16 @@ impl SimWorkload for HistoryWorkload {
         .expect("seed history keys");
     }
 
+    fn open_instance(db: &Database, id: InstanceId) -> HistoryInstance {
+        HistoryInstance {
+            id,
+            shared_view: db.stale(Duration::MAX),
+        }
+    }
+
     async fn run_op(
         db: &Database,
-        instance: InstanceId,
+        instance: &HistoryInstance,
         op: &Self::Op,
         state: &Self::State,
     ) -> Result<(), Error> {
@@ -2550,6 +2580,9 @@ mod sim_tests {
         ));
     }
 
+    const SHARED: HistoryMode = HistoryMode::StaleMax(HistoryView::Shared);
+    const NEW: HistoryMode = HistoryMode::StaleMax(HistoryView::New);
+
     /// A committed transaction that runs `actions` on `instance` between the
     /// two event points.
     fn on_instance(
@@ -2589,15 +2622,10 @@ mod sim_tests {
         let committed = state(&[(0, 1)]);
         let writer = on_instance(0, (0, 1), HistoryMode::Strict, 0, vec![write(0, 1)]);
         let stale = |mode, instance| on_instance(1, (2, 3), mode, instance, vec![read(0, 0)]);
-        check_history(
-            &initial,
-            &[writer.clone(), stale(HistoryMode::StaleMax, 1)],
-            &committed,
-        )
-        .unwrap();
+        check_history(&initial, &[writer.clone(), stale(SHARED, 1)], &committed).unwrap();
         // A zero bound and a write of the same instance both order the read
         // after the commit.
-        for (mode, instance) in [(HistoryMode::StaleZero, 1), (HistoryMode::StaleMax, 0)] {
+        for (mode, instance) in [(HistoryMode::StaleZero, 1), (SHARED, 0)] {
             assert!(
                 check_history(
                     &initial,
@@ -2615,7 +2643,7 @@ mod sim_tests {
         let committed = state(&[(0, 1), (1, 1)]);
         let foreign = on_instance(0, (0, 1), HistoryMode::Strict, 1, vec![write(1, 1)]);
         let own = on_instance(1, (2, 3), HistoryMode::Strict, 0, vec![write(0, 1)]);
-        let stale = |actions| on_instance(2, (4, 5), HistoryMode::StaleMax, 0, actions);
+        let stale = |actions| on_instance(2, (4, 5), SHARED, 0, actions);
         // The own write follows the foreign one, but the read does not observe
         // it, so the read can come before both.
         check_history(
@@ -2650,7 +2678,7 @@ mod sim_tests {
             on_instance(
                 2,
                 (4, 5),
-                HistoryMode::StaleMax,
+                SHARED,
                 0,
                 vec![
                     read(0, 0),
@@ -2709,7 +2737,7 @@ mod sim_tests {
             on_instance(
                 1,
                 (2, 3),
-                HistoryMode::StaleMax,
+                SHARED,
                 instance,
                 vec![step(0, HistoryCollectionOp::Read, None, Vec::new())],
             )
@@ -2719,49 +2747,51 @@ mod sim_tests {
     }
 
     #[test]
-    fn stale_reads_of_one_instance_are_monotonic() {
+    fn stale_reads_of_the_shared_view_are_monotonic() {
         let initial = state(&[(0, 0)]);
         let committed = state(&[(0, 1)]);
         let foreign = on_instance(0, (0, 1), HistoryMode::Strict, 1, vec![write(0, 1)]);
-        let first = on_instance(1, (2, 3), HistoryMode::StaleMax, 0, vec![read(0, 1)]);
-        let second =
-            |instance| on_instance(2, (4, 5), HistoryMode::StaleMax, instance, vec![read(0, 0)]);
+        let first = |mode| on_instance(1, (2, 3), mode, 0, vec![read(0, 1)]);
+        let second = |mode, instance| on_instance(2, (4, 5), mode, instance, vec![read(0, 0)]);
         assert!(
             check_history(
                 &initial,
-                &[foreign.clone(), first.clone(), second(0)],
+                &[foreign.clone(), first(SHARED), second(SHARED, 0)],
                 &committed
             )
             .is_err()
         );
-        // The floor does not order stale reads of another instance, which
-        // includes the instance of a later open.
-        check_history(&initial, &[foreign, first, second(2)], &committed).unwrap();
+        // The floor of a view does not order the stale reads of another view.
+        // Each instance has its own shared view, also the instance of a later
+        // open.
+        for (first_mode, second_mode, instance) in
+            [(SHARED, SHARED, 2), (SHARED, NEW, 0), (NEW, SHARED, 0)]
+        {
+            check_history(
+                &initial,
+                &[
+                    foreign.clone(),
+                    first(first_mode),
+                    second(second_mode, instance),
+                ],
+                &committed,
+            )
+            .unwrap();
+        }
     }
 
     #[test]
-    fn zero_bound_stale_read_orders_later_stale_reads_by_what_it_observed() {
+    fn zero_bound_stale_read_orders_no_later_unbounded_one() {
         let initial = state(&[(0, 0), (1, 0)]);
         let committed = state(&[(0, 0), (1, 1)]);
         let foreign = on_instance(0, (0, 1), HistoryMode::Strict, 1, vec![write(1, 1)]);
-        let zero = |actions| on_instance(1, (2, 3), HistoryMode::StaleZero, 0, actions);
-        let unbounded = on_instance(2, (4, 5), HistoryMode::StaleMax, 0, vec![read(1, 0)]);
-        // The floor rises only to the states that the first read used, so the
-        // second one can come before the foreign write that the first follows.
-        check_history(
-            &initial,
-            &[foreign.clone(), zero(vec![read(0, 0)]), unbounded.clone()],
-            &committed,
-        )
-        .unwrap();
-        assert!(
-            check_history(
-                &initial,
-                &[foreign, zero(vec![read(1, 1)]), unbounded],
-                &committed
-            )
-            .is_err()
-        );
+        let zero = on_instance(1, (2, 3), HistoryMode::StaleZero, 0, vec![read(1, 1)]);
+        let unbounded = on_instance(2, (4, 5), SHARED, 0, vec![read(1, 0)]);
+        // A zero bound runs through a view of its own, so the unbounded read
+        // can come before the foreign write that the zero-bound read follows.
+        // The cache does not let it return the older state of the same key,
+        // but the checker has no per-key order across views.
+        check_history(&initial, &[foreign, zero, unbounded], &committed).unwrap();
     }
 
     #[test]

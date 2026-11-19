@@ -11,9 +11,9 @@ use glassdb_data::{
 };
 use glassdb_storage::transaction::TxRecordStore;
 use glassdb_storage::{
-    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, LeafBody, Node,
-    NodeSizePolicy, NodeStore, PersistentCache, PersistentCacheConfig, PersistentCacheMedia,
-    Requirement, StorageError, StructuralIntentStore, Timeline, TreeRouter,
+    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, LeafBody,
+    MonotonicFloor, Node, NodeSizePolicy, NodeStore, PersistentCache, PersistentCacheConfig,
+    PersistentCacheMedia, Requirement, StorageError, StructuralIntentStore, Timeline, TreeRouter,
 };
 
 use crate::access::{AccessSet, ScanMutation, ScanRange};
@@ -278,9 +278,14 @@ impl Engine {
     }
 
     /// Starts a stale read-only transaction that accepts a cut point no older
-    /// than `max_staleness` before this call (ADR-097).
-    pub fn begin_stale_transaction(&self, max_staleness: Duration) -> EngineTransaction {
-        EngineTransaction(self.algo.begin_stale(max_staleness))
+    /// than `max_staleness` before this call (ADR-097), and not before
+    /// `floor`, the monotonic floor of its stale view (ADR-102).
+    pub fn begin_stale_transaction(
+        &self,
+        max_staleness: Duration,
+        floor: MonotonicFloor,
+    ) -> EngineTransaction {
+        EngineTransaction(self.algo.begin_stale(max_staleness, floor))
     }
 
     /// Replaces the logical accesses of an uncommitted transaction.

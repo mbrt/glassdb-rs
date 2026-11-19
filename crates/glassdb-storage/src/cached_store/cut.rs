@@ -68,8 +68,8 @@ impl CutSearch {
         }
     }
 
-    /// Plans a cut point not before `cutoff` and not before `floor`, or
-    /// returns `None` when no state can supply one.
+    /// Plans a cut point not before `cutoff` and not before `floor`, if there
+    /// is one, or returns `None` when no state can supply one.
     ///
     /// Call it after the body completes: its barrier is also the validation
     /// barrier when the target does not become a cut point, so it must follow
@@ -78,11 +78,15 @@ impl CutSearch {
     /// Several states need a point inside every interval, so the target is
     /// at or after their latest start. One state needs no interval: it was
     /// current when its read took effect, which is after its watermark.
-    pub fn plan(&self, cutoff: StalenessCutoff, floor: &MonotonicFloor) -> Option<CutTarget> {
+    pub fn plan(
+        &self,
+        cutoff: StalenessCutoff,
+        floor: Option<&MonotonicFloor>,
+    ) -> Option<CutTarget> {
         if self.unknown_start {
             return None;
         }
-        let bound = floor.get().max(cutoff.point());
+        let bound = floor.map_or(cutoff.point(), |floor| floor.get().max(cutoff.point()));
         let target = if self.states > 1 {
             bound.max(self.latest_start)
         } else {

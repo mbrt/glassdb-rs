@@ -6,9 +6,14 @@
 use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{
     Covered, FaultConfig, HistoryCollectionOp as C, HistoryInstruction as I, HistoryMode,
-    HistoryTransaction, HistoryWorkload, StructuralCoverage, pct_sweep, run_and_assert,
-    run_and_assert_with_faults,
+    HistoryTransaction, HistoryView, HistoryWorkload, StructuralCoverage, pct_sweep,
+    run_and_assert, run_and_assert_with_faults,
 };
+
+/// An unbounded stale program through the shared view of its instance.
+const SHARED: HistoryMode = HistoryMode::StaleMax(HistoryView::Shared);
+/// An unbounded stale program through a new view.
+const NEW: HistoryMode = HistoryMode::StaleMax(HistoryView::New);
 
 use crate::sim_support::{assert_slow_mutation_modes, fault_tape, tape};
 
@@ -160,10 +165,10 @@ fn exact_history_holds_with_guided_faults() {
     }
 }
 
-/// Stale read-only transactions with both bounds, around increments, writes,
-/// and deletes of both instances.
+/// Stale read-only transactions with both bounds, through shared and new
+/// views, around increments, writes, and deletes of both instances.
 fn stale_history() -> HistoryWorkload {
-    use HistoryMode::{StaleMax, StaleZero, Strict};
+    use HistoryMode::{StaleZero, Strict};
     let increment = |key| {
         vec![
             I::Read { key, register: 0 },
@@ -184,25 +189,25 @@ fn stale_history() -> HistoryWorkload {
         clients: vec![
             vec![
                 in_mode(0, 0, Strict, increment(0)),
-                in_mode(1, 0, StaleMax, vec![group(0, 1)]),
+                in_mode(1, 0, SHARED, vec![group(0, 1)]),
                 in_mode(2, 0, StaleZero, vec![scan(3), I::Yield, group(0, 2)]),
             ],
             vec![
                 in_mode(
                     3,
                     1,
-                    StaleMax,
+                    NEW,
                     vec![I::Read {
                         key: 0,
                         register: 0,
                     }],
                 ),
                 in_mode(4, 1, Strict, vec![I::WriteLiteral { key: 1, value: 9 }]),
-                in_mode(5, 1, StaleMax, vec![group(1, 2), scan(2)]),
+                in_mode(5, 1, SHARED, vec![group(1, 2), scan(2)]),
             ],
             vec![
                 in_mode(6, 2, Strict, increment(1)),
-                in_mode(7, 2, StaleMax, vec![group(1, 2)]),
+                in_mode(7, 2, NEW, vec![group(1, 2)]),
             ],
             vec![
                 in_mode(8, 3, Strict, vec![I::Delete { key: 2 }]),
@@ -218,7 +223,7 @@ fn stale_history() -> HistoryWorkload {
                 in_mode(
                     10,
                     3,
-                    StaleMax,
+                    SHARED,
                     vec![
                         scan(2),
                         I::Read {
@@ -262,10 +267,11 @@ fn pct_seed_breadth_holds_stale_history() {
 /// updates both values in one transaction. Each value has its own leaf, and an
 /// update does not change a binding. So a strict read of the first collection
 /// refreshes only its own leaf, and a stale read can then see its new value.
-/// Without the monotonic floor, a later stale read of the second collection
-/// could still use its old leaf.
+/// The stale reads run through the shared view of their instance. Without its
+/// monotonic floor, a later stale read of the second collection could still
+/// use its old leaf.
 fn floor_history() -> HistoryWorkload {
-    use HistoryMode::{StaleMax, Strict};
+    use HistoryMode::Strict;
     let collection = |slot, operation| I::Collection { slot, operation };
     let read = |slot| collection(slot, C::Read);
     HistoryWorkload {
@@ -277,15 +283,15 @@ fn floor_history() -> HistoryWorkload {
                     Strict,
                     vec![collection(0, C::Write(1)), collection(1, C::Write(1))],
                 ),
-                in_mode(1, 0, StaleMax, vec![read(0), read(1)]),
-                in_mode(2, 0, StaleMax, vec![read(0), read(1)]),
+                in_mode(1, 0, SHARED, vec![read(0), read(1)]),
+                in_mode(2, 0, SHARED, vec![read(0), read(1)]),
                 in_mode(3, 0, Strict, vec![read(0)]),
-                in_mode(4, 0, StaleMax, vec![read(0)]),
-                in_mode(5, 0, StaleMax, vec![read(1)]),
+                in_mode(4, 0, SHARED, vec![read(0)]),
+                in_mode(5, 0, SHARED, vec![read(1)]),
             ],
             vec![
-                in_mode(6, 1, StaleMax, vec![I::Yield, read(1)]),
-                in_mode(7, 1, StaleMax, vec![I::Yield, read(1)]),
+                in_mode(6, 1, SHARED, vec![I::Yield, read(1)]),
+                in_mode(7, 1, SHARED, vec![I::Yield, read(1)]),
             ],
             update_after(8, 2, 2, 2),
             update_after(11, 3, 4, 3),

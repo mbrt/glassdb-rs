@@ -37,6 +37,7 @@ impl Default for FailingWorkload {
 impl SimWorkload for FailingWorkload {
     type Op = ();
     type State = ();
+    type Instance = ();
 
     fn clients(&self) -> &[Vec<()>] {
         &self.clients
@@ -46,12 +47,9 @@ impl SimWorkload for FailingWorkload {
 
     async fn seed(&self, _db: &Database) {}
 
-    async fn run_op(
-        _db: &Database,
-        _instance: InstanceId,
-        _op: &(),
-        _state: &(),
-    ) -> Result<(), Error> {
+    fn open_instance(_db: &Database, _id: InstanceId) {}
+
+    async fn run_op(_db: &Database, _instance: &(), _op: &(), _state: &()) -> Result<(), Error> {
         panic!("the operation fails");
     }
 
@@ -87,6 +85,7 @@ impl Drop for PanicDuringUnwind {
 impl SimWorkload for AbortingWorkload {
     type Op = ();
     type State = ();
+    type Instance = ();
 
     fn clients(&self) -> &[Vec<()>] {
         &self.clients
@@ -96,12 +95,9 @@ impl SimWorkload for AbortingWorkload {
 
     async fn seed(&self, _db: &Database) {}
 
-    async fn run_op(
-        _db: &Database,
-        _instance: InstanceId,
-        _op: &(),
-        _state: &(),
-    ) -> Result<(), Error> {
+    fn open_instance(_db: &Database, _id: InstanceId) {}
+
+    async fn run_op(_db: &Database, _instance: &(), _op: &(), _state: &()) -> Result<(), Error> {
         let _destructor = PanicDuringUnwind;
         panic!("the operation fails");
     }

@@ -107,6 +107,7 @@ impl<W: SimWorkload> Covered<W> {
 impl<W: SimWorkload> SimWorkload for Covered<W> {
     type Op = W::Op;
     type State = CoveredState<W::State>;
+    type Instance = W::Instance;
 
     const CONTINUE_AFTER_ADMISSIBLE_ERROR: bool = W::CONTINUE_AFTER_ADMISSIBLE_ERROR;
 
@@ -133,9 +134,13 @@ impl<W: SimWorkload> SimWorkload for Covered<W> {
         self.workload.seed(db).await;
     }
 
+    fn open_instance(db: &Database, id: InstanceId) -> W::Instance {
+        W::open_instance(db, id)
+    }
+
     async fn run_op(
         db: &Database,
-        instance: InstanceId,
+        instance: &W::Instance,
         op: &W::Op,
         state: &CoveredState<W::State>,
     ) -> Result<(), Error> {

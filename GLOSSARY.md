@@ -372,8 +372,12 @@ The one sequence point at which every state that a read-only transaction depends
 _Avoid_: Snapshot timestamp, read version
 
 **Monotonic floor**:
-The earliest cut point that the next stale read-only transaction of a database instance can use.
+The earliest cut point that the next stale read-only transaction of a stale view can use.
 _Avoid_: Session watermark, read floor
+
+**Stale view**:
+A handle that runs stale read-only transactions with one staleness bound, and orders them with its own monotonic floor. Clones of a view share its floor.
+_Avoid_: Session, snapshot handle
 
 ## Point routing
 

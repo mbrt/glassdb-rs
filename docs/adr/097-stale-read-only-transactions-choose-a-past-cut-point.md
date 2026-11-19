@@ -8,6 +8,7 @@ Accepted.
 `Collection::read_stale` a stale read-only transaction with one read.
 [ADR-099](099-read-only-transactions-certify-at-a-zero-staleness-cut-point.md)
 certifies a read-only pass of `Database::tx` at a zero-staleness cut point.
+[ADR-102](102-a-stale-view-orders-its-stale-read-only-transactions.md) moves the monotonic floor from the database instance to a stale view.
 
 Refines [ADR-036](036-decoded-object-cache-with-bounded-freshness.md): a
 cached state also records where its currentness interval starts. Refines

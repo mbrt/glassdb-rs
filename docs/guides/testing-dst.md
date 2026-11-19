@@ -113,13 +113,15 @@ constrain that choice.
 
 A history program with no writes can also run as a stale read-only transaction
 with a zero or an unbounded staleness. With a zero bound, the checker places it
-as a transaction. With an unbounded staleness, it can take a past position: it
-follows only the earlier stale read-only transactions of its database instance
-and the earlier commits of the instance that wrote what it observes. A restart
-opens a new instance, so these orders do not cross a crash. A stale read-only
-transaction with a zero bound also counts as one with an unbounded staleness for
-the later ones, because the monotonic floor rises only to the states that it
-used. Finite bounds above zero depend on time and are not generated.
+as a transaction. With an unbounded staleness, the program runs through the
+shared view of its database instance (`HistoryView::Shared`) or through a new
+view (`HistoryView::New`), and it can take a past position. It follows only the
+earlier programs of the same shared view and the earlier commits of the
+instance that wrote what it observes. A restart opens a new instance with a new
+shared view, so these orders do not cross a crash. The checker does not check
+that a program never reads an older state of a key than an earlier program of
+the instance saw. Integration tests check that. Finite bounds above zero depend
+on time and are not generated.
 
 ## The four approaches in one paragraph each
 

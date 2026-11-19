@@ -42,6 +42,7 @@ impl Default for IdleWorkload {
 impl SimWorkload for IdleWorkload {
     type Op = ();
     type State = ();
+    type Instance = ();
 
     fn clients(&self) -> &[Vec<()>] {
         &self.clients
@@ -51,12 +52,9 @@ impl SimWorkload for IdleWorkload {
 
     async fn seed(&self, _db: &Database) {}
 
-    async fn run_op(
-        _db: &Database,
-        _instance: InstanceId,
-        _op: &(),
-        _state: &(),
-    ) -> Result<(), Error> {
+    fn open_instance(_db: &Database, _id: InstanceId) {}
+
+    async fn run_op(_db: &Database, _instance: &(), _op: &(), _state: &()) -> Result<(), Error> {
         Ok(())
     }
 

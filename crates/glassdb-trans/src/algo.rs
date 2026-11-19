@@ -238,9 +238,10 @@ pub struct Handle {
     /// The staleness cutoff of the cut point of a read-only pass, captured
     /// when the transaction starts (ADR-097, ADR-099).
     staleness_cutoff: StalenessCutoff,
-    /// Whether a certified read-only pass raises the monotonic floor. Only a
-    /// stale read-only transaction does (ADR-099).
-    raises_floor: bool,
+    /// The monotonic floor of the stale view that runs the transaction. A
+    /// certified read-only pass uses and raises it. Only a stale read-only
+    /// transaction has one (ADR-099, ADR-102).
+    floor: Option<MonotonicFloor>,
 }
 
 impl Handle {
@@ -478,8 +479,6 @@ pub struct Algo {
     // Weak so a captured `Algo` clone inside a spawned retirement task does not
     // keep [`Background`] alive past DB shutdown.
     background: Option<Weak<Background>>,
-    /// Orders the stale read-only transactions of this instance (ADR-097).
-    floor: MonotonicFloor,
     /// The collection records behind the directory reads of a cut.
     records: CollectionStore,
 }
@@ -538,7 +537,6 @@ impl Algo {
             collection_commit,
             retirement,
             background,
-            floor: MonotonicFloor::new(),
             records,
         }
     }
@@ -549,12 +547,13 @@ impl Algo {
     }
 
     /// Starts a stale read-only transaction that accepts a cut point no older
-    /// than `max_staleness` before this call (ADR-097). Replays of its body
-    /// keep the same cutoff.
-    pub fn begin_stale(&self, max_staleness: Duration) -> Handle {
+    /// than `max_staleness` before this call (ADR-097), and not before
+    /// `floor`, the monotonic floor of its stale view (ADR-102). Replays of
+    /// its body keep the same cutoff.
+    pub fn begin_stale(&self, max_staleness: Duration, floor: MonotonicFloor) -> Handle {
         let mut tx = self.begin(AccessSet::default(), CatalogAccesses::default());
         tx.staleness_cutoff = self.timeline.staleness_cutoff(max_staleness);
-        tx.raises_floor = true;
+        tx.floor = Some(floor);
         tx
     }
 
@@ -577,7 +576,7 @@ impl Algo {
             backoff: self.acquisition_retry.backoff(),
             directory_locks: DirectoryLocks::default(),
             staleness_cutoff: self.timeline.staleness_cutoff(Duration::ZERO),
-            raises_floor: false,
+            floor: None,
         }
     }
 
@@ -647,7 +646,7 @@ impl Algo {
         self.nodes.add_leaves_to_cut(&mut search, &states.leaves)?;
         self.records
             .add_records_to_cut(&mut search, &states.records)?;
-        let Some(target) = search.plan(tx.staleness_cutoff, &self.floor) else {
+        let Some(target) = search.plan(tx.staleness_cutoff, tx.floor.as_ref()) else {
             return fresh();
         };
         let (leaves, records) = futures::future::join(
@@ -659,17 +658,17 @@ impl Algo {
         if !(leaves? && records?) {
             return Ok(ReadCertification::ValidateAt(target.barrier()));
         }
-        if tx.raises_floor {
-            target.raise_floor(&self.floor);
+        if let Some(floor) = &tx.floor {
+            target.raise_floor(floor);
         }
         Ok(ReadCertification::AtCutPoint)
     }
 
-    /// Raises the monotonic floor after a stale read-only transaction
-    /// validated its reads at `barrier` (ADR-097).
+    /// Raises the monotonic floor of the stale view after a stale read-only
+    /// transaction validated its reads at `barrier` (ADR-097, ADR-102).
     fn raise_floor_after_validation(&self, tx: &Handle, barrier: CurrentnessBarrier) {
-        if tx.raises_floor {
-            self.floor.raise_to_barrier(barrier);
+        if let Some(floor) = &tx.floor {
+            floor.raise_to_barrier(barrier);
         }
     }
 

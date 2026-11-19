@@ -54,7 +54,8 @@ pub use harness::{
     record_input, replay_input,
 };
 pub use history::{
-    HistoryCollectionOp, HistoryInstruction, HistoryMode, HistoryTransaction, HistoryWorkload,
+    HistoryCollectionOp, HistoryInstruction, HistoryMode, HistoryTransaction, HistoryView,
+    HistoryWorkload,
 };
 pub use membership::{MembOp, MembershipAcct, MembershipWorkload, MergingMembershipWorkload};
 pub use rmw::{RMW_KEY_COUNT, RmwAcct, RmwOp, RmwWorkload};

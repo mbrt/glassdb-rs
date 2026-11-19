@@ -135,6 +135,7 @@ async fn run_api_step(
 impl SimWorkload for ApiWorkload {
     type Op = ApiTransaction;
     type State = Mutex<ApiAcct>;
+    type Instance = ();
 
     fn clients(&self) -> &[Vec<ApiTransaction>] {
         &self.clients
@@ -164,9 +165,11 @@ impl SimWorkload for ApiWorkload {
             .expect("create API collection");
     }
 
+    fn open_instance(_db: &Database, _id: InstanceId) {}
+
     async fn run_op(
         db: &Database,
-        _instance: InstanceId,
+        _instance: &(),
         op: &ApiTransaction,
         state: &Mutex<ApiAcct>,
     ) -> Result<(), Error> {
