@@ -1,6 +1,6 @@
 # Stale read-only transactions (ADR-097) on the mixed low-conflict workload:
-# the `ro` shapes run `Database::read_tx` beside the `rw` shapes on the same
-# instances. To compare with `Database::tx`, run `workers`.
+# the `ro` shapes run `StaleDatabaseView::read_tx` beside the `rw` shapes on
+# the same instances. To compare with `Database::tx`, run `workers`.
 tags = ["extra", "area/read"]
 include = ["../configs/workers.toml"]
 

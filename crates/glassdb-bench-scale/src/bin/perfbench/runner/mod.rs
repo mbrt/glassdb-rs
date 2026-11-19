@@ -17,7 +17,7 @@ pub(crate) mod workers;
 use std::error::Error;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use glassdb::{Collection, Database, Stats};
@@ -374,6 +374,7 @@ async fn run_cell(
                             home: instance % spec.collections,
                             collections: spec.collections,
                             seed: workers::worker_seed(worker_index),
+                            view: OnceLock::new(),
                         }
                         .spawn(),
                     );

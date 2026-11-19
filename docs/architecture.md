@@ -467,7 +467,7 @@ After a few failed checks, its replays use the locked commit
 A near miss then leaves no read lock, so it cannot push the writers of a hot
 leaf from direct commits to locked commits.
 
-**Stale read-only transactions** (`Database::read_tx`) validate at a cut point
+**Stale read-only transactions** (`StaleDatabaseView::read_tx`) validate at a cut point
 that can be in the past
 ([ADR-097](adr/097-stale-read-only-transactions-choose-a-past-cut-point.md)).
 Each cached state knows its currentness interval: from the completion of the

@@ -382,50 +382,17 @@ impl Database {
         self.inner.tx(f).await
     }
 
-    /// Runs `f` as a stale read-only transaction and returns its result.
+    /// Returns a view that runs stale read-only transactions with the bound
+    /// `max_staleness`.
     ///
-    /// The body sees the state of the database at one instant, its cut point.
-    /// The cut point is at most `max_staleness` older than the start of this
-    /// call, on the clock of this instance, and `Duration::MAX` accepts any
-    /// age. The result is serializable, and it contains every write that this
-    /// instance committed before the call. A stale read-only transaction of
-    /// this instance sees every transaction whose effect a previous one saw.
-    /// It can still have an earlier cut point than a previous one, for example
-    /// one with a zero bound that saw no effect of a recent transaction.
-    ///
-    /// With a warm cache, a stale read-only transaction can finish with no
-    /// backend operation. When the cache cannot supply a cut point, it
-    /// validates its reads like [`Database::tx`]. The body can run more than
-    /// once, as in [`Database::tx`].
-    ///
-    /// With `Duration::ZERO`, the result and the cost are the same as those of
-    /// a read-only [`Database::tx`]. The result contains every transaction of
-    /// any instance that committed before the call started. A later stale
-    /// read-only transaction of this instance sees what a `read_tx` saw, but
-    /// it can miss what a read-only [`Database::tx`] saw.
-    ///
-    /// With a bound above zero, a `read_tx` that follows a [`Database::tx`] of
-    /// the same instance can miss a write of another instance that the `tx`
-    /// saw. Use `Duration::ZERO` or [`Database::tx`] when the reads must
-    /// follow everything that this instance observed.
-    pub async fn read_tx<T, F, Fut>(&self, max_staleness: Duration, mut f: F) -> Result<T, Error>
-    where
-        F: FnMut(ReadTransaction) -> Fut + Send,
-        Fut: Future<Output = Result<T, Error>> + Send,
-        T: Send,
-    {
-        self.inner
-            .tx_with(Some(max_staleness), |tx| f(ReadTransaction::new(tx)))
-            .await
-    }
-
-    /// Returns a view whose collection helpers each run one stale read-only
-    /// transaction with the bound `max_staleness`.
-    ///
-    /// Each helper is the same as a [`Database::read_tx`] whose body does the
-    /// work of the strong helper of this database, with the same guarantees.
-    pub fn stale(&self, max_staleness: Duration) -> StaleDatabaseView<'_> {
-        self.reads(Some(max_staleness))
+    /// Each collection helper of the view is the same as a
+    /// [`StaleDatabaseView::read_tx`] whose body does the work of the strong
+    /// helper of this database, with the same guarantees.
+    pub fn stale(&self, max_staleness: Duration) -> StaleDatabaseView {
+        StaleDatabaseView {
+            inner: self.inner.clone(),
+            max_staleness,
+        }
     }
 
     /// Runs one full GC and returns when it is complete.
@@ -498,29 +465,106 @@ impl Database {
         }
     }
 
-    fn reads(&self, max_staleness: Option<Duration>) -> StaleDatabaseView<'_> {
-        StaleDatabaseView {
+    fn reads(&self, max_staleness: Option<Duration>) -> DatabaseReads<'_> {
+        DatabaseReads {
             inner: &self.inner,
             max_staleness,
         }
     }
 }
 
-/// The collection helpers of one database, each run as a stale read-only
-/// transaction. [`Database::stale`] returns it.
-pub struct StaleDatabaseView<'a> {
+/// Runs stale read-only transactions of one database with one staleness
+/// bound. [`Database::stale`] returns it.
+///
+/// A view is cheap to clone.
+#[derive(Clone)]
+pub struct StaleDatabaseView {
+    inner: Arc<DbInner>,
+    max_staleness: Duration,
+}
+
+impl StaleDatabaseView {
+    /// Runs `f` as a stale read-only transaction and returns its result.
+    ///
+    /// The body sees the state of the database at one instant, its cut point.
+    /// The cut point is at most the bound of this view older than the start of
+    /// this call, on the clock of this instance, and `Duration::MAX` accepts
+    /// any age. The result is serializable, and it contains every write that
+    /// this instance committed before the call. A stale read-only transaction
+    /// of this instance sees every transaction whose effect a previous one
+    /// saw. It can still have an earlier cut point than a previous one, for
+    /// example one with a zero bound that saw no effect of a recent
+    /// transaction.
+    ///
+    /// With a warm cache, a stale read-only transaction can finish with no
+    /// backend operation. When the cache cannot supply a cut point, it
+    /// validates its reads like [`Database::tx`]. The body can run more than
+    /// once, as in [`Database::tx`].
+    ///
+    /// With a view whose bound is `Duration::ZERO`, the result and the cost
+    /// are the same as those of a read-only [`Database::tx`]. The result contains every transaction of
+    /// any instance that committed before the call started. A later stale
+    /// read-only transaction of this instance sees what a `read_tx` saw, but
+    /// it can miss what a read-only [`Database::tx`] saw.
+    ///
+    /// With a bound above zero, a `read_tx` that follows a [`Database::tx`] of
+    /// the same instance can miss a write of another instance that the `tx`
+    /// saw. Use a view with a zero bound, or [`Database::tx`], when the reads
+    /// must follow everything that this instance observed.
+    pub async fn read_tx<T, F, Fut>(&self, mut f: F) -> Result<T, Error>
+    where
+        F: FnMut(ReadTransaction) -> Fut + Send,
+        Fut: Future<Output = Result<T, Error>> + Send,
+        T: Send,
+    {
+        self.inner
+            .tx_with(Some(self.max_staleness), |tx| f(ReadTransaction::new(tx)))
+            .await
+    }
+
+    /// Resolves a logical path to its bound collection ID.
+    ///
+    /// A string names one top-level collection; use [`CollectionPath`] for a
+    /// nested path.
+    pub async fn open_collection<P>(&self, path: P) -> Result<Collection, Error>
+    where
+        P: TryInto<CollectionPath>,
+        P::Error: Into<Error>,
+    {
+        self.reads().open_collection(path).await
+    }
+
+    /// Reports whether every component of a logical collection path is bound.
+    ///
+    /// A string names one top-level collection; use [`CollectionPath`] for a
+    /// nested path.
+    pub async fn collection_exists<P>(&self, path: P) -> Result<bool, Error>
+    where
+        P: TryInto<CollectionPath>,
+        P::Error: Into<Error>,
+    {
+        self.reads().collection_exists(path).await
+    }
+
+    fn reads(&self) -> DatabaseReads<'_> {
+        DatabaseReads {
+            inner: &self.inner,
+            max_staleness: Some(self.max_staleness),
+        }
+    }
+}
+
+/// The collection helpers of one database, as strong transactions or as
+/// stale read-only transactions.
+struct DatabaseReads<'a> {
     inner: &'a Arc<DbInner>,
     /// `None` runs each helper as a strong transaction, so that the strong
     /// helpers of [`Database`] share these bodies.
     max_staleness: Option<Duration>,
 }
 
-impl StaleDatabaseView<'_> {
-    /// Resolves a logical path to its bound collection ID.
-    ///
-    /// A string names one top-level collection; use [`CollectionPath`] for a
-    /// nested path.
-    pub async fn open_collection<P>(&self, path: P) -> Result<Collection, Error>
+impl DatabaseReads<'_> {
+    async fn open_collection<P>(&self, path: P) -> Result<Collection, Error>
     where
         P: TryInto<CollectionPath>,
         P::Error: Into<Error>,
@@ -533,11 +577,7 @@ impl StaleDatabaseView<'_> {
             .await
     }
 
-    /// Reports whether every component of a logical collection path is bound.
-    ///
-    /// A string names one top-level collection; use [`CollectionPath`] for a
-    /// nested path.
-    pub async fn collection_exists<P>(&self, path: P) -> Result<bool, Error>
+    async fn collection_exists<P>(&self, path: P) -> Result<bool, Error>
     where
         P: TryInto<CollectionPath>,
         P::Error: Into<Error>,

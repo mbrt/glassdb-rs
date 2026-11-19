@@ -192,11 +192,15 @@ impl Collection {
     /// Returns a view whose read helpers each run one stale read-only
     /// transaction with the bound `max_staleness`.
     ///
-    /// Each helper is the same as a [`Database::read_tx`](crate::Database::read_tx)
-    /// whose body does the work of the strong helper of this collection,
-    /// with the same guarantees.
-    pub fn stale(&self, max_staleness: Duration) -> StaleCollectionView<'_> {
-        self.reads(Some(max_staleness))
+    /// Each helper is the same as a
+    /// [`StaleDatabaseView::read_tx`](crate::StaleDatabaseView::read_tx) with
+    /// the same bound, whose body does the work of the strong helper of this
+    /// collection, with the same guarantees.
+    pub fn stale(&self, max_staleness: Duration) -> StaleCollectionView {
+        StaleCollectionView {
+            collection: self.clone(),
+            max_staleness,
+        }
     }
 
     pub(crate) fn new_root(db: Arc<DbInner>) -> Self {
@@ -236,8 +240,8 @@ impl Collection {
         self.db.database_id
     }
 
-    fn reads(&self, max_staleness: Option<Duration>) -> StaleCollectionView<'_> {
-        StaleCollectionView {
+    fn reads(&self, max_staleness: Option<Duration>) -> CollectionReads<'_> {
+        CollectionReads {
             collection: self,
             max_staleness,
         }
@@ -253,16 +257,68 @@ impl Collection {
 
 /// The read helpers of one collection, each run as a stale read-only
 /// transaction. [`Collection::stale`] returns it.
-pub struct StaleCollectionView<'a> {
+///
+/// A view is cheap to clone.
+#[derive(Clone)]
+pub struct StaleCollectionView {
+    collection: Collection,
+    max_staleness: Duration,
+}
+
+impl StaleCollectionView {
+    /// Reads the value for `key`, returning `None` when the key is absent.
+    pub async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        self.reads().read(key).await
+    }
+
+    /// Opens the direct child bound to `name`.
+    pub async fn open_collection(&self, name: impl AsRef<[u8]>) -> Result<Collection, Error> {
+        self.reads().open_collection(name).await
+    }
+
+    /// Reports whether a direct child is bound to `name`.
+    pub async fn collection_exists(&self, name: impl AsRef<[u8]>) -> Result<bool, Error> {
+        self.reads().collection_exists(name).await
+    }
+
+    /// Returns an owned iterator over the materialized keys of the collection.
+    ///
+    /// All I/O completes in one transaction before the iterator is returned.
+    pub async fn iter_keys(&self) -> Result<KeyIter, Error> {
+        self.reads().iter_keys().await
+    }
+
+    /// Materializes one sorted page of collection keys.
+    pub async fn scan_keys(&self, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
+        self.reads().scan_keys(scan).await
+    }
+
+    /// Returns an owned iterator over direct child bindings in raw-name order.
+    ///
+    /// All I/O completes in one transaction before the iterator is returned.
+    pub async fn iter_collections(&self) -> Result<CollectionIter, Error> {
+        self.reads().iter_collections().await
+    }
+
+    fn reads(&self) -> CollectionReads<'_> {
+        CollectionReads {
+            collection: &self.collection,
+            max_staleness: Some(self.max_staleness),
+        }
+    }
+}
+
+/// The read helpers of one collection, as strong transactions or as stale
+/// read-only transactions.
+struct CollectionReads<'a> {
     collection: &'a Collection,
     /// `None` runs each helper as a strong transaction, so that the strong
     /// helpers of [`Collection`] share these bodies.
     max_staleness: Option<Duration>,
 }
 
-impl StaleCollectionView<'_> {
-    /// Reads the value for `key`, returning `None` when the key is absent.
-    pub async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+impl CollectionReads<'_> {
+    async fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let c = self.collection;
         c.db.tx_with(
             self.max_staleness,
@@ -271,8 +327,7 @@ impl StaleCollectionView<'_> {
         .await
     }
 
-    /// Opens the direct child bound to `name`.
-    pub async fn open_collection(&self, name: impl AsRef<[u8]>) -> Result<Collection, Error> {
+    async fn open_collection(&self, name: impl AsRef<[u8]>) -> Result<Collection, Error> {
         let c = self.collection;
         let name = &collection_name(name.as_ref())?;
         c.db.tx_with(self.max_staleness, |tx| async move {
@@ -281,8 +336,7 @@ impl StaleCollectionView<'_> {
         .await
     }
 
-    /// Reports whether a direct child is bound to `name`.
-    pub async fn collection_exists(&self, name: impl AsRef<[u8]>) -> Result<bool, Error> {
+    async fn collection_exists(&self, name: impl AsRef<[u8]>) -> Result<bool, Error> {
         let c = self.collection;
         let name = &collection_name(name.as_ref())?;
         c.db.tx_with(self.max_staleness, |tx| async move {
@@ -291,17 +345,13 @@ impl StaleCollectionView<'_> {
         .await
     }
 
-    /// Returns an owned iterator over the materialized keys of the collection.
-    ///
-    /// All I/O completes in one transaction before the iterator is returned.
-    pub async fn iter_keys(&self) -> Result<KeyIter, Error> {
+    async fn iter_keys(&self) -> Result<KeyIter, Error> {
         Ok(KeyIter::new(
             self.scan_keys(KeyScan::all()).await?.into_keys(),
         ))
     }
 
-    /// Materializes one sorted page of collection keys.
-    pub async fn scan_keys(&self, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
+    async fn scan_keys(&self, scan: KeyScan<'_>) -> Result<KeyPage, Error> {
         let c = self.collection;
         c.db.tx_with(self.max_staleness, |tx| async move {
             tx.scan_keys(c, scan).await
@@ -309,10 +359,7 @@ impl StaleCollectionView<'_> {
         .await
     }
 
-    /// Returns an owned iterator over direct child bindings in raw-name order.
-    ///
-    /// All I/O completes in one transaction before the iterator is returned.
-    pub async fn iter_collections(&self) -> Result<CollectionIter, Error> {
+    async fn iter_collections(&self) -> Result<CollectionIter, Error> {
         let c = self.collection;
         c.db.tx_with(self.max_staleness, |tx| async move {
             tx.iter_collections(c).await

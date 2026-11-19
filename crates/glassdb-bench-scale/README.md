@@ -213,13 +213,13 @@ The built-in kinds:
 | Kind | Parameters | Transaction |
 | --- | --- | --- |
 | `read-modify-write` | `keys`, `value-bytes`, `collections`, `open-in-body` | Reads `keys` keys and writes each of them. With `collections` > 1, it uses the same keys in that many collections of the pool, from the home collection on. With `open-in-body`, the body first opens each of its collections by name, so the transaction also reads the directory of the root collection. |
-| `read` | `keys`, `staleness` | Serializable read of `keys` keys. With `staleness`, it runs a stale read-only transaction (`Database::read_tx`) with that bound. |
+| `read` | `keys`, `staleness`, `view` | Serializable read of `keys` keys. With `staleness`, it runs a stale read-only transaction (`StaleDatabaseView::read_tx`) with that bound. With `view = "call"`, each transaction uses a new view of `Database::stale`. With `view = "worker"`, a worker uses one view for all its transactions. `view` needs `staleness`. |
 | `write` | `value-bytes` | Writes one key without a read. A single-key write commits direct. |
 | `scan` | `span` | Scans `span` keys from the selected key. `span = "all"` scans the whole collection. |
 | `create-delete` | `value-bytes`, `locked` | Creates the selected key, and deletes it in the next transaction of the worker. With `locked = true`, the transaction first scans the whole collection, so it cannot commit direct and takes the membership lock. |
 
 `value-bytes` defaults to the `value-bytes` of the pool, `collections` to 1,
-`span` to `"all"`, and `locked` to `false`.
+`span` to `"all"`, `locked` to `false`, and `view` to `"call"`.
 
 ## Key sources and pools
 

@@ -45,14 +45,14 @@ and the run then stops.
 
 | Experiment | What it measures |
 | --- | --- |
-| The cases of [CI experiments](#ci-experiments) | Single transactions of one worker with warm caches, and their backend costs, and four shapes at the same time on one leaf. Each case has a fixed length of 10 s for its counters and of 300 s for its latency. |
+| The cases of [CI experiments](#ci-experiments) | Single transactions of one worker with warm caches, and their backend costs, three workers on one leaf, four shapes at the same time on one leaf, and stale read-only transactions beside a writer on shared leaves. Each case has a fixed length of 10 s for its counters and of 300 s for its latency. |
 | `inline-pressure` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
 | `contention` | Five writers whose transactions share some of their 1 to 6 keys. |
 | `split-merge-fight` | A stable load under which both a split and a merge of one leaf make sense. The default topology policy must settle at one leaf or at two leaves, from a start of either one. |
 | `membership-churn` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
 | `mixed` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
 | `workers` | The worker grid of the canonical plots: 1 to 200 workers per shape. Each count starts from the seed. |
-| `stale-reads` | The `workers` grid at 1, 50, 100, and 200 workers, with the `ro` shapes as stale read-only transactions (`Database::read_tx`, ADR-097). |
+| `stale-reads` | The `workers` grid at 1, 50, 100, and 200 workers, with the `ro` shapes as stale read-only transactions (`StaleDatabaseView::read_tx`, ADR-097). |
 | `affinity` | The affinity grid: 5 affinities × 1, 3, 5, and 7 database instances. It is not part of the canonical plots. |
 | `conflict-sweep` | The conflict grid of the canonical plots: 20 workers on 1 and on 5 database instances run read-modify-write transactions of 1 or 4 keys on one pool, from 5,000 keys down to 5 keys (1 key) or 100 keys (4 keys). A smaller pool gives more conflicts. |
 | `load-shift` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
@@ -87,7 +87,7 @@ pool.
 The experiments with the tags `ci/counters` and `ci/timing` replace the
 Criterion suite of `glassdb`. Each case of the CI comparison has two files:
 `<case>.toml` with the tag `ci/timing`, and `<case>-counters.toml` with the tag
-`ci/counters`. Except for the last one, each case runs one worker on one
+`ci/counters`. Except for the last three, each case runs one worker on one
 instance with warm caches. A case warms up for 1250 ms. The counter file
 measures for 10 s of model time, which ends before the first pass of the garbage
 collector. The timing file measures for 300 s. The counter files include
@@ -106,6 +106,7 @@ window. Most cases use built-in parts:
 | `read-long-keys` | A read in a collection of 1,024 keys of 256 bytes (`key-bytes = 256`), after its splits. |
 | `rmw-shared-leaf` | Three workers that update their own key of one leaf. |
 | `shapes-shared-leaf` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time on one leaf, with `low-conflict` keys. |
+| `stale-reads-shared-leaves` | Stale read-only transactions (`StaleDatabaseView::read_tx`, 5 s bound) of one key and of ten keys, each with a new view for each transaction (`stale-single`, `stale-multi`) and with one view for each worker (`stale-view-single`, `stale-view-multi`), and a writer of one key, all on the keys of one collection with leaves of at most 16 entries. Each write gives the readers a new leaf state, so the case shows what a new state costs the stale reads of the other leaves. |
 
 The CI comparison builds perfbench for both revisions, runs `make bench` with
 each binary, and then compares the results:
@@ -147,8 +148,10 @@ that is at least the floor of the metric: 2%, or the spread of one run if that
 is larger. A metric whose runs spread by 5% can change by 4% with no change of
 the engine, so the floor scales with the spread. With 32 runs of 300 s, a
 comparison of a revision with itself gave intervals of at most about ±1% for
-the 36 timing metrics of the cases, so an unchanged metric of a case does not stay
-inconclusive.
+the 36 timing metrics of the first nine cases, so an unchanged metric of these
+cases does not stay inconclusive. The metrics of `stale-reads-shared-leaves`
+spread more: up to about 10% in one run for the throughput of `stale-multi` and
+`stale-view-multi`, which can stay inconclusive.
 
 The report also compares the spread of one run of each timing metric, with the
 Brown-Forsythe test: a metric that becomes less stable is a change, even if

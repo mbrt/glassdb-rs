@@ -52,18 +52,19 @@ async fn read_tx_all(
     collections: &[Collection],
 ) -> Vec<Vec<u8>> {
     let collections = collections.to_vec();
-    db.read_tx(staleness, move |tx: ReadTransaction| {
-        let collections = collections.clone();
-        async move {
-            let mut values = Vec::new();
-            for collection in &collections {
-                values.push(tx.read(collection, b"k").await?.unwrap_or_default());
+    db.stale(staleness)
+        .read_tx(move |tx: ReadTransaction| {
+            let collections = collections.clone();
+            async move {
+                let mut values = Vec::new();
+                for collection in &collections {
+                    values.push(tx.read(collection, b"k").await?.unwrap_or_default());
+                }
+                Ok(values)
             }
-            Ok(values)
-        }
-    })
-    .await
-    .unwrap()
+        })
+        .await
+        .unwrap()
 }
 
 /// Returns the backend operations of `db` since `before`.
@@ -126,12 +127,13 @@ async fn warm_read_tx_scan_needs_no_backend_operation() {
         c.write(key, b"v").await.unwrap();
     }
     let scan = |db: Database, c: Collection| async move {
-        db.read_tx(STALENESS, move |tx: ReadTransaction| {
-            let c = c.clone();
-            async move { Ok(tx.scan_keys(&c, KeyScan::all()).await?.keys().len()) }
-        })
-        .await
-        .unwrap()
+        db.stale(STALENESS)
+            .read_tx(move |tx: ReadTransaction| {
+                let c = c.clone();
+                async move { Ok(tx.scan_keys(&c, KeyScan::all()).await?.keys().len()) }
+            })
+            .await
+            .unwrap()
     };
     // The first scan confirms the leaf, which gives its state an interval.
     scan(db.clone(), c.clone()).await;
@@ -150,15 +152,16 @@ async fn warm_read_tx_collection_listing_needs_no_backend_operation() {
         parent.create_collection(name).await.unwrap();
     }
     let list = |db: Database, parent: Collection| async move {
-        db.read_tx(STALENESS, move |tx: ReadTransaction| {
-            let parent = parent.clone();
-            async move {
-                let exists = tx.collection_exists(&parent, b"x").await?;
-                Ok((exists, tx.iter_collections(&parent).await?.count()))
-            }
-        })
-        .await
-        .unwrap()
+        db.stale(STALENESS)
+            .read_tx(move |tx: ReadTransaction| {
+                let parent = parent.clone();
+                async move {
+                    let exists = tx.collection_exists(&parent, b"x").await?;
+                    Ok((exists, tx.iter_collections(&parent).await?.count()))
+                }
+            })
+            .await
+            .unwrap()
     };
     list(db.clone(), parent.clone()).await;
     list(db.clone(), parent.clone()).await;
@@ -282,7 +285,8 @@ async fn read_tx_returns_an_error_outcome_after_validation() {
     let db = Database::open("example", mem()).await.unwrap();
     let c = create_top(&db, b"c").await;
     let err = db
-        .read_tx(STALENESS, move |tx: ReadTransaction| {
+        .stale(STALENESS)
+        .read_tx(move |tx: ReadTransaction| {
             let c = c.clone();
             async move {
                 tx.read(&c, b"k").await?;
@@ -302,12 +306,13 @@ async fn read_tx_checks_the_record_of_a_collection_that_it_opens() {
     let c = create_top(&db, b"c").await;
     c.write(b"k", b"v").await.unwrap();
     let open_and_read = |db: Database| async move {
-        db.read_tx(STALENESS, |tx: ReadTransaction| async move {
-            let c = tx.open_collection(&tx.root_collection(), b"c").await?;
-            tx.read(&c, b"k").await
-        })
-        .await
-        .unwrap()
+        db.stale(STALENESS)
+            .read_tx(|tx: ReadTransaction| async move {
+                let c = tx.open_collection(&tx.root_collection(), b"c").await?;
+                tx.read(&c, b"k").await
+            })
+            .await
+            .unwrap()
     };
     open_and_read(db.clone()).await;
     open_and_read(db.clone()).await;
@@ -605,7 +610,8 @@ async fn read_tx_replays_when_its_body_finds_a_committed_drop() {
     // The second run gives the cached binding and leaf an interval.
     for _ in 0..2 {
         reader
-            .read_tx(Duration::MAX, |tx: ReadTransaction| async move {
+            .stale(Duration::MAX)
+            .read_tx(|tx: ReadTransaction| async move {
                 let c = tx.open_collection(&tx.root_collection(), b"c").await?;
                 tx.read(&c, b"k").await
             })
@@ -621,7 +627,8 @@ async fn read_tx_replays_when_its_body_finds_a_committed_drop() {
     }
 
     let child = reader
-        .read_tx(Duration::MAX, |tx: ReadTransaction| async move {
+        .stale(Duration::MAX)
+        .read_tx(|tx: ReadTransaction| async move {
             let c = match tx.open_collection(&tx.root_collection(), b"c").await {
                 Ok(c) => c,
                 Err(Error::NotFound) => return Ok(None),

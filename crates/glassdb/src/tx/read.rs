@@ -6,7 +6,7 @@ use crate::iter::CollectionIter;
 use crate::scan::{KeyPage, KeyScan};
 use crate::tx::Transaction;
 
-/// A stale read-only transaction, which [`crate::Database::read_tx`] runs.
+/// A stale read-only transaction, which [`crate::StaleDatabaseView::read_tx`] runs.
 ///
 /// It has the read operations of [`Transaction`] and no write operation. The
 /// body sees the state of the database at one cut point. Reads are tracked

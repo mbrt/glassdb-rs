@@ -1,7 +1,8 @@
 # The settings of the experiments with the tag `ci/counters`, whose counters CI
 # compares between two revisions: single transactions of one worker with warm
-# caches, and four shapes at the same time on one leaf. Each of these
-# experiments includes this file and selects one workload. The experiments are
+# caches, three workers on one leaf, four shapes at the same time on one leaf,
+# and stale read-only transactions beside a writer. Each of these
+# experiments includes this file and selects one workload. Most of them are
 # the cases of the former Criterion suite.
 #
 # The window of 10 s ends before the first background pass of the garbage
