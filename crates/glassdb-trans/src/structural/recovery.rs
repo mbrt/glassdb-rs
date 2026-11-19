@@ -1102,23 +1102,29 @@ impl StructuralRecovery {
         test_key: &[u8],
         barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
-        let requirement = Requirement::after(barrier);
-        let node = match self.nodes.load_node(collection, id, requirement).await {
+        if self
+            .router
+            .node_reachable_at_key(collection, test_key, id, Requirement::after(barrier))
+            .await?
+        {
+            return Ok(true);
+        }
+        // A merge can move `test_key` out of a linked node, so reachability
+        // alone does not prove the link. A node that was never linked gets no
+        // traffic and no structural change, so it can lose `test_key` only
+        // after it was linked (ADR-073). Once lost, the key does not come
+        // back: a drained node stays drained, and a high key never rises,
+        // because a merge goes only into the right sibling. So if the descent
+        // did not reach a linked node, a read of the node that follows the
+        // descent shows the loss. A read before the descent can miss a merge
+        // that lands between the two reads.
+        let after_descent = Requirement::after(self.timeline.currentness_barrier());
+        let node = match self.nodes.load_node(collection, id, after_descent).await {
             Ok((node, _)) => node,
             Err(StorageError::NotFound) => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        // A merge can move `test_key` out of a linked node, so reachability
-        // alone does not prove the link. A node that was never linked gets no
-        // traffic and no structural change, so it can lose `test_key` only
-        // after it was linked (ADR-073).
-        if node.is_drained() || node.high_key().is_some_and(|high| high <= test_key) {
-            return Ok(true);
-        }
-        Ok(self
-            .router
-            .node_reachable_at_key(collection, test_key, id, requirement)
-            .await?)
+        Ok(node.is_drained() || node.high_key().is_some_and(|high| high <= test_key))
     }
 
     /// Fences the worker that recorded `source_revision` before classifying
