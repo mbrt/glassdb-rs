@@ -11,6 +11,9 @@ use glassdb::{Database, Error};
 /// Set in the child processes of these tests, which run the sweeps.
 const SWEEP_CHILD_VAR: &str = "GLASSDB_COVERAGE_SWEEP_CHILD";
 
+/// The first seed of the sweeps in the child processes.
+const SWEEP_START: u64 = 1234;
+
 const SPLITS_AND_MERGES: StructuralCoverage = StructuralCoverage {
     splits: true,
     merges: true,
@@ -71,13 +74,14 @@ fn sweep_if_child(requires: StructuralCoverage, faults: FaultConfig) -> bool {
 }
 
 /// Runs the test `test` of this module in a child process, with a sweep of
-/// `seeds` seeds.
+/// `seeds` seeds from seed `SWEEP_START`.
 fn run_child(test: &str, seeds: u64) -> Output {
     let test = format!("{}::{test}", module_path!().split_once("::").unwrap().1);
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &test, "--nocapture", "--test-threads=1"])
         .env(SWEEP_CHILD_VAR, "1")
         .env("GLASSDB_PCT_SEEDS", seeds.to_string())
+        .env("GLASSDB_PCT_SEED_START", SWEEP_START.to_string())
         .output()
         .unwrap()
 }
@@ -118,7 +122,10 @@ fn a_sweep_without_splits_fails() {
     let output = run_child("a_sweep_without_splits_fails", 10);
     assert_child_failed(
         &output,
-        "only 0 of 10 runs split a node, and the sweep needs 1",
+        &format!(
+            "only 0 of 10 runs split a node, and the sweep needs 1. \
+             GLASSDB_PCT_SEED_START={SWEEP_START} GLASSDB_PCT_SEEDS=10 reproduces the sweep."
+        ),
     );
 }
 
@@ -130,7 +137,10 @@ fn a_sweep_without_merges_fails() {
     let output = run_child("a_sweep_without_merges_fails", 10);
     assert_child_failed(
         &output,
-        "only 0 of 10 runs merged a node, and the sweep needs 1",
+        &format!(
+            "only 0 of 10 runs merged a node, and the sweep needs 1. \
+             GLASSDB_PCT_SEED_START={SWEEP_START} GLASSDB_PCT_SEEDS=10 reproduces the sweep."
+        ),
     );
 }
 

@@ -1,7 +1,9 @@
 //! Schedule selection and deterministic executor entry points.
 
 use std::cell::Cell;
+use std::collections::hash_map::RandomState;
 use std::env::VarError;
+use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
 use std::num::NonZeroU64;
 use std::panic;
@@ -216,22 +218,80 @@ pub const PCT_DEFAULT_SEEDS: u64 = 256;
 /// than an ordinary test run.
 const PCT_SEEDS_VAR: &str = "GLASSDB_PCT_SEEDS";
 
+/// Environment variable that sets the first seed of each [`pct_sweep`], to
+/// reproduce a sweep.
+const PCT_SEED_START_VAR: &str = "GLASSDB_PCT_SEED_START";
+
 /// Seed-breadth sweep: runs `workload` under one PCT schedule per seed, asserting
 /// the invariant on each. This is the seed-loop entry that complements the
 /// coverage-guided tape fuzzer.
 ///
-/// The sweep runs N seeds, from 0 to N - 1. N is [`PCT_DEFAULT_SEEDS`], or the
-/// value of the `GLASSDB_PCT_SEEDS` environment variable. A failure names its
-/// seed, so [`pct_assert`] reproduces it.
+/// The sweep runs N consecutive seeds from a start seed. N is
+/// [`PCT_DEFAULT_SEEDS`], or the value of the `GLASSDB_PCT_SEEDS` environment
+/// variable. The start seed is random, so that each sweep explores schedules
+/// that earlier sweeps did not run. The `GLASSDB_PCT_SEED_START` environment
+/// variable sets it. A failure names its seed, so [`pct_assert`] reproduces
+/// it.
 ///
 /// Sweep a [`Covered`](crate::sim::Covered) workload with
 /// [`Covered::pct_sweep`](crate::sim::Covered::pct_sweep). This sweep makes
 /// each of its runs check the structural changes, and a schedule can delay a
 /// change past the end of its run.
 pub fn pct_sweep<W: SimWorkload>(workload: &W, faults: FaultConfig) {
-    let seeds = pct_seed_count();
-    for seed in 0..seeds.get() {
-        pct_assert(workload, faults, seed);
+    PctSeeds::from_env().sweep(workload, faults);
+}
+
+/// The seeds of one [`pct_sweep`]. It displays as the environment variables
+/// that reproduce the sweep.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PctSeeds {
+    start: u64,
+    count: NonZeroU64,
+}
+
+impl PctSeeds {
+    /// Returns the seeds that the environment sets, with a random start seed
+    /// if the environment sets none.
+    pub(crate) fn from_env() -> Self {
+        Self {
+            start: pct_seed_start(),
+            count: pct_seed_count(),
+        }
+    }
+
+    /// Runs `workload` under one PCT schedule per seed, asserting the
+    /// invariant on each.
+    pub(crate) fn sweep<W: SimWorkload>(self, workload: &W, faults: FaultConfig) {
+        for offset in 0..self.count.get() {
+            pct_assert(workload, faults, self.start.wrapping_add(offset));
+        }
+    }
+}
+
+impl std::fmt::Display for PctSeeds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{PCT_SEED_START_VAR}={} {PCT_SEEDS_VAR}={}",
+            self.start, self.count
+        )
+    }
+}
+
+/// Returns the start seed that the `PCT_SEED_START_VAR` environment variable
+/// sets, or a random seed.
+fn pct_seed_start() -> u64 {
+    match std::env::var(PCT_SEED_START_VAR) {
+        Ok(value) => value.parse().unwrap_or_else(|_| {
+            panic!("{PCT_SEED_START_VAR} must be an unsigned 64-bit integer, not {value:?}")
+        }),
+        // The keys of `RandomState` are random in each process, and change in
+        // each call, so the hash of no input is a new value in each call. This
+        // avoids a dependency on a random number crate.
+        Err(VarError::NotPresent) => RandomState::new().build_hasher().finish(),
+        Err(VarError::NotUnicode(value)) => {
+            panic!("{PCT_SEED_START_VAR} must be an unsigned 64-bit integer, not {value:?}")
+        }
     }
 }
 
