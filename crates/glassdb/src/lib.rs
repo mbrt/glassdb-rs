@@ -38,7 +38,7 @@ pub use collection::{Collection, CollectionPath, StaleCollectionView};
 pub use db::{Database, DatabaseBuilder, StaleDatabaseView};
 pub use diagnostics::Diagnostics;
 pub use error::Error;
-pub use iter::{CollectionEntry, CollectionIter, KeyIter};
+pub use iter::{CollectionEntry, CollectionIter};
 pub use limits::TransactionLimits;
 pub use scan::{KeyPage, KeyScan};
 pub use stats::{Stats, TransactionStats};

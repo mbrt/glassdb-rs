@@ -1,0 +1,7 @@
+# Stale read-only transactions of one and of ten keys, with a new view for each
+# transaction and with one view for each worker, and a writer, on the same
+# leaves of one collection.
+# The counters of `stale-reads-shared-leaves`: one run without latency jitter,
+# in a window of 10 s.
+tags = ["ci/counters", "area/read"]
+include = ["../configs/default.toml", "../configs/stale-reads-shared-leaves.toml"]

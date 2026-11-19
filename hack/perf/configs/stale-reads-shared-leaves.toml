@@ -1,0 +1,64 @@
+# The body of the `stale-reads-shared-leaves` experiments: stale read-only
+# transactions (`StaleDatabaseView::read_tx`) of one and of ten keys, and a
+# writer, on the same leaves of one collection. Each write gives the readers a
+# new leaf state, so the cost of the order between stale read-only
+# transactions shows in the checks of the other leaves. The `stale` readers use
+# a new view for each transaction, and the `stale-view` readers one view for
+# all transactions of the worker.
+
+[pools.stale]
+keys = 256
+value-bytes = 256
+
+# Small leaves, so that the readers use many leaves. A seed leaf splits at
+# once only above twice its cap, so the seed cap is half of the cell cap: the
+# cell then starts with no leaf above its cap, and its topology does not change
+# during the window.
+[seed.database]
+leaf-max-entries = 8
+
+[cell.database]
+leaf-max-entries = 16
+
+[shapes.stale-writer]
+kind = "read-modify-write"
+pool = "stale"
+source = "pool"
+keys = 1
+
+[shapes.stale-single]
+kind = "read"
+pool = "stale"
+source = "pool"
+keys = 1
+staleness = "5s"
+
+[shapes.stale-multi]
+kind = "read"
+pool = "stale"
+source = "pool"
+keys = 10
+staleness = "5s"
+
+[shapes.stale-view-single]
+kind = "read"
+pool = "stale"
+source = "pool"
+keys = 1
+staleness = "5s"
+view = "worker"
+
+[shapes.stale-view-multi]
+kind = "read"
+pool = "stale"
+source = "pool"
+keys = 10
+staleness = "5s"
+view = "worker"
+
+[workloads.stale-shared-leaves.groups.all]
+instances = 1
+shapes = { stale-writer = 1, stale-single = 1, stale-multi = 1, stale-view-single = 1, stale-view-multi = 1 }
+
+[cell]
+workload = "stale-shared-leaves"

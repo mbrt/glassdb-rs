@@ -2,10 +2,10 @@
 //! the warm-up and the measurement, and the end of the measurement.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use glassdb::{Collection, Database, Error as GError, Stats};
+use glassdb::{Collection, Database, Error as GError, StaleDatabaseView, Stats};
 use glassdb_bench_scale::backend_breakdown::BackendBreakdownHandle;
 use glassdb_bench_scale::bench::Bench;
 use glassdb_concurr::rt;
@@ -112,6 +112,8 @@ pub(crate) struct Worker {
     pub(crate) home: usize,
     pub(crate) collections: usize,
     pub(crate) seed: u64,
+    /// The stale view of the worker on its instance, if its kind uses one.
+    pub(crate) view: OnceLock<StaleDatabaseView>,
 }
 
 /// A gate between the transactions of all workers of a cell.
@@ -330,6 +332,7 @@ impl Worker {
                     keys,
                     pool: &self.shape.pool,
                     round,
+                    view: &self.view,
                 };
                 bench.measure(|| self.run_kind(&op)).await
             }
@@ -345,12 +348,16 @@ impl Worker {
                     open_collections_of(&db, &opener.pool, opener.collections).await?;
                 let selected =
                     select_collections(&collections, collection, self.shape.kind.collections());
+                // A view belongs to one instance, and this instance ends with
+                // the transaction.
+                let view = OnceLock::new();
                 let op = Op {
                     db: &db,
                     collections: &selected,
                     keys,
                     pool: &self.shape.pool,
                     round,
+                    view: &view,
                 };
                 let before = Window::now(&db, &opener.breakdown);
                 let result = bench.measure(|| self.run_kind(&op)).await;

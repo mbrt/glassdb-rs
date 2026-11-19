@@ -196,10 +196,12 @@ async fn read_tx_ring_snapshot(
     node_count: usize,
     max_staleness: Duration,
 ) -> Result<Vec<usize>, Error> {
-    db.read_tx(max_staleness, |tx| async move {
-        futures::future::try_join_all((0..node_count).map(|k| read_next_stale(&tx, coll, k))).await
-    })
-    .await
+    db.stale(max_staleness)
+        .read_tx(|tx| async move {
+            futures::future::try_join_all((0..node_count).map(|k| read_next_stale(&tx, coll, k)))
+                .await
+        })
+        .await
 }
 
 impl SimWorkload for CycleWorkload {

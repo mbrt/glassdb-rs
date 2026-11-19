@@ -769,9 +769,9 @@ pub enum HistoryInstruction {
 pub enum HistoryMode {
     /// As [`Database::tx`].
     Strict,
-    /// As [`Database::read_tx`] with `Duration::ZERO`.
+    /// As [`crate::StaleDatabaseView::read_tx`] with `Duration::ZERO`.
     StaleZero,
-    /// As [`Database::read_tx`] with `Duration::MAX`.
+    /// As [`crate::StaleDatabaseView::read_tx`] with `Duration::MAX`.
     StaleMax,
 }
 
@@ -1476,14 +1476,15 @@ async fn run_program(
         .open_collection(&CollectionPath::new(HISTORY_COLLECTION)?)
         .await?;
     recorder.begin(program, instance);
-    let stale = |max_staleness| {
-        db.read_tx(max_staleness, |tx| {
-            interpret_body(HistoryTx::Stale(tx), &collection, program, recorder)
-        })
+    let collection = &collection;
+    let stale = |max_staleness| async move {
+        db.stale(max_staleness)
+            .read_tx(|tx| interpret_body(HistoryTx::Stale(tx), collection, program, recorder))
+            .await
     };
     let result = match program.mode {
         HistoryMode::Strict => {
-            db.tx(|tx| interpret_body(HistoryTx::Strict(tx), &collection, program, recorder))
+            db.tx(|tx| interpret_body(HistoryTx::Strict(tx), collection, program, recorder))
                 .await
         }
         HistoryMode::StaleZero => stale(Duration::ZERO).await,

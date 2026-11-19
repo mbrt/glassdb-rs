@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use glassdb::{Backend, CollectionPath, Database, Error, InlinePolicy};
+use glassdb::{Backend, CollectionPath, Database, Error, InlinePolicy, KeyScan};
 use glassdb_storage::Node;
 use tokio::sync::Barrier;
 
@@ -23,8 +23,8 @@ async fn list_keys() {
         .await
         .unwrap();
 
-    let empty = coll.iter_keys().await.unwrap();
-    assert_eq!(empty.len(), 0);
+    let empty = coll.scan_keys(KeyScan::all()).await.unwrap();
+    assert!(empty.is_empty());
 
     let keys: Vec<Vec<u8>> = (0u32..100).map(|i| i.to_be_bytes().to_vec()).collect();
     let test_val = b"val";
@@ -40,12 +40,7 @@ async fn list_keys() {
     .unwrap();
 
     let before_list = db.stats();
-    let mut plain = coll.iter_keys().await.unwrap();
-    assert_eq!(plain.len(), keys.len());
-    let first = plain.next().unwrap();
-    assert_eq!(plain.len(), keys.len() - 1);
-    drop(coll);
-    let got: Vec<Vec<u8>> = std::iter::once(first).chain(plain).collect();
+    let got = coll.scan_keys(KeyScan::all()).await.unwrap().into_keys();
     assert_eq!(got, keys);
 
     // Listing descends the B-link tree and scans its leaves via reads (ADR-031),
@@ -248,7 +243,7 @@ async fn keys_listing_is_phantom_safe() {
     }
 
     // A listing sees exactly the seeded keys, sorted, with no duplicates.
-    let listed: Vec<Vec<u8>> = coll.iter_keys().await.unwrap().collect();
+    let listed = coll.scan_keys(KeyScan::all()).await.unwrap().into_keys();
     let mut sorted = listed.clone();
     sorted.sort();
     assert_eq!(listed, sorted, "listing is sorted");
@@ -259,7 +254,7 @@ async fn keys_listing_is_phantom_safe() {
     // than caching a stale set.
     let extra = 999u32.to_be_bytes().to_vec();
     coll.write(&extra, b"v").await.unwrap();
-    let listed2: Vec<Vec<u8>> = coll.iter_keys().await.unwrap().collect();
+    let listed2 = coll.scan_keys(KeyScan::all()).await.unwrap().into_keys();
     assert!(
         listed2.contains(&extra),
         "new key visible to a later listing"
@@ -316,7 +311,7 @@ async fn listing_hides_keys_from_aborted_transactions() {
 
     // The listing observes exactly the committed keys, never the ghosts left
     // behind by the aborted transaction.
-    let listed: Vec<Vec<u8>> = coll.iter_keys().await.unwrap().collect();
+    let listed = coll.scan_keys(KeyScan::all()).await.unwrap().into_keys();
     assert_eq!(
         listed,
         vec![b"real-a".to_vec(), b"real-b".to_vec()],

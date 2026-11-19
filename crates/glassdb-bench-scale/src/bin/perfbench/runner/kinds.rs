@@ -1,11 +1,11 @@
 //! Kinds: what one transaction of a shape does.
 
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use futures::future::join_all;
-use glassdb::{Collection, Database, Error as GError, KeyScan};
+use glassdb::{Collection, Database, Error as GError, KeyScan, StaleDatabaseView};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use toml::Value;
@@ -22,6 +22,9 @@ pub(crate) struct Op<'a> {
     pub(crate) pool: &'a PoolSpec,
     /// The transactions of the worker before this one in the cell.
     pub(crate) round: u64,
+    /// The stale view of the worker on `db`, which a kind creates in its
+    /// first transaction and uses in each later one on the same instance.
+    pub(crate) view: &'a OnceLock<StaleDatabaseView>,
 }
 
 /// What one transaction of a shape does, with the parameters of the kind.
@@ -56,7 +59,7 @@ pub(crate) fn build(name: &str, params: Table) -> Result<Arc<dyn Kind>, Box<dyn 
     let params = Value::Table(params);
     Ok(match name {
         "read-modify-write" => Arc::new(parse::<ReadModifyWrite>(&params, name)?),
-        "read" => Arc::new(parse::<Read>(&params, name)?),
+        "read" => Arc::new(Read::parse(&params, name)?),
         "write" => Arc::new(parse::<Write>(&params, name)?),
         "scan" => Arc::new(parse::<Scan>(&params, name)?),
         "create-delete" => Arc::new(parse::<CreateDelete>(&params, name)?),
@@ -101,6 +104,30 @@ pub(crate) struct Read {
     /// of `Database::tx`.
     #[serde(default, deserialize_with = "optional_duration")]
     staleness: Option<std::time::Duration>,
+    /// The stale view that runs each stale read-only transaction. The
+    /// default is a new view for each transaction.
+    #[serde(default)]
+    view: Option<View>,
+}
+
+/// The stale view of a stale read-only transaction.
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+enum View {
+    /// A new view for each transaction.
+    Call,
+    /// One view for all transactions of a worker.
+    Worker,
+}
+
+impl Read {
+    fn parse(params: &Value, name: &str) -> Result<Self, Box<dyn Error>> {
+        let read: Self = parse(params, name)?;
+        if read.view.is_some() && read.staleness.is_none() {
+            return Err(format!("kind {name}: view needs staleness").into());
+        }
+        Ok(read)
+    }
 }
 
 /// Keeps the values of a read from being optimized away.
@@ -203,11 +230,16 @@ impl Kind for Read {
         let collection = &op.collections[0];
         match self.staleness {
             Some(staleness) => {
-                op.db
-                    .read_tx(staleness, |tx| async move {
-                        consume(join_all(op.keys.iter().map(|key| tx.read(collection, key))).await)
-                    })
-                    .await
+                let body = |tx: glassdb::ReadTransaction| async move {
+                    consume(join_all(op.keys.iter().map(|key| tx.read(collection, key))).await)
+                };
+                match self.view.unwrap_or(View::Call) {
+                    View::Call => op.db.stale(staleness).read_tx(body).await,
+                    View::Worker => {
+                        let view = op.view.get_or_init(|| op.db.stale(staleness));
+                        view.read_tx(body).await
+                    }
+                }
             }
             None => {
                 op.db
@@ -332,6 +364,19 @@ mod tests {
             .to_string();
         assert!(error.contains("span"), "{error}");
         assert!(build("teleport", Table::new()).is_err());
+    }
+
+    #[test]
+    fn a_view_of_a_read_needs_staleness() {
+        let mut params = Table::new();
+        params.insert("keys".into(), Value::Integer(1));
+        for view in ["call", "worker"] {
+            params.insert("view".into(), Value::String(view.into()));
+            let error = build("read", params.clone()).err().unwrap().to_string();
+            assert!(error.contains("view needs staleness"), "{view}: {error}");
+        }
+        params.insert("staleness".into(), Value::String("5s".into()));
+        assert!(build("read", params).is_ok());
     }
 
     #[test]
