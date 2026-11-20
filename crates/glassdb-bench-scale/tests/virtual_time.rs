@@ -390,6 +390,9 @@ fn transactions_with_no_backend_operation_advance_virtual_time() {
     let shapes = report["experiments"][0]["runs"][0]["cells"][0]["shapes"]
         .as_array()
         .unwrap();
-    let ro = shapes.iter().find(|s| s["shape"] == "ro-single").unwrap();
+    let ro = shapes
+        .iter()
+        .find(|s| s["shape"] == "ro-single-stale")
+        .unwrap();
     assert!(ro["committed"].as_u64().unwrap() > 0, "{ro}");
 }

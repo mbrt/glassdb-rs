@@ -27,14 +27,13 @@ Lines show the p50. Bands show the p10 to p90 range of a shape's throughput
 windows for throughput, and the p50 to p90 range of its transaction latencies
 for latency. With
 several runs in a file, lines and band edges show the cross-run median. Pass `--canonical`
-to render the four fixed worker and conflict figures of the local S3 model
-instead; that mode insists on the complete grids described in the README.
+to render the five fixed worker, conflict, and stale-read figures of the local
+S3 model in virtual time instead; that mode insists on the complete grids described in the README.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -71,6 +70,14 @@ CONFLICT_POOLS = {
     4: (5000, 2000, 1000, 500, 300, 200, 100),
 }
 CONFLICT_WORKERS = 20
+# The writers of each shape in the cells of `stale-reads`.
+STALE_WORKER_POINTS = (1, 50, 100, 200)
+# The line of each read of `stale-reads`: its label and its line style.
+STALE_READS = {
+    "strong": ("Database::tx", "-"),
+    "stale": ("Independent stale view", "--"),
+    "view": ("Ordered stale view", ":"),
+}
 METRICS = (
     "throughput",
     "throughput_p10",
@@ -144,6 +151,16 @@ def validate_conflict_sweep(data: pd.DataFrame) -> None:
         expected = len(EXPECTED_RUNS) * len(CONFLICT_DATABASES) * len(pools)
         if len(selected) != expected:
             raise ReportError(f"{label}: report does not contain the complete cell grid")
+
+
+def validate_stale_sweep(data: pd.DataFrame) -> None:
+    """Require the canonical stale-reads cells."""
+    _require_values(data, "run", EXPECTED_RUNS, "stale sweep")
+    _require_values(data, "workers", STALE_WORKER_POINTS, "stale sweep")
+    expected = len(EXPECTED_RUNS) * len(STALE_WORKER_POINTS)
+    cells = data.groupby(["run", "workers", "keys", "read"]).ngroups
+    if cells != expected * len(perfbench_results.STALE_READERS):
+        raise ReportError("stale sweep: report does not contain the complete cell grid")
 
 
 def median_rows(data: pd.DataFrame, dimensions: list[str]) -> pd.DataFrame:
@@ -327,6 +344,76 @@ def plot_conflict_throughput(data: pd.DataFrame, out_dir: Path) -> Path:
 
 def plot_conflict_latency(data: pd.DataFrame, out_dir: Path) -> Path:
     return _plot_conflict(data, out_dir, "latency", "conflict-latency.png")
+
+
+def plot_stale_latency(
+    data: pd.DataFrame, out_dir: Path, name: str = "stale-latency.png"
+) -> Path:
+    """One panel for each number of keys, with one line for each read.
+
+    The line is the mean, not the p50: a read through a view that a worker
+    keeps uses the cache for about half of its transactions, so its p50 jumps
+    between the two modes."""
+    medians = (
+        data.groupby(["keys", "read", "workers"], as_index=False, sort=True)[
+            ["mean_ms", "p50_ms", "p90_ms"]
+        ]
+        .median()
+        .reset_index(drop=True)
+    )
+    reads = list(STALE_READS)
+    colors = dict(zip(reads, sns.color_palette("colorblind", len(reads)), strict=True))
+    sizes = sorted(medians["keys"].unique())
+    fig, axes = plt.subplots(
+        1, len(sizes), figsize=(14, 6), sharex=True, sharey=True, squeeze=False
+    )
+    for ax, keys in zip(axes.flat, sizes, strict=True):
+        for read in reads:
+            label, style = STALE_READS[read]
+            line = medians[
+                (medians["keys"] == keys) & (medians["read"] == read)
+            ].sort_values("workers")
+            x = line["workers"].to_numpy()
+            ax.fill_between(
+                x,
+                line["p50_ms"].to_numpy(),
+                line["p90_ms"].to_numpy(),
+                color=colors[read],
+                alpha=0.15,
+                linewidth=0,
+            )
+            ax.plot(
+                x,
+                line["mean_ms"].to_numpy(),
+                color=colors[read],
+                linestyle=style,
+                marker="o",
+                label=label,
+            )
+        ax.set_title(f"{keys} key" + ("" if keys == 1 else "s") + " for each read")
+        ax.set_xlabel("Concurrent writers per shape")
+        ax.set_xticks(STALE_WORKER_POINTS)
+    axes.flat[0].set_yscale("log")
+    axes.flat[0].set_ylabel("Latency (ms)")
+    # The lines of the panel of ten keys are close together at the top.
+    axes.flat[-1].legend(title="Read", loc="lower right")
+    fig.suptitle(
+        "Read-only latency under writes\nmean line; p50–p90 band (log scale)"
+    )
+    fig.tight_layout()
+    return _save(fig, out_dir, name)
+
+
+def plot_stale_report(
+    series: Mapping[str, Path], out_dir: Path, stem: str, name: str | None = None
+) -> list[Path]:
+    """Plot the latency of the readers of a `stale-reads` experiment against
+    the writers. It does not overlay several files."""
+    if len(series) != 1:
+        raise ReportError("a stale-reads experiment cannot be overlaid")
+    path = next(iter(series.values()))
+    _, data = perfbench_results.read_stale(path, require_converged=False, name=name)
+    return [plot_stale_latency(data, out_dir, f"{stem}-latency.png")]
 
 
 def plot_conflict_report(
@@ -547,6 +634,7 @@ PLOTTERS = {
     "mixed": plot_mixed_report,
     "conflict-sweep": plot_conflict_report,
     "contention": plot_contention_report,
+    "stale-reads": plot_stale_report,
 }
 
 
@@ -598,33 +686,41 @@ def _scenario(path: Path, name: str | None) -> str:
     return perfbench_results.read_envelope(path, name)["scenario"]
 
 
-def render(worker_path: Path, conflict_path: Path, out_dir: Path) -> list[Path]:
-    """Validate both canonical reports and render their four figures."""
+def render(
+    worker_path: Path, conflict_path: Path, stale_path: Path, out_dir: Path
+) -> list[Path]:
+    """Validate the three canonical reports and render their five figures."""
     worker_metadata, workers = perfbench_results.read_mixed(
         worker_path, require_converged=True, name="workers"
     )
     conflict_metadata, conflicts = perfbench_results.read_conflict_sweep(
         conflict_path, require_converged=True, name="conflict-sweep"
     )
-    if _model(worker_metadata) != _model(conflict_metadata):
-        raise ReportError(
-            "worker and conflict reports must use the same backend and time model"
-        )
-    if (
-        worker_metadata.backend != "memory"
-        or worker_metadata.time_mode != "real"
-        or not math.isclose(worker_metadata.model_time_speedup, 1.0)
+    stale_metadata, stale = perfbench_results.read_stale(
+        stale_path, require_converged=True, name="stale-reads"
+    )
+    if not _model(worker_metadata) == _model(conflict_metadata) == _model(
+        stale_metadata
     ):
         raise ReportError(
-            "canonical sweeps require --backend=memory in real time, at the speed of wall time"
+            "worker, conflict, and stale reports must use the same backend and time model"
+        )
+    # Virtual time gives each database instance all the CPU that it needs,
+    # as on a host of its own, and charges a model of the CPU time of each
+    # transaction.
+    if worker_metadata.backend != "memory" or worker_metadata.time_mode != "virtual":
+        raise ReportError(
+            "canonical sweeps require --backend=memory in virtual time"
         )
     validate_worker_sweep(workers)
     validate_conflict_sweep(conflicts)
+    validate_stale_sweep(stale)
     return [
         plot_worker_throughput(workers, out_dir),
         plot_worker_latency(workers, out_dir),
         plot_conflict_throughput(conflicts, out_dir),
         plot_conflict_latency(conflicts, out_dir),
+        plot_stale_latency(stale, out_dir),
     ]
 
 
@@ -652,12 +748,13 @@ def main() -> int:
     parser.add_argument(
         "--canonical",
         action="store_true",
-        help="render the fixed worker and conflict figures instead of FILES",
+        help="render the fixed worker, conflict, and stale figures instead of FILES",
     )
     parser.add_argument("--workers", type=Path, default=sweeps / "workers.json")
     parser.add_argument(
         "--conflicts", type=Path, default=sweeps / "conflict-sweep.json"
     )
+    parser.add_argument("--stale", type=Path, default=sweeps / "stale-reads.json")
     args = parser.parse_args()
     modes = [bool(args.files), bool(args.series), args.canonical]
     if sum(modes) != 1:
@@ -667,7 +764,7 @@ def main() -> int:
 
     sns.set_theme(style="whitegrid", context="talk")
     if args.canonical:
-        render(args.workers, args.conflicts, args.out or sweeps)
+        render(args.workers, args.conflicts, args.stale, args.out or sweeps)
     elif args.series:
         plot_overlay(_parse_series(parser, args.series), args.out)
     else:

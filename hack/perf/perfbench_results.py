@@ -32,6 +32,18 @@ SHAPE_NAMES = {
 MIXED_MODES = {"low-conflict": "lo", "high-conflict": "hi"}
 # The experiments whose cells are mixed workloads.
 MIXED_EXPERIMENTS = ("mixed", "ci", "workers", "affinity")
+# The readers of the `stale-reads` experiment, by their names in the
+# configuration: the keys of a transaction, and the read. `strong` is
+# `Database::tx`, `stale` a stale view for each transaction, and `view` one
+# stale view for all transactions of a worker.
+STALE_READERS = {
+    "ro-single": (1, "strong"),
+    "ro-multi": (10, "strong"),
+    "ro-single-stale": (1, "stale"),
+    "ro-multi-stale": (10, "stale"),
+    "ro-single-view": (1, "view"),
+    "ro-multi-view": (10, "view"),
+}
 # The pool of the `conflict-sweep` experiment, and the label of its cells
 # (`keys<K>-pool<N>`: keys for each transaction, and keys of the pool).
 CONFLICT_POOL_PATH = "pools.sweep.keys"
@@ -260,6 +272,70 @@ def read_mixed(
 
     if not rows:
         raise ReportError(f"{source}: report has no mixed cells")
+    return meta, pd.DataFrame(rows)
+
+
+def read_stale(
+    path: Path, *, require_converged: bool, name: str | None = None
+) -> tuple[ReportMetadata, pd.DataFrame]:
+    """Load the `stale-reads` experiment of a report into one row per run,
+    cell, and reader, with the `keys` and the `read` of the reader.
+
+    With `require_converged`, a reader that hit its time cap before reaching
+    the target commits per window is an error. The writers only give the load,
+    so the result has no entry for them.
+    """
+    source = str(path)
+    report = check_envelope(_load(path), source, "stale-reads", name)
+    meta = metadata(report, source)
+    expected = set(STALE_READERS)
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for run_id, run in runs(report, source):
+        cells = _array(run.get("cells"), f"{source}: run {run_id}.cells")
+        for index, value in enumerate(cells):
+            label = f"{source}: run {run_id} cell {index}"
+            cell = _object(value, label)
+            failures = _integer(cell.get("failures"), f"{label}.failures")
+            if failures:
+                raise ReportError(f"{label}: contains {failures} failures")
+            workers = _integer(
+                cell.get("workersPerShape"), f"{label}.workersPerShape", minimum=1
+            )
+            if (run_id, workers) in seen:
+                raise ReportError(f"{label}: duplicate cell with {workers} workers")
+            seen.add((run_id, workers))
+            shapes: dict[str, dict[str, Any]] = {}
+            for value in _array(cell.get("shapes"), f"{label}.shapes"):
+                shape = _object(value, f"{label}.shapes")
+                shapes[shape.get("shape")] = shape
+            if set(shapes) != expected:
+                raise ReportError(
+                    f"{label}: shapes are {sorted(shapes, key=str)}; "
+                    f"expected {sorted(expected)}"
+                )
+            for name, (keys, read) in STALE_READERS.items():
+                shape = shapes[name]
+                if require_converged and shape.get("converged") is not True:
+                    raise ReportError(f"{label}: shape {name} did not converge")
+                mean_ms = _number(shape.get("meanMs"), f"{label}.{name}.meanMs")
+                p50_ms = _number(shape.get("p50Ms"), f"{label}.{name}.p50Ms")
+                p90_ms = _number(shape.get("p90Ms"), f"{label}.{name}.p90Ms")
+                if p90_ms < p50_ms:
+                    raise ReportError(
+                        f"{label}.{name}: p90Ms={p90_ms} is below p50Ms={p50_ms}"
+                    )
+                rows.append(
+                    {
+                        "run": run_id,
+                        "workers": workers,
+                        "keys": keys,
+                        "read": read,
+                        "mean_ms": mean_ms,
+                        "p50_ms": p50_ms,
+                        "p90_ms": p90_ms,
+                    }
+                )
     return meta, pd.DataFrame(rows)
 
 

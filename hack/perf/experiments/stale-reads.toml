@@ -1,14 +1,53 @@
-# Stale read-only transactions (ADR-097) on the mixed low-conflict workload:
-# the `ro` shapes run `StaleDatabaseView::read_tx` beside the `rw` shapes on
-# the same instances. To compare with `Database::tx`, run `workers`.
-tags = ["extra", "area/read"]
+# The stale-reads grid of the canonical plots: the latency of read-only
+# transactions of one and of ten keys under the writes of `rw-single` and
+# `rw-many`, with `cell.workers` writers of each shape. One worker reads with
+# each kind of read: `Database::tx` (`ro-single`, `ro-multi`), a stale view
+# with a 5 s bound for each transaction (`-stale`), and one stale view for all
+# transactions of the worker (`-view`).
+#
+# A stale read that uses cached leaf states only takes about as much wall time
+# as model time in virtual time, so each kind of read has one worker, and the
+# writers only give the load (`loads`). With one reader, the throughput of a
+# reader is the inverse of its latency.
+tags = ["extra", "canonical", "area/read"]
 include = ["../configs/workers.toml"]
 
-[shapes.ro-single]
+[shapes.ro-single-stale]
+kind = "read"
+pool = "wide"
+keys = 1
 staleness = "5s"
 
-[shapes.ro-multi]
+[shapes.ro-multi-stale]
+kind = "read"
+pool = "wide"
+keys = 10
 staleness = "5s"
+
+[shapes.ro-single-view]
+kind = "read"
+pool = "wide"
+keys = 1
+staleness = "5s"
+view = "worker"
+
+[shapes.ro-multi-view]
+kind = "read"
+pool = "wide"
+keys = 10
+staleness = "5s"
+view = "worker"
+
+[workloads.stale-reads.groups.all]
+shapes = { ro-single = 1, ro-multi = 1, ro-single-stale = 1, ro-multi-stale = 1, ro-single-view = 1, ro-multi-view = 1 }
+loads = { rw-single = "cell", rw-many = "cell" }
+
+# One instance and one collection, so that every writer writes the collection
+# of the readers, with the same topology at each writer count.
+[cell]
+workload = "stale-reads"
+databases = 1
+collections = 1
 
 [[axes]]
 path = "cell.workers"

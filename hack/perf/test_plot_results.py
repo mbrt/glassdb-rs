@@ -71,6 +71,7 @@ def report(runs: list[dict], name: str = "mixed") -> dict:
     return {
         "schemaVersion": 3,
         "backend": "memory",
+        "timeMode": "virtual",
         "modelTimeSpeedup": 1.0,
         "experiments": [{"name": name, "runs": runs}],
     }
@@ -119,6 +120,126 @@ def conflict_report() -> dict:
         ],
         "conflict-sweep",
     )
+
+
+def stale_cell(run: int, workers: int, shapes: list[str] | None = None) -> dict:
+    names = shapes or list(perfbench_results.STALE_READERS)
+    return {
+        "failures": 0,
+        "workload": "stale-reads",
+        "workersPerShape": workers,
+        "shapes": [
+            {
+                "shape": name,
+                "meanMs": float(run + workers + index) * 1.5,
+                "p50Ms": float(run + workers + index),
+                "p90Ms": float(2 * (run + workers + index)),
+                "converged": True,
+            }
+            for index, name in enumerate(names)
+        ],
+    }
+
+
+def stale_report() -> dict:
+    return report(
+        [
+            {
+                "run": run,
+                "cells": [
+                    stale_cell(run, workers) for workers in plotter.STALE_WORKER_POINTS
+                ],
+            }
+            for run in plotter.EXPECTED_RUNS
+        ],
+        "stale-reads",
+    )
+
+
+class StaleSweepTest(unittest.TestCase):
+    def write_report(self, directory: Path, value: dict) -> Path:
+        path = directory / "stale-reads.json"
+        path.write_text(json.dumps(value))
+        return path
+
+    def test_reads_one_row_for_each_reader_with_its_keys_and_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(Path(directory_name), stale_report())
+            _, data = perfbench_results.read_stale(path, require_converged=True)
+        plotter.validate_stale_sweep(data)
+        first = data[(data["run"] == 1) & (data["workers"] == 1)]
+        self.assertEqual(
+            sorted(zip(first["keys"], first["read"])),
+            sorted(perfbench_results.STALE_READERS.values()),
+        )
+
+    def test_a_cell_needs_every_reader_and_writer(self) -> None:
+        value = stale_report()
+        value["experiments"][0]["runs"][0]["cells"][0] = stale_cell(
+            1, 1, ["ro-single", "ro-multi"]
+        )
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(Path(directory_name), value)
+            with self.assertRaisesRegex(perfbench_results.ReportError, "shapes are"):
+                perfbench_results.read_stale(path, require_converged=True)
+
+    def test_a_reader_must_converge(self) -> None:
+        value = stale_report()
+        value["experiments"][0]["runs"][0]["cells"][0]["shapes"][0]["converged"] = False
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(Path(directory_name), value)
+            with self.assertRaisesRegex(perfbench_results.ReportError, "converge"):
+                perfbench_results.read_stale(path, require_converged=True)
+
+    def test_the_grid_needs_every_writer_count(self) -> None:
+        value = stale_report()
+        for run in value["experiments"][0]["runs"]:
+            run["cells"].pop()
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(Path(directory_name), value)
+            _, data = perfbench_results.read_stale(path, require_converged=True)
+        with self.assertRaisesRegex(plotter.ReportError, "workers values"):
+            plotter.validate_stale_sweep(data)
+
+    def test_the_figure_has_a_log_panel_for_each_size_and_a_line_for_each_read(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory_name:
+            path = self.write_report(Path(directory_name), stale_report())
+            _, data = perfbench_results.read_stale(path, require_converged=True)
+        figures = {}
+
+        def capture(figure, out_dir, name):
+            figures[name] = figure
+            return out_dir / name
+
+        with mock.patch.object(plotter, "_save", side_effect=capture):
+            plotter.plot_stale_latency(data, Path("plots"))
+        figure = figures["stale-latency.png"]
+        self.assertEqual(
+            [axis.get_title() for axis in figure.axes],
+            ["1 key for each read", "10 keys for each read"],
+        )
+        for axis in figure.axes:
+            self.assertEqual(axis.get_yscale(), "log")
+            self.assertEqual(
+                [line.get_linestyle() for line in axis.get_lines()], ["-", "--", ":"]
+            )
+        plotter.plt.close(figure)
+
+
+class StaleFilePlotterTest(unittest.TestCase):
+    def test_a_stale_reads_file_is_plotted_without_canonical_grid(self) -> None:
+        value = stale_report()
+        for run in value["experiments"][0]["runs"]:
+            run["cells"].pop()
+        with tempfile.TemporaryDirectory() as directory_name:
+            directory = Path(directory_name)
+            path = directory / "stale.json"
+            path.write_text(json.dumps(value))
+            outputs = plotter.plot_file(path, directory / "plots")
+            self.assertEqual([output.name for output in outputs], ["stale-latency.png"])
+            self.assertTrue(outputs[0].stat().st_size > 0)
 
 
 class MixedSweepPlotterTest(unittest.TestCase):
@@ -342,7 +463,10 @@ class MixedSweepPlotterTest(unittest.TestCase):
             conflict_path = self.write_report(
                 directory, "conflict-sweep.json", conflict_report()
             )
-            outputs = plotter.render(workers_path, conflict_path, directory / "plots")
+            stale_path = self.write_report(directory, "stale-reads.json", stale_report())
+            outputs = plotter.render(
+                workers_path, conflict_path, stale_path, directory / "plots"
+            )
 
             self.assertEqual(
                 {path.name for path in outputs},
@@ -351,6 +475,7 @@ class MixedSweepPlotterTest(unittest.TestCase):
                     "worker-latency.png",
                     "conflict-throughput.png",
                     "conflict-latency.png",
+                    "stale-latency.png",
                 },
             )
             self.assertTrue(all(path.stat().st_size > 0 for path in outputs))
@@ -362,13 +487,16 @@ class MixedSweepPlotterTest(unittest.TestCase):
             directory = Path(directory_name)
             workers_path = self.write_report(directory, "workers.json", worker_report())
             conflict_path = self.write_report(directory, "conflict-sweep.json", conflict)
+            stale_path = self.write_report(directory, "stale-reads.json", stale_report())
             with self.assertRaisesRegex(plotter.ReportError, "same backend"):
-                plotter.render(workers_path, conflict_path, directory / "plots")
+                plotter.render(
+                    workers_path, conflict_path, stale_path, directory / "plots"
+                )
 
-    def test_canonical_sweeps_need_real_time_at_the_speed_of_wall_time(self) -> None:
-        # Virtual time shows no CPU saturation, and an older compressed run
-        # makes CPU time count more than backend latency.
-        for change in ({"timeMode": "virtual"}, {"modelTimeSpeedup": 5.0}):
+    def test_canonical_sweeps_need_virtual_time(self) -> None:
+        # Real time makes the CPU of the host part of the result, and a
+        # synthetic backend other than memory cannot run in virtual time.
+        for change in ({"timeMode": "real"}, {"backend": "fakes3"}):
             workers = copy.deepcopy(worker_report())
             conflict = copy.deepcopy(conflict_report())
             workers.update(change)
@@ -379,8 +507,13 @@ class MixedSweepPlotterTest(unittest.TestCase):
                 conflict_path = self.write_report(
                     directory, "conflict-sweep.json", conflict
                 )
-                with self.assertRaisesRegex(plotter.ReportError, "in real time"):
-                    plotter.render(workers_path, conflict_path, directory / "plots")
+                stale = copy.deepcopy(stale_report())
+                stale.update(change)
+                stale_path = self.write_report(directory, "stale-reads.json", stale)
+                with self.assertRaisesRegex(plotter.ReportError, "in virtual time"):
+                    plotter.render(
+                        workers_path, conflict_path, stale_path, directory / "plots"
+                    )
 
 
 class GenericPlotterTest(unittest.TestCase):

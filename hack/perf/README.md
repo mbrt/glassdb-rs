@@ -53,7 +53,7 @@ cell completion deadline, and the run then stops.
 | `membership-churn` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
 | `mixed` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
 | `workers` | The worker grid of the canonical plots: 1 to 200 workers per shape. Each count starts from the seed. |
-| `stale-reads` | The `workers` grid at 1, 50, 100, and 200 workers, with the `ro` shapes as stale read-only transactions (`StaleDatabaseView::read_tx`, ADR-097). |
+| `stale-reads` | The stale-read grid of the canonical plots, on one database instance and one collection: `rw-single` and `rw-many` with 1, 50, 100, and 200 workers each give the load, and one worker for each read-only shape of one and of ten keys reads with `Database::tx`, with a stale view for each transaction, or with one stale view for the worker (`StaleDatabaseView::read_tx`, 5 s bound). |
 | `affinity` | The affinity grid: 5 affinities × 1, 3, 5, and 7 database instances. It is not part of the canonical plots. |
 | `conflict-sweep` | The conflict grid of the canonical plots: 20 workers on 1 and on 5 database instances run read-modify-write transactions of 1 or 4 keys on one pool, from 5,000 keys down to 5 keys (1 key) or 100 keys (4 keys). A smaller pool gives more conflicts. |
 | `load-shift` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |
@@ -193,19 +193,23 @@ for each tag.
 
 ### Canonical sweep plots
 
-The canonical plots come from the `workers` and `conflict-sweep` experiments, in
-`hack/perf/out-sweeps/`. They use the local S3 model. `--prefix-depth=3` gives
-each collection its own simulated S3 request-rate limit:
+The canonical plots come from the `workers`, `conflict-sweep`, and
+`stale-reads` experiments, in `hack/perf/out-sweeps/`. They use the local S3
+model in virtual time, so each database instance has all the CPU that it needs,
+as on a host of its own. `--prefix-depth=3` gives each collection its own
+simulated S3 request-rate limit:
 
 ```bash
 cargo build --release -p glassdb-bench-scale --bin perfbench
 common=(--backend=memory --delays=s3 --prefix-depth=3 --runs=3
-  --drain-timeout=90s)
+  --drain-timeout=90s --time=virtual)
 e=hack/perf/experiments
 target/release/perfbench "${common[@]}" --experiment=$e/workers.toml \
   --output=hack/perf/out-sweeps/workers.json
 target/release/perfbench "${common[@]}" --experiment=$e/conflict-sweep.toml \
   --output=hack/perf/out-sweeps/conflict-sweep.json
+target/release/perfbench "${common[@]}" --experiment=$e/stale-reads.toml \
+  --output=hack/perf/out-sweeps/stale-reads.json
 uv run hack/perf/plot_results.py --canonical
 ```
 
@@ -218,8 +222,16 @@ Both figures have a log y axis and a linear x axis. The second line of each
 title says "log scale". The x axis is the probability that a transaction shares
 a key with a concurrent one, from the size of the pool, the keys of the
 transaction, and the workers (`perfbench_results.conflict_probability`). It is
-an upper bound, because a worker is not always inside a transaction. The four
-figures go to `hack/perf/out-sweeps/`.
+an upper bound, because a worker is not always inside a transaction. The
+stale-read figure has one panel for each number of keys of a read, and one line
+for each read: solid for `Database::tx`, dashed for an independent stale view
+(a new view for each transaction), and dotted for an ordered stale view (one
+view for all the transactions of the worker). It shows the latency
+against the writers of each shape, with a log y axis. Its line is the mean,
+because the latency of a read through a view that a worker keeps has two
+modes, and its p50 jumps between them. The band is the p50 to p90 range. With one worker for each
+reader, its throughput is the inverse of its latency. The five figures go to
+`hack/perf/out-sweeps/`.
 
 ### Plotting any result file
 
@@ -236,13 +248,15 @@ uv run hack/perf/plot_results.py hack/aws-bench/out/mixed.json \
 A mixed experiment (`mixed`, `ci`, `workers`, or `affinity`) must sweep exactly
 one of affinity or workers; it gets one panel for each conflict level (`lo` and
 `hi`). A `conflict-sweep` experiment gets the two conflict figures, with no
-check of the grid. A `contention` experiment shows the 100% overlap cells by
-contended keys. A file with several experiments, such as the result of `make
-bench-all`, gets the figures of each experiment that has them, named
-`<file>-<experiment>-*.png`. `--canonical` reads the `workers` and
-`conflict-sweep` experiments, so `--workers` and `--conflicts` can be the same
-file. Shapes that did not converge are plotted with a warning. Both
-`plot_results.py` and `compare.py` read result files through
+check of the grid. A `stale-reads` experiment gets the stale-read figure, also
+with no check of the grid. A `contention` experiment shows the 100% overlap
+cells by contended keys. A file with several experiments, such as the result of
+`make bench-all`, gets the figures of each experiment that has them, named
+`<file>-<experiment>-*.png`. `--canonical` reads the
+`workers`, `conflict-sweep`, and `stale-reads` experiments, so `--workers`,
+`--conflicts`, and `--stale` can be the same file. Shapes that did not converge
+are plotted with a warning. Both `plot_results.py` and `compare.py` read result
+files through
 `perfbench_results.py`, which owns the JSON schema. `make test-bench` runs their
 tests.
 

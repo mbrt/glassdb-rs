@@ -162,11 +162,12 @@ takes model time and each wait can end up to a millisecond late, so a
 comparison must use one mode on both sides. The
 comparison of two revisions in CI uses it, because both sides have the same
 effects and the results repeat. Use it also for fast checks and for a first look
-at the shape of a sweep. These effects make it unfit for the canonical plots and
-for the absolute value of a metric:
+at the shape of a sweep. The canonical plots use it too, because they assume
+that each database instance has a host of its own with enough CPU. These
+effects make it unfit for the absolute value of a metric on one host:
 
-- CPU and allocation costs take no model time, apart from the fixed wait after
-  each transaction, so a run shows no saturation of the host.
+- CPU and allocation costs take no model time, apart from the wait that models
+  the CPU time of each transaction, so a run shows no saturation of the host.
 - The watchdogs use virtual time, so only a wall-time limit on the process
   stops a CPU livelock.
 

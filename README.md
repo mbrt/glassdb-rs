@@ -42,6 +42,8 @@ very easy.
 ## Quick start
 
 ```rust
+use std::time::Duration;
+
 use glassdb::Database;
 use glassdb::backend::memory::MemoryBackend;
 
@@ -69,6 +71,15 @@ async fn main() -> Result<(), glassdb::Error> {
         tx.write(users, b"counter", next.to_string().as_bytes())
     })
     .await?;
+
+    // A read-only transaction through a stale view accepts data with bounded
+    // staleness. It reads at one consistent point in time, and often needs no
+    // request to object storage.
+    let view = db.stale(Duration::from_secs(5));
+    let v = view
+        .read_tx(|tx| async move { tx.read(users, b"alice").await })
+        .await?;
+    assert_eq!(v.as_deref(), Some(&b"hello"[..]));
 
     // Collection lifecycle changes compose with key changes in the same transaction.
     let active = db
@@ -208,7 +219,13 @@ This is a lot slower than most databases, but still has a few advantages:
 1. Size scalability: object storage scales to petabytes and probably more, as
    cloud providers keep working on making them faster and more scalable.
 
-The benchmark below uses 5,000 keys per collection. It runs single-key and
+The benchmarks below run in `perfbench`, against an in-memory backend that
+simulates the latency and the request-rate limits of S3. Each `Database`
+instance has the CPU of a host of its own, so the numbers show what the protocol
+and the storage latency allow, not the limits of one machine.
+[hack/perf/README.md](hack/perf/README.md) has the commands.
+
+The first benchmark uses 20,000 keys per collection. It runs single-key and
 10-key read-only and read-modify-write transaction shapes together. It varies
 each shape from 1 through 200 workers and opens up to five `Database` instances,
 each with an independent collection.
@@ -220,22 +237,17 @@ workers:
 
 ![](docs/img/tx-throughput.png)
 
-As you can see, median throughput increases almost linearly for all shapes,
-although more slowly for multi-key read-write transactions. It reaches 5k+
-transactions per second with 200 workers per shape (800 workers in total).
-
-Increase in probability of conflicts between transactions, as concurrency goes
-up, causes slight dips in throughput for some workers.
+Median throughput increases almost linearly for all shapes, although more slowly
+for multi-key read-write transactions. With 200 workers per shape (800 workers
+in total), the four shapes together reach about 14,000 transactions per second.
 
 ### Latency
 
-Read latency stays mostly flat as concurrency increases. Multi-key write latency
-rises when hitting S3 prefix write limits:
-
+Latency rises slowly as concurrency increases:
 ![](docs/img/tx-latency.png)
 
-The p50-p90 bands also shows tail-latency growth. Body replays can add more delay
-after an invalidated read.
+At the same time, the commits of an instance share backend writes. The p50-p90
+bands show the growth of the tail latency.
 
 ### Conflicts
 
@@ -263,6 +275,38 @@ instances, especially at moderate level of conflicts.
 There's no solution to high conflict rates, as [Two-Phase
 Commit](https://en.wikipedia.org/wiki/Two-phase_commit_protocol) is notorious
 for thrashing under high contention.
+
+### Stale read-only transactions
+
+A read-only transaction through a stale view (see the [quick
+start](#quick-start)) reads at one consistent point in time, which is not older
+than the bound of the view. When the local cache has that available, the
+transaction needs no request to object storage.
+
+A view orders the transactions that run through it: a transaction never misses
+a write that an earlier one saw. This order has a cost, so there are two ways to
+use views:
+
+- An independent view is new for each transaction:
+  `db.stale(bound).read_tx(...)`. Its transactions are not ordered with each
+  other.
+- An ordered view is one view that the caller keeps for many transactions.
+
+The benchmark below reads 1 or 10 keys in each transaction, with `Database::tx`,
+an independent view, or an ordered view, all with a bound of 5 s.
+Read-modify-write transactions from 1 to 200 workers provide background changes
+on the same collection:
+
+![](docs/img/stale-latency.png)
+
+- With one key, an independent view reads from the cache almost always, at any
+  load.
+- An ordered view requires each transaction to see state not older than the
+  preceding ones. Under writes, about half of read transactions wait for a
+  check, which slows them down.
+- When touching 10 keys, the three workloads run about at the same speed. The
+  consistent point must follow the newest of the 10 states, and one of them
+  almost always changed a moment ago, so the others need a check as well.
 
 ## Development
 
