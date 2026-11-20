@@ -434,24 +434,25 @@ impl CollectionLifecycle {
         };
         // The record needs its own completion evidence, but a cached freeze
         // still permits a removal CAS without a preceding currentness check.
-        let mut read_requirement = Requirement::ANY;
-        loop {
-            let (mut record, observed) =
-                match self.records.load_record(collection, read_requirement).await {
-                    Ok(record) => record,
-                    Err(StorageError::NotFound) => return Ok(changed),
-                    Err(error) => return Err(error.into()),
-                };
-            if !record.remove_topology_freeze(id) {
-                if observed.satisfies(requirement) {
-                    return Ok(changed);
-                }
-                read_requirement = requirement;
-                continue;
-            }
-            if self.records.store_record(&record, &observed).await? {
-                return Ok(true);
-            }
+        let unfrozen = self
+            .records
+            .converge(
+                collection,
+                requirement,
+                CasRetries::Unbounded(self.retry),
+                |mut record, _| {
+                    ready(Ok::<_, TransError>(if record.remove_topology_freeze(id) {
+                        Decision::Write(record, ())
+                    } else {
+                        Decision::Done(())
+                    }))
+                },
+            )
+            .await?;
+        match unfrozen {
+            Converged::Written { .. } => Ok(true),
+            Converged::Done(()) | Converged::Missing => Ok(changed),
+            Converged::Stop(()) | Converged::Exhausted => Err(TransError::Retry),
         }
     }
 }

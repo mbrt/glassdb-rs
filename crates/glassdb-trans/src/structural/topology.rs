@@ -1,9 +1,13 @@
 //! Admission and departure of topology participants (ADR-049).
 
+use std::future::ready;
+
 use glassdb_concurr::{RetrySchedule, rt};
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord};
-use glassdb_storage::{CollectionStore, Requirement, StorageError};
+use glassdb_storage::{
+    CasRetries, CollectionStore, Converged, Decision, Requirement, StorageError,
+};
 
 use crate::error::TransError;
 use crate::monitor::{Monitor, OwnerAbortOutcome, TxRecoveryManifest};
@@ -105,46 +109,38 @@ impl TopologyMembership {
     /// Removes participants whose structural intents have settled, with one
     /// CAS for all of them.
     ///
-    /// Returns whether a removal CAS applied. A present record without any of
-    /// the participants must satisfy `requirement`. Local admission or
-    /// topology-freeze evidence permits `ANY`.
+    /// Returns whether a removal CAS applied. A record without any of the
+    /// participants, or a missing record, must satisfy `requirement`. Local
+    /// admission or topology-freeze evidence permits `ANY`.
     pub(crate) async fn leave(
         &self,
         collection: &CollectionAddress,
         ids: &[TxId],
         requirement: Requirement,
     ) -> Result<bool, TransError> {
-        let mut backoff = self.retry.backoff();
-        let mut read_requirement = Requirement::ANY;
-        loop {
-            let (mut record, observed) =
-                match self.records.load_record(collection, read_requirement).await {
-                    Ok(record) => record,
-                    // Published collections already have their record, and
-                    // deleted identities are not reused. Local preparation
-                    // shares this cache, and GC eligibility excludes a
-                    // pre-creation cached absence for recorded collections.
-                    // Thus an absence cannot hide later admission.
-                    Err(StorageError::NotFound) => return Ok(false),
-                    Err(error) => return Err(error.into()),
-                };
-            let mut removed = false;
-            for id in ids {
-                removed |= record.remove_topology_participant(id);
-            }
-            if !removed {
-                if observed.satisfies(requirement) {
-                    return Ok(false);
-                }
-                // Intent cleanup does not refresh the collection record. Only
-                // a no-op without sufficient evidence needs a bounded reload.
-                read_requirement = requirement;
-                continue;
-            }
-            if self.records.store_record(&record, &observed).await? {
-                return Ok(true);
-            }
-            rt::sleep(backoff.next_delay()).await;
+        let left = self
+            .records
+            .converge(
+                collection,
+                requirement,
+                CasRetries::Unbounded(self.retry),
+                |mut record, _| {
+                    let mut removed = false;
+                    for id in ids {
+                        removed |= record.remove_topology_participant(id);
+                    }
+                    ready(Ok::<_, TransError>(if removed {
+                        Decision::Write(record, ())
+                    } else {
+                        Decision::Done(())
+                    }))
+                },
+            )
+            .await?;
+        match left {
+            Converged::Written { .. } => Ok(true),
+            Converged::Done(()) | Converged::Missing => Ok(false),
+            Converged::Stop(()) | Converged::Exhausted => Err(TransError::Retry),
         }
     }
 
