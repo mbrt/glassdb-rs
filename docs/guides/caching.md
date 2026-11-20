@@ -214,7 +214,7 @@ knows its ordering, so the policy owns the capture point:
 | GC checks | After the eligibility checks finish. The earlier status barrier cannot replace this one. |
 | Structural recovery | After all intents in a discovery batch are observed, before their sources and reachability are checked. Later discoveries need a new barrier. |
 | Split recovery link check | After a reachability descent that did not reach the created node, before that node is read. A merge can drain the node between an earlier read and the descent. |
-| Merge recovery reservation removal | After the read that shows the drained source, before the target is read to remove its merge reservation. The absorb sets the reservation, so a target state from before the drain can follow the discovery barrier and still have no reservation. |
+| Merge recovery reservation removal | After the read that shows the drained source, before a target state without the merge reservation ends the removal. The absorb sets the reservation, so a target state from before the drain can follow the discovery barrier and still have no reservation. |
 | Parent reconciliation | After the split or merge is observed, before routing and reading its child chain. The barrier stays in use for the whole reconciliation. |
 | Merge check | After the source is gated, before the read of the target for the final merge decision. |
 | Stale merge-target copy | After observing the route that reached a copy whose low key is above the key, before that node is read again. |
@@ -229,10 +229,17 @@ It is not safe when the decision skips the change, or when it changes a
 different object, as the split recovery link check does when it deletes the
 created node. In these cases, capture a new barrier after the read that proves
 the event, and read the second object at that barrier. The split recovery link
-check and the merge recovery reservation removal follow this rule. A skip needs
-no new barrier when the stale state shows a fact that never reverts and that
-alone excludes the event. For example, `abandon_merge` skips a target that is
-drained or that has a different membership generation.
+check and the merge recovery reservation removal follow this rule. Most changes
+of one node by a single writer, outside the leaf coordinator round, go through
+`NodeStore::converge`. It takes the barrier as the freshness requirement
+`proof`. It reads the node at `ANY` first. When the node is missing, or when the
+change ends without a write and its result depends on the state
+(`Decision::Done`), it reads the node again at `proof`. The single CASes at a
+gated revision, such as the split shrink and the merge drain, do not skip: a
+lost CAS ends the change. A skip needs no new barrier when the stale state shows
+a fact that never reverts and that alone excludes the event. For example,
+`abandon_merge` skips a target that is drained or that has a different
+membership generation.
 
 Transaction validation uses one barrier for every point read, scan, collection
 directory, and transaction-status dependency. Each validation attempt captures

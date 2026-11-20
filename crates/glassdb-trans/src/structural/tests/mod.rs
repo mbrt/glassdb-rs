@@ -128,9 +128,12 @@ impl TestStore {
         prefix: &str,
         requirement: Requirement,
     ) -> Result<Option<(Node, LeafObservation)>, StorageError> {
-        self.nodes
-            .load_root_node(&collection_at(prefix), requirement)
-            .await
+        let observation = self
+            .nodes
+            .load_root_state(&collection_at(prefix), requirement)
+            .await?;
+        let node = observation.value().map(|node| node.as_ref().clone());
+        Ok(node.map(|node| (node, observation)))
     }
 
     async fn load_root(

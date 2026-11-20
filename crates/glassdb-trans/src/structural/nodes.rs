@@ -1,12 +1,13 @@
 //! Structural-node mutation primitives.
 
-use std::collections::BTreeMap;
+use std::future::ready;
 
 use glassdb_concurr::rt;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxRecord};
 use glassdb_storage::{
-    LeafBody, LeafObservation, LockType, MergeTarget, Node, NodeStore, Requirement, StorageError,
+    CasRetries, Converged, Decision, LeafObservation, LockType, MergeTarget, Node, NodeStore,
+    Requirement, StorageError,
 };
 
 use crate::error::TransError;
@@ -14,8 +15,7 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::LeafCoordinator;
 use crate::monitor::Monitor;
 use crate::node_locking::{
-    GateAcquisition, GatedNode, LeafState, NodeLockReconciler, StructuralGateOperation,
-    StructuralGateOutcome,
+    GateAcquisition, NodeLockReconciler, StructuralGateOperation, StructuralGateOutcome,
 };
 
 use super::NODE_CAS_ATTEMPTS;
@@ -90,15 +90,7 @@ impl StructuralNodeAccess {
         id: &TxId,
         acquisition: GateAcquisition,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
-        let path = match node_id {
-            Some(node_id) => ObjectPath::Node {
-                collection: collection.clone(),
-                id: *node_id,
-            },
-            None => ObjectPath::TreeRoot {
-                collection: collection.clone(),
-            },
-        };
+        let path = ObjectPath::tree_node(collection, node_id);
         // This read selects the acquisition path; missing roots defer work.
         // Publication still requires the gated observation and a source CAS.
         let (node, _) = match self.nodes.load_node_at(&path, Requirement::ANY).await {
@@ -111,47 +103,44 @@ impl StructuralNodeAccess {
                 .acquire_leaf_structural_gate(&path, id, acquisition)
                 .await;
         }
-        self.acquire_structural_gate_direct(collection, node_id, id, acquisition)
+        self.acquire_index_structural_gate(&path, id, acquisition)
             .await
     }
 
-    /// Releases a source gate whose acquisition or presence this cache knows.
+    /// Releases the structural gate of `id` on a source node.
     ///
-    /// The caller must have acquired the gate locally or completed a bounded
-    /// read containing this holder through the same cache. The worker must not
-    /// acquire this source gate again. Thus an ANY no-holder result proves
-    /// removal, while a retained holder is removed by CAS.
+    /// A state without the gate ends the release only if it satisfies
+    /// `proof`. [`Requirement::ANY`] is enough when this cache holds a state
+    /// with the gate: the caller acquired it here, or completed a read through
+    /// this cache that showed it. The worker must not acquire this source gate
+    /// again.
     pub(super) async fn release_structural_gate(
         &self,
         collection: &CollectionAddress,
         node_id: Option<&NodeId>,
         id: &TxId,
+        proof: Requirement,
     ) -> Result<(), TransError> {
-        for _ in 0..NODE_CAS_ATTEMPTS {
-            let (mut node, observation) = match node_id {
-                Some(node_id) => {
-                    self.nodes
-                        .load_node(collection, node_id, Requirement::ANY)
-                        .await?
-                }
-                None => {
-                    let (root, observation) =
-                        self.nodes.load_root(collection, Requirement::ANY).await?;
-                    (root, observation)
-                }
-            };
-            if !node.remove_structural_gate(id) {
-                return Ok(());
-            }
-            if self
-                .store_structural_node(&node, &observation)
-                .await?
-                .is_some()
-            {
-                return Ok(());
-            }
+        let released = self
+            .nodes
+            .converge(
+                &ObjectPath::tree_node(collection, node_id),
+                proof,
+                CasRetries::Bounded(NODE_CAS_ATTEMPTS),
+                |mut node, _| {
+                    ready(Ok::<_, TransError>(if node.remove_structural_gate(id) {
+                        Decision::Write(node, ())
+                    } else {
+                        Decision::Done(())
+                    }))
+                },
+            )
+            .await?;
+        match released {
+            Converged::Written { .. } | Converged::Done(()) => Ok(()),
+            Converged::Missing => Err(StorageError::NotFound.into()),
+            Converged::Stop(()) | Converged::Exhausted => Err(TransError::Retry),
         }
-        Err(TransError::Retry)
     }
 
     /// Compare-and-swaps `node` over the object `observation` was taken from,
@@ -172,14 +161,17 @@ impl StructuralNodeAccess {
     /// reverts it. If not, it advances the target's membership generation
     /// when the absorb could still land, because the absorb requires the
     /// generation recorded in the intent.
+    ///
+    /// A target state that needs no change ends the call only if it satisfies
+    /// `proof`.
     pub(super) async fn abandon_merge(
         &self,
         collection: &CollectionAddress,
         target: &MergeTarget,
         intent: &StructuralIntentId,
-        requirement: Requirement,
+        proof: Requirement,
     ) -> Result<(), TransError> {
-        self.update_node(collection, &target.node_id, requirement, |node| {
+        self.update_node(collection, &target.node_id, proof, |node| {
             if node.abandon_merge(intent, &target.boundary) {
                 return true;
             }
@@ -194,15 +186,17 @@ impl StructuralNodeAccess {
         .await
     }
 
-    /// Removes the merge reservation of `intent` from node `node_id`, if present.
+    /// Removes the merge reservation of `intent` from node `node_id`, if
+    /// present. A state without the reservation ends the call only if it
+    /// satisfies `proof`.
     pub(super) async fn remove_merge_reservation(
         &self,
         collection: &CollectionAddress,
         node_id: &NodeId,
         intent: &StructuralIntentId,
-        requirement: Requirement,
+        proof: Requirement,
     ) -> Result<(), TransError> {
-        self.update_node(collection, node_id, requirement, |node| {
+        self.update_node(collection, node_id, proof, |node| {
             node.remove_merge_reservation(intent)
         })
         .await
@@ -233,7 +227,10 @@ impl StructuralNodeAccess {
         node_id: Option<&NodeId>,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let release = self.release_structural_gate(collection, node_id, id).await;
+        // The worker acquired the gate through this cache.
+        let release = self
+            .release_structural_gate(collection, node_id, id, Requirement::ANY)
+            .await;
         self.finalize_worker(id).await;
         release
     }
@@ -267,92 +264,90 @@ impl StructuralNodeAccess {
         }
     }
 
-    async fn acquire_structural_gate_direct(
+    /// Acquires the structural gate of the index node at `path` with a direct
+    /// CAS. An index node has no entries, so only its node locks change.
+    async fn acquire_index_structural_gate(
         &self,
-        collection: &CollectionAddress,
-        node_id: Option<&NodeId>,
+        path: &ObjectPath,
         id: &TxId,
         acquisition: GateAcquisition,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
-        for _ in 0..NODE_CAS_ATTEMPTS {
-            let (mut node, observation) = match node_id {
-                Some(node_id) => {
-                    self.nodes
-                        .load_node(collection, node_id, Requirement::ANY)
-                        .await?
-                }
-                None => match self.nodes.load_root(collection, Requirement::ANY).await {
-                    Ok((root, observation)) => (root, observation),
-                    Err(StorageError::NotFound) => return Ok(None),
-                    Err(error) => return Err(error.into()),
+        let reconciler =
+            NodeLockReconciler::with_acquisition(&self.key_state, &self.mon, id, acquisition);
+        let reconciler = &reconciler;
+        let gated = self
+            .nodes
+            .converge(
+                path,
+                // A state with the gate of `id` is a state that `id` wrote, so it
+                // needs no proof.
+                Requirement::ANY,
+                CasRetries::Bounded(NODE_CAS_ATTEMPTS),
+                move |mut node, observation| async move {
+                    let gate = node.structural_gate();
+                    if gate.lock_type() == LockType::Write && gate.contains(id) {
+                        return Ok(Decision::Done(Some((node, observation))));
+                    }
+                    // The read that selected this path showed an index node, and
+                    // an index node never becomes a leaf again.
+                    if node.as_index().is_none() {
+                        return Err(TransError::other(
+                            "an index node became a leaf before its structural gate",
+                        ));
+                    }
+                    let mut locks = node.locks().clone();
+                    if reconciler.gate_locks(&mut locks).await?.is_some() {
+                        return Ok(Decision::Stop(None));
+                    }
+                    node.set_locks(locks);
+                    Ok::<_, TransError>(Decision::Write(node, None))
                 },
-            };
-            if node.structural_gate().lock_type() == LockType::Write
-                && node.structural_gate().contains(id)
-            {
-                return Ok(Some((node, observation)));
-            }
-
-            let entries: Option<BTreeMap<Vec<u8>, _>> = node.as_leaf().map(|leaf| {
-                leaf.entries()
-                    .cloned()
-                    .map(|entry| (entry.key.clone(), entry))
-                    .collect()
-            });
-            let leaf = entries.as_ref().map(|entries| LeafState {
-                collection,
-                entries,
-                requirement: Requirement::ANY,
-            });
-            let reconciler =
-                NodeLockReconciler::with_acquisition(&self.key_state, &self.mon, id, acquisition);
-            let GatedNode::Gated { entries, locks } =
-                reconciler.gate_node(leaf.as_ref(), node.locks()).await?
-            else {
-                return Ok(None);
-            };
-            if let Some(entries) = entries {
-                node.set_leaf(LeafBody::from_entries(entries.into_values()))?;
-            }
-            node.set_locks(locks);
+            )
+            .await?;
+        Ok(match gated {
             // The CAS receipt holds the gated state itself. A re-read reports
             // whatever revision this database knows of by then, which the caller
             // would then pair with the body it gated.
-            if let Some(gated) = self.store_structural_node(&node, &observation).await? {
-                return Ok(Some((node, gated)));
-            }
-        }
-        Ok(None)
+            Converged::Written {
+                state, observation, ..
+            } => Some((state, observation)),
+            Converged::Done(acquired) | Converged::Stop(acquired) => acquired,
+            // A missing root defers the work, as in the read that selected
+            // this path.
+            Converged::Missing if matches!(path, ObjectPath::TreeRoot { .. }) => None,
+            Converged::Missing => return Err(StorageError::NotFound.into()),
+            Converged::Exhausted => None,
+        })
     }
 
-    /// Applies `change` to node `node_id` read at `requirement`, retrying on a
-    /// lost CAS. `change` returns `false` when the node needs no change. A
-    /// missing node needs no change.
+    /// Applies `change` to node `node_id`, retrying on a lost CAS. `change`
+    /// returns `false` when the node needs no change, and that state ends the
+    /// call only if it satisfies `proof`. A missing node needs no change.
     async fn update_node(
         &self,
         collection: &CollectionAddress,
         node_id: &NodeId,
-        requirement: Requirement,
+        proof: Requirement,
         mut change: impl FnMut(&mut Node) -> bool,
     ) -> Result<(), TransError> {
-        for _ in 0..NODE_CAS_ATTEMPTS {
-            let (mut node, observation) =
-                match self.nodes.load_node(collection, node_id, requirement).await {
-                    Ok(loaded) => loaded,
-                    Err(StorageError::NotFound) => return Ok(()),
-                    Err(error) => return Err(error.into()),
-                };
-            if !change(&mut node) {
-                return Ok(());
-            }
-            if self
-                .store_structural_node(&node, &observation)
-                .await?
-                .is_some()
-            {
-                return Ok(());
-            }
+        let updated = self
+            .nodes
+            .converge(
+                &ObjectPath::tree_node(collection, Some(node_id)),
+                proof,
+                CasRetries::Bounded(NODE_CAS_ATTEMPTS),
+                |mut node, _| {
+                    ready(Ok::<_, TransError>(if change(&mut node) {
+                        Decision::Write(node, ())
+                    } else {
+                        Decision::Done(())
+                    }))
+                },
+            )
+            .await?;
+        match updated {
+            Converged::Written { .. } | Converged::Done(()) | Converged::Missing => Ok(()),
+            Converged::Stop(()) | Converged::Exhausted => Err(TransError::Retry),
         }
-        Err(TransError::Retry)
     }
 }

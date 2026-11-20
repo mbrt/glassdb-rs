@@ -782,12 +782,14 @@ impl StructuralChangeAttempt<'_> {
     }
 
     async fn release_gate(&self) -> Result<(), TransError> {
+        // The worker acquired the gate through this cache.
         self.lifecycle
             .structural_nodes
             .release_structural_gate(
                 self.change.collection(),
                 self.change.source_node_id(),
                 self.worker,
+                Requirement::ANY,
             )
             .await
     }

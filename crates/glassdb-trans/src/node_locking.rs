@@ -36,13 +36,6 @@ pub(crate) struct NodeLockReconciler<'a> {
     acquisition: GateAcquisition,
 }
 
-/// The staged entries of one leaf, as seen by a mutation deciding on its locks.
-pub(crate) struct LeafState<'a> {
-    pub(crate) collection: &'a CollectionAddress,
-    pub(crate) entries: &'a BTreeMap<Vec<u8>, LeafEntry>,
-    pub(crate) requirement: Requirement,
-}
-
 /// How an operation treats live holders of the node locks that block it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GateAcquisition {
@@ -82,39 +75,39 @@ impl<'a> NodeLockReconciler<'a> {
         }
     }
 
-    /// Quiesces one node and closes its structural gate: help-forwards or
-    /// removes each foreign holder of its entries and node locks.
+    /// Quiesces the staged leaf of `draft` and closes its structural gate:
+    /// help-forwards or removes each foreign holder of its entries and node
+    /// locks. `draft` gets the changed entries and the gated locks. When the
+    /// result is a blocker, `draft` can hold part of these changes, and the
+    /// caller must discard it.
     ///
     /// The entries and the locks change together, because a membership writer
-    /// leaves the membership lock only with its key locks (ADR-077). `entries`
-    /// is `None` for an index node.
+    /// leaves the membership lock only with its key locks (ADR-077).
     ///
-    /// The result is a candidate for CAS against the source observation, not
+    /// The draft is a candidate for CAS against the staged observation, not
     /// proof that the stored node is quiescent. With `ANY`, stale Pending or
     /// Unknown status must lead to waiting or a durable wound; final decisions
     /// are stable.
-    pub(crate) async fn gate_node(
+    pub(crate) async fn gate_leaf(
         &self,
-        leaf: Option<&LeafState<'_>>,
-        locks: &NodeLocks,
-    ) -> Result<GatedNode, TransError> {
-        let entries = match leaf {
-            Some(leaf) => match self
-                .quiesce_entries(leaf.collection, leaf.entries, leaf.requirement)
-                .await?
-            {
-                QuiescedEntries::Ready(entries) => Some(entries),
-                QuiescedEntries::Wait(holder) => {
-                    return Ok(GatedNode::Blocked(GateBlocker::Holder(holder)));
-                }
-            },
-            None => None,
+        draft: &mut StageDraft<'_>,
+        collection: &CollectionAddress,
+        requirement: Requirement,
+    ) -> Result<Option<GateBlocker>, TransError> {
+        let staged = draft.staged();
+        let entries = match self
+            .quiesce_entries(collection, staged.entries(), requirement)
+            .await?
+        {
+            QuiescedEntries::Ready(entries) => entries,
+            QuiescedEntries::Wait(holder) => return Ok(Some(GateBlocker::Holder(holder))),
         };
-        let mut locks = locks.clone();
-        if let Some(blocker) = self.acquire_structural_gate(&mut locks).await? {
-            return Ok(GatedNode::Blocked(blocker));
+        for (key, entry) in entries {
+            if staged.entry(&key) != Some(&entry) {
+                draft.put(key, entry);
+            }
         }
-        Ok(GatedNode::Gated { entries, locks })
+        self.gate_locks(draft.locks_mut()).await
     }
 
     /// Resolves every entry and removes holders this structural operation can
@@ -182,14 +175,15 @@ impl<'a> NodeLockReconciler<'a> {
         Ok(Some(holder))
     }
 
-    /// Closes the structural gate after quiescing membership holders. The
-    /// quiesced entries of [`Self::gate_node`] have no key lock of the
+    /// Closes the structural gate in `locks` after quiescing membership
+    /// holders. An index node needs only this. For a leaf, use
+    /// [`Self::gate_leaf`]: its quiesced entries have no key lock of the
     /// membership holders removed here.
     ///
     /// Returns what blocks the gate, or leaves both node-lock scopes free of
     /// foreign holders with a final status, with a structural gate installed
     /// for this operation.
-    async fn acquire_structural_gate(
+    pub(crate) async fn gate_locks(
         &self,
         locks: &mut NodeLocks,
     ) -> Result<Option<GateBlocker>, TransError> {
@@ -552,31 +546,23 @@ impl MemberPolicy for StructuralGateOperation {
             &self.id,
             self.acquisition,
         );
-        let leaf = LeafState {
-            collection: leaf_collection(&self.path)?,
-            entries: staged.entries(),
-            requirement: ctx.requirement,
-        };
-        let (entries, locks) = match reconciler.gate_node(Some(&leaf), staged.locks()).await? {
-            GatedNode::Gated { entries, locks } => (entries.unwrap_or_default(), locks),
-            GatedNode::Blocked(GateBlocker::Holder(holder)) => {
+        let mut draft = staged.draft();
+        match reconciler
+            .gate_leaf(&mut draft, leaf_collection(&self.path)?, ctx.requirement)
+            .await?
+        {
+            None => {}
+            Some(GateBlocker::Holder(holder)) => {
                 return Ok(Step::Skip {
                     outcome: MemberOutcome::Wait(holder),
                 });
             }
-            GatedNode::Blocked(GateBlocker::MergeReservation) => {
+            Some(GateBlocker::MergeReservation) => {
                 return Ok(Step::Skip {
                     outcome: MemberOutcome::Conflict,
                 });
             }
-        };
-        let mut draft = staged.draft();
-        for (key, entry) in entries {
-            if staged.entry(&key) != Some(&entry) {
-                draft.put(key, entry);
-            }
         }
-        *draft.locks_mut() = locks;
         Ok(draft.stage(
             StageAdmission::ExistingKeys,
             MemberOutcome::Locked {
@@ -656,15 +642,4 @@ enum Reclaimed {
 enum QuiescedEntries {
     Ready(BTreeMap<Vec<u8>, LeafEntry>),
     Wait(TxId),
-}
-
-/// A node state with a structural gate, ready for one CAS.
-pub(crate) enum GatedNode {
-    /// The quiesced entries of a leaf (`None` for an index node) and the
-    /// node locks with the gate. They must land together.
-    Gated {
-        entries: Option<BTreeMap<Vec<u8>, LeafEntry>>,
-        locks: NodeLocks,
-    },
-    Blocked(GateBlocker),
 }

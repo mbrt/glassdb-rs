@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex};
 use glassdb_data::{CollectionAddress, DbPrefix, NodeId, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CurrentnessBarrier, LeafObservation, LockType, MergeTarget, Node, NodeStore, Observation,
-    Requirement, StorageError, StructuralChange, StructuralIntent, StructuralIntentPhase,
-    StructuralIntentStore, Timeline, TreeRouter,
+    CasRetries, Converged, CurrentnessBarrier, Decision, LeafObservation, LockType, MergeTarget,
+    NodeStore, Observation, Requirement, StorageError, StructuralChange, StructuralIntent,
+    StructuralIntentPhase, StructuralIntentStore, Timeline, TreeRouter,
 };
 
 use crate::error::TransError;
@@ -440,9 +440,15 @@ impl StructuralRecovery {
                 Err(error) => ReadyIntentTransition::RecoveryRequired(ready, error),
             },
             Ok(None) => {
+                // The worker acquired the gate through this cache.
                 let error = match self
                     .structural_nodes
-                    .release_structural_gate(&collection, source_node_id.as_ref(), worker)
+                    .release_structural_gate(
+                        &collection,
+                        source_node_id.as_ref(),
+                        worker,
+                        Requirement::ANY,
+                    )
                     .await
                 {
                     Ok(()) => TransError::Retry,
@@ -1085,8 +1091,8 @@ impl StructuralRecovery {
         // The absorb sets the reservation, and it lands before the drain. A
         // state of the target from before the drained source can be after
         // `barrier` and still have no reservation. With no reservation to
-        // remove, no CAS rejects that stale state. So read the target after
-        // the read that showed the drain.
+        // remove, no CAS rejects that stale state. So a state without the
+        // reservation must be after the read that showed the drain.
         let after_drain = Requirement::after(self.timeline.currentness_barrier());
         self.structural_nodes
             .remove_merge_reservation(collection, &target.node_id, intent_id, after_drain)
@@ -1150,63 +1156,53 @@ impl StructuralRecovery {
         source_revision: &str,
         barrier: CurrentnessBarrier,
     ) -> Result<bool, TransError> {
-        for _ in 0..NODE_CAS_ATTEMPTS {
-            let Some((node, observed)) = self
-                .load_source(collection, source_node_id, barrier)
-                .await?
-            else {
-                return Ok(true);
-            };
-            if !observed
-                .revision()
-                .is_some_and(|revision| revision.serialize() == source_revision)
-            {
-                return Ok(true);
+        let fenced = self
+            .nodes
+            .converge(
+                &ObjectPath::tree_node(collection, source_node_id),
+                // A cached source past `source_revision` can also be from before
+                // the gate. The barrier follows the Ready observation, so a state
+                // after it is past the gate.
+                Requirement::after(barrier),
+                CasRetries::Bounded(NODE_CAS_ATTEMPTS),
+                |mut node, observed| async move {
+                    if !observed
+                        .revision()
+                        .is_some_and(|revision| revision.serialize() == source_revision)
+                    {
+                        return Ok(Decision::Done(true));
+                    }
+                    // The worker recorded this revision while it held the gate, so
+                    // a source still at it must still carry that gate.
+                    let gate = node.structural_gate();
+                    let holder = (gate.lock_type() == LockType::Write)
+                        .then(|| gate.holders().first().copied())
+                        .flatten()
+                        .ok_or_else(|| {
+                            TransError::other(
+                                "structural source is at its recorded revision without a gate",
+                            )
+                        })?;
+                    // A Pending holder can still land its publish. A cached state
+                    // can show the source at the recorded revision after the
+                    // publish landed, so this result also needs the proof.
+                    if self.mon.tx_status(&holder).await? == TxCommitStatus::Pending {
+                        return Ok(Decision::Done(false));
+                    }
+                    // A holder with a final status can still have its publish CAS
+                    // in flight. This CAS at the recorded revision either lands
+                    // first and fences that publish, or loses to it.
+                    node.remove_structural_gate(&holder);
+                    Ok::<_, TransError>(Decision::Write(node, true))
+                },
+            )
+            .await?;
+        match fenced {
+            Converged::Written { value, .. } | Converged::Done(value) | Converged::Stop(value) => {
+                Ok(value)
             }
-            // The worker recorded this revision while it held the gate, so a
-            // source still at it must still carry that gate.
-            let gate = node.structural_gate();
-            let holder = (gate.lock_type() == LockType::Write)
-                .then(|| gate.holders().first())
-                .flatten()
-                .ok_or_else(|| {
-                    TransError::other(
-                        "structural source is at its recorded revision without a gate",
-                    )
-                })?;
-            if self.mon.tx_status(holder).await? == TxCommitStatus::Pending {
-                return Ok(false);
-            }
-            // A holder with a final status can still have its publish CAS in flight. This
-            // cleanup CAS either wins first and fences that publish, or loses
-            // and the next iteration sees the source past `source_revision`.
-            self.structural_nodes
-                .release_structural_gate(collection, source_node_id, holder)
-                .await?;
-        }
-        Err(TransError::Retry)
-    }
-
-    async fn load_source(
-        &self,
-        collection: &CollectionAddress,
-        source_node_id: Option<&NodeId>,
-        barrier: CurrentnessBarrier,
-    ) -> Result<Option<(Node, LeafObservation)>, TransError> {
-        match source_node_id {
-            Some(id) => match self
-                .nodes
-                .load_node(collection, id, Requirement::after(barrier))
-                .await
-            {
-                Ok(source) => Ok(Some(source)),
-                Err(StorageError::NotFound) => Ok(None),
-                Err(error) => Err(error.into()),
-            },
-            None => Ok(self
-                .nodes
-                .load_root_node(collection, Requirement::after(barrier))
-                .await?),
+            Converged::Missing => Ok(true),
+            Converged::Exhausted => Err(TransError::Retry),
         }
     }
 }

@@ -888,12 +888,15 @@ A caller states the evidence that it needs as a freshness requirement:
 
 An `ANY` decision needs a separate proof, such as later validation or a
 conditional mutation
-([cache guide](guides/caching.md#decisions-from-any-reads)). A currentness
-barrier is captured after the prerequisite work and before the operations that
-depend on it. Transaction validation captures one after the body and before the
-lock CASes. GC and structural recovery capture their own. Higher layers can
-hold and compare barriers and requirements, but cannot create evidence
-([currentness barriers](guides/caching.md#currentness-barriers)).
+([cache guide](guides/caching.md#decisions-from-any-reads)). A conditional
+mutation proves only the changes that it makes. So the read-modify-write step of
+a store (`NodeStore::converge`) accepts a result without a write, or a missing
+object, only from a state that satisfies the freshness requirement of the
+caller. A currentness barrier is captured after the prerequisite work and before
+the operations that depend on it. Transaction validation captures one after the
+body and before the lock CASes. GC and structural recovery capture their own.
+Higher layers can hold and compare barriers and requirements, but cannot create
+evidence ([currentness barriers](guides/caching.md#currentness-barriers)).
 
 A CAS receipt proves that one conditional change took effect. It does not prove
 that the installed state is still current, and a later read cannot renew its
