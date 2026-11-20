@@ -164,6 +164,7 @@ mod tests {
                     ..Default::default()
                 },
                 tombstones_reclaimed: 4,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -194,6 +195,7 @@ mod tests {
                     ..Default::default()
                 },
                 tombstones_reclaimed: 9,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -224,6 +226,7 @@ mod tests {
                     ..Default::default()
                 },
                 tombstones_reclaimed: 5,
+                ..Default::default()
             },
             ..Default::default()
         };

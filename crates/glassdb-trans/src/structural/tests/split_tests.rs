@@ -144,6 +144,70 @@ async fn root_leaf_gate_acquisition_uses_one_coordinator_round() {
     assert!(root.structural_gate().holders().is_empty());
 }
 
+// A direct gate release over a current cached leaf lands with one CAS. Over a
+// cached leaf that is older than another write of the leaf, it loses its first
+// CAS, and the topology stats count the rejection.
+#[tokio::test]
+async fn a_direct_gate_release_that_loses_its_cas_counts_the_rejection() {
+    let memory = Arc::new(MemoryBackend::new());
+    let s = store_with_backend(memory.clone());
+    let peer = store_with_backend(memory);
+    peer.create_root(COLL, &leaf_node(&[b"a"], None, None))
+        .await
+        .unwrap();
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&s, &bg, tiny());
+    let nodes = &sp.changes.structural_nodes;
+    let worker = TxId::with_priority(1, b"root-gate");
+    let acquire = || async {
+        nodes
+            .acquire_structural_gate(&collection(), None, &worker, GateAcquisition::WoundWait)
+            .await
+            .unwrap()
+            .expect("the root leaf can acquire its structural gate");
+    };
+
+    acquire().await;
+    sp.stats_and_reset();
+    nodes
+        .release_structural_gate(&collection(), None, &worker)
+        .await
+        .unwrap();
+    assert_eq!(
+        sp.stats_and_reset().direct_lock_writes,
+        DirectWriteStats {
+            sent: 1,
+            rejected: 0,
+        }
+    );
+
+    acquire().await;
+    sp.stats_and_reset();
+    // Another database instance changes the leaf after this cache saw it.
+    let (mut root, observed) = peer
+        .load_root(
+            COLL,
+            Requirement::after(peer.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    let mut locks = root.locks().clone();
+    locks.add_membership_reader(TxId::with_priority(2, b"reader"));
+    root.set_locks(locks);
+    assert!(peer.store_root(COLL, &root, &observed).await.unwrap());
+    nodes
+        .release_structural_gate(&collection(), None, &worker)
+        .await
+        .unwrap();
+    assert_eq!(
+        sp.stats_and_reset().direct_lock_writes,
+        DirectWriteStats {
+            sent: 2,
+            rejected: 1,
+        }
+    );
+}
+
 #[tokio::test]
 async fn failed_compaction_does_not_publish_reclamation_outcomes() {
     let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
@@ -196,6 +260,11 @@ async fn failed_compaction_does_not_publish_reclamation_outcomes() {
                 candidates: 1,
                 deferred: 1,
                 ..SplitStats::default()
+            },
+            // The release of the gate of the failed split.
+            direct_lock_writes: DirectWriteStats {
+                sent: 1,
+                rejected: 0,
             },
             ..TopologyStats::default()
         }

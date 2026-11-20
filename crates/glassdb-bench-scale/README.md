@@ -21,7 +21,7 @@ Raw backend latency is measured by `backendbench`, in the same crate.
 
    | Part | What it does | Built-in parts |
    | --- | --- | --- |
-   | Kind (`runner/kinds.rs`) | Runs one transaction with the selected keys. | `read-modify-write`, `read`, `write`, `scan`, `create-delete` |
+   | Kind (`runner/kinds.rs`) | Runs one transaction with the selected keys. | `read-modify-write`, `read`, `write`, `scan`, `create-delete`, `delete` |
    | Key source (`runner/sources.rs`) | Selects the keys of one transaction. | `stripe`, `pool`, `adjacent`, `index`, `sequence`, `overlap` |
    | End condition (`runner/until.rs`) | Decides when a measurement ends. | `converged`, `duration`, `passes` |
    | Axis generator | Gives the values of a coupled axis. | none |
@@ -217,6 +217,7 @@ The built-in kinds:
 | `write` | `value-bytes` | Writes one key without a read. A single-key write commits direct. |
 | `scan` | `span` | Scans `span` keys from the selected key. `span = "all"` scans the whole collection. |
 | `create-delete` | `value-bytes`, `locked` | Creates the selected key, and deletes it in the next transaction of the worker. With `locked = true`, the transaction first scans the whole collection, so it cannot commit direct and takes the membership lock. |
+| `delete` | none | Deletes the selected key. |
 
 `value-bytes` defaults to the `value-bytes` of the pool, `collections` to 1,
 `span` to `"all"`, `locked` to `false`, and `view` to `"call"`.

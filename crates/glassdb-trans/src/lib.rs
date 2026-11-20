@@ -38,5 +38,7 @@ pub use leaf_coord::CoordinatorStats;
 pub use monitor::{MonitorStats, ProtocolTiming};
 pub use reader::{ReadOutcome, ReadValue};
 pub use retry_timing::RetryTiming;
-pub use structural::{MergeStats, SplitCauseStats, SplitStats, TopologyPolicy, TopologyStats};
+pub use structural::{
+    DirectWriteStats, MergeStats, SplitCauseStats, SplitStats, TopologyPolicy, TopologyStats,
+};
 pub use tlocker::LockerStats;

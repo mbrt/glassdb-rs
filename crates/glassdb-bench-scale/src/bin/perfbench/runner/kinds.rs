@@ -63,6 +63,7 @@ pub(crate) fn build(name: &str, params: Table) -> Result<Arc<dyn Kind>, Box<dyn 
         "write" => Arc::new(parse::<Write>(&params, name)?),
         "scan" => Arc::new(parse::<Scan>(&params, name)?),
         "create-delete" => Arc::new(parse::<CreateDelete>(&params, name)?),
+        "delete" => Arc::new(parse::<Delete>(&params, name)?),
         other => match crate::scenarios::kind(other, &params)? {
             Some(kind) => kind,
             None => return Err(format!("unknown kind {other:?}").into()),
@@ -160,6 +161,11 @@ struct Scan {
     #[serde(default)]
     span: Option<usize>,
 }
+
+/// Deletes the selected key.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct Delete {}
 
 /// Creates the selected key, and deletes it in the next transaction.
 #[derive(Deserialize)]
@@ -263,6 +269,17 @@ impl Kind for Write {
         op.collections[0]
             .write(&op.keys[0], &round_value(op.round, size))
             .await
+    }
+}
+
+#[async_trait]
+impl Kind for Delete {
+    fn keys(&self) -> usize {
+        1
+    }
+
+    async fn run(&self, op: &Op<'_>) -> Result<(), GError> {
+        op.collections[0].delete(&op.keys[0]).await
     }
 }
 

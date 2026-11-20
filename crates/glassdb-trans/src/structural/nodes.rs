@@ -1,6 +1,7 @@
 //! Structural-node mutation primitives.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use glassdb_concurr::rt;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, StructuralIntentId, TxId};
@@ -19,6 +20,7 @@ use crate::node_locking::{
 };
 
 use super::NODE_CAS_ATTEMPTS;
+use super::stats::Stats;
 
 /// Shares structural-node mutation primitives between structural changes,
 /// parent reconciliation, and recovery.
@@ -28,6 +30,7 @@ pub(super) struct StructuralNodeAccess {
     mon: Monitor,
     key_state: KeyStateResolver,
     pub(super) coord: LeafCoordinator,
+    stats: Arc<Stats>,
 }
 
 impl StructuralNodeAccess {
@@ -36,12 +39,14 @@ impl StructuralNodeAccess {
         mon: Monitor,
         key_state: KeyStateResolver,
         coord: LeafCoordinator,
+        stats: Arc<Stats>,
     ) -> Self {
         Self {
             nodes,
             mon,
             key_state,
             coord,
+            stats,
         }
     }
 
@@ -143,11 +148,7 @@ impl StructuralNodeAccess {
             if !node.remove_structural_gate(id) {
                 return Ok(());
             }
-            if self
-                .store_structural_node(&node, &observation)
-                .await?
-                .is_some()
-            {
+            if self.store_lock_change(&node, &observation).await? {
                 return Ok(());
             }
         }
@@ -165,6 +166,24 @@ impl StructuralNodeAccess {
             .nodes
             .store_node_at(observation.path(), node, observation)
             .await?)
+    }
+
+    /// Compare-and-swaps a node lock change outside a coordinator round, and
+    /// counts it if the node is a leaf, where it can race a round. Reports
+    /// whether it landed.
+    async fn store_lock_change(
+        &self,
+        node: &Node,
+        observation: &LeafObservation,
+    ) -> Result<bool, TransError> {
+        let stored = self.store_structural_node(node, observation).await;
+        if node.as_leaf().is_some() {
+            // A CAS that ends in an error, for example in doubt, was sent
+            // too, and it was not rejected.
+            self.stats
+                .record_direct_lock_write(matches!(stored, Ok(None)));
+        }
+        Ok(stored?.is_some())
     }
 
     /// Makes sure that the merge of `intent` into `target` never takes effect,
@@ -345,11 +364,7 @@ impl StructuralNodeAccess {
             if !change(&mut node) {
                 return Ok(());
             }
-            if self
-                .store_structural_node(&node, &observation)
-                .await?
-                .is_some()
-            {
+            if self.store_lock_change(&node, &observation).await? {
                 return Ok(());
             }
         }

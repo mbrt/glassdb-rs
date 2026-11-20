@@ -1,0 +1,136 @@
+# How the structural changes of one database instance affect its coordinator
+# rounds on the same leaves. A grower creates keys until the leaves split, then
+# a shrinker deletes them until the leaves merge, while four writers update one
+# key each in the leaves that change. The last cell has the writers alone, as
+# the control.
+#
+# A split or a merge writes some node lock changes with its own CAS, outside
+# the coordinator round: the release of its structural gate and the changes of
+# a merge reservation. Each of them can make a round of the writers lose its
+# leaf CAS. The measurement counts these CASes (`directLockWrites`) and the
+# coordinator CAS retries of the round.
+#
+# All workers run on one database instance, because only the rounds of that
+# instance can share a CAS with its structural changes.
+#
+# The splits and merges are background work, and their number varies between
+# runs, also in virtual time without latency jitter. So the counters do not
+# repeat exactly, and the experiment is not part of the CI comparison.
+tags = ["extra", "area/topology"]
+
+[pools.tree]
+keys = 512
+seeded = false
+
+# The grower and the shrinker skip the keys of the writers, so that they never
+# create or delete a key that a writer updates.
+[shapes.grow-a]
+kind = "write"
+pool = "tree"
+source = { sequence = { start = 1, count = 127, order = "ascending" } }
+
+[shapes.grow-b]
+kind = "write"
+pool = "tree"
+source = { sequence = { start = 129, count = 127, order = "ascending" } }
+
+[shapes.grow-c]
+kind = "write"
+pool = "tree"
+source = { sequence = { start = 257, count = 127, order = "ascending" } }
+
+[shapes.grow-d]
+kind = "write"
+pool = "tree"
+source = { sequence = { start = 385, count = 127, order = "ascending" } }
+
+[shapes.shrink-a]
+kind = "delete"
+pool = "tree"
+source = { sequence = { start = 1, count = 127, order = "ascending" } }
+
+[shapes.shrink-b]
+kind = "delete"
+pool = "tree"
+source = { sequence = { start = 129, count = 127, order = "ascending" } }
+
+[shapes.shrink-c]
+kind = "delete"
+pool = "tree"
+source = { sequence = { start = 257, count = 127, order = "ascending" } }
+
+[shapes.shrink-d]
+kind = "delete"
+pool = "tree"
+source = { sequence = { start = 385, count = 127, order = "ascending" } }
+
+[shapes.write-0]
+kind = "read-modify-write"
+pool = "tree"
+source = { index = { keys = [0] } }
+keys = 1
+
+[shapes.write-128]
+kind = "read-modify-write"
+pool = "tree"
+source = { index = { keys = [128] } }
+keys = 1
+
+[shapes.write-256]
+kind = "read-modify-write"
+pool = "tree"
+source = { index = { keys = [256] } }
+keys = 1
+
+[shapes.write-384]
+kind = "read-modify-write"
+pool = "tree"
+source = { index = { keys = [384] } }
+keys = 1
+
+[workloads.grow.groups.all]
+instances = 1
+shapes = { grow-a = 1, grow-b = 1, grow-c = 1, grow-d = 1, write-0 = 1, write-128 = 1, write-256 = 1, write-384 = 1 }
+
+[workloads.shrink.groups.all]
+instances = 1
+shapes = { shrink-a = 1, shrink-b = 1, shrink-c = 1, shrink-d = 1, write-0 = 1, write-128 = 1, write-256 = 1, write-384 = 1 }
+
+[workloads.quiet.groups.all]
+instances = 1
+shapes = { write-0 = 1, write-128 = 1, write-256 = 1, write-384 = 1 }
+
+[seed]
+quiet-period = "0s"
+
+# Small leaves, so that 512 keys make many splits and merges.
+[seed.database]
+leaf-max-entries = 16
+leaf-min-entries = 4
+
+[cell]
+collections = 1
+gc = false
+
+[cell.database]
+leaf-max-entries = 16
+leaf-min-entries = 4
+
+[cell.warm-up]
+timeout = "0s"
+
+[cell.measure]
+until = "passes"
+max-duration = "120s"
+
+# Each cell continues on the database instance and the tree of the cell before
+# it. The control waits until 60 s pass with no split and no merge, and then
+# measures for a fixed time.
+[[axes]]
+name = "phase"
+start = "previous"
+values = [
+  { label = "grow", set = { "cell.workload" = "grow" } },
+  { label = "shrink", set = { "cell.workload" = "shrink" } },
+  { label = "quiet", set = { "cell.workload" = "quiet", "cell.warm-up.timeout" = "300s", "cell.warm-up.quiet" = "60s", "cell.warm-up.quiet-rate" = 0.0, "cell.measure.until" = "duration", "cell.measure.duration" = "10s" } },
+]

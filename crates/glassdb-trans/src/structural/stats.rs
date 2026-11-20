@@ -16,6 +16,40 @@ pub struct TopologyStats {
     pub merges: MergeStats,
     /// Holder-free tombstone entries removed by acknowledged leaf rewrites.
     pub tombstones_reclaimed: u64,
+    /// Leaf CASes that change only node locks and that a structural change
+    /// sends itself, outside a coordinator round: the release of a structural
+    /// gate, and the removal of a merge reservation or the abandon of a merge.
+    /// A gate release that also compacts the entries of a leaf is not one of
+    /// them.
+    pub direct_lock_writes: DirectWriteStats,
+}
+
+/// The node CASes of one kind of direct write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirectWriteStats {
+    /// CASes sent, also the ones that ended in an error.
+    pub sent: u64,
+    /// CASes that another write of the node made fail.
+    pub rejected: u64,
+}
+
+impl AddAssign for DirectWriteStats {
+    fn add_assign(&mut self, rhs: Self) {
+        let Self { sent, rejected } = rhs;
+        self.sent += sent;
+        self.rejected += rejected;
+    }
+}
+
+impl Sub for DirectWriteStats {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            sent: self.sent.saturating_sub(rhs.sent),
+            rejected: self.rejected.saturating_sub(rhs.rejected),
+        }
+    }
 }
 
 impl AddAssign for TopologyStats {
@@ -25,10 +59,12 @@ impl AddAssign for TopologyStats {
             splits,
             merges,
             tombstones_reclaimed,
+            direct_lock_writes,
         } = rhs;
         self.splits += splits;
         self.merges += merges;
         self.tombstones_reclaimed += tombstones_reclaimed;
+        self.direct_lock_writes += direct_lock_writes;
     }
 }
 
@@ -42,6 +78,7 @@ impl Sub for TopologyStats {
             tombstones_reclaimed: self
                 .tombstones_reclaimed
                 .saturating_sub(rhs.tombstones_reclaimed),
+            direct_lock_writes: self.direct_lock_writes - rhs.direct_lock_writes,
         }
     }
 }
@@ -198,6 +235,8 @@ pub(super) struct Stats {
     splits: SplitCounters,
     merges: MergeCounters,
     tombstones_reclaimed: AtomicU64,
+    direct_lock_writes_sent: AtomicU64,
+    direct_lock_writes_rejected: AtomicU64,
 }
 
 #[derive(Default)]
@@ -233,6 +272,19 @@ impl Stats {
             splits: self.splits.take(),
             merges: self.merges.take(),
             tombstones_reclaimed: take(&self.tombstones_reclaimed),
+            direct_lock_writes: DirectWriteStats {
+                sent: take(&self.direct_lock_writes_sent),
+                rejected: take(&self.direct_lock_writes_rejected),
+            },
+        }
+    }
+
+    /// Counts one direct CAS of a node lock change, and whether it was
+    /// rejected.
+    pub(super) fn record_direct_lock_write(&self, rejected: bool) {
+        bump(&self.direct_lock_writes_sent);
+        if rejected {
+            bump(&self.direct_lock_writes_rejected);
         }
     }
 
