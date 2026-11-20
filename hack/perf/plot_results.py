@@ -349,7 +349,8 @@ def plot_conflict_latency(data: pd.DataFrame, out_dir: Path) -> Path:
 def plot_stale_latency(
     data: pd.DataFrame, out_dir: Path, name: str = "stale-latency.png"
 ) -> Path:
-    """One panel for each number of keys, with one line for each read.
+    """One panel for each number of keys, stacked and sharing both axes, with
+    one line for each read.
 
     The line is the mean, not the p50: a read through a view that a worker
     keeps uses the cache for about half of its transactions, so its p50 jumps
@@ -365,7 +366,12 @@ def plot_stale_latency(
     colors = dict(zip(reads, sns.color_palette("colorblind", len(reads)), strict=True))
     sizes = sorted(medians["keys"].unique())
     fig, axes = plt.subplots(
-        1, len(sizes), figsize=(14, 6), sharex=True, sharey=True, squeeze=False
+        len(sizes),
+        1,
+        figsize=(12, 4.5 * len(sizes)),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
     )
     for ax, keys in zip(axes.flat, sizes, strict=True):
         for read in reads:
@@ -391,10 +397,10 @@ def plot_stale_latency(
                 label=label,
             )
         ax.set_title(f"{keys} key" + ("" if keys == 1 else "s") + " for each read")
-        ax.set_xlabel("Concurrent writers per shape")
         ax.set_xticks(STALE_WORKER_POINTS)
+        ax.set_ylabel("Latency (ms)")
+    axes.flat[-1].set_xlabel("Concurrent writers per shape")
     axes.flat[0].set_yscale("log")
-    axes.flat[0].set_ylabel("Latency (ms)")
     # The lines of the panel of ten keys are close together at the top.
     axes.flat[-1].legend(title="Read", loc="lower right")
     fig.suptitle(
