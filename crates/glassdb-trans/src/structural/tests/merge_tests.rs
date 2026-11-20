@@ -959,6 +959,74 @@ async fn recovery_fences_a_late_absorb() {
     assert_not_merged(&local, &[b"a", b"b"], &[b"m", b"n"]).await;
 }
 
+// The aborted worker of a Ready merge still runs. After recovery discovers the
+// intent, another task of the recovering instance reads L1, and then the
+// worker absorbs L0 into L1 and drains L0. The cached L1 is from after the
+// discovery but has no merge reservation, because the absorb sets it. Recovery
+// sees the drain, so it must remove the reservation from a state of L1 that
+// follows the drain.
+#[tokio::test]
+async fn recovery_removes_the_reservation_of_an_absorb_that_lands_during_recovery() {
+    let memory = Arc::new(MemoryBackend::new());
+    let hooks = HookBackend::new(memory.clone());
+    let local = store_with_backend(hooks.clone());
+    let peer = store_with_backend(memory);
+    let bg = Arc::new(Background::new());
+    let sp = restructurer(&local, &bg, mergeable());
+    seed_interrupted_merge(&peer, &sp, MergeCrash::Ready).await;
+
+    let landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    hooks.set_before({
+        let local = local.clone();
+        let peer = peer.clone();
+        let landed = landed.clone();
+        let source = node_path("L0").to_string();
+        move |op| {
+            let land = matches!(
+                op,
+                BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+            ) && op.path() == source
+                && !landed.swap(true, Ordering::SeqCst);
+            let local = local.clone();
+            let peer = peer.clone();
+            Box::pin(async move {
+                if land {
+                    let fresh = Requirement::after(local.timeline.currentness_barrier());
+                    let (cached, _) = local.load_node(COLL, "L1", fresh).await.unwrap();
+                    assert!(cached.locks().merge_reservation().is_none());
+
+                    let fresh = || Requirement::after(peer.timeline.currentness_barrier());
+                    let (left, gated) = peer.load_node(COLL, "L0", fresh()).await.unwrap();
+                    let (mut right, observed) = peer.load_node(COLL, "L1", fresh()).await.unwrap();
+                    right.absorb(&left, test_intent_id("M")).unwrap();
+                    assert!(
+                        peer.store_node(COLL, "L1", &right, Some(&observed))
+                            .await
+                            .unwrap()
+                    );
+                    let mut drained = left;
+                    drained.drain(test_node_id("L1"));
+                    assert!(
+                        peer.store_node(COLL, "L0", &drained, Some(&gated))
+                            .await
+                            .unwrap()
+                    );
+                }
+                Ok(())
+            })
+        }
+    });
+
+    assert!(sp.recover_structural_intents().await.unwrap());
+
+    hooks.clear_before();
+    assert!(
+        landed.load(Ordering::SeqCst),
+        "the absorb landed during recovery"
+    );
+    assert_merged(&peer).await;
+}
+
 // A root over the leaves L0..L{count-1}, each with one key: "a", "b", and so
 // on. Every leaf is underfull.
 async fn seed_leaf_chain(s: &TestStore, count: u8) {
