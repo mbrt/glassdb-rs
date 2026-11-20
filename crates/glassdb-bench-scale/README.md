@@ -264,10 +264,15 @@ to must have `keys`.
 [workloads.<name>.groups.<group>]
 instances = 1                     # optional, the default is cell.databases
 shapes = { rw-single = 8 }        # shape name = its workers, or "cell"
+loads = { rw-many = 8 }           # optional, as `shapes`, but not measured
 ```
 
 - `shapes` maps each shape to the workers of the group. The value `"cell"`
   takes `cell.workers`.
+- `loads` has the same form as `shapes`. Its shapes run as the ones of
+  `shapes`, and the counters of the cell include their transactions. The
+  result has no entry for them, and the end condition does not wait for them.
+  A shape cannot be in both, and a workload must measure at least one shape.
 - A group opens `instances` database instances, but at most the largest worker
   count of its shapes, and at least one. The workers of each shape are spread
   as evenly as possible over the instances. Each instance runs all shapes of its

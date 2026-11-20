@@ -325,6 +325,7 @@ async fn run_cell(
         for shape in &group.shapes {
             let run = Arc::new(ShapeRun {
                 name: shape.name.clone(),
+                measured: shape.measured,
                 kind: shape.kind.clone(),
                 pool: spec.pools[&shape.pool].clone(),
                 bench: Arc::new(Bench::new(max)),
@@ -343,7 +344,8 @@ async fn run_cell(
                             .source
                             .worker(pool_size, *slot, family_workers, shape.kind.keys());
                     *slot += 1;
-                    if keys.pass_len().is_some() && until.by_passes() {
+                    // Only the passes of measured shapes end the measurement.
+                    if keys.pass_len().is_some() && until.by_passes() && shape.measured {
                         shared.passes_left.fetch_add(1, Ordering::Relaxed);
                     }
                     let target = if shape.kind.fresh_instance() {
@@ -493,8 +495,10 @@ async fn run_cell(
         until::Until::Converged => spec.params.measure.window_commits * THROUGHPUT_WINDOWS as u64,
         _ => 0,
     };
+    // The end condition waits only for the measured shapes.
     let benches: Vec<_> = shapes
         .iter()
+        .filter(|(_, _, shape)| shape.measured)
         .map(|(_, _, shape)| shape.bench.clone())
         .collect();
     let drive = workers::drive(&shared, &benches, target, spec.params.measure.duration, max);
@@ -586,7 +590,7 @@ async fn run_cell(
         total += *delta;
     }
     total += own_workload.stats;
-    let shape_results: Vec<ShapeResult> = shapes
+    let mut shape_results: Vec<(bool, ShapeResult)> = shapes
         .iter()
         .map(|(group, workers, shape)| {
             let mut results = shape.bench.results();
@@ -595,13 +599,19 @@ async fn run_cell(
                 results.completions.truncate(cut.samples);
                 results.tot_duration = cut.model.duration_since(measure_model_start);
             }
-            ShapeResult::summarize(&shape.name, group, *workers, &results, target)
+            let result = ShapeResult::summarize(&shape.name, group, *workers, &results, target);
+            (shape.measured, result)
         })
         .collect();
+    // The costs are for each transaction of the cell, including the ones of
+    // the shapes that only give load.
     let logical: u64 = shape_results
         .iter()
-        .map(|shape| shape.committed as u64)
+        .map(|(_, shape)| shape.committed as u64)
         .sum();
+    shape_results.retain(|(measured, _)| *measured);
+    let shape_results: Vec<ShapeResult> =
+        shape_results.into_iter().map(|(_, shape)| shape).collect();
     // The storage counts the opens of the instances that workers open for
     // single transactions, which are not in any window, so they are taken out.
     let mut workload = Window {

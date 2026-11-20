@@ -2,8 +2,7 @@
 # transaction, and a writer, on the same leaves of one collection. The reader
 # uses cached leaf states only, so a window of 2 s has about 360,000 of its
 # transactions, and a run takes about 2.5 s of wall time in virtual time. The
-# writer has only about 36 transactions in the window, so its metrics are
-# noisy: `stale-reads-shared-leaves` measures it.
+# writer only gives the load, and `stale-reads-shared-leaves` measures it.
 # The CI comparison runs it 32 times with latency jitter.
 tags = ["ci/timing", "area/read"]
 include = ["../configs/ci-timing.toml", "../configs/stale-reads-shared-leaves.toml"]

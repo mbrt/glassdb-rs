@@ -62,6 +62,8 @@ pub(crate) struct Boundary {
 /// One shape of one group, as its workers run it.
 pub(crate) struct ShapeRun {
     pub(crate) name: String,
+    /// Whether the result has the shape, and the end condition waits for it.
+    pub(crate) measured: bool,
     pub(crate) kind: Arc<dyn Kind>,
     pub(crate) pool: PoolSpec,
     pub(crate) bench: Arc<Bench>,
@@ -232,7 +234,10 @@ impl Worker {
         let mut cpu_rng = StdRng::seed_from_u64(self.seed ^ CPU_SEED);
         let kind = &self.shape.kind;
         let repeats = kind.repeats().max(1);
-        let pass_len = self.keys.pass_len().filter(|_| shared.until.by_passes());
+        let pass_len = self
+            .keys
+            .pass_len()
+            .filter(|_| shared.until.by_passes() && self.shape.measured);
         let mut round = 0u64;
         let mut measured = 0u64;
         let mut pass_start: Option<(Stats, Boundary)> = None;

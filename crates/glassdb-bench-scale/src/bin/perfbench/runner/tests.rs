@@ -244,3 +244,87 @@ fn a_negative_quiet_rate_is_an_error() {
     let error = run("mixed", &set).unwrap_err();
     assert!(error.to_string().contains("quiet-rate"), "{error}");
 }
+
+#[test]
+fn a_load_shape_runs_but_has_no_result() -> Result<(), Box<dyn Error>> {
+    let mut set = SHORT.to_vec();
+    set.extend([
+        "pools.wide.keys=100",
+        "cell.databases=1",
+        "cell.collections=1",
+        "workloads.loaded.groups.all.instances=1",
+        "workloads.loaded.groups.all.shapes={ ro-single = 1 }",
+        "workloads.loaded.groups.all.loads={ rw-single = 1 }",
+        "cell.workload=\"loaded\"",
+    ]);
+    let cells = run("workers", &set)?;
+    let shapes: Vec<_> = cells[0]["shapes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|shape| shape["shape"].clone())
+        .collect();
+    assert_eq!(shapes, ["ro-single"]);
+    // The writes of the load are in the counters of the cell.
+    assert!(cells[0]["costs"]["workload"]["writes"].as_f64().unwrap() > 0.0);
+    Ok(())
+}
+
+#[test]
+fn a_shape_cannot_be_measured_and_a_load() {
+    let error = resolve(
+        "workers",
+        &[
+            "workloads.both.groups.all.shapes={ rw-single = 1 }",
+            "workloads.both.groups.all.loads={ rw-single = 1 }",
+            "cell.workload=\"both\"",
+        ],
+    )
+    .and_then(|resolved| run_resolved(&resolved))
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("both `shapes` and `loads`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_workload_must_measure_a_shape() {
+    let error = resolve(
+        "workers",
+        &[
+            "workloads.none.groups.all.shapes={}",
+            "workloads.none.groups.all.loads={ rw-single = 1 }",
+            "cell.workload=\"none\"",
+        ],
+    )
+    .and_then(|resolved| run_resolved(&resolved))
+    .unwrap_err();
+    assert!(error.to_string().contains("measures no shape"), "{error}");
+}
+
+#[test]
+fn convergence_does_not_wait_for_a_load_shape() -> Result<(), Box<dyn Error>> {
+    let mut set = SHORT.to_vec();
+    set.extend([
+        "pools.wide.keys=100",
+        "cell.databases=1",
+        "cell.collections=1",
+        "workloads.loaded.groups.all.instances=1",
+        "workloads.loaded.groups.all.shapes={ ro-single = 1 }",
+        // A load with no workers never commits, so a cell that waited for it
+        // would end at its maximum duration with its condition not met.
+        "workloads.loaded.groups.all.loads={ rw-many = 0 }",
+        "cell.workload=\"loaded\"",
+        "cell.measure.until=\"converged\"",
+        "cell.measure.duration=\"0s\"",
+        "cell.measure.max-duration=\"5s\"",
+        "cell.measure.window-commits=20",
+    ]);
+    let cells = run("workers", &set)?;
+    let shape = &cells[0]["shapes"][0];
+    assert_eq!(shape["shape"], "ro-single");
+    assert_eq!(shape["converged"], true);
+    assert_eq!(cells[0]["measure"]["met"], true);
+    Ok(())
+}

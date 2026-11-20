@@ -63,10 +63,13 @@ shapes = { stale-writer = 1, stale-multi = 1, stale-view-single = 1, stale-view-
 # `stale-single` alone beside the writer. Each of its transactions uses cached
 # leaf states only, so it commits one transaction for each 5 µs of model time,
 # and in virtual time it takes about as much wall time as model time. Its cases
-# have a short window, so that the other shapes keep the long one.
+# have a short window, so that the other shapes keep the long one. The writer
+# has too few transactions in a short window for its metrics, so it only gives
+# the load.
 [workloads.stale-single-shared-leaves.groups.all]
 instances = 1
-shapes = { stale-writer = 1, stale-single = 1 }
+shapes = { stale-single = 1 }
+loads = { stale-writer = 1 }
 
 [cell]
 workload = "stale-shared-leaves"

@@ -9,8 +9,8 @@ use toml::Value;
 /// When the measurement of a cell ends.
 #[derive(Clone)]
 pub(crate) enum Until {
-    /// Every shape has its commits in each throughput window on average, after
-    /// the minimum duration.
+    /// Every measured shape has its commits in each throughput window on
+    /// average, after the minimum duration.
     Converged,
     /// Exactly the measurement duration.
     Duration,

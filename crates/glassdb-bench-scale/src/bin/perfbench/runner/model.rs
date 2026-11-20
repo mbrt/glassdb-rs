@@ -70,6 +70,9 @@ pub(crate) struct ShapeSpec {
     pub(crate) pool: String,
     pub(crate) source: SourceSpec,
     pub(crate) workers: usize,
+    /// Whether the result has the shape, and the end condition waits for it.
+    /// A shape of `loads` only gives load.
+    pub(crate) measured: bool,
 }
 
 /// The parameters of the seed.
@@ -186,6 +189,9 @@ struct GroupTable {
     #[serde(default)]
     instances: Option<usize>,
     shapes: IndexMap<String, Workers>,
+    /// Shapes that run as the ones of `shapes`, but are not measured.
+    #[serde(default)]
+    loads: IndexMap<String, Workers>,
 }
 
 #[derive(Deserialize)]
@@ -226,7 +232,19 @@ impl CellSpec {
         for (group_name, group) in &workload.groups {
             uses_cell_databases |= group.instances.is_none();
             let mut group_shapes = Vec::new();
-            for (shape_name, workers) in &group.shapes {
+            if let Some(name) = group
+                .loads
+                .keys()
+                .find(|name| group.shapes.contains_key(*name))
+            {
+                return Err(format!(
+                    "group {group_name}: shape {name:?} is in both `shapes` and `loads`"
+                )
+                .into());
+            }
+            let measured = group.shapes.iter().map(|entry| (entry, true));
+            let loads = group.loads.iter().map(|entry| (entry, false));
+            for ((shape_name, workers), measured) in measured.chain(loads) {
                 let workers = match workers {
                     Workers::Count(count) => *count,
                     Workers::Cell(CellWorkers::Cell) => {
@@ -244,6 +262,7 @@ impl CellSpec {
                     workload.pool.as_deref(),
                     workload.source.as_ref(),
                     workers,
+                    measured,
                 )?);
             }
             let largest = group_shapes
@@ -267,6 +286,13 @@ impl CellSpec {
                 instances,
                 shapes: group_shapes,
             });
+        }
+        if !groups
+            .iter()
+            .flat_map(|group| &group.shapes)
+            .any(|shape| shape.measured)
+        {
+            return Err(format!("workload {:?} measures no shape", params.workload).into());
         }
         let instances: usize = groups.iter().map(|group| group.instances.max(1)).sum();
         let collections = match params.collections {
@@ -387,6 +413,7 @@ impl ShapeSpec {
         workload_pool: Option<&str>,
         workload_source: Option<&Value>,
         workers: usize,
+        measured: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let mut params = table.clone();
         let kind_name = params
@@ -411,6 +438,7 @@ impl ShapeSpec {
             pool,
             source,
             workers,
+            measured,
         })
     }
 }
