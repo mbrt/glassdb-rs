@@ -142,11 +142,17 @@ the cadence of its background tasks, so a window that holds a pass of the
 garbage collector can count one listing more or less, and records with a
 timestamp can change their size by a byte with the start time of the process.
 This moves the latency of large writes by under 1%. CPU work takes no model
-time, so after each transaction a worker waits a fixed 0.2 ms of model time in
-its place. That is close to the mean CPU time of a transaction of the
-`stale-reads` grid with the memory backend, not the CPU time of each kind, and
-it is in the measured latency. A transaction with no backend
-operation then still advances model time. A task that runs in a loop at one
+time, so after each transaction a worker waits in its place, and the wait is in
+the measured latency. The wait is a first-order model of the CPU time: 5 µs for
+each key that the transaction only reads, and 80 µs for each key that it
+writes, its read included (`Kind::cpu_units`). A scan costs 5 µs for each key of
+its span, or of the pool for a scan of the whole collection. A transaction
+costs at least 5 µs. These values
+are the wall time of a measurement in virtual time over its transactions, with
+one worker on warm caches. With `--latency-jitter`, each wait is uniform within
+15% of its mean, so that workers on transactions with no backend operation do
+not run in lockstep. A transaction with no backend operation then still
+advances model time. A task that runs in a loop at one
 model instant, such as a livelock, still stops model time. If model time does
 not advance for 60 s of wall time while a cell runs, the run fails with an error
 that names the cell and its shapes. Virtual time needs `--backend=memory`:

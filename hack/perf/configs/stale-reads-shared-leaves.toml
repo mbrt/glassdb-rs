@@ -1,8 +1,8 @@
-# The body of the `stale-reads-shared-leaves` experiments: stale read-only
-# transactions (`StaleDatabaseView::read_tx`) of one and of ten keys, and a
-# writer, on the same leaves of one collection. Each write gives the readers a
-# new leaf state, so the cost of the order between stale read-only
-# transactions shows in the checks of the other leaves. The `stale` readers use
+# The body of the `stale-reads-shared-leaves` and `stale-reads-single`
+# experiments: stale read-only transactions (`StaleDatabaseView::read_tx`) of
+# one and of ten keys, and a writer, on the same leaves of one collection.
+# Each write gives the readers a new leaf state, so the cost of the order
+# between stale read-only transactions shows in the checks of the other leaves. The `stale` readers use
 # a new view for each transaction, and the `stale-view` readers one view for
 # all transactions of the worker.
 
@@ -58,7 +58,15 @@ view = "worker"
 
 [workloads.stale-shared-leaves.groups.all]
 instances = 1
-shapes = { stale-writer = 1, stale-single = 1, stale-multi = 1, stale-view-single = 1, stale-view-multi = 1 }
+shapes = { stale-writer = 1, stale-multi = 1, stale-view-single = 1, stale-view-multi = 1 }
+
+# `stale-single` alone beside the writer. Each of its transactions uses cached
+# leaf states only, so it commits one transaction for each 5 µs of model time,
+# and in virtual time it takes about as much wall time as model time. Its cases
+# have a short window, so that the other shapes keep the long one.
+[workloads.stale-single-shared-leaves.groups.all]
+instances = 1
+shapes = { stale-writer = 1, stale-single = 1 }
 
 [cell]
 workload = "stale-shared-leaves"

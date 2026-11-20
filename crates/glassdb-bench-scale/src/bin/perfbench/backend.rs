@@ -17,7 +17,8 @@ pub(super) struct Options {
     /// Cloud latency profile simulated by memory and fakes3.
     #[arg(long, default_value = "s3", value_parser = ["gcs", "s3"])]
     delays: String,
-    /// Vary simulated provider latency around its mean.
+    /// Vary simulated provider latency around its mean. In virtual time, also
+    /// vary the model time that stands for the CPU work of each transaction.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub(super) latency_jitter: bool,
     /// Enable simulated per-object and per-prefix throttling.

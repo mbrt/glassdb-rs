@@ -37,15 +37,15 @@ repository uses these tags:
 Each experiment has one of the tags `ci/counters`, `ci/timing`, `extra`, and
 `cloud`. The experiments of this directory run in both time modes. `make
 bench-all` runs all of them in real time, and `make bench-all TIME=virtual` runs
-all of them in virtual time. In virtual time, CPU takes no model time, so the
-absolute values differ from real time, and `workers` shows no CPU saturation
-(see `--time=virtual` in the crate README). In real time, a cell of
-`open-in-body` with one database instance can miss the cell completion deadline,
-and the run then stops.
+all of them in virtual time. In virtual time, a model of the CPU time of each
+kind replaces the CPU time, so the absolute values differ from real time, and
+`workers` shows no CPU saturation (see `--time=virtual` in the crate README).
+In real time, a cell of `open-in-body` with one database instance can miss the
+cell completion deadline, and the run then stops.
 
 | Experiment | What it measures |
 | --- | --- |
-| The cases of [CI experiments](#ci-experiments) | Single transactions of one worker with warm caches, and their backend costs, three workers on one leaf, four shapes at the same time on one leaf, and stale read-only transactions beside a writer on shared leaves. Each case has a fixed length of 10 s for its counters and of 300 s for its latency. |
+| The cases of [CI experiments](#ci-experiments) | Single transactions of one worker with warm caches, and their backend costs, three workers on one leaf, four shapes at the same time on one leaf, and stale read-only transactions beside a writer on shared leaves. Each case has a fixed length of 10 s for its counters and of 300 s for its latency, except `stale-reads-single`. |
 | `inline-pressure` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
 | `contention` | Five writers whose transactions share some of their 1 to 6 keys. |
 | `split-merge-fight` | A stable load under which both a split and a merge of one leaf make sense. The default topology policy must settle at one leaf or at two leaves, from a start of either one. |
@@ -106,7 +106,8 @@ window. Most cases use built-in parts:
 | `read-long-keys` | A read in a collection of 1,024 keys of 256 bytes (`key-bytes = 256`), after its splits. |
 | `rmw-shared-leaf` | Three workers that update their own key of one leaf. |
 | `shapes-shared-leaf` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time on one leaf, with `low-conflict` keys. |
-| `stale-reads-shared-leaves` | Stale read-only transactions (`StaleDatabaseView::read_tx`, 5 s bound) of one key and of ten keys, each with a new view for each transaction (`stale-single`, `stale-multi`) and with one view for each worker (`stale-view-single`, `stale-view-multi`), and a writer of one key, all on the keys of one collection with leaves of at most 16 entries. Each write gives the readers a new leaf state, so the case shows what a new state costs the stale reads of the other leaves. |
+| `stale-reads-shared-leaves` | Stale read-only transactions (`StaleDatabaseView::read_tx`, 5 s bound) of ten keys with a new view for each transaction (`stale-multi`), and of one key and of ten keys with one view for each worker (`stale-view-single`, `stale-view-multi`), and a writer of one key, all on the keys of one collection with leaves of at most 16 entries. Each write gives the readers a new leaf state, so the case shows what a new state costs the stale reads of the other leaves. |
+| `stale-reads-single` | The same leaves, with the writer and a stale read-only transaction of one key with a new view for each transaction (`stale-single`). The reader uses cached leaf states only, so it commits one transaction for each 5 µs of model time, and in virtual time it costs about as much wall time as model time. Its windows are 500 ms for the counters and 2 s for the latency. The writer has only about 36 transactions in 2 s, so its metrics in this case are noisy and can stay inconclusive. |
 
 The CI comparison builds perfbench for both revisions, runs `make bench` with
 each binary, and then compares the results:

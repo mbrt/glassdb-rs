@@ -13,6 +13,10 @@ use toml::value::Table;
 
 use super::model::PoolSpec;
 
+/// The units of CPU work of each key that a transaction writes, from the wall
+/// time of a measurement in virtual time over its transactions.
+const WRITE_CPU_UNITS: usize = 16;
+
 /// The inputs of one transaction.
 pub(crate) struct Op<'a> {
     pub(crate) db: &'a Database,
@@ -32,6 +36,14 @@ pub(crate) struct Op<'a> {
 pub(crate) trait Kind: Send + Sync {
     /// The keys of one transaction.
     fn keys(&self) -> usize;
+
+    /// The units of CPU work of one transaction on `pool`, which virtual
+    /// time charges in model time (`TransactionCpu`). The default is one for
+    /// each key, as a read of a key costs. A first-order approximation is
+    /// enough.
+    fn cpu_units(&self, _pool: &PoolSpec) -> usize {
+        self.keys()
+    }
 
     /// The collections of one transaction.
     fn collections(&self) -> usize {
@@ -179,6 +191,10 @@ impl Kind for ReadModifyWrite {
         self.keys
     }
 
+    fn cpu_units(&self, _pool: &PoolSpec) -> usize {
+        WRITE_CPU_UNITS * self.keys * self.collections
+    }
+
     fn collections(&self) -> usize {
         self.collections
     }
@@ -258,6 +274,10 @@ impl Kind for Write {
         1
     }
 
+    fn cpu_units(&self, _pool: &PoolSpec) -> usize {
+        WRITE_CPU_UNITS
+    }
+
     async fn run(&self, op: &Op<'_>) -> Result<(), GError> {
         let size = self.value_bytes.unwrap_or(op.pool.value_bytes);
         op.collections[0]
@@ -270,6 +290,12 @@ impl Kind for Write {
 impl Kind for Scan {
     fn keys(&self) -> usize {
         1
+    }
+
+    /// One unit for each key of the span, or of the pool for a scan of the
+    /// whole collection.
+    fn cpu_units(&self, pool: &PoolSpec) -> usize {
+        self.span.or(pool.keys).unwrap_or(1)
     }
 
     async fn run(&self, op: &Op<'_>) -> Result<(), GError> {
@@ -292,6 +318,10 @@ impl Kind for Scan {
 impl Kind for CreateDelete {
     fn keys(&self) -> usize {
         1
+    }
+
+    fn cpu_units(&self, _pool: &PoolSpec) -> usize {
+        WRITE_CPU_UNITS
     }
 
     fn repeats(&self) -> u64 {
