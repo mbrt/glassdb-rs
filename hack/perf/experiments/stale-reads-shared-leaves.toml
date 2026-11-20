@@ -1,6 +1,7 @@
-# Stale read-only transactions of one and of ten keys, with a new view for each
-# transaction and with one view for each worker, and a writer, on the same
-# leaves of one collection.
+# Stale read-only transactions of ten keys with a new view for each
+# transaction, and of one and of ten keys with one view for each worker, and a
+# writer, on the same leaves of one collection. `stale-reads-single` has the
+# read of one key with a new view for each transaction.
 # The CI comparison runs it 32 times with latency jitter.
 tags = ["ci/timing", "area/read"]
 include = ["../configs/ci-timing.toml", "../configs/stale-reads-shared-leaves.toml"]

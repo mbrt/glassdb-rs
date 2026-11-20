@@ -24,7 +24,7 @@ use std::time::Duration;
 use clap::{Parser, ValueEnum};
 use glassdb::ProtocolTiming;
 use serde::Serialize;
-use time::TimeMode;
+use time::{TimeMode, TransactionCpu};
 
 const SCHEMA_VERSION: u32 = 3;
 
@@ -152,7 +152,7 @@ struct Execution {
     run_cooldown: Duration,
     drain_timeout: Duration,
     /// The model time that a worker spends after each transaction.
-    transaction_cpu: Duration,
+    transaction_cpu: TransactionCpu,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -173,7 +173,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         runs: cli.runs,
         run_cooldown: cli.run_cooldown,
         drain_timeout: cli.drain_timeout,
-        transaction_cpu: cli.time.transaction_cpu(),
+        transaction_cpu: cli.time.transaction_cpu(cli.backend.latency_jitter),
     };
     let chains = parallel::chains(&resolved, cli.runs)?;
     // The process of a chain has the same arguments, so it filters its own log.

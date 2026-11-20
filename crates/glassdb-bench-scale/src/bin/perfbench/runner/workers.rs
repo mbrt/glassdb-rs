@@ -19,6 +19,7 @@ use super::model::{DatabaseOptions, PoolSpec};
 use super::seed::{open_collections_of, shutdown};
 use super::sources::WorkerKeys;
 use super::until::Until;
+use crate::time::TransactionCpu;
 
 /// The state that all workers of a cell share.
 pub(crate) struct Shared {
@@ -44,8 +45,8 @@ pub(crate) struct Shared {
     /// condition leaves that pass out.
     pub(crate) boundary: Mutex<Option<Boundary>>,
     /// The model time that a worker spends after each transaction, in place
-    /// of its CPU work. It is in the measured latency.
-    pub(crate) transaction_cpu: Duration,
+    /// of its CPU work.
+    pub(crate) transaction_cpu: TransactionCpu,
 }
 
 /// The state at the start of the pass that ended the measurement.
@@ -61,6 +62,8 @@ pub(crate) struct Boundary {
 /// One shape of one group, as its workers run it.
 pub(crate) struct ShapeRun {
     pub(crate) name: String,
+    /// Whether the result has the shape, and the end condition waits for it.
+    pub(crate) measured: bool,
     pub(crate) kind: Arc<dyn Kind>,
     pub(crate) pool: PoolSpec,
     pub(crate) bench: Arc<Bench>,
@@ -226,9 +229,15 @@ impl Worker {
     async fn run(self) -> Result<(), GError> {
         let shared = &self.shared;
         let mut rng = StdRng::seed_from_u64(self.seed);
+        // The CPU charges have their own generator, so that their jitter does
+        // not change the keys that the worker selects.
+        let mut cpu_rng = StdRng::seed_from_u64(self.seed ^ CPU_SEED);
         let kind = &self.shape.kind;
         let repeats = kind.repeats().max(1);
-        let pass_len = self.keys.pass_len().filter(|_| shared.until.by_passes());
+        let pass_len = self
+            .keys
+            .pass_len()
+            .filter(|_| shared.until.by_passes() && self.shape.measured);
         let mut round = 0u64;
         let mut measured = 0u64;
         let mut pass_start: Option<(Stats, Boundary)> = None;
@@ -273,7 +282,10 @@ impl Worker {
                 };
                 pass_start = Some((stats, boundary));
             }
-            self.once(bench, collection, &keys, round, recording)
+            let cpu = shared
+                .transaction_cpu
+                .charge(kind.cpu_units(&self.shape.pool), &mut cpu_rng);
+            self.once(bench, collection, &keys, round, recording, cpu)
                 .await?;
             round += 1;
             let Some(pass_len) = pass_len.filter(|_| recording) else {
@@ -304,12 +316,12 @@ impl Worker {
         Ok(())
     }
 
-    /// Runs one transaction of the shape, then spends the model time that
-    /// stands for its CPU work.
-    async fn run_kind(&self, op: &Op<'_>) -> Result<(), GError> {
+    /// Runs one transaction of the shape, then spends `cpu`, the model time
+    /// that stands for its CPU work. It is in the measured latency.
+    async fn run_kind(&self, op: &Op<'_>, cpu: Duration) -> Result<(), GError> {
         let result = self.shape.kind.run(op).await;
-        if !self.shared.transaction_cpu.is_zero() {
-            rt::sleep(self.shared.transaction_cpu).await;
+        if !cpu.is_zero() {
+            rt::sleep(cpu).await;
         }
         result
     }
@@ -321,6 +333,7 @@ impl Worker {
         keys: &[Vec<u8>],
         round: u64,
         recording: bool,
+        cpu: Duration,
     ) -> Result<(), GError> {
         match &self.target {
             Target::Instance { db, collections } => {
@@ -334,7 +347,7 @@ impl Worker {
                     round,
                     view: &self.view,
                 };
-                bench.measure(|| self.run_kind(&op)).await
+                bench.measure(|| self.run_kind(&op, cpu)).await
             }
             Target::Fresh { opener, own } => {
                 let start = opener.breakdown.snapshot();
@@ -360,7 +373,7 @@ impl Worker {
                     view: &view,
                 };
                 let before = Window::now(&db, &opener.breakdown);
-                let result = bench.measure(|| self.run_kind(&op)).await;
+                let result = bench.measure(|| self.run_kind(&op, cpu)).await;
                 let after = Window::now(&db, &opener.breakdown);
                 drop(selected);
                 drop(collections);
@@ -434,6 +447,9 @@ pub(crate) fn split_workers(workers: usize, instances: usize) -> Vec<usize> {
         .map(|index| base + usize::from(index < remainder))
         .collect()
 }
+
+/// Changes the seed of a worker into the seed of its CPU charges.
+const CPU_SEED: u64 = 0xC0FF_EE00_C0FF_EE00;
 
 /// Returns the random seed of the `index`th worker of a cell.
 pub(crate) fn worker_seed(index: usize) -> u64 {
