@@ -822,7 +822,7 @@ impl Gc {
     /// entry can name the identity only if that transaction put it there.
     ///
     /// The recorded keys are routed to their leaves by descent
-    /// ([`TreeRouter::route_keys_with_requirements`]) so each touched leaf is fetched
+    /// ([`TreeRouter::route_keys_checking_leaf`]) so each touched leaf is fetched
     /// once — a write and its write-lock name the same key, and sibling keys
     /// share a leaf, so a per-key load would re-read the same leaf several times
     /// per candidate. Each key carries the [`CheckKind`] that says which field
@@ -866,7 +866,7 @@ impl Gc {
             // Thus an old absence cannot hide a later live route.
             let groups = match self
                 .router
-                .route_keys_with_requirements(items, Requirement::ANY, Requirement::after(barrier))
+                .route_keys_checking_leaf(items, Requirement::after(barrier))
                 .await
             {
                 Ok(groups) => groups,

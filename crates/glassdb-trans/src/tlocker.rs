@@ -288,7 +288,7 @@ async fn build_groups(
     // coordination CAS revalidates at the revision, so neither the root `_r` nor
     // the terminal leaf needs a separate validation read.
     let grouped = router
-        .route_keys_with_requirements(items, Requirement::ANY, Requirement::ANY)
+        .route_keys_checking_leaf(items, Requirement::ANY)
         .await
         .map_err(|error| TransError::from(error).context("grouping keys by leaf"))?;
 
@@ -1219,7 +1219,7 @@ impl KeyLocker {
             // lock later under a missing prepared root.
             match self
                 .router
-                .route_keys_with_requirements(items, Requirement::ANY, requirement)
+                .route_keys_checking_leaf(items, requirement)
                 .await
             {
                 Ok(groups) => {
@@ -1354,7 +1354,7 @@ impl KeyLocker {
                     // so a rerouted leaf has no inherited hold to overlook.
                     let groups = match self
                         .router
-                        .route_keys_with_requirements(items, Requirement::ANY, Requirement::ANY)
+                        .route_keys_checking_leaf(items, Requirement::ANY)
                         .await
                     {
                         Ok(groups) => groups,

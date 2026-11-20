@@ -186,7 +186,7 @@ impl DirectCommit {
             .collect::<Vec<_>>();
         let groups = self
             .router
-            .route_keys_with_requirements(keys, Requirement::ANY, Requirement::ANY)
+            .route_keys_checking_leaf(keys, Requirement::ANY)
             .await?;
         Ok(match groups.as_slice() {
             [group] => Some(group.path().clone()),

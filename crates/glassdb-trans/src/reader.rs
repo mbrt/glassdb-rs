@@ -151,9 +151,8 @@ impl Reader {
                 // writer that is still unresolvable under fresh evidence is truly
                 // in-doubt: report absence so transaction validation replays the
                 // body rather than trusting an empty placeholder.
-                let fresh = Requirement::after(self.timeline.currentness_barrier());
-                if !refreshed && requirement.stricter(fresh) != requirement {
-                    requirement = fresh;
+                if !refreshed {
+                    requirement = Requirement::after(self.timeline.currentness_barrier());
                     refreshed = true;
                     continue;
                 }
