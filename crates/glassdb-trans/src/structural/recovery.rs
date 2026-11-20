@@ -1082,8 +1082,14 @@ impl StructuralRecovery {
                 .await?;
             return Ok(IntentRecoveryPhase::Delete);
         }
+        // The absorb sets the reservation, and it lands before the drain. A
+        // state of the target from before the drained source can be after
+        // `barrier` and still have no reservation. With no reservation to
+        // remove, no CAS rejects that stale state. So read the target after
+        // the read that showed the drain.
+        let after_drain = Requirement::after(self.timeline.currentness_barrier());
         self.structural_nodes
-            .remove_merge_reservation(collection, &target.node_id, intent_id, requirement)
+            .remove_merge_reservation(collection, &target.node_id, intent_id, after_drain)
             .await?;
         Ok(IntentRecoveryPhase::Reconcile {
             reconciliation: self
