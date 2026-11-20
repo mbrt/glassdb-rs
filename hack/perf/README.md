@@ -49,6 +49,7 @@ cell completion deadline, and the run then stops.
 | `inline-pressure` | How leaves adapt when their aggregate inline budget is full (ADR-056): passes over the next keys until one pass commits without locks. |
 | `contention` | Five writers whose transactions share some of their 1 to 6 keys. |
 | `split-merge-fight` | A stable load under which both a split and a merge of one leaf make sense. The default topology policy must settle at one leaf or at two leaves, from a start of either one. |
+| `structural-rounds` | How the splits and merges of one database instance affect its coordinator rounds on the same leaves: a grower creates keys until the leaves split, then a shrinker deletes them until the leaves merge, while four writers update one key each. A round that loses its leaf CAS to a structural change shows in the coordinator CAS retries. Its splits and merges vary between runs, so it is not a `ci/counters` experiment. |
 | `membership-churn` | Creates and deletes of keys in one leaf, with direct and locked commits, while another instance scans the leaf. |
 | `mixed` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
 | `workers` | The worker grid of the canonical plots: 1 to 200 workers per shape. Each count starts from the seed. |

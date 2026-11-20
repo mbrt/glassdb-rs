@@ -18,7 +18,7 @@ use crate::error::TransError;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{
     CoordinatedOutcome, LeafOperation, MemberOutcome, MemberPolicy, ResolveCtx, StageAdmission,
-    Step,
+    StageDraft, StagedLeaf, Step,
 };
 use crate::monitor::Monitor;
 use crate::wound_wait::{Reclaim, try_reclaim};
@@ -254,17 +254,20 @@ impl<'a> NodeLockReconciler<'a> {
         }
     }
 
-    /// Acquires the requested membership lock, returning a holder to wait for.
+    /// Acquires the requested membership lock in `draft`, returning a holder
+    /// to wait for.
     ///
-    /// A membership writer that this removes appends the release of its key
-    /// locks to `changes` (see [`Self::remove_membership_writer`]).
+    /// A membership writer that this removes puts the release of its key
+    /// locks into `draft` (see [`Self::remove_membership_writer`]). The keys
+    /// of `collection` resolve at `requirement`.
     pub(crate) async fn acquire_membership(
         &self,
-        locks: &mut NodeLocks,
+        draft: &mut StageDraft<'_>,
         desired: LockType,
-        leaf: &LeafState<'_>,
-        changes: &mut Vec<(Vec<u8>, LeafEntry)>,
+        collection: &CollectionAddress,
+        requirement: Requirement,
     ) -> Result<Option<TxId>, TransError> {
+        let locks = draft.locks();
         let conflicts = match desired {
             LockType::Read => {
                 locks.membership().lock_type() == LockType::Write
@@ -276,9 +279,14 @@ impl<'a> NodeLockReconciler<'a> {
             }
             _ => false,
         };
-        if conflicts && let Some(holder) = self.clear_membership(locks, leaf, changes).await? {
+        if conflicts
+            && let Some(holder) = self
+                .clear_membership(draft, collection, requirement)
+                .await?
+        {
             return Ok(Some(holder));
         }
+        let locks = draft.locks_mut();
         match desired {
             LockType::Read if locks.membership().lock_type() != LockType::Write => {
                 self.prune_known_final_readers(locks);
@@ -298,33 +306,34 @@ impl<'a> NodeLockReconciler<'a> {
     /// Admits a publication that takes no node lock, returning a holder that
     /// blocks it.
     ///
-    /// It removes holders with a final status from the node locks. When the
-    /// publication changes the key membership, the membership lock must have
-    /// no live holder, and a membership writer that this removes appends the
-    /// release of its key locks to `changes`. Otherwise, the publication does
-    /// not wait for readers, and its own CAS removes the ones known to be
-    /// final.
+    /// It removes holders with a final status from the node locks of `draft`.
+    /// When the publication changes the key membership, the membership lock
+    /// must have no live holder, and a membership writer that this removes
+    /// puts the release of its key locks into `draft`. Otherwise, the
+    /// publication does not wait for readers, and its own CAS removes the ones
+    /// known to be final. The keys of `collection` resolve at `requirement`.
     pub(crate) async fn admit_publication(
         &self,
-        locks: &mut NodeLocks,
-        leaf: &LeafState<'_>,
+        draft: &mut StageDraft<'_>,
+        collection: &CollectionAddress,
+        requirement: Requirement,
         changes_membership: bool,
-        changes: &mut Vec<(Vec<u8>, LeafEntry)>,
     ) -> Result<Option<TxId>, TransError> {
-        if let Some(holder) = self.admit_non_structural(locks).await? {
+        if let Some(holder) = self.admit_non_structural(draft.locks_mut()).await? {
             return Ok(Some(holder));
         }
         if changes_membership {
-            return self.clear_membership(locks, leaf, changes).await;
+            return self.clear_membership(draft, collection, requirement).await;
         }
-        self.prune_known_final_readers(locks);
+        self.prune_known_final_readers(draft.locks_mut());
         Ok(None)
     }
 
-    /// Removes `holder`, which has a final status, from the membership lock in
-    /// `locks`, and appends to `changes` the release of its write locks and
-    /// create locks in `leaf`. A committed holder is help-forwarded on these
-    /// keys. Keys already in `changes` no longer name the holder.
+    /// Removes `holder`, which has a final status, from the membership lock of
+    /// `draft`, and puts into `draft` the release of its write locks and
+    /// create locks in the staged leaf. A committed holder is help-forwarded
+    /// on these keys. Keys that `draft` already changes no longer name the
+    /// holder.
     ///
     /// A holder leaves the membership write lock only together with these key
     /// locks, so that a key lock outside the membership lock never changes the
@@ -333,29 +342,31 @@ impl<'a> NodeLockReconciler<'a> {
         &self,
         holder: &TxId,
         status: TxCommitStatus,
-        locks: &mut NodeLocks,
-        leaf: &LeafState<'_>,
-        changes: &mut Vec<(Vec<u8>, LeafEntry)>,
+        draft: &mut StageDraft<'_>,
+        collection: &CollectionAddress,
+        requirement: Requirement,
     ) -> Result<(), TransError> {
         debug_assert!(status.is_final(), "{holder} is not final: {status:?}");
-        let exclusive = locks.membership().lock_type() == LockType::Write;
+        let exclusive = draft.locks().membership().lock_type() == LockType::Write;
         if exclusive {
-            for (key, entry) in leaf.entries {
+            for (key, entry) in draft.staged().entries() {
                 if !matches!(entry.lock_type(), LockType::Write | LockType::Create)
                     || !entry.is_locked_by(holder)
-                    || changes.iter().any(|(staged, _)| staged == key)
+                    || draft.drafts(key)
                 {
                     continue;
                 }
                 let mut released = entry.clone();
                 if status == TxCommitStatus::Committed {
-                    released.current = self.committed_current(holder, key, entry, leaf).await?;
+                    released.current = self
+                        .committed_current(holder, key, entry, collection, requirement)
+                        .await?;
                 }
                 released.release_lock(holder);
-                changes.push((key.clone(), released));
+                draft.put(key.clone(), released);
             }
         }
-        locks.remove_membership_holder(holder);
+        draft.locks_mut().remove_membership_holder(holder);
         Ok(())
     }
 
@@ -378,15 +389,16 @@ impl<'a> NodeLockReconciler<'a> {
         holder: &TxId,
         key: &[u8],
         entry: &LeafEntry,
-        leaf: &LeafState<'_>,
+        collection: &CollectionAddress,
+        requirement: Requirement,
     ) -> Result<CurrentState, TransError> {
         let resolved = self
             .key_state
             .resolve_holders(
-                &LogicalKey::new(leaf.collection.clone(), key),
+                &LogicalKey::new(collection.clone(), key),
                 Some(entry),
                 Some(self.id),
-                leaf.requirement,
+                requirement,
             )
             .await?;
         // A committed status is final, so a pending result means the holder
@@ -444,17 +456,17 @@ impl<'a> NodeLockReconciler<'a> {
     /// [`GateAcquisition`], or returns a holder to wait for.
     async fn clear_membership(
         &self,
-        locks: &mut NodeLocks,
-        leaf: &LeafState<'_>,
-        changes: &mut Vec<(Vec<u8>, LeafEntry)>,
+        draft: &mut StageDraft<'_>,
+        collection: &CollectionAddress,
+        requirement: Requirement,
     ) -> Result<Option<TxId>, TransError> {
-        let holders = self.foreign_membership_holders(locks);
+        let holders = self.foreign_membership_holders(draft.locks());
         let statuses = match self.reclaim_holders(&holders).await? {
             Reclaimed::Final(statuses) => statuses,
             Reclaimed::Wait(holder) => return Ok(Some(holder)),
         };
         for (holder, status) in holders.iter().zip(statuses) {
-            self.remove_membership_writer(holder, status, locks, leaf, changes)
+            self.remove_membership_writer(holder, status, draft, collection, requirement)
                 .await?;
         }
         Ok(None)
@@ -533,12 +545,7 @@ impl StructuralGateOperation {
 
 #[async_trait]
 impl MemberPolicy for StructuralGateOperation {
-    async fn resolve(
-        &self,
-        ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, LeafEntry>,
-        staged_locks: &NodeLocks,
-    ) -> Result<Step, TransError> {
+    async fn resolve(&self, ctx: &ResolveCtx<'_>, staged: &StagedLeaf) -> Result<Step, TransError> {
         let reconciler = NodeLockReconciler::with_acquisition(
             ctx.key_state,
             ctx.tmon,
@@ -547,10 +554,10 @@ impl MemberPolicy for StructuralGateOperation {
         );
         let leaf = LeafState {
             collection: leaf_collection(&self.path)?,
-            entries: staged,
+            entries: staged.entries(),
             requirement: ctx.requirement,
         };
-        let (entries, locks) = match reconciler.gate_node(Some(&leaf), staged_locks).await? {
+        let (entries, locks) = match reconciler.gate_node(Some(&leaf), staged.locks()).await? {
             GatedNode::Gated { entries, locks } => (entries.unwrap_or_default(), locks),
             GatedNode::Blocked(GateBlocker::Holder(holder)) => {
                 return Ok(Step::Skip {
@@ -563,19 +570,20 @@ impl MemberPolicy for StructuralGateOperation {
                 });
             }
         };
-        let entries = entries
-            .into_iter()
-            .filter(|(key, entry)| staged.get(key) != Some(entry))
-            .collect();
-        Ok(Step::Stage {
-            entries,
-            locks,
-            admission: StageAdmission::ExistingKeys,
-            outcome: MemberOutcome::Locked {
+        let mut draft = staged.draft();
+        for (key, entry) in entries {
+            if staged.entry(&key) != Some(&entry) {
+                draft.put(key, entry);
+            }
+        }
+        *draft.locks_mut() = locks;
+        Ok(draft.stage(
+            StageAdmission::ExistingKeys,
+            MemberOutcome::Locked {
                 typ: LockType::Write,
                 membership: LockType::None,
             },
-        })
+        ))
     }
 
     fn reorderable(&self) -> bool {

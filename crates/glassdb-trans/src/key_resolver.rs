@@ -266,7 +266,7 @@ impl KeyResolver {
         // each index node only adds a backend read to each validation.
         let mut leaf = self
             .router
-            .route_key_with_requirements(collection, &range.start, Requirement::ANY, requirement)
+            .route_key_checking_leaf(collection, &range.start, requirement)
             .await
             .map_err(|error| error.classify_collection_absence(collection))?;
         if range.is_empty() {
@@ -338,7 +338,7 @@ impl KeyResolver {
                     .collect::<Vec<_>>();
                 let groups = self
                     .router
-                    .route_keys_with_requirements(items, Requirement::ANY, requirement)
+                    .route_keys_checking_leaf(items, requirement)
                     .await?;
 
                 let group_results = map_all_bounded(groups, self.parallelism, |group| async move {
@@ -431,10 +431,10 @@ impl KeyResolver {
     /// Resolves `key` to its routed leaf and effective writer.
     /// An absent key resolves to no writer.
     ///
-    /// `requirement` is forwarded to the descent: same-leaf direct commit passes
-    /// [`Requirement::ANY`] so its eligibility check reuses a leaf already
-    /// cached by the transaction, without a revalidation round-trip; a stale
-    /// copy is caught by the publication's revision-conditional CAS (ADR-030).
+    /// `requirement` is forwarded to the descent and checks only the terminal
+    /// leaf. A transaction body read passes [`Requirement::ANY`], because
+    /// validation checks the read later. A retry passes a stricter
+    /// requirement, for example after a reclaimed transaction record.
     pub(crate) async fn resolve_key(
         &self,
         key: &LogicalKey,
@@ -473,7 +473,7 @@ impl KeyResolver {
         // The same proof applies to batched point routing above.
         let loc = self
             .router
-            .route_key_with_requirements(key.collection(), key.key(), Requirement::ANY, requirement)
+            .route_key_checking_leaf(key.collection(), key.key(), requirement)
             .await
             .map_err(|error| error.classify_collection_absence(key.collection()))?;
         if let Some(node) = loc.node() {

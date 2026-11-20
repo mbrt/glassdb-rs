@@ -230,8 +230,11 @@ impl CheckPipeline {
             let gc = self.gc.clone();
             self.status_reads.push(
                 async move {
-                    // The status read needs evidence from after its own start, so
-                    // that an earlier cached status cannot authorize deletion.
+                    // A cached committed or aborted status is final, so the read
+                    // serves it without a check. The barrier applies to the
+                    // states that can change: a stale absence would report the
+                    // candidate missing, and a stale pending or wounded state
+                    // would decide its outcome.
                     let barrier = gc.timeline.currentness_barrier();
                     let result = gc.filter_candidate(&tid, barrier).await;
                     (tid, result)

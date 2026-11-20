@@ -35,7 +35,8 @@ async fn resolve_step(
         requirement: Requirement::ANY,
         cause,
     };
-    policy.resolve(&ctx, staged, locks).await.unwrap()
+    let staged = StagedLeaf::new(&LeafBody::from_entries(staged.values().cloned()), locks);
+    policy.resolve(&ctx, &staged).await.unwrap()
 }
 
 /// Classifies a direct-commit outcome for a chosen leaf state and reload cause.
@@ -46,9 +47,10 @@ async fn resolve_outcome(
     staged: &BTreeMap<Vec<u8>, LeafEntry>,
     locks: &NodeLocks,
 ) -> MemberOutcome {
-    match resolve_step(policy, tctx, cause, staged, locks).await {
-        Step::Skip { outcome } | Step::Stage { outcome, .. } => outcome,
-    }
+    resolve_step(policy, tctx, cause, staged, locks)
+        .await
+        .outcome()
+        .clone()
 }
 
 fn put_policy(
@@ -73,7 +75,6 @@ fn put_policy(
                 write: Some(DirectWrite::Put(Arc::from(value))),
             }]
             .into(),
-            writes: 1,
             has_reads,
         },
         InlinePolicy::default(),
@@ -805,33 +806,55 @@ async fn direct_membership_change_neither_waits_for_nor_wounds_a_live_holder() {
 #[tokio::test]
 async fn direct_overwrite_removes_membership_readers_known_to_be_final() {
     let (tm, tctx) = new_algo().await;
+    let key = logical_key(b"key");
+    commit_writes(&tm, vec![wa(&key, b"old")]).await;
     let aborted = TxId::with_priority(8, b"aborted");
     let live = TxId::with_priority(9, b"live");
     for holder in [aborted, live] {
         tctx.tmon.begin_tx(&holder);
     }
     tctx.tmon.abort_owned_tx(&aborted).await.unwrap();
-    let key = logical_key(b"key");
-    let staged = BTreeMap::from([(
-        b"key".to_vec(),
-        LeafEntry::new(b"key".to_vec()).with_current(CurrentState::External {
-            writer: TxId::with_priority(1, b"seed"),
-        }),
-    )]);
-    let mut locks = NodeLocks::default();
+    let fresh = || Requirement::after(tctx.timeline.currentness_barrier());
+    let loaded = tctx
+        .nodes
+        .load_leaf(&test_root_path(), fresh())
+        .await
+        .unwrap();
+    let mut edit = loaded.into_edit();
+    let mut locks = edit.locks().clone();
     locks.add_membership_reader(aborted);
     locks.add_membership_reader(live);
-    let direct = put_policy(&tm, TxId::with_priority(2, b"direct"), key, None, b"new");
+    let generation = locks.membership_generation();
+    edit.set_locks(locks);
+    assert!(tctx.nodes.commit_leaf(edit).await.unwrap().is_applied());
 
-    let Step::Stage { locks, .. } =
-        resolve_step(&direct, &tctx, ReloadCause::Fresh, &staged, &locks).await
-    else {
-        panic!("an overwrite with a live reader must stage");
-    };
+    let mut h = begin_accesses(
+        &tm,
+        AccessSet::new(Vec::new(), vec![wa(&key, b"new")], Vec::new()),
+    );
+    let direct = *h.id();
+    tm.commit(&mut h).await.unwrap();
+    tm.end(&mut h).await.unwrap();
+
+    let e = entry(&tctx, b"key").await.unwrap();
+    assert_eq!(
+        e.current,
+        CurrentState::Inline {
+            writer: direct,
+            value: Arc::from(b"new".as_slice()),
+        },
+        "the overwrite took the direct path"
+    );
+    let stored = tctx
+        .nodes
+        .load_leaf(&test_root_path(), fresh())
+        .await
+        .unwrap();
+    let locks = stored.locks();
     assert_eq!(locks.membership().holders(), &[live]);
     assert_eq!(locks.membership().lock_type(), LockType::Read);
     // An absence read compares the generation, which readers never change.
-    assert_eq!(locks.membership_generation(), 0);
+    assert_eq!(locks.membership_generation(), generation);
 }
 
 #[tokio::test]
@@ -907,10 +930,7 @@ async fn a_blind_put_after_an_in_doubt_cas_never_republishes_over_a_newer_writer
     // comes back in doubt.
     assert!(matches!(
         resolve_step(&blind, &tctx, ReloadCause::Fresh, &staged, &locks).await,
-        Step::Stage {
-            outcome: MemberOutcome::Landed,
-            ..
-        }
+        step @ Step::Stage(_) if matches!(step.outcome(), MemberOutcome::Landed)
     ));
 
     // The entry still names that writer, so the in-doubt CAS provably did not
@@ -927,10 +947,7 @@ async fn a_blind_put_after_an_in_doubt_cas_never_republishes_over_a_newer_writer
             &locks,
         )
         .await,
-        Step::Stage {
-            outcome: MemberOutcome::Landed,
-            ..
-        }
+        step @ Step::Stage(_) if matches!(step.outcome(), MemberOutcome::Landed)
     ));
 
     let superseded = BTreeMap::from([(
@@ -981,7 +998,7 @@ async fn an_unchanged_leaf_does_not_prove_that_an_in_doubt_cas_cannot_land() {
     let locks = NodeLocks::default();
     assert!(matches!(
         resolve_step(&policy, &tctx, ReloadCause::Fresh, &staged, &locks).await,
-        Step::Stage { .. }
+        Step::Stage(_)
     ));
 
     // A live holder now blocks the publication, while every output still
@@ -1048,7 +1065,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
             &NodeLocks::default(),
         )
         .await,
-        Step::Stage { .. }
+        Step::Stage(_)
     ));
 
     let recovered = BTreeMap::from([
@@ -1110,7 +1127,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
             &NodeLocks::default(),
         )
         .await,
-        Step::Stage { .. }
+        Step::Stage(_)
     ));
     assert!(matches!(
         resolve_step(
@@ -1163,7 +1180,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
             &NodeLocks::default(),
         )
         .await,
-        Step::Stage { .. }
+        Step::Stage(_)
     ));
     assert!(matches!(
         resolve_step(
@@ -1177,10 +1194,7 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
             &NodeLocks::default(),
         )
         .await,
-        Step::Stage {
-            outcome: MemberOutcome::Landed,
-            ..
-        }
+        step @ Step::Stage(_) if matches!(step.outcome(), MemberOutcome::Landed)
     ));
 }
 
@@ -1715,7 +1729,6 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
             },
         ]
         .into(),
-        writes: 1,
         has_reads: true,
     };
     let policy = DirectCommitOperation::new(

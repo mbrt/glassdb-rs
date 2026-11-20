@@ -9,6 +9,83 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-11-20: direct structural lock CASes beside coordinator rounds
+
+Status: no coordinator round lost its leaf CAS to a structural change. The
+node lock changes that a split or a merge writes with its own CAS cost a round
+at most one extra leaf load, a few times in a run. GLA-22 does not move these
+CASes into the round.
+
+A split or a merge writes some node lock changes with a direct CAS, outside
+the coordinator round: the release of its structural gate
+(`StructuralNodeAccess::release_structural_gate`) and the removal of a merge
+reservation or the abandon of a merge (`update_node`). The question was
+whether these CASes make the rounds on the same leaf slower. A direct CAS
+that lands first makes the round reload, plan again, back off and CAS again.
+
+No experiment showed this. `split-merge-fight` (both starts) and
+`membership-churn` have no splits and no merges in the warm-up or in the
+measure window at `52d04f0ea`. So the new experiment `structural-rounds`
+keeps the leaves changing during the measurement, with small leaves
+(`leaf-max-entries = 16`, `leaf-min-entries = 4`) on one database instance:
+
+- `grow`: four workers create keys 1 to 511 in ascending order, except the
+  keys of the writers, so the leaves split.
+- `shrink`: four workers delete the same keys, so the leaves merge.
+- `quiet`: the writers alone, after 60 s with no split and no merge.
+- In all three cells, four writers do read-modify-write on keys 0, 128, 256
+  and 384.
+
+A temporary patch counted these direct CASes on leaves, and the ones that
+another write rejected (`TopologyStats::direct_lock_writes`, reported by
+perfbench in the `measure` section). It was removed after the measurement,
+because the result changed no decision. All runs used `--time=virtual
+--latency-jitter=false --runs=1`.
+
+Results of three runs on `52d04f0ea` with the experiment and the patch:
+
+| Cell | Splits | Merges | Direct lock CASes | Rejected | Coordinator CAS retries | Ops per tx |
+| --- | --- | --- | --- | --- | --- | --- |
+| `grow` | 42, 42, 40 | 0, 0, 0 | 30, 27, 26 | 0, 0, 0 | 3, 4, 2 | 1.43, 1.44, 1.39 |
+| `shrink` | 0, 1, 3 | 23, 23, 20 | 30, 28, 28 | 0, 0, 0 | 0, 0, 0 | 1.57, 1.59, 1.49 |
+| `quiet` | 0, 0, 0 | 0, 3, 2 | 7, 12, 8 | 0, 0, 0 | 0, 0, 0 | 1.26, 1.92, 1.33 |
+
+The rejected count shows only one side of the race: a direct CAS that a round
+write made fail. A round that loses to a direct CAS shows in the
+coordinator CAS retries. A temporary patch of `CasWorker::attempt` logged each
+retry of a round and the state of the leaf, in three more runs:
+
+- No round CAS was rejected. This covers every write that can race a round,
+  also the absorb of a merge, which is not a lock change.
+- All retries (4 in each run, all in `grow`) were precondition misses. The
+  round loaded a leaf that a split held with its structural gate, so its one
+  member got `Wait`, and the round sent no CAS. The split then wrote the leaf
+  before the check of the clean plan, so the round loaded the leaf again.
+
+So a direct CAS costs a round at most one leaf load, and only when the round
+plans nothing. A round in the same CAS as the gate release could avoid that
+load only if the coordinator planned the release first, which the member
+order of ADR-028 does not do.
+
+The direct CASes are about 0.7 for each split (26 to 30 for 40 to 42 splits)
+and 1.3 for each merge (28 to 30 for 20 to 23 merges). Changes that stop
+before they complete release their gate too: `quiet` has 7 to 12 of them for
+0 to 3 merges. That is 1 to 2% of the backend operations of `grow` and
+`shrink`, in a load that does little else. Moving them into the round would
+save some of these writes, only when a round of the same leaf happens to be in
+flight. That gain does not pay for the risks of a structural member in the
+round: an error of one member ends the round for all members, capacity
+admission must never reject a stage that only removes locks, and the member
+must handle a CAS in doubt.
+
+The counters do not repeat exactly: the splits of `grow` vary from 39 to 44
+over all runs, and the transactions of each cell vary too. The splits and
+merges are background work, and their order varies also in virtual time
+without latency jitter. So `structural-rounds` has the tag `extra`, not
+`ci/counters`. The `quiet` cell can still merge during its measure window,
+after 60 s with no change, because the last merges of the leaves of the
+writers come later than that.
+
 ## 2026-11-18: backend operations on the collection record
 
 Status: the collection record (`_i`) has at most 1.8% of the backend

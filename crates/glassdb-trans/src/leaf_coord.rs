@@ -48,6 +48,9 @@ use crate::key_state_resolver::KeyStateResolver;
 use crate::monitor::Monitor;
 use crate::retry_timing::RetryTiming;
 
+mod stage;
+pub(crate) use stage::{StageDraft, StagedLeaf};
+
 /// Maximum inner CAS retries on a single leaf/root before treating the
 /// operation as conflicted and restarting the transaction.
 pub(crate) const CAS_RETRIES: usize = 50;
@@ -275,13 +278,8 @@ pub(crate) enum StageAdmission {
 pub(crate) enum Step {
     /// Apply these entry changes and replace the running node-lock state. The
     /// coordinator alone owns the node's topology, body reconstruction, and
-    /// capacity admission.
-    Stage {
-        entries: Vec<(Vec<u8>, LeafEntry)>,
-        locks: NodeLocks,
-        admission: StageAdmission,
-        outcome: MemberOutcome,
-    },
+    /// capacity admission. Only [`StageDraft::stage`] makes a stage.
+    Stage(ProposedStage),
     /// Propose no changes. Delivery still waits for successful persistence if
     /// another member staged changes, because this outcome can depend on them.
     /// A direct-commit member that reports `Landed` also protects its existing markers
@@ -290,9 +288,10 @@ pub(crate) enum Step {
 }
 
 impl Step {
-    fn outcome(&self) -> &MemberOutcome {
+    /// Returns the member outcome of this decision.
+    pub(crate) fn outcome(&self) -> &MemberOutcome {
         match self {
-            Step::Stage { outcome, .. } | Step::Skip { outcome } => outcome,
+            Step::Stage(ProposedStage { outcome, .. }) | Step::Skip { outcome } => outcome,
         }
     }
 }
@@ -318,8 +317,9 @@ pub(crate) trait MemberPolicy: Send + Sync {
     /// remember an exact own marker; other policies need no initial leaf state.
     fn observe_loaded(&self, _entries: &BTreeMap<Vec<u8>, LeafEntry>) {}
 
-    /// Resolves this member against entries and node locks as currently staged
-    /// this round. Policies cannot mutate node topology.
+    /// Resolves this member against the leaf as currently staged this round,
+    /// usually by drafting its stage with [`StagedLeaf::draft`]. Policies
+    /// cannot mutate node topology.
     ///
     /// Use `ctx.requirement` for dependent object reads. The leaf state can
     /// predate that bound; the coordinator confirms it by CAS or a currentness
@@ -333,12 +333,7 @@ pub(crate) trait MemberPolicy: Send + Sync {
     /// new stage must already be safe to apply zero or one additional time.
     /// That reconciliation must remain valid even if this plan is discarded or
     /// its CAS is rejected.
-    async fn resolve(
-        &self,
-        ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, LeafEntry>,
-        staged_locks: &NodeLocks,
-    ) -> Result<Step, TransError>;
+    async fn resolve(&self, ctx: &ResolveCtx<'_>, staged: &StagedLeaf) -> Result<Step, TransError>;
 
     /// Whether this member may join any in-flight round instead of FIFO-blocking
     /// behind an unrelated writer. Read-only acquires, releases, and write-backs
@@ -562,8 +557,7 @@ struct PlannedMember {
 }
 
 struct MutationPlan {
-    entries: BTreeMap<Vec<u8>, LeafEntry>,
-    locks: NodeLocks,
+    staged: StagedLeaf,
     members: Vec<PlannedMember>,
     // Whether a staged member makes the leaf write a topology signal.
     signals_topology: bool,
@@ -583,7 +577,9 @@ impl MutationPlan {
     }
 }
 
-struct ProposedStage {
+/// The entry changes, node locks, capacity admission, and outcome of one
+/// member's stage.
+pub(crate) struct ProposedStage {
     entries: Vec<(Vec<u8>, LeafEntry)>,
     locks: NodeLocks,
     admission: StageAdmission,
@@ -729,13 +725,7 @@ impl CasWorker {
         in_doubt: &mut InDoubtMembers,
     ) -> Result<MutationPlan, TransError> {
         let mut plan = MutationPlan {
-            entries: edit
-                .entries()
-                .entries()
-                .cloned()
-                .map(|e| (e.key.clone(), e))
-                .collect(),
-            locks: edit.locks().clone(),
+            staged: StagedLeaf::new(edit.entries(), edit.locks()),
             members: Vec::with_capacity(members.len()),
             signals_topology: false,
         };
@@ -748,7 +738,7 @@ impl CasWorker {
         // member evaluation order. Give every member a chance to retain it before a
         // preceding publisher can replace the corresponding entry in memory.
         for member in members.values() {
-            member.policy.observe_loaded(&plan.entries);
+            member.policy.observe_loaded(plan.staged.entries());
         }
         // A direct-commit stage is its commit's only evidence, so another member may
         // not overwrite it before the shared CAS (ADR-051).
@@ -799,43 +789,27 @@ impl CasWorker {
                 continue;
             }
 
-            let step = member
-                .policy
-                .resolve(&ctx, &plan.entries, &plan.locks)
-                .await?;
+            let step = member.policy.resolve(&ctx, &plan.staged).await?;
             // The new CAS from the expected state either lands, which fences
             // the in-doubt CAS, or fails, and then the doubt stays.
-            let restaged = !cas_fenced && matches!(step, Step::Stage { .. });
+            let restaged = !cas_fenced && matches!(step, Step::Stage(_));
             if member_in_doubt && !restaged && !matches!(step.outcome(), MemberOutcome::InDoubt(_))
             {
                 in_doubt.remove(tx);
             }
             let member_in_doubt = in_doubt.contains_key(tx);
             match step {
-                Step::Stage {
-                    entries: changes,
-                    locks,
-                    admission,
-                    outcome,
-                } => {
-                    let proposed = ProposedStage {
-                        entries: changes,
-                        locks,
-                        admission,
-                        outcome,
-                    };
+                Step::Stage(proposed) => {
                     match self.capacity_decision(
                         path,
                         edit,
                         member.policy.as_ref(),
                         member_in_doubt,
-                        &plan.entries,
+                        &plan.staged,
                         proposed,
                     )? {
                         CapacityDecision::Admitted(proposed) => {
-                            for (key, entry) in proposed.entries {
-                                plan.entries.insert(key, entry);
-                            }
+                            plan.staged.apply(proposed.entries, proposed.locks);
                             protected_markers.extend(
                                 member
                                     .policy
@@ -843,7 +817,6 @@ impl CasWorker {
                                     .into_iter()
                                     .map(<[u8]>::to_vec),
                             );
-                            plan.locks = proposed.locks;
                             plan.signals_topology |= member.policy.signals_topology();
                             plan.members.push(PlannedMember {
                                 id: *tx,
@@ -888,21 +861,11 @@ impl CasWorker {
         edit: &LeafEdit,
         policy: &dyn MemberPolicy,
         in_doubt: bool,
-        entries: &BTreeMap<Vec<u8>, LeafEntry>,
+        staged: &StagedLeaf,
         proposed: ProposedStage,
     ) -> Result<CapacityDecision, TransError> {
-        let mut candidate_entries = entries.clone();
-        for (key, entry) in &proposed.entries {
-            candidate_entries.insert(key.clone(), entry.clone());
-        }
-        let candidate_leaf = LeafBody::from_entries(
-            candidate_entries
-                .values()
-                .filter(|entry| !entry.is_vestigial())
-                .cloned(),
-        );
         let mut candidate_node = edit.node().clone();
-        candidate_node.set_leaf(candidate_leaf.clone())?;
+        candidate_node.set_leaf(staged.leaf_with(&proposed.entries))?;
         candidate_node.set_locks(proposed.locks.clone());
         let (inline_publication, direct_adds_key, pressure_hint) = match proposed.admission {
             StageAdmission::InlinePublication {
@@ -914,7 +877,7 @@ impl CasWorker {
         let create_full = (proposed.admission == StageAdmission::AddsEntries || direct_adds_key)
             && (candidate_node.content_encoded_len()
                 > self.core.config.node_size_policy.content_limit()
-                || self.content_len(edit, entries)?
+                || self.content_len(edit, staged)?
                     > self.core.config.node_size_policy.create_limit());
         let inline_entry_full = inline_publication
             && proposed.entries.iter().any(|(_, entry)| {
@@ -933,7 +896,7 @@ impl CasWorker {
 
         if proposed.admission == StageAdmission::AddsEntries
             && create_full
-            && self.never_fits(entries, &proposed)
+            && self.never_fits(staged.entries(), &proposed)
         {
             return Ok(CapacityDecision::Rejected(MemberOutcome::Oversized));
         }
@@ -952,19 +915,11 @@ impl CasWorker {
         Ok(CapacityDecision::Rejected(outcome))
     }
 
-    /// Returns the content size of the leaf of `edit` with `entries`.
-    fn content_len(
-        &self,
-        edit: &LeafEdit,
-        entries: &BTreeMap<Vec<u8>, LeafEntry>,
-    ) -> Result<usize, TransError> {
+    /// Returns the content size of the leaf of `edit` with the entries of
+    /// `staged`.
+    fn content_len(&self, edit: &LeafEdit, staged: &StagedLeaf) -> Result<usize, TransError> {
         let mut node = edit.node().clone();
-        node.set_leaf(LeafBody::from_entries(
-            entries
-                .values()
-                .filter(|entry| !entry.is_vestigial())
-                .cloned(),
-        ))?;
+        node.set_leaf(staged.leaf())?;
         Ok(node.content_encoded_len())
     }
 
@@ -1030,13 +985,9 @@ impl CasWorker {
         // same CAS that clears the last holder — keeps nodes tidy on
         // every path (acquire / write-back / release, ADR-029) instead
         // of leaving dead entries for a later GC cycle.
-        let new_leaf = LeafBody::from_entries(
-            std::mem::take(&mut plan.entries)
-                .into_values()
-                .filter(|entry| !entry.is_vestigial()),
-        );
+        let new_leaf = plan.staged.take_leaf();
         edit.set_entries(new_leaf.clone());
-        edit.set_locks(plan.locks.clone());
+        edit.set_locks(plan.staged.locks().clone());
         match self.core.nodes.commit_leaf(edit).await {
             // Hint the background restructurer if this write left the leaf
             // over the soft cap (ADR-031); the restructurer reloads and
@@ -1737,11 +1688,10 @@ mod tests {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            staged: &BTreeMap<Vec<u8>, LeafEntry>,
-            staged_locks: &NodeLocks,
+            staged: &StagedLeaf,
         ) -> Result<Step, TransError> {
             let mut e = staged
-                .get(&self.key)
+                .entry(&self.key)
                 .cloned()
                 .unwrap_or_else(|| entry(&self.key, LockType::None, None, None));
             if self.admission == StageAdmission::AddsEntries {
@@ -1749,15 +1699,15 @@ mod tests {
             } else {
                 e.replace_write_lock(self.tx);
             }
-            Ok(Step::Stage {
-                entries: vec![(self.key.clone(), e)],
-                locks: staged_locks.clone(),
-                admission: self.admission,
-                outcome: MemberOutcome::Locked {
+            let mut draft = staged.draft();
+            draft.put(self.key.clone(), e);
+            Ok(draft.stage(
+                self.admission,
+                MemberOutcome::Locked {
                     typ: LockType::Write,
                     membership: LockType::None,
                 },
-            })
+            ))
         }
 
         fn reorderable(&self) -> bool {
@@ -1812,8 +1762,7 @@ mod tests {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
-            _staged_locks: &NodeLocks,
+            _staged: &StagedLeaf,
         ) -> Result<Step, TransError> {
             Ok(Step::Skip {
                 outcome: MemberOutcome::Released {
@@ -1849,22 +1798,18 @@ mod tests {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            staged: &BTreeMap<Vec<u8>, LeafEntry>,
-            staged_locks: &NodeLocks,
+            staged: &StagedLeaf,
         ) -> Result<Step, TransError> {
             self.trace
                 .lock()
                 .unwrap()
-                .push((self.tx, staged.keys().cloned().collect()));
-            Ok(Step::Stage {
-                entries: vec![(
-                    self.key.clone(),
-                    entry(&self.key, LockType::None, None, Some(&self.tx)),
-                )],
-                locks: staged_locks.clone(),
-                admission: StageAdmission::ExistingKeys,
-                outcome: MemberOutcome::Landed,
-            })
+                .push((self.tx, staged.entries().keys().cloned().collect()));
+            let mut draft = staged.draft();
+            draft.put(
+                self.key.clone(),
+                entry(&self.key, LockType::None, None, Some(&self.tx)),
+            );
+            Ok(draft.stage(StageAdmission::ExistingKeys, MemberOutcome::Landed))
         }
 
         fn reorderable(&self) -> bool {
@@ -1889,17 +1834,16 @@ mod tests {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
-            staged: &BTreeMap<Vec<u8>, LeafEntry>,
-            locks: &NodeLocks,
+            staged: &StagedLeaf,
         ) -> Result<Step, TransError> {
             self.requirements.lock().unwrap().push(ctx.requirement);
-            if self.stage_until_present && !staged.contains_key(b"driver".as_slice()) {
+            if self.stage_until_present && !staged.entries().contains_key(b"driver".as_slice()) {
                 return StageLock {
                     tx: self.tx,
                     key: b"driver".to_vec(),
                     admission: StageAdmission::ExistingKeys,
                 }
-                .resolve(ctx, staged, locks)
+                .resolve(ctx, staged)
                 .await;
             }
             let has_peer = match &self.dependency {
@@ -1909,7 +1853,7 @@ mod tests {
                     .entries()
                     .lookup(b"peer")
                     .is_some(),
-                None => staged.contains_key(b"peer".as_slice()),
+                None => staged.entries().contains_key(b"peer".as_slice()),
             };
             Ok(Step::Skip {
                 outcome: if has_peer {
@@ -2165,8 +2109,7 @@ mod tests {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
-            staged: &BTreeMap<Vec<u8>, LeafEntry>,
-            locks: &NodeLocks,
+            staged: &StagedLeaf,
         ) -> Result<Step, TransError> {
             {
                 let mut requested = self.requested.lock().unwrap();
@@ -2176,7 +2119,7 @@ mod tests {
                     return Err(TransError::ValidateRetry(requirement));
                 }
             }
-            SkipRelease.resolve(ctx, staged, locks).await
+            SkipRelease.resolve(ctx, staged).await
         }
 
         fn reorderable(&self) -> bool {
@@ -3448,19 +3391,15 @@ mod tests {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
-            staged_locks: &NodeLocks,
+            staged: &StagedLeaf,
         ) -> Result<Step, TransError> {
             let e = LeafEntry::new(self.key.clone()).with_current(CurrentState::Inline {
                 writer: self.tx,
                 value: self.value.clone(),
             });
-            Ok(Step::Stage {
-                entries: vec![(self.key.clone(), e)],
-                locks: staged_locks.clone(),
-                admission: StageAdmission::ExistingKeys,
-                outcome: MemberOutcome::Landed,
-            })
+            let mut draft = staged.draft();
+            draft.put(self.key.clone(), e);
+            Ok(draft.stage(StageAdmission::ExistingKeys, MemberOutcome::Landed))
         }
 
         fn reorderable(&self) -> bool {
@@ -3532,31 +3471,22 @@ mod tests {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
-            staged_locks: &NodeLocks,
+            staged: &StagedLeaf,
         ) -> Result<Step, TransError> {
             if self.already_landed {
                 return Ok(Step::Skip {
                     outcome: MemberOutcome::Landed,
                 });
             }
-            let entries = self
-                .keys
-                .iter()
-                .map(|key| {
-                    let entry = LeafEntry::new(key.clone()).with_current(CurrentState::Inline {
-                        writer: self.tx,
-                        value: Arc::from(self.tx.as_bytes().as_slice()),
-                    });
-                    (key.clone(), entry)
-                })
-                .collect();
-            Ok(Step::Stage {
-                entries,
-                locks: staged_locks.clone(),
-                admission: StageAdmission::ExistingKeys,
-                outcome: MemberOutcome::Landed,
-            })
+            let mut draft = staged.draft();
+            for key in &self.keys {
+                let entry = LeafEntry::new(key.clone()).with_current(CurrentState::Inline {
+                    writer: self.tx,
+                    value: Arc::from(self.tx.as_bytes().as_slice()),
+                });
+                draft.put(key.clone(), entry);
+            }
+            Ok(draft.stage(StageAdmission::ExistingKeys, MemberOutcome::Landed))
         }
 
         fn reorderable(&self) -> bool {
@@ -3852,8 +3782,7 @@ mod tests {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
-            _staged_locks: &NodeLocks,
+            _staged: &StagedLeaf,
         ) -> Result<Step, TransError> {
             let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true, .. });
             let outcome = if in_doubt {
@@ -4263,22 +4192,21 @@ mod tests {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
-            staged_locks: &NodeLocks,
+            staged: &StagedLeaf,
         ) -> Result<Step, TransError> {
             let e = LeafEntry::new(self.key.clone()).with_current(CurrentState::Inline {
                 writer: self.tx,
                 value: self.value.clone(),
             });
-            Ok(Step::Stage {
-                entries: vec![(self.key.clone(), e)],
-                locks: staged_locks.clone(),
-                admission: StageAdmission::InlinePublication {
+            let mut draft = staged.draft();
+            draft.put(self.key.clone(), e);
+            Ok(draft.stage(
+                StageAdmission::InlinePublication {
                     adds_key: false,
                     pressure_hint: true,
                 },
-                outcome: MemberOutcome::Landed,
-            })
+                MemberOutcome::Landed,
+            ))
         }
 
         fn reorderable(&self) -> bool {
@@ -4419,8 +4347,7 @@ mod tests {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
-            staged_locks: &NodeLocks,
+            staged: &StagedLeaf,
         ) -> Result<Step, TransError> {
             let evaluation = self.evaluations.fetch_add(1, Ordering::SeqCst);
             let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true, .. });
@@ -4440,12 +4367,9 @@ mod tests {
                 writer: self.tx,
                 value,
             });
-            Ok(Step::Stage {
-                entries: vec![(self.key.clone(), entry)],
-                locks: staged_locks.clone(),
-                admission: StageAdmission::ExistingKeys,
-                outcome: MemberOutcome::Landed,
-            })
+            let mut draft = staged.draft();
+            draft.put(self.key.clone(), entry);
+            Ok(draft.stage(StageAdmission::ExistingKeys, MemberOutcome::Landed))
         }
 
         fn reorderable(&self) -> bool {
@@ -4701,19 +4625,15 @@ mod tests {
         async fn resolve(
             &self,
             ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
-            staged_locks: &NodeLocks,
+            staged: &StagedLeaf,
         ) -> Result<Step, TransError> {
             if self.evaluations.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Ok(Step::Stage {
-                    entries: vec![(
-                        self.key.clone(),
-                        entry(&self.key, LockType::Write, Some(&self.tx), None),
-                    )],
-                    locks: staged_locks.clone(),
-                    admission: StageAdmission::ExistingKeys,
-                    outcome: MemberOutcome::Landed,
-                });
+                let mut draft = staged.draft();
+                draft.put(
+                    self.key.clone(),
+                    entry(&self.key, LockType::Write, Some(&self.tx), None),
+                );
+                return Ok(draft.stage(StageAdmission::ExistingKeys, MemberOutcome::Landed));
             }
             let in_doubt = matches!(ctx.cause, ReloadCause::Reloaded { in_doubt: true, .. });
             *self.seen_in_doubt.lock().unwrap() = Some(in_doubt);
@@ -4855,18 +4775,14 @@ mod tests {
         async fn resolve(
             &self,
             _ctx: &ResolveCtx<'_>,
-            _staged: &BTreeMap<Vec<u8>, LeafEntry>,
-            staged_locks: &NodeLocks,
+            staged: &StagedLeaf,
         ) -> Result<Step, TransError> {
-            Ok(Step::Stage {
-                entries: vec![(
-                    self.key.clone(),
-                    entry(&self.key, LockType::Write, Some(&self.tx), None),
-                )],
-                locks: staged_locks.clone(),
-                admission: StageAdmission::ExistingKeys,
-                outcome: MemberOutcome::Landed,
-            })
+            let mut draft = staged.draft();
+            draft.put(
+                self.key.clone(),
+                entry(&self.key, LockType::Write, Some(&self.tx), None),
+            );
+            Ok(draft.stage(StageAdmission::ExistingKeys, MemberOutcome::Landed))
         }
 
         fn reorderable(&self) -> bool {
