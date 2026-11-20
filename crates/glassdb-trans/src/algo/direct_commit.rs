@@ -588,7 +588,7 @@ impl MemberPolicy for DirectCommitOperation {
         // Unchanged predecessors prove only that the in-doubt CAS has not
         // landed yet, while the leaf stays in the state it expected. Only a new
         // CAS from that state can fence it, so any other decision stays in doubt.
-        if in_doubt && !cas_fenced && !matches!(step, Step::Stage { .. }) {
+        if in_doubt && !cas_fenced && !matches!(step, Step::Stage(_)) {
             return Ok(Step::Skip {
                 outcome: self.in_doubt_outcome(),
             });

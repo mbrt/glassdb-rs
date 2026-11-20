@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use glassdb_storage::{LeafBody, LeafEntry, NodeLocks};
 
-use super::{MemberOutcome, StageAdmission, Step};
+use super::{MemberOutcome, ProposedStage, StageAdmission, Step};
 
 /// The entries and node locks of one leaf after the loaded state and the
 /// admitted stages of the earlier members of the round (ADR-028).
@@ -156,11 +156,11 @@ impl<'a> StageDraft<'a> {
 
     /// Proposes this draft as the member's stage.
     pub(crate) fn stage(self, admission: StageAdmission, outcome: MemberOutcome) -> Step {
-        Step::Stage {
+        Step::Stage(ProposedStage {
             entries: self.entries.into_iter().collect(),
             locks: self.locks,
             admission,
             outcome,
-        }
+        })
     }
 }
