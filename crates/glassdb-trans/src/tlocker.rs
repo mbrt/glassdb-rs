@@ -39,7 +39,7 @@ use glassdb_data::{LeafRef, LogicalKey, ObjectPath, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock};
 use glassdb_storage::{
     CurrentState, CurrentnessBarrier, KeyLockState, LeafEntry, LeafObservation, LockType,
-    NodeLocks, Requirement, StorageError, TreeRouter,
+    Requirement, StorageError, TreeRouter,
 };
 
 use crate::access::{AccessSet, WriteOp};
@@ -47,10 +47,10 @@ use crate::collection_coordination::{CollectionLocker, CollectionStateResolver};
 use crate::error::TransError;
 use crate::leaf_coord::{
     CoordinatedOutcome, CoordinationEvidence, LeafCoordinator, LeafOperation, MemberOutcome,
-    MemberPolicy, ResolveCtx, StageAdmission, Step,
+    MemberPolicy, ResolveCtx, StageAdmission, StageDraft, StagedLeaf, Step,
 };
 use crate::monitor::Monitor;
-use crate::node_locking::{LeafState, NodeLockReconciler, leaf_collection};
+use crate::node_locking::{NodeLockReconciler, leaf_collection};
 use crate::retry_timing::RetryTiming;
 use crate::wound_wait::{Reclaim, try_reclaim};
 
@@ -374,26 +374,20 @@ struct AcquireOperation {
 
 #[async_trait]
 impl MemberPolicy for AcquireOperation {
-    async fn resolve(
-        &self,
-        ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, LeafEntry>,
-        staged_locks: &NodeLocks,
-    ) -> Result<Step, TransError> {
-        let mut locks = staged_locks.clone();
+    async fn resolve(&self, ctx: &ResolveCtx<'_>, staged: &StagedLeaf) -> Result<Step, TransError> {
+        let mut draft = staged.draft();
         let reconciler = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id);
-        if let Some(holder) = reconciler.admit_non_structural(&mut locks).await? {
+        if let Some(holder) = reconciler.admit_non_structural(draft.locks_mut()).await? {
             return Ok(Step::Skip {
                 outcome: MemberOutcome::Wait(holder),
             });
         }
         let mut membership = self.membership;
         let mut admission = StageAdmission::ExistingKeys;
-        let mut entries = Vec::with_capacity(self.intents.len());
         // The holders that this stage removed from its own entries.
         let mut removed = BTreeSet::new();
         for intent in self.intents.iter() {
-            let cur = staged.get(&intent.raw_key).cloned();
+            let cur = staged.entry(&intent.raw_key).cloned();
             // The lock of an absent key needs a new entry, also for a read or
             // a delete (ADR-093).
             let adds_entry = cur.as_ref().is_none_or(LeafEntry::is_vestigial);
@@ -414,7 +408,7 @@ impl MemberPolicy for AcquireOperation {
                     if adds_entry || (changes_membership && intent.desired == Desired::Put) {
                         admission = StageAdmission::AddsEntries;
                     }
-                    entries.push((intent.raw_key.clone(), entry));
+                    draft.put(intent.raw_key.clone(), entry);
                 }
                 // A member stages all its keys or none (member atomicity): the
                 // moment a key must wait, stage nothing and return Wait.
@@ -428,39 +422,25 @@ impl MemberPolicy for AcquireOperation {
 
         if membership != LockType::None {
             let collection = leaf_collection(&self.path)?;
-            let leaf = LeafState {
-                collection,
-                entries: staged,
-                requirement: ctx.requirement,
-            };
             if let Some(holder) = reconciler
-                .acquire_membership(&mut locks, membership, &leaf, &mut entries)
+                .acquire_membership(&mut draft, membership, collection, ctx.requirement)
                 .await?
             {
                 return Ok(Step::Skip {
                     outcome: MemberOutcome::Wait(holder),
                 });
             }
-            membership = locks.membership().lock_type();
+            membership = draft.locks().membership().lock_type();
         }
         let outcome = MemberOutcome::Locked {
             typ: key_lock_type(&self.intents),
             membership,
         };
-        let retained = locks == *staged_locks
-            && entries
-                .iter()
-                .all(|(key, entry)| staged.get(key) == Some(entry));
-        if retained {
+        if draft.is_unchanged() {
             return Ok(Step::Skip { outcome });
         }
-        sweep_aborted_holders(ctx.tmon, &removed, staged, &mut entries);
-        Ok(Step::Stage {
-            entries,
-            locks,
-            admission,
-            outcome,
-        })
+        sweep_aborted_holders(ctx.tmon, &removed, &mut draft);
+        Ok(draft.stage(admission, outcome))
     }
 
     fn reorderable(&self) -> bool {
@@ -554,21 +534,16 @@ struct WriteBackOperation {
 
 #[async_trait]
 impl MemberPolicy for WriteBackOperation {
-    async fn resolve(
-        &self,
-        ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, LeafEntry>,
-        staged_locks: &NodeLocks,
-    ) -> Result<Step, TransError> {
+    async fn resolve(&self, ctx: &ResolveCtx<'_>, staged: &StagedLeaf) -> Result<Step, TransError> {
         let owns_entry = self.intents.iter().any(|intent| {
             staged
-                .get(&intent.raw_key)
+                .entry(&intent.raw_key)
                 .is_some_and(|entry| entry.is_locked_by(&self.id))
         });
-        let owns_membership = staged_locks.membership().contains(&self.id);
-        let mut locks = staged_locks.clone();
+        let owns_membership = staged.locks().membership().contains(&self.id);
+        let mut draft = staged.draft();
         if let Some(holder) = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id)
-            .admit_non_structural(&mut locks)
+            .admit_non_structural(draft.locks_mut())
             .await?
         {
             if !owns_entry && !owns_membership {
@@ -582,21 +557,13 @@ impl MemberPolicy for WriteBackOperation {
                 outcome: MemberOutcome::Wait(holder),
             });
         }
-        let WritebackStaged {
-            changes,
-            superseded,
-        } = writeback_changes(&self.id, &self.intents, staged);
+        let superseded = writeback_changes(&self.id, &self.intents, &mut draft);
         let outcome = MemberOutcome::Released { superseded };
-        let locks_changed = locks.release_membership(&self.id);
-        if changes.is_empty() && !locks_changed {
+        let locks_changed = draft.locks_mut().release_membership(&self.id);
+        if !draft.changes_entries() && !locks_changed {
             Ok(Step::Skip { outcome })
         } else {
-            Ok(Step::Stage {
-                entries: changes,
-                locks,
-                admission: StageAdmission::ExistingKeys,
-                outcome,
-            })
+            Ok(draft.stage(StageAdmission::ExistingKeys, outcome))
         }
     }
 
@@ -686,17 +653,15 @@ struct ReleaseOperation {
 
 #[async_trait]
 impl MemberPolicy for ReleaseOperation {
-    async fn resolve(
-        &self,
-        ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, LeafEntry>,
-        staged_locks: &NodeLocks,
-    ) -> Result<Step, TransError> {
-        let owns_entry = staged.values().any(|entry| entry.is_locked_by(&self.id));
-        let owns_membership = staged_locks.membership().contains(&self.id);
-        let mut locks = staged_locks.clone();
+    async fn resolve(&self, ctx: &ResolveCtx<'_>, staged: &StagedLeaf) -> Result<Step, TransError> {
+        let owns_entry = staged
+            .entries()
+            .values()
+            .any(|entry| entry.is_locked_by(&self.id));
+        let owns_membership = staged.locks().membership().contains(&self.id);
+        let mut draft = staged.draft();
         if let Some(holder) = NodeLockReconciler::new(ctx.key_state, ctx.tmon, &self.id)
-            .admit_non_structural(&mut locks)
+            .admit_non_structural(draft.locks_mut())
             .await?
         {
             if !owns_entry && !owns_membership {
@@ -710,20 +675,15 @@ impl MemberPolicy for ReleaseOperation {
                 outcome: MemberOutcome::Wait(holder),
             });
         }
-        let changes = release_changes(&self.id, staged);
+        release_changes(&self.id, &mut draft);
         let outcome = MemberOutcome::Released {
             superseded: Vec::new(),
         };
-        let locks_changed = locks.release_membership(&self.id);
-        if changes.is_empty() && !locks_changed {
+        let locks_changed = draft.locks_mut().release_membership(&self.id);
+        if !draft.changes_entries() && !locks_changed {
             Ok(Step::Skip { outcome })
         } else {
-            Ok(Step::Stage {
-                entries: changes,
-                locks,
-                admission: StageAdmission::ExistingKeys,
-                outcome,
-            })
+            Ok(draft.stage(StageAdmission::ExistingKeys, outcome))
         }
     }
 
@@ -800,13 +760,6 @@ enum EntryResolution {
     Locked(LeafEntry, bool),
     /// A live pending holder this transaction does not outrank: wait for it.
     Wait(TxId),
-}
-
-/// The staged result of a write-back: the entry changes to apply and the
-/// transaction-object references they superseded (GC candidates, ADR-022).
-struct WritebackStaged {
-    changes: Vec<(Vec<u8>, LeafEntry)>,
-    superseded: Vec<TxId>,
 }
 
 enum WriteBackOutcome {
@@ -901,17 +854,12 @@ async fn resolve_and_lock(
     Ok(EntryResolution::Locked(e, changes_membership))
 }
 
-/// Removes from the other entries of the leaf the locks of each holder in
-/// `removed` whose aborted or wounded status this instance already knows.
-/// A holder in `removed` left an entry of the stage, so the stage writes the
-/// leaf anyway, and this adds no request. A committed holder keeps its other
-/// locks, because write-back or help-forward still needs them.
-fn sweep_aborted_holders(
-    tmon: &Monitor,
-    removed: &BTreeSet<TxId>,
-    staged: &BTreeMap<Vec<u8>, LeafEntry>,
-    entries: &mut Vec<(Vec<u8>, LeafEntry)>,
-) {
+/// Removes from the entries that `draft` does not change the locks of each
+/// holder in `removed` whose aborted or wounded status this instance already
+/// knows. A holder in `removed` left an entry of the stage, so the stage
+/// writes the leaf anyway, and this adds no request. A committed holder keeps
+/// its other locks, because write-back or help-forward still needs them.
+fn sweep_aborted_holders(tmon: &Monitor, removed: &BTreeSet<TxId>, draft: &mut StageDraft<'_>) {
     let aborted: Vec<&TxId> = removed
         .iter()
         .filter(|holder| {
@@ -924,8 +872,8 @@ fn sweep_aborted_holders(
     if aborted.is_empty() {
         return;
     }
-    for (key, entry) in staged {
-        if entries.iter().any(|(staged_key, _)| staged_key == key) {
+    for (key, entry) in draft.staged().entries() {
+        if draft.drafts(key) {
             continue;
         }
         let mut swept = entry.clone();
@@ -934,22 +882,20 @@ fn sweep_aborted_holders(
             changed |= swept.release_lock(holder);
         }
         if changed {
-            entries.push((key.clone(), swept));
+            draft.put(key.clone(), swept);
         }
     }
 }
 
-/// Stages `id`'s write-back on its `intents`: publish the committed current state
-/// (`current_writer` / tombstone) for each key it still holds and remove its hold
-/// (ADR-020). Returns one changed entry per affected key; keys `id` no longer
-/// holds are skipped, so re-running is a no-op (idempotent, ADR-009). Publishing
-/// only `id`'s own monotonic current state, this never conflicts with another member.
-fn writeback_changes(
-    id: &TxId,
-    intents: &[KeyIntent],
-    entries: &BTreeMap<Vec<u8>, LeafEntry>,
-) -> WritebackStaged {
-    let mut changes = Vec::new();
+/// Drafts `id`'s write-back on its `intents`: publish the committed current
+/// state (`current_writer` / tombstone) for each key it still holds and remove
+/// its hold (ADR-020). Puts one changed entry per affected key into `draft`;
+/// keys `id` no longer holds are skipped, so re-running is a no-op
+/// (idempotent, ADR-009). Publishing only `id`'s own monotonic current state,
+/// this never conflicts with another member. Returns the transaction-object
+/// references that the changes superseded (GC candidates, ADR-022).
+fn writeback_changes(id: &TxId, intents: &[KeyIntent], draft: &mut StageDraft<'_>) -> Vec<TxId> {
+    let entries = draft.staged().entries();
     let mut superseded = Vec::new();
     for intent in intents {
         let Some(e) = entries.get(&intent.raw_key) else {
@@ -980,39 +926,34 @@ fn writeback_changes(
             Desired::Read => {}
         }
         e.release_lock(id);
-        changes.push((intent.raw_key.clone(), e));
+        draft.put(intent.raw_key.clone(), e);
     }
     // An earlier commit pass can lock keys that the transaction did not write
     // in the end. Their locks go too, because a membership writer leaves the
     // membership lock only with all of its key locks (ADR-077).
     for (key, entry) in entries {
-        if entry.is_locked_by(id) && !changes.iter().any(|(changed, _)| changed == key) {
+        if entry.is_locked_by(id) && !draft.drafts(key) {
             let mut entry = entry.clone();
             entry.release_lock(id);
-            changes.push((key.clone(), entry));
+            draft.put(key.clone(), entry);
         }
     }
-    WritebackStaged {
-        changes,
-        superseded,
-    }
+    superseded
 }
 
-/// Stages `id`'s release: remove its hold from **every** entry in the leaf,
+/// Drafts `id`'s release: remove its hold from **every** entry in the leaf,
 /// publishing nothing. Release does not know the tx's keys (it runs from the
-/// per-tx bookkeeping, ADR-024), so it sweeps the loaded entries. Idempotent —
+/// per-tx bookkeeping, ADR-024), so it sweeps the staged entries. Idempotent —
 /// entries `id` does not hold are untouched.
-fn release_changes(id: &TxId, entries: &BTreeMap<Vec<u8>, LeafEntry>) -> Vec<(Vec<u8>, LeafEntry)> {
-    let mut changes = Vec::new();
-    for (k, e) in entries {
+fn release_changes(id: &TxId, draft: &mut StageDraft<'_>) {
+    for (k, e) in draft.staged().entries() {
         if !e.is_locked_by(id) {
             continue;
         }
         let mut e = e.clone();
         e.release_lock(id);
-        changes.push((k.clone(), e));
+        draft.put(k.clone(), e);
     }
-    changes
 }
 
 /// Final outcome of acquiring every lock a transaction needs.

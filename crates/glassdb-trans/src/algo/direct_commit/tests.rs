@@ -35,7 +35,8 @@ async fn resolve_step(
         requirement: Requirement::ANY,
         cause,
     };
-    policy.resolve(&ctx, staged, locks).await.unwrap()
+    let staged = StagedLeaf::new(&LeafBody::from_entries(staged.values().cloned()), locks);
+    policy.resolve(&ctx, &staged).await.unwrap()
 }
 
 /// Classifies a direct-commit outcome for a chosen leaf state and reload cause.
@@ -73,7 +74,6 @@ fn put_policy(
                 write: Some(DirectWrite::Put(Arc::from(value))),
             }]
             .into(),
-            writes: 1,
             has_reads,
         },
         InlinePolicy::default(),
@@ -1715,7 +1715,6 @@ async fn cross_key_aggregate_rejection_does_not_hint() {
             },
         ]
         .into(),
-        writes: 1,
         has_reads: true,
     };
     let policy = DirectCommitOperation::new(

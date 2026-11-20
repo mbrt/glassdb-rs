@@ -465,6 +465,10 @@ _Avoid_: Fold member
 The proposed leaf changes of one round member. It is different from the staged changes of a transaction, which a transaction body records.
 _Avoid_: Member changes
 
+**Staged leaf**:
+The leaf state that a round member decides on: the loaded leaf with the admitted stages of the earlier round members applied. A member proposes its stage over the staged leaf.
+_Avoid_: Overlay, running plan
+
 **Mutation plan**:
 The proposed state of one leaf and the round members' outcomes, which at most one CAS publishes. A plan does not prove that its CAS took effect.
 _Avoid_: Fold, fold plan

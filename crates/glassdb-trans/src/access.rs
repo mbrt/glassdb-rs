@@ -379,10 +379,6 @@ impl DirectShape<'_> {
     pub(crate) fn read_count(&self) -> usize {
         self.accesses.read_count()
     }
-
-    pub(crate) fn write_count(&self) -> usize {
-        self.accesses.write_count()
-    }
 }
 
 /// One key's optional point-read fact and optional final key write.

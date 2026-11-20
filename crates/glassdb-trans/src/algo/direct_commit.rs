@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use glassdb_data::{CollectionAddress, LogicalKey, ObjectPath, TxId};
 use glassdb_storage::{
-    CurrentState, InlinePolicy, LeafEntry, NodeLocks, Requirement, StorageError, TreeRouter,
+    CurrentState, InlinePolicy, LeafEntry, Requirement, StorageError, TreeRouter,
 };
 
 use super::handle_state::HandleState;
@@ -16,9 +16,9 @@ use crate::gc::GcHints;
 use crate::key_state_resolver::HolderResolution;
 use crate::leaf_coord::{
     CoordinatedOutcome, LeafCoordinator, LeafOperation, MemberOutcome, MemberPolicy, ReloadCause,
-    ResolveCtx, StageAdmission, Step,
+    ResolveCtx, StageAdmission, StageDraft, StagedLeaf, Step,
 };
-use crate::node_locking::{GateAcquisition, LeafState, NodeLockReconciler, leaf_collection};
+use crate::node_locking::{GateAcquisition, NodeLockReconciler, leaf_collection};
 use crate::structural::StructuralHintSink;
 
 /// Direct same-leaf commit coverage for one snapshot or accumulated interval.
@@ -215,7 +215,6 @@ enum DirectWrite {
 #[derive(Clone)]
 struct DirectMember {
     keys: Arc<[DirectKey]>,
-    writes: usize,
     has_reads: bool,
 }
 
@@ -283,13 +282,13 @@ impl DirectCommitOperation {
     async fn resolve_keys(
         &self,
         ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, LeafEntry>,
+        staged: &StagedLeaf,
     ) -> Result<Vec<HolderResolution>, TransError> {
         let mut resolutions = Vec::with_capacity(self.member.keys.len());
         for key in self.member.keys.iter() {
             resolutions.push(
                 ctx.key_state
-                    .resolve_holders(&key.key, staged.get(&key.raw_key), None, ctx.requirement)
+                    .resolve_holders(&key.key, staged.entry(&key.raw_key), None, ctx.requirement)
                     .await?,
             );
         }
@@ -301,19 +300,12 @@ impl DirectCommitOperation {
     async fn reconcile_node_blockers(
         &self,
         ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, LeafEntry>,
-        locks: &mut NodeLocks,
+        draft: &mut StageDraft<'_>,
         changes_membership: bool,
-        published: &mut Vec<(Vec<u8>, LeafEntry)>,
     ) -> Result<bool, TransError> {
-        // Pruning only the staged copy keeps this outside the lock lifecycle:
+        // Pruning only the draft keeps this outside the lock lifecycle:
         // removals of holders with a final status become durable iff the
         // publication CAS lands.
-        let leaf = LeafState {
-            collection: leaf_collection(&self.leaf_path)?,
-            entries: staged,
-            requirement: ctx.requirement,
-        };
         let reconciler = NodeLockReconciler::with_acquisition(
             ctx.key_state,
             ctx.tmon,
@@ -321,7 +313,12 @@ impl DirectCommitOperation {
             GateAcquisition::Polite,
         );
         Ok(reconciler
-            .admit_publication(locks, &leaf, changes_membership, published)
+            .admit_publication(
+                draft,
+                leaf_collection(&self.leaf_path)?,
+                ctx.requirement,
+                changes_membership,
+            )
             .await?
             .is_some())
     }
@@ -331,8 +328,7 @@ impl DirectCommitOperation {
     async fn resolve_fresh(
         &self,
         ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, LeafEntry>,
-        staged_locks: &NodeLocks,
+        staged: &StagedLeaf,
         resolutions: &[HolderResolution],
     ) -> Result<Step, TransError> {
         let changes_membership = self
@@ -346,10 +342,9 @@ impl DirectCommitOperation {
                 None => false,
             });
 
-        let mut locks = staged_locks.clone();
-        let mut published = Vec::new();
+        let mut draft = staged.draft();
         if self
-            .reconcile_node_blockers(ctx, staged, &mut locks, changes_membership, &mut published)
+            .reconcile_node_blockers(ctx, &mut draft, changes_membership)
             .await?
         {
             return Ok(Step::Skip {
@@ -371,7 +366,7 @@ impl DirectCommitOperation {
             .zip(resolutions)
             .any(|(key, state)| {
                 key.read.as_ref().is_some_and(|read| {
-                    !read.validates(state.writer.as_ref(), locks.membership_generation())
+                    !read.validates(state.writer.as_ref(), draft.locks().membership_generation())
                 })
             })
         {
@@ -379,7 +374,7 @@ impl DirectCommitOperation {
             // generation. A skipped publication would discard that change, so
             // replaying the same absence read could never converge. The locked
             // path makes the cleanup durable before validating the read.
-            let outcome = if locks.membership_generation() != staged_locks.membership_generation() {
+            let outcome = if draft.membership_moved() {
                 MemberOutcome::Moved
             } else {
                 MemberOutcome::Replay
@@ -393,6 +388,7 @@ impl DirectCommitOperation {
             .map(|key| key.raw_key.as_slice())
             .collect();
         let retained_inline = staged
+            .entries()
             .iter()
             .filter(|(key, _)| !output_keys.contains(key.as_slice()))
             .try_fold(0usize, |total, (_, entry)| {
@@ -417,9 +413,6 @@ impl DirectCommitOperation {
         }
 
         // The outputs replace any entry of the same key, held or not.
-        let mut entries = published;
-        entries.retain(|(key, _)| !output_keys.contains(key.as_slice()));
-        entries.reserve(self.member.writes);
         let mut predecessors = BTreeMap::new();
         let mut adds_key = false;
         for (key, state) in self.member.keys.iter().zip(resolutions) {
@@ -428,7 +421,7 @@ impl DirectCommitOperation {
             };
             predecessors.insert(
                 key.raw_key.clone(),
-                state.resolved_current(staged.get(&key.raw_key)),
+                state.resolved_current(staged.entry(&key.raw_key)),
             );
             let current = match write {
                 DirectWrite::Put(value) => {
@@ -440,24 +433,22 @@ impl DirectCommitOperation {
                 }
                 DirectWrite::Delete => CurrentState::Tombstone { writer: self.id },
             };
-            entries.push((
+            draft.put(
                 key.raw_key.clone(),
                 LeafEntry::new(key.raw_key.clone()).with_current(current),
-            ));
+            );
         }
         if changes_membership {
-            locks.advance_membership_generation();
+            draft.locks_mut().advance_membership_generation();
         }
         *self.staged_over.lock().unwrap() = Some(predecessors);
-        Ok(Step::Stage {
-            entries,
-            locks,
-            admission: StageAdmission::InlinePublication {
+        Ok(draft.stage(
+            StageAdmission::InlinePublication {
                 adds_key,
                 pressure_hint: self.member.keys.len() == 1,
             },
-            outcome: MemberOutcome::Landed,
-        })
+            MemberOutcome::Landed,
+        ))
     }
 
     /// Reports single-key aggregate pressure without steering multi-key
@@ -572,13 +563,8 @@ impl MemberPolicy for DirectCommitOperation {
         }
     }
 
-    async fn resolve(
-        &self,
-        ctx: &ResolveCtx<'_>,
-        staged: &BTreeMap<Vec<u8>, LeafEntry>,
-        staged_locks: &NodeLocks,
-    ) -> Result<Step, TransError> {
-        if self.proven_landed() || self.has_marker(staged) {
+    async fn resolve(&self, ctx: &ResolveCtx<'_>, staged: &StagedLeaf) -> Result<Step, TransError> {
+        if self.proven_landed() || self.has_marker(staged.entries()) {
             self.remember_landed();
             return Ok(Step::Skip {
                 outcome: MemberOutcome::Landed,
@@ -598,9 +584,7 @@ impl MemberPolicy for DirectCommitOperation {
                 outcome: self.in_doubt_outcome(),
             });
         }
-        let step = self
-            .resolve_fresh(ctx, staged, staged_locks, &resolutions)
-            .await?;
+        let step = self.resolve_fresh(ctx, staged, &resolutions).await?;
         // Unchanged predecessors prove only that the in-doubt CAS has not
         // landed yet, while the leaf stays in the state it expected. Only a new
         // CAS from that state can fence it, so any other decision stays in doubt.
@@ -730,7 +714,6 @@ fn direct_member(accesses: &AccessSet) -> Option<DirectMember> {
         .collect::<Vec<_>>();
     Some(DirectMember {
         keys: keys.into(),
-        writes: shape.write_count(),
         has_reads: shape.read_count() != 0,
     })
 }
