@@ -7,8 +7,7 @@
 # A split or a merge writes some node lock changes with its own CAS, outside
 # the coordinator round: the release of its structural gate and the changes of
 # a merge reservation. Each of them can make a round of the writers lose its
-# leaf CAS. The measurement counts these CASes (`directLockWrites`) and the
-# coordinator CAS retries of the round.
+# leaf CAS, which shows in the coordinator CAS retries.
 #
 # All workers run on one database instance, because only the rounds of that
 # instance can share a CAS with its structural changes.

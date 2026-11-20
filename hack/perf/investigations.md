@@ -36,13 +36,13 @@ keeps the leaves changing during the measurement, with small leaves
 - In all three cells, four writers do read-modify-write on keys 0, 128, 256
   and 384.
 
-A new topology counter, `TopologyStats::direct_lock_writes`, counts these
-direct CASes on leaves, and the ones that another write rejected. perfbench
-reports them as `directLockWrites` and `directLockWritesRejected` in the
-`measure` section. All runs used `--time=virtual --latency-jitter=false
---runs=1`.
+A temporary patch counted these direct CASes on leaves, and the ones that
+another write rejected (`TopologyStats::direct_lock_writes`, reported by
+perfbench in the `measure` section). It was removed after the measurement,
+because the result changed no decision. All runs used `--time=virtual
+--latency-jitter=false --runs=1`.
 
-Results of three runs on `52d04f0ea` with the counter and the experiment:
+Results of three runs on `52d04f0ea` with the experiment and the patch:
 
 | Cell | Splits | Merges | Direct lock CASes | Rejected | Coordinator CAS retries | Ops per tx |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -50,8 +50,8 @@ Results of three runs on `52d04f0ea` with the counter and the experiment:
 | `shrink` | 0, 1, 3 | 23, 23, 20 | 30, 28, 28 | 0, 0, 0 | 0, 0, 0 | 1.57, 1.59, 1.49 |
 | `quiet` | 0, 0, 0 | 0, 3, 2 | 7, 12, 8 | 0, 0, 0 | 0, 0, 0 | 1.26, 1.92, 1.33 |
 
-`directLockWritesRejected` shows only one side of the race: a direct CAS that
-a round write made fail. A round that loses to a direct CAS shows in the
+The rejected count shows only one side of the race: a direct CAS that a round
+write made fail. A round that loses to a direct CAS shows in the
 coordinator CAS retries. A temporary patch of `CasWorker::attempt` logged each
 retry of a round and the state of the leaf, in three more runs:
 

@@ -673,8 +673,6 @@ async fn run_cell(
             met: outcome == Outcome::Met,
             split_completed: total.topology.splits.completed,
             merge_completed: total.topology.merges.completed,
-            direct_lock_writes: total.topology.direct_lock_writes.sent,
-            direct_lock_writes_rejected: total.topology.direct_lock_writes.rejected,
             worker_drain_ms: drain.as_secs_f64() * 1000.0,
         },
         shapes: shape_results,

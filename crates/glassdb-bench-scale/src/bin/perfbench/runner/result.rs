@@ -95,10 +95,6 @@ pub(crate) struct MeasureResult {
     pub(crate) met: bool,
     pub(crate) split_completed: u64,
     pub(crate) merge_completed: u64,
-    /// The node lock CASes that structural changes sent outside a
-    /// coordinator round, and how many of them another write rejected.
-    pub(crate) direct_lock_writes: u64,
-    pub(crate) direct_lock_writes_rejected: u64,
     /// The wall time after the measurement until all workers stopped.
     pub(crate) worker_drain_ms: f64,
 }

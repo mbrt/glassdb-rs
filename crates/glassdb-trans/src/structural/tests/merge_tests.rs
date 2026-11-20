@@ -147,11 +147,6 @@ async fn underfull_leaf_merges_into_its_right_sibling() {
                 completed: 1,
                 ..MergeStats::default()
             },
-            // The removal of the merge reservation.
-            direct_lock_writes: DirectWriteStats {
-                sent: 1,
-                rejected: 0,
-            },
             ..TopologyStats::default()
         }
     );
@@ -266,11 +261,6 @@ async fn merge_compacts_the_cold_tombstones_of_its_target() {
                 ..MergeStats::default()
             },
             tombstones_reclaimed: 3,
-            // The removal of the merge reservation.
-            direct_lock_writes: DirectWriteStats {
-                sent: 1,
-                rejected: 0,
-            },
             ..TopologyStats::default()
         }
     );

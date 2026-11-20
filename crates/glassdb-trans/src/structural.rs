@@ -62,7 +62,7 @@ use stats::Stats;
 
 pub use policy::TopologyPolicy;
 pub use sink::StructuralHintSink;
-pub use stats::{DirectWriteStats, MergeStats, SplitCauseStats, SplitStats, TopologyStats};
+pub use stats::{MergeStats, SplitCauseStats, SplitStats, TopologyStats};
 pub(crate) use topology::TopologyMembership;
 
 /// Back off empty structural-intent listings independently of candidates.
@@ -307,7 +307,7 @@ impl Restructurer {
         let stats = Arc::new(Stats::default());
         let router = TreeRouter::new(nodes.clone(), NonZeroUsize::MIN);
         let structural_nodes =
-            StructuralNodeAccess::new(nodes.clone(), mon.clone(), key_state, coord, stats.clone());
+            StructuralNodeAccess::new(nodes.clone(), mon.clone(), key_state, coord);
         let reconciler = ParentReconciler::new(
             structural_nodes.clone(),
             router.clone(),
