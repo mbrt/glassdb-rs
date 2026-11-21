@@ -12,7 +12,7 @@ use std::sync::Arc;
 use glassdb_concurr::{RetrySchedule, rt};
 use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
-use glassdb_storage::{Requirement, StorageError, Timeline};
+use glassdb_storage::{FloorPoint, Requirement, StorageError, Timeline};
 
 use crate::access::ReadEvidence;
 use crate::error::trans_to_storage;
@@ -67,6 +67,15 @@ impl Reader {
             resolver,
             timeline,
             retry,
+        }
+    }
+
+    /// Returns a reader that uses the leaf states that were current at
+    /// `point`, when the cache has them (ADR-103).
+    pub fn at(&self, point: FloorPoint) -> Self {
+        Reader {
+            resolver: self.resolver.at(point),
+            ..self.clone()
         }
     }
 

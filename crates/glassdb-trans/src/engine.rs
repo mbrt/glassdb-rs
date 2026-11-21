@@ -11,7 +11,7 @@ use glassdb_data::{
 };
 use glassdb_storage::transaction::TxRecordStore;
 use glassdb_storage::{
-    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, LeafBody,
+    CacheStats, CachedStore, CollectionRecord, CollectionStore, FloorPoint, InlinePolicy, LeafBody,
     MonotonicFloor, Node, NodeSizePolicy, NodeStore, PersistentCache, PersistentCacheConfig,
     PersistentCacheMedia, Requirement, StorageError, StructuralIntentStore, Timeline, TreeRouter,
 };
@@ -163,6 +163,12 @@ impl EngineTransaction {
     pub fn collection_reservations(&self) -> CollectionReservations {
         self.0.collection_reservations()
     }
+
+    /// Returns the floor at which the next body execution reads, for a stale
+    /// read-only transaction (ADR-103). Call it once for each execution.
+    pub fn take_read_point(&mut self) -> Option<FloorPoint> {
+        self.0.take_read_point()
+    }
 }
 
 /// Runtime counters collected from one engine snapshot.
@@ -243,8 +249,15 @@ impl Engine {
 
     /// Reads one logical key from any usable cached state, for a transaction
     /// body that validates the read later.
-    pub async fn read(&self, key: &LogicalKey) -> Result<ReadOutcome, StorageError> {
-        self.reader.read(key).await
+    pub async fn read(
+        &self,
+        key: &LogicalKey,
+        at: Option<FloorPoint>,
+    ) -> Result<ReadOutcome, StorageError> {
+        match at {
+            Some(point) => self.reader.at(point).read(key).await,
+            None => self.reader.read(key).await,
+        }
     }
 
     /// Scans one logical key range and returns its validation evidence.
@@ -253,10 +266,22 @@ impl Engine {
         collection: &CollectionAddress,
         range: &ScanRange,
         overlay: &[ScanMutation],
+        at: Option<FloorPoint>,
     ) -> Result<ScanResult, StorageError> {
-        self.resolver
+        let resolver = match at {
+            Some(point) => self.resolver.at(point),
+            None => self.resolver.clone(),
+        };
+        resolver
             .scan_keys(collection, range, overlay, None, None)
             .await
+    }
+
+    /// Creates the monotonic floor of a new stale view. While the view lives,
+    /// the decoded cache keeps the earlier states that its floor can use
+    /// (ADR-103).
+    pub fn new_view_floor(&self) -> MonotonicFloor {
+        self.objects.view_floors().new_floor()
     }
 
     /// Loads a logical snapshot of a collection's direct-child directory.

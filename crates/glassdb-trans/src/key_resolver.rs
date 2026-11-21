@@ -9,7 +9,7 @@ use std::num::NonZeroUsize;
 
 use glassdb_concurr::map_all_bounded;
 use glassdb_data::{CollectionAddress, LogicalKey, TxId};
-use glassdb_storage::{LeafEntry, Requirement, RoutedLeaf, StorageError, TreeRouter};
+use glassdb_storage::{FloorPoint, LeafEntry, Requirement, RoutedLeaf, StorageError, TreeRouter};
 
 use crate::access::{LeafCoverage, ScanAccess, ScanEvidence, ScanMutation, ScanRange};
 use crate::error::{TransError, trans_to_storage};
@@ -60,6 +60,15 @@ pub(crate) struct KeyResolver {
 }
 
 impl KeyResolver {
+    /// Returns key resolution that uses the leaf states that were current at
+    /// `point`, when the cache has them (ADR-103).
+    pub(crate) fn at(&self, point: FloorPoint) -> Self {
+        KeyResolver {
+            router: self.router.at(point),
+            ..self.clone()
+        }
+    }
+
     /// Creates key resolution over a tree router and loaded-state resolver.
     pub(crate) fn new(
         router: TreeRouter,

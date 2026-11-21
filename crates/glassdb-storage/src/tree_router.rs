@@ -24,6 +24,7 @@ use crate::cached_store::Requirement;
 use crate::error::StorageError;
 use crate::node::{Node, NodeBody};
 use crate::node_store::{LeafObservation, NodeStore};
+use crate::timeline::FloorPoint;
 
 /// Bounds a self-correcting right-link walk, which steps right only to pass
 /// splits that moved a key after the descent read its parent, so it is expected
@@ -692,6 +693,16 @@ impl TreeRouter {
     /// Creates a router that reads nodes through `nodes`.
     pub fn new(nodes: NodeStore, parallelism: NonZeroUsize) -> Self {
         TreeRouter { nodes, parallelism }
+    }
+
+    /// Returns a router that reads the leaf state that was current at `point`,
+    /// when the cache has one (ADR-103). It routes through the cached index
+    /// nodes.
+    pub fn at(&self, point: FloorPoint) -> Self {
+        TreeRouter {
+            nodes: self.nodes.at(point),
+            parallelism: self.parallelism,
+        }
     }
 
     /// Routes `key` to a leaf by descending from the root `_r` and

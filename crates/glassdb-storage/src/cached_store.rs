@@ -34,7 +34,7 @@ use crate::cache_stats::{CacheMetrics, CacheStats};
 use crate::disk_cache::PersistentCache;
 use crate::error::StorageError;
 pub use crate::timeline::Requirement;
-use crate::timeline::{SequencePoint, Timeline};
+use crate::timeline::{FloorPoint, SequencePoint, Timeline, ViewFloors};
 use glassdb_backend::{self as backend, Backend, BackendError};
 use glassdb_concurr::map_all_bounded;
 use glassdb_data::{ObjectPath, PathError};
@@ -46,7 +46,7 @@ mod mutation;
 mod path_lane;
 mod persistent_bridge;
 
-pub use cut::{CutSearch, CutTarget};
+pub use cut::{CutKey, CutSearch, CutTarget};
 use evidence::Evidence;
 pub use evidence::{CasReceipt, CasResult, Observation, ObservationCheck, Revision};
 
@@ -151,6 +151,12 @@ pub(crate) trait Codec: Send + Sync + 'static {
 
     /// Describes this physical object type in diagnostics.
     fn name() -> &'static str;
+
+    /// Reports whether the decoded cache keeps `value` as an earlier state
+    /// after a newer state replaces it (ADR-103).
+    fn keeps_earlier_states(_value: &Self::Value) -> bool {
+        false
+    }
 }
 
 /// The decoded object cache over a [`Backend`] (ADR-036). Reads and mutations of
@@ -189,12 +195,18 @@ impl CachedStore {
             .then(|| Arc::new(persistent.clone()) as Arc<dyn EvictionSink>);
         CachedStore {
             backend,
-            knowledge: Knowledge::new(max_size, timeline.clone(), sink),
+            knowledge: Knowledge::new(max_size, timeline.clone(), ViewFloors::default(), sink),
             timeline,
             coordinator,
             metrics,
             persistent,
         }
+    }
+
+    /// The floors of the live stale views over this cache. The cache keeps
+    /// earlier states while one of them can use them (ADR-103).
+    pub fn view_floors(&self) -> ViewFloors {
+        self.knowledge.view_floors()
     }
 
     /// Starts a cut search on the timeline of this cache (ADR-097).
@@ -224,6 +236,7 @@ impl CachedStore {
     pub(crate) fn typed<C: Codec>(&self) -> TypedCachedStore<C> {
         TypedCachedStore {
             store: self.clone(),
+            at: None,
             codec: PhantomData,
         }
     }
@@ -535,7 +548,7 @@ impl CachedStore {
                     self.publish_present::<C>(key, reply.contents, reply.revision, invoked, state)
                 }
                 Err(BackendError::Precondition) => {
-                    Ok(self.publish_unchanged(key.as_str(), seed, invoked))
+                    Ok(self.publish_unchanged::<C>(key.as_str(), seed, invoked))
                 }
                 Err(BackendError::NotFound) => {
                     Ok(self.publish_absent(key.as_str(), invoked, state))
@@ -597,13 +610,13 @@ impl CachedStore {
 
     /// Handles a "not modified" response by reusing the body retained for the
     /// conditional request.
-    fn publish_unchanged(
+    fn publish_unchanged<C: Codec>(
         &self,
         path: &str,
         seed: PresentSeed,
         invoked: SequencePoint,
     ) -> FetchResult {
-        self.knowledge.confirm_unchanged(path, seed, invoked)
+        self.knowledge.confirm_unchanged::<C>(path, seed, invoked)
     }
 
     /// Publishes a confirmed absence.
@@ -623,6 +636,9 @@ impl CachedStore {
 /// A typed facade over the shared decoded cache.
 pub(crate) struct TypedCachedStore<C: Codec> {
     store: CachedStore,
+    /// The floor at which reads use the state that was current, for one call
+    /// of a stale view (ADR-103).
+    at: Option<FloorPoint>,
     codec: PhantomData<fn() -> C>,
 }
 
@@ -636,12 +652,22 @@ impl<C: Codec> Clone for TypedCachedStore<C> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
+            at: self.at,
             codec: PhantomData,
         }
     }
 }
 
 impl<C: Codec> TypedCachedStore<C> {
+    /// Returns a store whose reads use the state that was current at `point`,
+    /// when the cache has one (ADR-103).
+    pub(crate) fn at(&self, point: FloorPoint) -> Self {
+        Self {
+            at: Some(point),
+            ..self.clone()
+        }
+    }
+
     /// Captures a currentness barrier on the timeline of the shared cache.
     pub(crate) fn currentness_barrier(&self) -> crate::CurrentnessBarrier {
         self.store.timeline.currentness_barrier()
@@ -677,6 +703,15 @@ impl<C: Codec> TypedCachedStore<C> {
     ) -> Result<Observation<C::Value>, StorageError> {
         let key = key.into();
         Self::check_path(&key)?;
+        if let Some(point) = self.at
+            && let Some(observed) =
+                self.store
+                    .knowledge
+                    .peek_earlier::<C>(&key, requirement, point)?
+        {
+            self.store.metrics.l1_hit();
+            return Ok(observed);
+        }
         self.store.read::<C>(key, requirement).await
     }
 
@@ -792,6 +827,28 @@ impl<C: Codec> TypedCachedStore<C> {
         Ok(())
     }
 
+    /// Adds the interval of the part of `observed` that `part` selects to a cut
+    /// search, from every known state of its path (ADR-103). `part` must
+    /// select a value that never comes back after it changes. Without an
+    /// interval of the part, the search uses the interval of `observed`.
+    pub(crate) fn add_part_to_cut<S: PartialEq>(
+        &self,
+        search: &mut CutSearch,
+        observed: &Observation<C::Value>,
+        part: impl Fn(&C::Value) -> Option<S>,
+    ) -> Result<CutKey, StorageError> {
+        Self::check_path(&observed.key)?;
+        match self.store.knowledge.part_interval::<C, S>(observed, part)? {
+            Some(interval) => {
+                Ok(search.add_key(interval.start, interval.watermark, interval.cached_changed))
+            }
+            None => {
+                search.add(std::slice::from_ref(observed));
+                Ok(CutKey::of_state(observed))
+            }
+        }
+    }
+
     /// Checks the states of `observations` that do not reach `target`, with
     /// bounded parallel work. Reports whether every state is still current,
     /// so that `target` is a cut point for them.
@@ -894,7 +951,7 @@ mod tests {
     use crate::disk_cache::PathChanges;
     use crate::disk_cache::PersistentCacheConfig;
     use crate::disk_cache::sim_media::{MediaFaultProfile, SimMedia};
-    use crate::timeline::TimeSource;
+    use crate::timeline::{MonotonicFloor, StalenessCutoff, TimeSource};
 
     // A trivial identity codec so the concurrency layer can be exercised in
     // isolation from any real object type.
@@ -3919,7 +3976,12 @@ mod tests {
         }
         let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
         // A zero budget evicts each state as soon as it is installed.
-        let knowledge = Knowledge::new(0, Timeline::new(), Some(recorder.clone()));
+        let knowledge = Knowledge::new(
+            0,
+            Timeline::new(),
+            ViewFloors::default(),
+            Some(recorder.clone()),
+        );
         let revision = Revision::from_backend(backend::Revision::new("r1".to_owned()));
         let point = SequencePoint::from_raw;
 
@@ -3935,9 +3997,147 @@ mod tests {
         );
     }
 
+    /// A codec whose replaced states the decoded cache keeps (ADR-103).
+    struct Kept;
+
+    impl Codec for Kept {
+        type Value = Vec<u8>;
+        fn decode(_path: &ObjectPath, bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
+            Ok(bytes.to_vec())
+        }
+        fn encode(_path: &ObjectPath, value: &Vec<u8>) -> Result<Vec<u8>, StorageError> {
+            Ok(value.clone())
+        }
+        fn size(value: &Vec<u8>) -> usize {
+            value.len()
+        }
+        fn accepts(_: &ObjectPath) -> bool {
+            true
+        }
+        fn name() -> &'static str {
+            "kept"
+        }
+        fn keeps_earlier_states(_value: &Vec<u8>) -> bool {
+            true
+        }
+    }
+
+    /// Installs `value` at `path` with a new revision, as a fetch invoked at
+    /// a new point does, and returns its observation.
+    fn fetch_kept(
+        knowledge: &Knowledge,
+        timeline: &Timeline,
+        path: &str,
+        value: &[u8],
+    ) -> Observation<Vec<u8>> {
+        let revision = Revision::from_backend(backend::Revision::new(format!("{value:?}")));
+        let fetched = knowledge.install_fetched::<Kept>(
+            path,
+            v(value),
+            value.len(),
+            revision,
+            timeline.now(),
+        );
+        knowledge
+            .to_observation::<Kept>(ObjectKey::from(path), fetched)
+            .unwrap()
+    }
+
+    /// Confirms the cached state of `path` with a check invoked at a new
+    /// point.
+    fn confirm_kept(knowledge: &Knowledge, timeline: &Timeline, path: &str) {
+        let key = ObjectKey::from(path);
+        let seed = knowledge.present_seed::<Kept>(&key, None).unwrap().unwrap();
+        knowledge.confirm_unchanged::<Kept>(path, seed, timeline.now());
+    }
+
+    fn floor_at(views: &ViewFloors, observed: &Observation<Vec<u8>>) -> MonotonicFloor {
+        let floor = views.new_floor();
+        floor.raise(observed.evidence.start().unwrap());
+        floor
+    }
+
+    fn value_at(knowledge: &Knowledge, path: &str, floor: &MonotonicFloor) -> Option<Vec<u8>> {
+        let point = floor.point_within(StalenessCutoff::ANY).unwrap();
+        knowledge
+            .peek_earlier::<Kept>(&ObjectKey::from(path), Requirement::ANY, point)
+            .unwrap()
+            .map(|observed| observed.value().unwrap().to_vec())
+    }
+
+    #[test]
+    fn a_replaced_state_stays_while_a_live_view_can_use_it() {
+        let timeline = Timeline::new();
+        let views = ViewFloors::default();
+        let knowledge = Knowledge::new(1 << 20, timeline.clone(), views.clone(), None);
+        let first = fetch_kept(&knowledge, &timeline, "p", b"a");
+        confirm_kept(&knowledge, &timeline, "p");
+        let floor = floor_at(&views, &first);
+
+        fetch_kept(&knowledge, &timeline, "p", b"b");
+        assert_eq!(value_at(&knowledge, "p", &floor), Some(b"a".to_vec()));
+        // A newer replacement keeps the state that covers the floor.
+        fetch_kept(&knowledge, &timeline, "p", b"c");
+        assert_eq!(value_at(&knowledge, "p", &floor), Some(b"a".to_vec()));
+
+        // With no live view, the next replacement keeps no earlier state.
+        let point = floor.point_within(StalenessCutoff::ANY).unwrap();
+        drop(floor);
+        fetch_kept(&knowledge, &timeline, "p", b"d");
+        let at_point = knowledge
+            .peek_earlier::<Kept>(&ObjectKey::from("p"), Requirement::ANY, point)
+            .unwrap();
+        assert!(at_point.is_none());
+    }
+
+    #[test]
+    fn a_state_with_no_confirmation_after_the_floor_does_not_cover_it() {
+        let timeline = Timeline::new();
+        let views = ViewFloors::default();
+        let knowledge = Knowledge::new(1 << 20, timeline.clone(), views.clone(), None);
+        // One fetch gives an empty interval, so the state never covers its
+        // own start.
+        let first = fetch_kept(&knowledge, &timeline, "p", b"a");
+        let floor = floor_at(&views, &first);
+        fetch_kept(&knowledge, &timeline, "p", b"b");
+        assert_eq!(value_at(&knowledge, "p", &floor), None);
+    }
+
+    #[test]
+    fn a_part_interval_spans_the_states_with_the_same_part() {
+        let timeline = Timeline::new();
+        let views = ViewFloors::default();
+        let knowledge = Knowledge::new(1 << 20, timeline.clone(), views.clone(), None);
+        let first = fetch_kept(&knowledge, &timeline, "p", b"a1");
+        let _floor = floor_at(&views, &first);
+        let second = fetch_kept(&knowledge, &timeline, "p", b"a2");
+        let head = |value: &Vec<u8>| Some(value[0]);
+        let tail = |value: &Vec<u8>| Some(value[1]);
+
+        let interval = knowledge
+            .part_interval::<Kept, _>(&second, head)
+            .unwrap()
+            .unwrap();
+        assert_eq!(interval.start, first.evidence.start().unwrap());
+        assert!(!interval.cached_changed);
+
+        // The part that changed starts with the newer state, and the cached
+        // state shows the change to the older one.
+        let interval = knowledge
+            .part_interval::<Kept, _>(&second, tail)
+            .unwrap()
+            .unwrap();
+        assert_eq!(interval.start, second.evidence.start().unwrap());
+        let interval = knowledge
+            .part_interval::<Kept, _>(&first, tail)
+            .unwrap()
+            .unwrap();
+        assert!(interval.cached_changed);
+    }
+
     #[test]
     fn only_watermarks_newer_than_the_persistent_copy_are_unpersisted() {
-        let knowledge = Knowledge::new(1 << 20, Timeline::new(), None);
+        let knowledge = Knowledge::new(1 << 20, Timeline::new(), ViewFloors::default(), None);
         let revision = Revision::from_backend(backend::Revision::new("r1".to_owned()));
         let point = SequencePoint::from_raw;
         let advanced = knowledge.install_persistent::<Bytes>(
@@ -3952,7 +4152,7 @@ mod tests {
         // The persistent cache has no copy of a fetched state until its
         // publication.
         knowledge.install_fetched::<Bytes>("fetched", v(b"a"), 1, revision.clone(), point(7));
-        knowledge.confirm_unchanged("advanced", advanced, point(9));
+        knowledge.confirm_unchanged::<Bytes>("advanced", advanced, point(9));
 
         let unpersisted: BTreeMap<_, _> = knowledge
             .present_states()

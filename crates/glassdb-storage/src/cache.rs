@@ -7,11 +7,20 @@
 use std::sync::Mutex;
 
 use glassdb_concurr::shard::{self, Sharded};
-use hashlink::LinkedHashMap;
+use hashlink::{LinkedHashMap, LinkedHashSet};
 
 /// Implemented by cached values to report their size in bytes.
 pub trait Weighable {
     fn size(&self) -> usize;
+
+    /// The part of [`size`](Self::size) that [`shed`](Self::shed) frees: content
+    /// that the cache drops before it evicts any entry.
+    fn sheddable(&self) -> usize {
+        0
+    }
+
+    /// Drops the sheddable content.
+    fn shed(&mut self) {}
 }
 
 struct Inner<V> {
@@ -22,6 +31,8 @@ struct Inner<V> {
     /// eviction, and eviction follows that list order (not the hash buckets),
     /// so behavior is independent of the hasher.
     map: LinkedHashMap<String, V>,
+    /// The keys of the entries with sheddable content, oldest insertion first.
+    sheddable: LinkedHashSet<String>,
 }
 
 struct WeightReplacement {
@@ -52,6 +63,32 @@ impl<V: Weighable + Clone> Inner<V> {
         };
         self.curr_size = replace_weight(self.curr_size, old_size, 0).size;
         self.map.remove(key);
+        self.sheddable.remove(key);
+    }
+
+    fn insert_entry(&mut self, key: &str, value: V) {
+        if value.sheddable() > 0 {
+            self.sheddable.insert(key.to_string());
+        } else {
+            self.sheddable.remove(key);
+        }
+        // `insert` appends at the back (most-recently-used) and, for an
+        // existing key, moves it there while replacing the value.
+        self.map.insert(key.to_string(), value);
+    }
+
+    /// Sheds the content of the oldest entry with sheddable content. Reports
+    /// whether there was one.
+    fn shed_oldest(&mut self) -> bool {
+        let Some(key) = self.sheddable.pop_front() else {
+            return false;
+        };
+        if let Some(value) = self.map.get_mut(&key) {
+            let freed = value.sheddable();
+            value.shed();
+            self.curr_size = replace_weight(self.curr_size, freed, 0).size;
+        }
+        true
     }
 
     fn recompute_weight(&mut self) -> bool {
@@ -71,6 +108,9 @@ impl<V: Weighable + Clone> Inner<V> {
 
     fn remove_oldest(&mut self, mut overflowed: bool, evicted: &mut Vec<(String, V)>) {
         while overflowed || self.curr_size > self.max_size {
+            if !overflowed && self.shed_oldest() {
+                continue;
+            }
             let Some((k, v)) = self.map.pop_front() else {
                 return;
             };
@@ -83,6 +123,7 @@ impl<V: Weighable + Clone> Inner<V> {
                 self.curr_size = replacement.size;
                 overflowed = replacement.overflowed;
             }
+            self.sheddable.remove(&k);
             evicted.push((k, v));
         }
     }
@@ -102,6 +143,7 @@ impl<V: Weighable + Clone> CacheShard<V> {
                 max_size,
                 curr_size: 0,
                 map: LinkedHashMap::new(),
+                sheddable: LinkedHashSet::new(),
             }),
         }
     }
@@ -160,9 +202,7 @@ impl<V: Weighable + Clone> CacheShard<V> {
                 }
                 let replacement = replace_weight(inner.curr_size, old_size, new_size);
                 inner.curr_size = replacement.size;
-                // `insert` appends at the back (most-recently-used) and, for an
-                // existing key, moves it there while replacing the value.
-                inner.map.insert(key.to_string(), newv);
+                inner.insert_entry(key, newv);
                 inner.remove_oldest(replacement.overflowed, &mut evicted);
             }
         }
@@ -301,8 +341,49 @@ mod tests {
         }
     }
 
+    /// An entry of `kept` bytes with `extra` sheddable bytes.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    struct SheddableEntry {
+        kept: usize,
+        extra: usize,
+    }
+
+    impl Weighable for SheddableEntry {
+        fn size(&self) -> usize {
+            self.kept + self.extra
+        }
+
+        fn sheddable(&self) -> usize {
+            self.extra
+        }
+
+        fn shed(&mut self) {
+            self.extra = 0;
+        }
+    }
+
     fn e(s: &str) -> TestEntry {
         TestEntry(s.to_string())
+    }
+
+    #[test]
+    fn sheddable_content_goes_before_any_entry() {
+        let c = CacheShard::new(100);
+        let entry = |kept, extra| SheddableEntry { kept, extra };
+        c.set("old", entry(30, 20));
+        c.set("mid", entry(30, 0));
+        // The third entry goes over the budget. The oldest sheddable content
+        // goes first, and no entry leaves.
+        c.set("new", entry(10, 15));
+        assert_eq!(c.get("old"), Some(entry(30, 0)));
+        assert_eq!(c.get("new"), Some(entry(10, 15)));
+        assert_eq!(c.size(), 85);
+
+        // With no sheddable content left in the way, the oldest entry goes.
+        c.set("big", entry(40, 0));
+        assert_eq!(c.get("new"), Some(entry(10, 0)));
+        assert_eq!(c.get("mid"), None);
+        assert_eq!(c.size(), 80);
     }
 
     // The behavior tests drive a single shard directly so they are independent

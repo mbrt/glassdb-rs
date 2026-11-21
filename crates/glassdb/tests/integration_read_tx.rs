@@ -1,5 +1,6 @@
-//! Stale read-only transactions (ADR-097) and the cut points of read-only
-//! `Database::tx` calls (ADR-099).
+//! Stale read-only transactions (ADR-097), the cut points of read-only
+//! `Database::tx` calls (ADR-099), and the cut point that a stale view keeps
+//! (ADR-103).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -113,15 +114,122 @@ async fn read_tx_checks_states_older_than_the_staleness_bound() {
     assert_eq!(backend_ops(&db, &before), (LEAVES as u64, 0, 0));
 }
 
-#[tokio::test(start_paused = true)]
-async fn read_tx_sees_the_writes_of_its_own_instance() {
-    let db = Database::open("example", mem()).await.unwrap();
-    let collections = collections_with_one_key(&db).await;
-    tx_read_all(&db, &collections).await;
+/// Reads `keys` of `c` in one call through `view`.
+async fn view_read_keys(view: &StaleDatabaseView, c: &Collection, keys: &[&[u8]]) -> Vec<Vec<u8>> {
+    let c = c.clone();
+    let keys: Vec<Vec<u8>> = keys.iter().map(|key| key.to_vec()).collect();
+    view.read_tx(move |tx: ReadTransaction| {
+        let (c, keys) = (c.clone(), keys.clone());
+        async move {
+            let mut values = Vec::new();
+            for key in &keys {
+                values.push(tx.read(&c, key).await?.unwrap_or_default());
+            }
+            Ok(values)
+        }
+    })
+    .await
+    .unwrap()
+}
 
-    collections[3].write(b"k", b"w").await.unwrap();
-    let values = read_tx_all(&db, Duration::MAX, &collections).await;
-    assert_eq!(values[3], b"w");
+/// Writes `old` to key `k` of a new collection, and confirms its state, so
+/// that the state has an interval.
+async fn confirmed_collection(db: &Database) -> Collection {
+    let c = create_top(db, b"c").await;
+    c.write(b"k", b"old").await.unwrap();
+    tx_read_all(db, std::slice::from_ref(&c)).await;
+    c
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_view_keeps_its_cut_point_after_a_write_of_its_own_instance() {
+    let db = Database::open("example", mem()).await.unwrap();
+    let c = confirmed_collection(&db).await;
+    let view = db.stale(Duration::MAX);
+    assert_eq!(
+        view_read_all(&view, std::slice::from_ref(&c)).await,
+        [b"old"]
+    );
+
+    c.write(b"k", b"new").await.unwrap();
+    let before = db.stats();
+    assert_eq!(
+        view_read_all(&view, std::slice::from_ref(&c)).await,
+        [b"old"]
+    );
+    assert_eq!(backend_ops(&db, &before), (0, 0, 0));
+    // A new view reads the cached state.
+    assert_eq!(read_tx_all(&db, Duration::MAX, &[c]).await, [b"new"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_view_keeps_its_cut_point_after_its_instance_sees_a_foreign_write() {
+    let backend = mem();
+    let reader = Database::open("example", backend.clone()).await.unwrap();
+    let (x, z) = cache_then_write_both(&reader, backend).await;
+    let both = [x, z];
+    let view = reader.stale(Duration::MAX);
+    assert_eq!(view_read_all(&view, &both).await, [b"old", b"old"]);
+
+    assert_eq!(tx_read_all(&reader, &both).await, [b"new", b"new"]);
+    let before = reader.stats();
+    assert_eq!(view_read_all(&view, &both).await, [b"old", b"old"]);
+    assert_eq!(backend_ops(&reader, &before), (0, 0, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_view_moves_its_cut_point_when_the_point_is_older_than_the_bound() {
+    let db = Database::open("example", mem()).await.unwrap();
+    let c = confirmed_collection(&db).await;
+    let view = db.stale(STALENESS);
+    assert_eq!(
+        view_read_all(&view, std::slice::from_ref(&c)).await,
+        [b"old"]
+    );
+
+    c.write(b"k", b"new").await.unwrap();
+    assert_eq!(
+        view_read_all(&view, std::slice::from_ref(&c)).await,
+        [b"old"]
+    );
+    tokio::time::sleep(STALENESS * 2).await;
+    assert_eq!(view_read_all(&view, &[c]).await, [b"new"]);
+}
+
+/// A write of another key of a leaf gives the leaf a new state, but the read
+/// key keeps its writer, so the view keeps its cut point.
+#[tokio::test(start_paused = true)]
+async fn a_view_keeps_its_cut_point_when_only_another_key_of_the_leaf_changes() {
+    let backend = mem();
+    let reader = Database::open("example", backend.clone()).await.unwrap();
+    let pair = create_top(&reader, b"pair").await;
+    pair.write(b"a", b"a").await.unwrap();
+    pair.write(b"b", b"b").await.unwrap();
+    let other = create_top(&reader, b"other").await;
+    other.write(b"k", b"v").await.unwrap();
+    // Only the state of `other` has a confirmation after its start, so the
+    // floor of the view is after the last confirmation of `pair`.
+    tx_read_all(&reader, std::slice::from_ref(&other)).await;
+    let view = reader.stale(Duration::MAX);
+    assert_eq!(
+        view_read_all(&view, std::slice::from_ref(&other)).await,
+        [b"v"]
+    );
+
+    let writer = Database::open("example", backend).await.unwrap();
+    open_top(&writer, b"pair")
+        .await
+        .write(b"b", b"new")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(pair.read(b"b").await.unwrap().unwrap(), b"new");
+
+    let before = reader.stats();
+    assert_eq!(view_read_keys(&view, &pair, &[b"a"]).await, [b"a"]);
+    assert_eq!(view_read_all(&view, &[other]).await, [b"v"]);
+    assert_eq!(backend_ops(&reader, &before), (0, 0, 0));
+    writer.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -284,20 +392,6 @@ async fn calls_through_two_views_are_not_ordered() {
     assert_eq!(read_tx_all(&reader, Duration::ZERO, &[x]).await, [b"new"]);
     // A new view has its own floor, so the cached state of `z` serves it.
     assert_eq!(read_tx_all(&reader, Duration::MAX, &[z]).await, [b"old"]);
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_new_view_never_reads_an_older_state_of_a_key() {
-    let backend = mem();
-    let reader = Database::open("example", backend.clone()).await.unwrap();
-    let (x, _) = cache_then_write_both(&reader, backend).await;
-
-    assert_eq!(
-        read_tx_all(&reader, Duration::ZERO, std::slice::from_ref(&x)).await,
-        [b"new"]
-    );
-    // The cache never goes back to an older state of an object.
-    assert_eq!(read_tx_all(&reader, Duration::MAX, &[x]).await, [b"new"]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -489,34 +583,6 @@ mod persistent {
         // An L1 too small to keep a leaf, so every read comes from L2.
         let db = open(backend, &dir, 1).await;
         assert_eq!(measure(&db, STALENESS).await, (LEAVES as u64, 0));
-        db.shutdown().await;
-    }
-
-    /// A fetch of a newer state replaces the persistent copy, so a new view
-    /// that reloads the state does not read the older one again.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_new_view_never_reloads_an_older_state_of_a_key() {
-        let (dir, backend) = seeded("view-order").await;
-        // An L1 too small to keep a leaf, so every read comes from L2.
-        let db = open(backend.clone(), &dir, 1).await;
-        let collections = open_collections(&db).await;
-        let (c0, others) = collections.split_at(1);
-        assert_eq!(read_tx_all(&db, Duration::MAX, c0).await, [b"v"]);
-
-        let writer = Database::open("example", backend).await.unwrap();
-        open_top(&writer, b"c0")
-            .await
-            .write(b"k", b"new")
-            .await
-            .unwrap();
-        assert_eq!(read_tx_all(&db, Duration::ZERO, c0).await, [b"new"]);
-        // The other leaves take the one L1 entry, so the next read of `c0`
-        // loads its state from L2.
-        read_tx_all(&db, Duration::MAX, others).await;
-        let before = db.stats();
-        assert_eq!(read_tx_all(&db, Duration::MAX, c0).await, [b"new"]);
-        assert_eq!(backend_ops(&db, &before), (0, 0, 0));
-        writer.shutdown().await;
         db.shutdown().await;
     }
 }

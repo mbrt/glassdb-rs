@@ -37,8 +37,8 @@ pub mod sim {
 
 pub use cache_stats::CacheStats;
 pub use cached_store::{
-    CachedStore, CasReceipt, CasResult, CutSearch, CutTarget, Observation, ObservationCheck,
-    Revision,
+    CachedStore, CasReceipt, CasResult, CutKey, CutSearch, CutTarget, Observation,
+    ObservationCheck, Revision,
 };
 pub use collection_store::{CollectionRecord, CollectionStore};
 pub use disk_cache::{
@@ -60,6 +60,7 @@ pub use structural_intent::{
 };
 pub use structural_intent_store::{StructuralIntentPage, StructuralIntentStore};
 pub use timeline::{
-    CurrentnessBarrier, MonotonicFloor, Requirement, SequencePoint, StalenessCutoff, Timeline,
+    CurrentnessBarrier, FloorPoint, MonotonicFloor, Requirement, SequencePoint, StalenessCutoff,
+    Timeline, ViewFloors,
 };
 pub use tree_router::{RoutedLeaf, RoutedLeafGroup, TreeRouter};

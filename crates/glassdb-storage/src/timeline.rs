@@ -9,8 +9,8 @@
 //! Changes to this module require the review in
 //! `docs/guides/storage-consistency.md` (E1, E2).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use glassdb_concurr::rt;
@@ -118,14 +118,16 @@ impl StalenessCutoff {
 /// stale view can use (ADR-097, ADR-102). Clones share one floor.
 ///
 /// It only rises. Use it only with the timeline of the database instance of
-/// its view.
-#[derive(Debug, Clone, Default)]
+/// its view. [`ViewFloors::new_floor`] creates it.
+#[derive(Debug, Clone)]
 pub struct MonotonicFloor(Arc<AtomicU64>);
 
 impl MonotonicFloor {
-    /// Creates a floor that admits every cut point.
-    pub fn new() -> Self {
-        Self::default()
+    /// Captures the floor for one stale read-only transaction, if an earlier
+    /// transaction raised it and it is not older than `cutoff` (ADR-103).
+    pub fn point_within(&self, cutoff: StalenessCutoff) -> Option<FloorPoint> {
+        let floor = self.get();
+        (floor != SequencePoint::default() && floor >= cutoff.point()).then_some(FloorPoint(floor))
     }
 
     /// Raises the floor to a barrier captured after completed work.
@@ -139,6 +141,52 @@ impl MonotonicFloor {
 
     pub(crate) fn raise(&self, point: SequencePoint) {
         self.0.fetch_max(point.0, Ordering::SeqCst);
+    }
+}
+
+/// The monotonic floor of a stale view, as one stale read-only transaction
+/// captured it within its staleness bound (ADR-103). A read at this point uses
+/// the state that was current at it, when the decoded cache has one.
+///
+/// It exposes its point only to storage modules. Do not convert it to a
+/// barrier or a requirement.
+#[derive(Debug, Clone, Copy)]
+pub struct FloorPoint(SequencePoint);
+
+impl FloorPoint {
+    pub(crate) fn point(self) -> SequencePoint {
+        self.0
+    }
+}
+
+/// The monotonic floors of the live stale views of one database instance.
+/// The decoded cache keeps an earlier state only while one of these floors can
+/// use it (ADR-103).
+#[derive(Debug, Clone, Default)]
+pub struct ViewFloors(Arc<Mutex<Vec<Weak<AtomicU64>>>>);
+
+impl ViewFloors {
+    /// Creates the floor of a new stale view. It admits every cut point.
+    pub fn new_floor(&self) -> MonotonicFloor {
+        let floor = MonotonicFloor(Arc::default());
+        let mut floors = self.0.lock().unwrap();
+        floors.retain(|floor| floor.strong_count() > 0);
+        floors.push(Arc::downgrade(&floor.0));
+        floor
+    }
+
+    /// The lowest floor that a call of a live view raised, or `None` when no
+    /// live view has one.
+    pub(crate) fn lowest(&self) -> Option<SequencePoint> {
+        let mut floors = self.0.lock().unwrap();
+        floors.retain(|floor| floor.strong_count() > 0);
+        floors
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|floor| floor.load(Ordering::SeqCst))
+            .filter(|point| *point != 0)
+            .min()
+            .map(SequencePoint)
     }
 }
 
@@ -272,6 +320,29 @@ fn duration_to_nanos(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_floor_gives_a_read_point_only_within_the_cutoff() {
+        let timeline = Timeline::new();
+        let floor = ViewFloors::default().new_floor();
+        assert!(floor.point_within(StalenessCutoff::ANY).is_none());
+        floor.raise(timeline.now());
+        assert!(floor.point_within(StalenessCutoff::ANY).is_some());
+        let zero = timeline.staleness_cutoff(Duration::ZERO);
+        assert!(floor.point_within(zero).is_none());
+    }
+
+    #[test]
+    fn view_floors_track_the_lowest_raised_floor_of_the_live_views() {
+        let views = ViewFloors::default();
+        let (low, high, _unraised) = (views.new_floor(), views.new_floor(), views.new_floor());
+        assert_eq!(views.lowest(), None);
+        high.raise(SequencePoint(9));
+        low.raise(SequencePoint(4));
+        assert_eq!(views.lowest(), Some(SequencePoint(4)));
+        drop(low);
+        assert_eq!(views.lowest(), Some(SequencePoint(9)));
+    }
 
     struct FixedSource(Duration);
 

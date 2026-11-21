@@ -12,12 +12,14 @@ use glassdb_backend as backend;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 
 use crate::cached_store::{
-    CachedStore, CasResult, Codec, CutSearch, CutTarget, Observation, ObservationCheck, Requirement,
+    CachedStore, CasResult, Codec, CutKey, CutSearch, CutTarget, Observation, ObservationCheck,
+    Requirement,
 };
 use crate::error::StorageError;
 use crate::leaf::LeafBody;
 use crate::lock::LockType;
 use crate::node::{Node, NodeLocks};
+use crate::timeline::FloorPoint;
 
 const NODE_LIST_PAGE_SIZE: usize = 128;
 
@@ -158,6 +160,12 @@ impl Codec for Node {
     fn name() -> &'static str {
         "node"
     }
+
+    /// A stale view reads a key at its floor from the leaf, and routes through
+    /// the cached index nodes (ADR-103).
+    fn keeps_earlier_states(node: &Self::Value) -> bool {
+        node.as_leaf().is_some()
+    }
 }
 
 impl NodeStore {
@@ -166,6 +174,15 @@ impl NodeStore {
         Self {
             nodes: objects.typed(),
             parallelism,
+        }
+    }
+
+    /// Returns a node store whose reads use the leaf state that was current at
+    /// `point`, when the cache has one (ADR-103).
+    pub fn at(&self, point: FloorPoint) -> Self {
+        Self {
+            nodes: self.nodes.at(point),
+            parallelism: self.parallelism,
         }
     }
 
@@ -198,6 +215,19 @@ impl NodeStore {
     /// Starts a cut search on the timeline of the node cache (ADR-097).
     pub fn cut_search(&self) -> CutSearch {
         self.nodes.cut_search()
+    }
+
+    /// Adds the interval of one read key to a cut search (ADR-103). `key_state`
+    /// returns the state of the key in a leaf state, and must return a value
+    /// that never comes back after the key changes, or `None` when the leaf
+    /// state cannot show the key unchanged.
+    pub fn add_key_to_cut<S: PartialEq>(
+        &self,
+        search: &mut CutSearch,
+        observed: &LeafObservation,
+        key_state: impl Fn(&Node) -> Option<S>,
+    ) -> Result<CutKey, StorageError> {
+        self.nodes.add_part_to_cut(search, observed, key_state)
     }
 
     /// Adds retained leaf observations to a cut search (ADR-097).
