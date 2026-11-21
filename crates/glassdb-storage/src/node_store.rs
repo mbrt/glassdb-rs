@@ -361,11 +361,12 @@ impl NodeStore {
     /// copy of it, and a [`Decision::Write`] lands with a CAS on the loaded
     /// state.
     ///
-    /// Each load starts at [`Requirement::ANY`], so a cached state costs no
-    /// backend call. A CAS that loses loads the node again. A
-    /// [`Decision::Done`] and a missing node need a state that satisfies
-    /// `proof`, so the step loads again at `proof` when the loaded state does
-    /// not satisfy it. A landed CAS proves its own premise, because the CAS
+    /// The first load is at [`Requirement::ANY`], so a cached state costs no
+    /// backend call, and so is each load after a CAS. A CAS that loses loads
+    /// the node again. A [`Decision::Done`] and a missing node need a state
+    /// that satisfies `proof`, so the step loads again at `proof` when the
+    /// loaded state does not satisfy it. [`Decision::Reload`] and
+    /// [`Decision::Wait`] set the requirement of the next load. A landed CAS proves its own premise, because the CAS
     /// rejects a stale state. Give `proof` from the observation or the event
     /// that the decision depends on, for example a barrier captured after the
     /// read that shows the premise. Use [`Requirement::ANY`] only when this
@@ -391,7 +392,7 @@ impl NodeStore {
                 let decided = decide(node, observation.clone());
                 async move {
                     let decision = decided.await?;
-                    if let Decision::Write(node, _) = &decision {
+                    if let Decision::Write(node, _) | Decision::Advance(node) = &decision {
                         debug_assert!(no_key_lock_outlives_membership(&observation, node));
                     }
                     Ok(decision)
@@ -1269,5 +1270,152 @@ mod tests {
         assert!(matches!(result, Converged::Stop(())));
         assert_eq!(decisions, 2);
         assert_eq!(drop_intent(&peer).await, Some(owner));
+    }
+
+    // An advance writes and then decides on the state that its CAS installed,
+    // without a backend read in between.
+    #[tokio::test]
+    async fn converge_advances_on_the_installed_state() {
+        let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));
+        let log = recorder.log();
+        let store = store_over(Arc::new(recorder));
+        let empty = Node::leaf(LeafBody::new());
+        assert!(
+            store
+                .store_node(&collection(), &node_id(1), &empty, None)
+                .await
+                .unwrap()
+        );
+        let reads = count(&log, "read") + count(&log, "read_if_modified");
+        let first = TxId::with_priority(0, b"first");
+        let mut seen = Vec::new();
+
+        let result = store
+            .converge(
+                &node_path(1),
+                Requirement::ANY,
+                CasRetries::Bounded(8),
+                |mut node, _| {
+                    seen.push(node.drop_intent().copied());
+                    let decision = match node.drop_intent() {
+                        None => {
+                            node.set_drop_intent(first);
+                            Decision::Advance(node)
+                        }
+                        Some(_) => Decision::Done(()),
+                    };
+                    std::future::ready(Ok::<_, StorageError>(decision))
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, Converged::Done(())));
+        assert_eq!(seen, [None, Some(first)]);
+        assert_eq!(
+            count(&log, "read") + count(&log, "read_if_modified"),
+            reads,
+            "the second decision uses the installed state"
+        );
+    }
+
+    // A reload at a requirement replaces a stale cached state with one that
+    // satisfies it.
+    #[tokio::test]
+    async fn converge_reloads_at_the_requirement_of_the_decision() {
+        let owner = TxId::with_priority(0, b"owner");
+        let (local, _peer) = stale_without_intent(&owner).await;
+        let fresh = Requirement::after(local.timeline.currentness_barrier());
+        let mut seen = Vec::new();
+
+        let result = local
+            .converge(
+                &node_path(1),
+                Requirement::ANY,
+                CasRetries::Bounded(8),
+                |node, observed| {
+                    seen.push(node.drop_intent().copied());
+                    let decision = if observed.satisfies(fresh) {
+                        Decision::Done(())
+                    } else {
+                        Decision::Reload(fresh)
+                    };
+                    std::future::ready(Ok::<_, StorageError>(decision))
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, Converged::Done(())));
+        assert_eq!(seen, [None, Some(owner)]);
+    }
+
+    /// Decides `Wait(ANY)` once and then `Done`, and returns how long the step
+    /// took in paused time.
+    async fn wait_once(retries: CasRetries) -> std::time::Duration {
+        let store = store_over(Arc::new(MemoryBackend::new()));
+        let empty = Node::leaf(LeafBody::new());
+        assert!(
+            store
+                .store_node(&collection(), &node_id(1), &empty, None)
+                .await
+                .unwrap()
+        );
+        let mut waited = false;
+        let started = tokio::time::Instant::now();
+        let result = store
+            .converge(&node_path(1), Requirement::ANY, retries, |_, _| {
+                let decision = if waited {
+                    Decision::Done(())
+                } else {
+                    waited = true;
+                    Decision::Wait(Requirement::ANY)
+                };
+                std::future::ready(Ok::<_, StorageError>(decision))
+            })
+            .await
+            .unwrap();
+        assert!(matches!(result, Converged::Done(())));
+        started.elapsed()
+    }
+
+    // A wait uses the backoff of an unbounded step. A bounded step has none
+    // and loads again at once.
+    #[tokio::test(start_paused = true)]
+    async fn converge_waits_with_the_backoff_of_the_step() {
+        let schedule = glassdb_concurr::RetrySchedule {
+            initial_interval: std::time::Duration::from_secs(10),
+            max_interval: std::time::Duration::from_secs(20),
+        };
+        // The first delay is the initial interval with a jitter of at most
+        // one half.
+        assert!(wait_once(CasRetries::Unbounded(schedule)).await >= schedule.initial_interval / 2);
+        assert!(wait_once(CasRetries::Bounded(8)).await < schedule.initial_interval / 2);
+    }
+
+    // A lost advance counts toward the bound like a lost write.
+    #[tokio::test]
+    async fn converge_counts_a_lost_advance() {
+        let owner = TxId::with_priority(0, b"owner");
+        let (local, _peer) = stale_without_intent(&owner).await;
+        let other = TxId::with_priority(0, b"other");
+        let mut decisions = 0;
+
+        let result = local
+            .converge(
+                &node_path(1),
+                Requirement::ANY,
+                CasRetries::Bounded(1),
+                |mut node, _| {
+                    decisions += 1;
+                    node.set_drop_intent(other);
+                    std::future::ready(Ok::<_, StorageError>(Decision::<Node, ()>::Advance(node)))
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, Converged::Exhausted));
+        assert_eq!(decisions, 1);
     }
 }

@@ -5,7 +5,7 @@ use std::future::ready;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use glassdb_concurr::{RetrySchedule, rt};
+use glassdb_concurr::RetrySchedule;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
@@ -215,50 +215,51 @@ impl CollectionLifecycle {
         collection: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let mut backoff = self.retry.backoff();
-        loop {
-            let (mut record, observed) = self
-                .records
-                .load_record(collection, Requirement::ANY)
-                .await?;
-            if record.topology_freeze() != Some(id)
-                && let Some(holder) = record.topology_freeze().cloned()
-            {
-                match resolve_tx_conflict(&self.monitor, id, &holder).await? {
-                    TxFinalStatus::Committed => return Err(TransError::StaleCollection),
-                    TxFinalStatus::Aborted => {
-                        record.remove_topology_freeze(&holder);
+        let frozen = self
+            .records
+            .converge(
+                collection,
+                Requirement::ANY,
+                CasRetries::Unbounded(self.retry),
+                |mut record, _| async move {
+                    if record.topology_freeze() != Some(id)
+                        && let Some(holder) = record.topology_freeze().cloned()
+                    {
+                        match resolve_tx_conflict(&self.monitor, id, &holder).await? {
+                            TxFinalStatus::Committed => return Err(TransError::StaleCollection),
+                            TxFinalStatus::Aborted => {
+                                record.remove_topology_freeze(&holder);
+                            }
+                        }
                     }
-                }
+                    if record.topology_freeze().is_none() {
+                        assert!(record.set_topology_freeze(*id));
+                        return Ok(Decision::Advance(record));
+                    }
+                    if record.topology_freeze() != Some(id) {
+                        return Ok(Decision::Reload(Requirement::ANY));
+                    }
+                    let Some(participant) = record.topology_participants().next().cloned() else {
+                        // This cache includes our freeze CAS. While this
+                        // identity can still commit, the freeze prevents
+                        // admission and participants can only leave. The empty
+                        // set needs no currentness check.
+                        return Ok(Decision::Done(()));
+                    };
+                    resolve_tx_conflict(&self.monitor, id, &participant).await?;
+                    self.topology
+                        .settle_topology_participant(collection, &participant)
+                        .await?;
+                    Ok::<_, TransError>(Decision::Wait(Requirement::ANY))
+                },
+            )
+            .await?;
+        match frozen {
+            Converged::Done(()) => Ok(()),
+            Converged::Missing => Err(StorageError::NotFound.into()),
+            Converged::Written { .. } | Converged::Stop(()) | Converged::Exhausted => {
+                Err(TransError::Retry)
             }
-            if record.topology_freeze().is_none() {
-                assert!(record.set_topology_freeze(*id));
-                if self.records.store_record(&record, &observed).await? {
-                    continue;
-                }
-                rt::sleep(backoff.next_delay()).await;
-                continue;
-            }
-            if record.topology_freeze() != Some(id) {
-                continue;
-            }
-            if record.topology_participants().next().is_none() {
-                // This cache includes our freeze CAS. While this identity can
-                // still commit, the freeze prevents admission and participants
-                // can only leave. The empty set needs no currentness check.
-                return Ok(());
-            }
-
-            let participant = record
-                .topology_participants()
-                .next()
-                .cloned()
-                .expect("participant presence was checked above");
-            resolve_tx_conflict(&self.monitor, id, &participant).await?;
-            self.topology
-                .settle_topology_participant(collection, &participant)
-                .await?;
-            rt::sleep(backoff.next_delay()).await;
         }
     }
 
@@ -309,7 +310,7 @@ impl CollectionLifecycle {
                     }
                     if let Some(holder) = self.pending_node_holder(&node, id).await? {
                         self.resolve_pending_holder(&holder, id).await?;
-                        return Ok(Decision::Reload);
+                        return Ok(Decision::Reload(Requirement::ANY));
                     }
                     // The topology freeze has drained structural participants.
                     // This exact-revision rewrite fuses the remaining one-shot

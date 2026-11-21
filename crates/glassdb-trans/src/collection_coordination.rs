@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::ready;
 use std::num::NonZeroUsize;
 
-use glassdb_concurr::{RetrySchedule, map_all_bounded, rt};
+use glassdb_concurr::{RetrySchedule, map_all_bounded};
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::transaction::{
     TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecordStore,
@@ -196,66 +196,80 @@ impl CollectionLocker {
         id: &TxId,
         desired: LockType,
     ) -> Result<(), TransError> {
-        let mut backoff = self.retry.backoff();
-        let mut requirement = Requirement::ANY;
-        loop {
-            let (mut record, observed) = self
-                .state
-                .load_resolved(parent, Some(id), requirement, PendingHolders::Wait)
-                .await?;
-            let lock = record.directory_lock();
-            let already_held = lock.contains(id)
-                && (desired == LockType::Read || lock.lock_type() == LockType::Write);
-            if already_held {
-                // This active identity's releases update the same cache;
-                // foreign cleanup requires finalization. Retained ownership
-                // permits this return. Directory contents are validated later.
-                return Ok(());
-            }
-            let conflicts = match desired {
-                LockType::Read => lock.lock_type() == LockType::Write,
-                LockType::Write => !lock.holders().is_empty(),
-                _ => false,
-            };
-            if conflicts
-                && let Some(holder) = lock.holders().iter().find(|holder| *holder != id).cloned()
-            {
-                match resolve_tx_conflict(&self.monitor, id, &holder).await? {
-                    TxFinalStatus::Committed => {
-                        match self.state.help_committed_write_back(parent, &holder).await {
-                            Ok(()) => {}
-                            // As in `load_resolved`: GC can reclaim the log
-                            // after another instance removed the holder.
-                            Err(TransError::Storage(StorageError::NotFound)) => {
-                                requirement =
-                                    Requirement::after(self.state.timeline.currentness_barrier());
+        let locked = self
+            .records
+            .converge(
+                parent,
+                Requirement::ANY,
+                CasRetries::Unbounded(self.retry),
+                |record, _| async move {
+                    let mut record = match self
+                        .state
+                        .resolve_record(parent, record, Some(id), PendingHolders::Wait)
+                        .await?
+                    {
+                        Ok(record) => record,
+                        Err(next) => return Ok(next),
+                    };
+                    let lock = record.directory_lock();
+                    let already_held = lock.contains(id)
+                        && (desired == LockType::Read || lock.lock_type() == LockType::Write);
+                    if already_held {
+                        // This active identity's releases update the same
+                        // cache; foreign cleanup requires finalization.
+                        // Retained ownership permits this return. Directory
+                        // contents are validated later.
+                        return Ok(Decision::Done(()));
+                    }
+                    let conflicts = match desired {
+                        LockType::Read => lock.lock_type() == LockType::Write,
+                        LockType::Write => !lock.holders().is_empty(),
+                        _ => false,
+                    };
+                    if conflicts
+                        && let Some(holder) =
+                            lock.holders().iter().find(|holder| *holder != id).cloned()
+                    {
+                        return match resolve_tx_conflict(&self.monitor, id, &holder).await? {
+                            TxFinalStatus::Committed => {
+                                match self.state.help_committed_write_back(parent, &holder).await {
+                                    Ok(()) => Ok(Decision::Wait(Requirement::ANY)),
+                                    // As in `load_resolved`: GC can reclaim the
+                                    // log after another instance removed the
+                                    // holder.
+                                    Err(TransError::Storage(StorageError::NotFound)) => {
+                                        Ok(Decision::Wait(Requirement::after(
+                                            self.state.timeline.currentness_barrier(),
+                                        )))
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             }
-                            Err(error) => return Err(error),
+                            TxFinalStatus::Aborted => {
+                                record.remove_directory_holder(&holder);
+                                Ok(Decision::Advance(record))
+                            }
+                        };
+                    }
+                    match desired {
+                        LockType::Read => record.add_directory_reader(*id),
+                        LockType::Write => record.set_directory_writer(*id),
+                        _ => {
+                            return Err(TransError::other(
+                                "invalid collection-directory lock request",
+                            ));
                         }
                     }
-                    TxFinalStatus::Aborted => {
-                        record.remove_directory_holder(&holder);
-                        if self.records.store_record(&record, &observed).await? {
-                            continue;
-                        }
-                    }
-                }
-                rt::sleep(backoff.next_delay()).await;
-                continue;
-            }
-            match desired {
-                LockType::Read => record.add_directory_reader(*id),
-                LockType::Write => record.set_directory_writer(*id),
-                _ => {
-                    return Err(TransError::other(
-                        "invalid collection-directory lock request",
-                    ));
-                }
-            }
-            if self.records.store_record(&record, &observed).await? {
-                return Ok(());
-            }
-            rt::sleep(backoff.next_delay()).await;
+                    Ok::<_, TransError>(Decision::Write(record, ()))
+                },
+            )
+            .await?;
+        match locked {
+            Converged::Written { .. } | Converged::Done(()) => Ok(()),
+            Converged::Missing => Err(StorageError::NotFound
+                .classify_collection_absence(parent)
+                .into()),
+            Converged::Stop(()) | Converged::Exhausted => Err(TransError::Retry),
         }
     }
 
@@ -327,70 +341,95 @@ impl CollectionStateResolver {
         requirement: Requirement,
         pending: PendingHolders,
     ) -> Result<(CollectionRecord, Observation<CollectionRecord>), TransError> {
-        let mut backoff = self.retry.backoff();
-        let mut requirement = requirement;
-        loop {
-            let (mut record, observed) = self
-                .records
-                .load_record(parent, requirement)
-                .await
-                .map_err(|error| error.classify_collection_absence(parent))?;
-            if let Some(holder) = record.topology_freeze().cloned()
-                && Some(&holder) != own
-            {
-                let Some(status) = self.holder_status(&holder, pending).await? else {
-                    return Ok((record, observed));
-                };
-                match status {
-                    TxFinalStatus::Committed => return Err(TransError::StaleCollection),
-                    TxFinalStatus::Aborted => {
-                        record.remove_topology_freeze(&holder);
-                        if self.records.store_record(&record, &observed).await? {
-                            continue;
-                        }
+        let resolved = self
+            .records
+            .converge(
+                parent,
+                requirement,
+                CasRetries::Unbounded(self.retry),
+                |record, observed| async move {
+                    // Resolve only states at `requirement`, as a load at it
+                    // would give.
+                    if !observed.satisfies(requirement) {
+                        return Ok(Decision::Reload(requirement));
                     }
-                }
-                rt::sleep(backoff.next_delay()).await;
-                continue;
+                    Ok::<_, TransError>(
+                        match self.resolve_record(parent, record, own, pending).await? {
+                            Ok(record) => Decision::Done((record, observed)),
+                            Err(next) => next,
+                        },
+                    )
+                },
+            )
+            .await?;
+        match resolved {
+            Converged::Done(resolved) => Ok(resolved),
+            Converged::Missing => Err(StorageError::NotFound
+                .classify_collection_absence(parent)
+                .into()),
+            Converged::Written { .. } | Converged::Stop(_) | Converged::Exhausted => {
+                Err(TransError::Retry)
             }
+        }
+    }
 
-            // Pending readers cannot change the bindings or the generation, so
-            // a load does not wait for them. A writer that needs the lock
-            // resolves them in `CollectionLocker::lock_directory` (ADR-089).
-            if record.directory_lock().lock_type() == LockType::Read {
-                return Ok((record, observed));
-            }
-            let holder = record
-                .directory_lock()
-                .holders()
-                .iter()
-                .find(|holder| Some(*holder) != own)
-                .cloned();
-            let Some(holder) = holder else {
-                return Ok((record, observed));
-            };
+    /// Resolves one state of the record of `parent`: the foreign topology
+    /// freeze and the foreign directory writer, when they have a final status.
+    /// Returns the resolved record, or the decision that the step of the
+    /// caller makes first.
+    /// Pending readers cannot change the bindings or the generation, so they
+    /// stay. A writer that needs the lock resolves them in
+    /// `CollectionLocker::lock_directory` (ADR-089).
+    async fn resolve_record<T>(
+        &self,
+        parent: &CollectionAddress,
+        mut record: CollectionRecord,
+        own: Option<&TxId>,
+        pending: PendingHolders,
+    ) -> Result<Result<CollectionRecord, Decision<CollectionRecord, T>>, TransError> {
+        if let Some(holder) = record.topology_freeze().cloned()
+            && Some(&holder) != own
+        {
             let Some(status) = self.holder_status(&holder, pending).await? else {
-                return Ok((record, observed));
+                return Ok(Ok(record));
             };
-            match status {
-                TxFinalStatus::Committed => {
-                    match self.help_committed_write_back(parent, &holder).await {
-                        Ok(()) => {}
-                        Err(TransError::Storage(StorageError::NotFound)) => {
-                            // GC can reclaim a log after another instance removes
-                            // its directory holder. A cached record must reload.
-                            requirement = Requirement::after(self.timeline.currentness_barrier());
-                            rt::sleep(backoff.next_delay()).await;
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
+            return match status {
+                TxFinalStatus::Committed => Err(TransError::StaleCollection),
                 TxFinalStatus::Aborted => {
-                    record.remove_directory_holder(&holder);
-                    if !self.records.store_record(&record, &observed).await? {
-                        rt::sleep(backoff.next_delay()).await;
-                    }
+                    record.remove_topology_freeze(&holder);
+                    Ok(Err(Decision::Advance(record)))
                 }
+            };
+        }
+        if record.directory_lock().lock_type() == LockType::Read {
+            return Ok(Ok(record));
+        }
+        let holder = record
+            .directory_lock()
+            .holders()
+            .iter()
+            .find(|holder| Some(*holder) != own)
+            .cloned();
+        let Some(holder) = holder else {
+            return Ok(Ok(record));
+        };
+        let Some(status) = self.holder_status(&holder, pending).await? else {
+            return Ok(Ok(record));
+        };
+        match status {
+            TxFinalStatus::Committed => match self.help_committed_write_back(parent, &holder).await
+            {
+                Ok(()) => Ok(Err(Decision::Reload(Requirement::ANY))),
+                // GC can reclaim a log after another instance removes its
+                // directory holder. A cached record must reload.
+                Err(TransError::Storage(StorageError::NotFound)) => Ok(Err(Decision::Wait(
+                    Requirement::after(self.timeline.currentness_barrier()),
+                ))),
+                Err(error) => Err(error),
+            },
+            TxFinalStatus::Aborted => {
+                record.remove_directory_holder(&holder);
+                Ok(Err(Decision::Advance(record)))
             }
         }
     }

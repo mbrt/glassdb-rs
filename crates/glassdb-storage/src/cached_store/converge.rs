@@ -25,19 +25,29 @@ pub enum Decision<V, T> {
     /// Write this changed state with a CAS. The step returns `T` when the CAS
     /// lands, and loads the object again when the CAS loses.
     Write(V, T),
+    /// Write this changed state with a CAS, and decide again after it lands,
+    /// on a load at [`Requirement::ANY`]. That load gives the state that the
+    /// CAS installed, or a newer one, with no backend call. The step loads the
+    /// object again when the CAS loses. Use it for a change that needs more
+    /// than one write, each on the result of the one before.
+    Advance(V),
     /// The change ends without a write, with a result that a newer state of
     /// the object can change, for example because the object is already as
     /// the change needs it. The step returns `T` only if the loaded state
     /// satisfies `proof`, the freshness requirement of the caller. Otherwise it
-    /// loads the object again at
-    /// that requirement and decides again.
+    /// loads the object again at that requirement and decides again.
     Done(T),
     /// The change ends without a write, with a result that the caller can
     /// accept also from an older state, for example when it gives up the
     /// change. The step returns `T` at once.
     Stop(T),
-    /// Load the object again and decide again, for example after a wait.
-    Reload,
+    /// Load the object again at this requirement and decide again, for
+    /// example after a wait in the decision.
+    Reload(Requirement),
+    /// Wait for the next delay of the backoff of the step, then load the
+    /// object again at this requirement and decide again. A step with
+    /// [`CasRetries::Bounded`] has no backoff and loads at once.
+    Wait(Requirement),
 }
 
 /// The result of a converge step.
@@ -57,18 +67,20 @@ pub enum Converged<V, T> {
     Stop(T),
     /// The object is missing, in a state that satisfies `proof`.
     Missing,
-    /// All CAS attempts lost.
+    /// The [`CasRetries::Bounded`] number of CASes lost.
     Exhausted,
 }
 
-/// How many CAS attempts a step makes, and how long it waits after a lost
-/// CAS.
+/// How many lost CASes a step accepts, and how long it waits after a lost CAS
+/// and for a [`Decision::Wait`].
 #[derive(Clone, Copy)]
 pub enum CasRetries {
-    /// At most this many CAS attempts, with no wait between them.
+    /// The step ends with [`Converged::Exhausted`] after this many lost CASes.
+    /// It does not wait.
     Bounded(usize),
-    /// CAS attempts until one lands, with waits from this schedule between
-    /// them.
+    /// The step accepts any number of lost CASes. It waits with delays from
+    /// this schedule after each lost CAS and for each [`Decision::Wait`], from
+    /// one backoff for the whole step.
     Unbounded(RetrySchedule),
 }
 
@@ -78,11 +90,13 @@ where
 {
     /// Changes the object at `key` until `decide` gives a result.
     ///
-    /// Each load starts at [`Requirement::ANY`], so a cached state costs no
-    /// backend call. `decide` gets a copy of the loaded state and its
-    /// observation. A [`Decision::Done`] and a missing object need a state
-    /// that satisfies `proof`, so the step loads again at `proof` when the
-    /// loaded state does not satisfy it.
+    /// The first load is at [`Requirement::ANY`], so a cached state costs no
+    /// backend call, and so is each load after a CAS. `decide` gets a copy of
+    /// the loaded state and its observation. A [`Decision::Done`] and a
+    /// missing object need a state that satisfies `proof`, so the step loads
+    /// again at `proof` when the loaded state does not satisfy it.
+    /// [`Decision::Reload`] and [`Decision::Wait`] set the requirement of the
+    /// next load.
     ///
     /// An in-doubt CAS is an error.
     pub(crate) async fn converge<T, E, F, Fut>(
@@ -119,35 +133,54 @@ where
             // large. Inlined in the future of every caller, it overflows the
             // stack of a debug build (the `database_options` tests). One
             // allocation for each decision costs little next to the load.
-            match Box::pin(decide(state, observation.clone())).await? {
-                Decision::Write(state, value) => {
-                    match self.replace(&observation, Arc::new(state.clone())).await {
-                        Ok(CasResult::Applied(receipt)) => {
-                            return Ok(Converged::Written {
-                                value,
-                                state,
-                                observation: receipt.into_installed(),
-                            });
-                        }
-                        Ok(CasResult::Rejected) | Err(StorageError::NotFound) => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                    lost += 1;
-                    match (retries, backoff.as_mut()) {
-                        (CasRetries::Bounded(attempts), _) if lost >= attempts => {
-                            return Ok(Converged::Exhausted);
-                        }
-                        (_, Some(backoff)) => rt::sleep(backoff.next_delay()).await,
-                        _ => {}
-                    }
-                    // The lost CAS removed the stale state from the cache.
-                    requirement = Requirement::ANY;
-                }
+            let (state, value) = match Box::pin(decide(state, observation.clone())).await? {
+                Decision::Write(state, value) => (state, Some(value)),
+                Decision::Advance(state) => (state, None),
                 Decision::Done(value) if proven => return Ok(Converged::Done(value)),
-                Decision::Done(_) => requirement = proof,
+                Decision::Done(_) => {
+                    requirement = proof;
+                    continue;
+                }
                 Decision::Stop(value) => return Ok(Converged::Stop(value)),
-                Decision::Reload => requirement = Requirement::ANY,
+                Decision::Reload(next) => {
+                    requirement = next;
+                    continue;
+                }
+                Decision::Wait(next) => {
+                    if let Some(backoff) = backoff.as_mut() {
+                        rt::sleep(backoff.next_delay()).await;
+                    }
+                    requirement = next;
+                    continue;
+                }
+            };
+            match self.replace(&observation, Arc::new(state.clone())).await {
+                Ok(CasResult::Applied(receipt)) => match value {
+                    Some(value) => {
+                        return Ok(Converged::Written {
+                            value,
+                            state,
+                            observation: receipt.into_installed(),
+                        });
+                    }
+                    None => {
+                        requirement = Requirement::ANY;
+                        continue;
+                    }
+                },
+                Ok(CasResult::Rejected) | Err(StorageError::NotFound) => {}
+                Err(error) => return Err(error.into()),
             }
+            lost += 1;
+            match (retries, backoff.as_mut()) {
+                (CasRetries::Bounded(attempts), _) if lost >= attempts => {
+                    return Ok(Converged::Exhausted);
+                }
+                (_, Some(backoff)) => rt::sleep(backoff.next_delay()).await,
+                _ => {}
+            }
+            // The lost CAS removed the stale state from the cache.
+            requirement = Requirement::ANY;
         }
     }
 }

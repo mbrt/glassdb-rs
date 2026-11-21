@@ -229,18 +229,18 @@ It is not safe when the decision skips the change, or when it changes a
 different object, as the split recovery link check does when it deletes the
 created node. In these cases, capture a new barrier after the read that proves
 the event, and read the second object at that barrier. The split recovery link
-check and the merge recovery reservation removal follow this rule. Most changes
-of one node or collection record by a single writer, outside the leaf
-coordinator round, go through `NodeStore::converge` or
-`CollectionStore::converge`. These take the barrier as the freshness requirement
-`proof`. They read the object at `ANY` first. When the object is missing, or
-when the change ends without a write and its result depends on the state
-(`Decision::Done`), they read the object again at `proof`. The record loops that
-write more than once (`join`, `freeze_topology`, `load_resolved`,
-`lock_directory`) do not use them and check their own skips. The single CASes at
-a gated revision, such as the split shrink and the merge drain, do not skip: a
-lost CAS ends the change. A skip needs no new barrier when the stale state shows
-a fact that never reverts and that alone excludes the event. For example,
+check and the merge recovery reservation removal follow this rule. Changes of
+one node or collection record by a single writer, outside the leaf coordinator
+round, go through `NodeStore::converge` or `CollectionStore::converge`. These
+take the barrier as the freshness requirement `proof`. They read the object at
+`ANY` first. When the object is missing, or when the change ends without a write
+and its result depends on the state (`Decision::Done`), they read the object
+again at `proof`. A change that must decide only on states that satisfy a
+requirement returns `Decision::Reload` with that requirement for an older state,
+as `CollectionStateResolver::load_resolved` does. The single CASes at a gated
+revision, such as the split shrink and the merge drain, do not skip: a lost CAS
+ends the change. A skip needs no new barrier when the stale state shows a fact
+that never reverts and that alone excludes the event. For example,
 `abandon_merge` skips a target that is drained or that has a different
 membership generation.
 
