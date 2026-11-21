@@ -26,7 +26,7 @@ repository uses these tags:
 
 | Tag | Meaning |
 | --- | --- |
-| `ci/counters` | An experiment whose counters the CI comparison and `make bench` compare. It runs once in virtual time without latency jitter, so its counters repeat exactly. |
+| `ci/counters` | An experiment whose counters the CI comparison and `make bench` compare. It runs three times in virtual time without latency jitter, so its counters almost always repeat, and the comparison uses the median of each counter. |
 | `ci/timing` | An experiment whose latency the CI comparison and `make bench` compare. It runs 32 times in virtual time with latency jitter. |
 | `ci/extended` | An experiment of `ci/timing` that the CI comparison and `make bench` run only on request, because it is expensive. [Comparing revisions](#comparing-revisions) tells how to request it. |
 | `extra` | An experiment that is too slow for CI, but that runs on one host. |
@@ -125,7 +125,7 @@ so both binaries and both runs use the same benchmark code and experiments, and
 only the engine differs.
 
 `make bench` runs two perfbench processes: `--tag=ci/counters
---latency-jitter=false --runs=1` and `--tag=ci/timing --latency-jitter=true
+--latency-jitter=false --runs=3` and `--tag=ci/timing --latency-jitter=true
 --runs=32`. The Makefile is the only place that has their options. By default it
 builds perfbench and runs the experiments of the current tree; `PERFBENCH` and
 `EXPERIMENTS_DIR` change both, as in CI. The timing process excludes the
@@ -139,10 +139,10 @@ directory in `/tmp`. CI writes the output of each side to `<side>.log` beside
 its results. To print the summary of a result directory again, run
 `hack/ci/perf_report.py --summary DIR`.
 
-The counter run compares the `costs` of each cell. They repeat exactly, so a
-change of any count shows, and a byte count shows when it changes by more than
-1%: the size of a record with a timestamp changes by a byte with the start time
-of the process. The timing runs compare the p50 latency, the p90 latency, and
+The counter runs compare the median of the `costs` of each cell over the three
+runs. The counters almost always repeat, so a change of any count shows, and a
+byte count shows when it changes by more than 1%: the size of a record with a
+timestamp changes by a byte with the start time of the process. The timing runs compare the p50 latency, the p90 latency, and
 the throughput of each shape. Each run is an independent sample of the latency
 jitter, so the report compares the 32 runs of each side with a simultaneous 95%
 interval of the change. It shows a change whose interval excludes zero and
@@ -185,9 +185,9 @@ latency jitter too.
 The name of a metric is the experiment, then the labels of the cell if the
 experiment has more than one cell, then the shape if the cell has more than one
 shape, for example `shapes-shared-leaf/rw-single: p50Ms`. To add an experiment
-to the comparison, give it the tag `ci/counters` if its counters repeat exactly
-without latency jitter, the tag `ci/timing` if its latency matters, or one file
-for each tag.
+to the comparison, give it the tag `ci/counters` if its counters repeat without
+latency jitter in almost every run, the tag `ci/timing` if its latency matters,
+or one file for each tag.
 
 ## Plotting results
 

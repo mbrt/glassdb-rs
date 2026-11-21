@@ -76,9 +76,9 @@ jobs:
     - name: Measure workloads
       id: measure
       timeout-minutes: 90
-      # Each revision runs `make bench` with the binary and the experiments
-      # that the build step records in its manifest: the counter experiments
-      # once, and the timing experiments 32 times, on virtual time, with the
+      # Each revision runs `make bench` with the binary and the experiments that
+      # the build step records in its manifest: the counter experiments three
+      # times, and the timing experiments 32 times, on virtual time, with the
       # runs in parallel. On 4 vCPUs, the timing process takes about 6 minutes,
       # and about 25 minutes with EXTENDED. The timeout of this step also stops
       # a process that hangs, such as a CPU livelock that virtual time cannot

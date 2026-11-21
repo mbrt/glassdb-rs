@@ -15,6 +15,8 @@ SHARED_LEAF = "shapes-shared-leaf"
 SHARED_LEAF_SHAPES = ("rw-single", "rw-many", "ro-single", "ro-multi")
 # The runs of the timing experiments of each side.
 RUNS = 4
+# The runs of the counter experiments of each side.
+COUNTER_RUNS = 3
 COUNTER_KEYS = (
     "reads",
     "writes",
@@ -102,9 +104,9 @@ class PerfReportTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         for side in ("main", "pr"):
-            # The counters come from one run without latency jitter.
+            # The counters come from runs without latency jitter.
             self.write(self.root / side / "timing.json", result(True, RUNS))
-            self.write(self.root / side / "counters.json", result(False, 1))
+            self.write(self.root / side / "counters.json", result(False, COUNTER_RUNS))
 
     @staticmethod
     def write(path, value):
@@ -518,6 +520,20 @@ class PerfReportTest(unittest.TestCase):
         self.assertIn("example/shutdown: writeBodyBytes", report)
         self.assertIn("new from zero", report)
 
+    def test_a_counter_that_changes_in_one_run_is_not_a_change(self):
+        # The seed of an experiment can take another path in a few runs
+        # (hack/perf/investigations.md, 2026-11-21).
+        for runs, reported in (([2], False), ([1, 3], True)):
+            with self.subTest(runs=runs):
+                self.setUp()
+                self.update_cell(
+                    "counters",
+                    "example",
+                    lambda cell: cell["costs"]["combined"].update(writeBodyBytes=500),
+                    runs=runs,
+                )
+                self.assertEqual("example/combined: writeBodyBytes" in self.report(), reported)
+
     def test_any_count_change_is_visible(self):
         base = perf_report.Metric("count/tx", "cost")
         candidate = perf_report.Metric("count/tx", "cost")
@@ -583,6 +599,12 @@ class PerfReportTest(unittest.TestCase):
         report = self.report()
         self.assertIn(f"{SHARED_LEAF}/run 1: cell failed", report)
         self.assertIn("incomplete measurements", report)
+
+    def test_a_counter_missing_from_one_run_is_incomplete(self):
+        # The median of the two other runs would be their mean, which is the
+        # value of neither path.
+        self.remove_cell("counters", "example", runs=[2])
+        self.assertIn("example/combined: writeBodyBytes: incomplete measurements", self.report())
 
     def test_invalid_numbers_and_low_sample_counts_are_warnings(self):
         self.update_cell(
