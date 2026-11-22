@@ -55,7 +55,7 @@ use evidence::Evidence;
 pub use evidence::{CasReceipt, CasResult, Observation, ObservationCheck, Revision};
 
 use earlier::EarlierStates;
-use entry::EvictionSink;
+use entry::{DecodedCache, EvictionSink};
 use latest::{FetchResult, LatestStates, PresentSeed};
 use mutation::{MutationOutcome, MutationRound};
 use path_lane::{FlightOutcome, PathCoordinator, PathState, ReadAdmission};
@@ -194,7 +194,7 @@ impl CachedStore {
         let sink = persistent
             .is_configured()
             .then(|| Arc::new(persistent.clone()) as Arc<dyn EvictionSink>);
-        let cache = entry::decoded_cache(max_size, sink);
+        let cache = DecodedCache::new(max_size, sink);
         let earlier = EarlierStates::new(cache.clone(), ViewFloors::default());
         CachedStore {
             backend,
@@ -4008,7 +4008,7 @@ mod tests {
         views: ViewFloors,
         sink: Option<Arc<dyn EvictionSink>>,
     ) -> (LatestStates, EarlierStates) {
-        let cache = entry::decoded_cache(max_size, sink);
+        let cache = DecodedCache::new(max_size, sink);
         let earlier = EarlierStates::new(cache.clone(), views);
         (LatestStates::new(cache, earlier.clone(), timeline), earlier)
     }

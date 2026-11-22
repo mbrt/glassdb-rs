@@ -2,12 +2,11 @@
 
 use std::sync::Arc;
 
-use crate::cache::Slot;
 use crate::error::StorageError;
 use crate::timeline::{SequencePoint, Timeline};
 
 use super::earlier::EarlierStates;
-use super::entry::{CacheEntry, DecodedCache, ErasedValue, LatestState, downcast};
+use super::entry::{DecodedCache, ErasedValue, LatestState, downcast};
 use super::{Codec, Evidence, ObjectKey, Observation, Requirement, Revision};
 
 /// The type-erased result shared by compatible readers of one flight.
@@ -171,23 +170,17 @@ impl LatestStates {
         }
     }
 
-    fn get(&self, path: &str) -> Option<LatestState> {
-        self.cache
-            .get(Slot::Latest, path)
-            .and_then(CacheEntry::into_latest)
-    }
-
     /// Lists the cached present states with their paths, revisions, and
     /// evidence.
     pub(super) fn present_states(&self) -> Vec<(String, Revision, Evidence)> {
         self.cache
-            .entries()
+            .latest_states()
             .into_iter()
-            .filter_map(|(_, path, entry)| match entry {
-                CacheEntry::Latest(LatestState::Present {
+            .filter_map(|(path, state)| match state {
+                LatestState::Present {
                     revision, evidence, ..
-                }) => Some((path, revision, evidence)),
-                _ => None,
+                } => Some((path, revision, evidence)),
+                LatestState::Absent { .. } => None,
             })
             .collect()
     }
@@ -198,7 +191,7 @@ impl LatestStates {
         key: &ObjectKey,
         req: Requirement,
     ) -> Result<Option<Observation<C::Value>>, StorageError> {
-        let Some(state) = self.get(key.as_str()) else {
+        let Some(state) = self.cache.latest(key.as_str()) else {
             return Ok(None);
         };
         match state {
@@ -243,7 +236,7 @@ impl LatestStates {
             size,
             revision,
             evidence,
-        }) = self.get(key.as_str())
+        }) = self.cache.latest(key.as_str())
         {
             downcast::<C>(key.as_str(), value.clone())?;
             return Ok(Some(PresentSeed {
@@ -442,7 +435,7 @@ impl LatestStates {
     }
 
     pub(super) fn capture_expected(&self, path: &str, expected: &mut Expected) {
-        expected.capture_cached(self.get(path));
+        expected.capture_cached(self.cache.latest(path));
     }
 
     pub(super) fn advance_expected(&self, expected: &Expected, current_after: SequencePoint) {
@@ -450,14 +443,14 @@ impl LatestStates {
     }
 
     pub(super) fn invalidate_expected(&self, path: &str, expected: &Expected) {
-        self.cache.update(Slot::Latest, path, |old| match old {
-            Some(CacheEntry::Latest(state)) if expected.matches(&state) => None,
-            other => other,
+        self.cache.update_latest(path, |old| match old {
+            Some(state) if expected.matches(&state) => (None, ()),
+            other => (other, ()),
         });
     }
 
     pub(super) fn invalidate(&self, path: &str) {
-        self.cache.delete(Slot::Latest, path);
+        self.cache.delete_latest(path);
     }
 
     /// Installs a present state that a backend operation of this open
@@ -488,41 +481,35 @@ impl LatestStates {
         revision: Revision,
         incoming: Evidence,
     ) -> Evidence {
-        self.cache.update_both(path, |old, kept| {
-            match old.and_then(CacheEntry::into_latest) {
-                Some(LatestState::Present {
+        self.cache.update_both(path, |old, kept| match old {
+            Some(LatestState::Present {
+                value: old_value,
+                size: old_size,
+                revision: old_revision,
+                evidence,
+            }) if old_revision == revision => {
+                evidence.advance(incoming.get());
+                let installed = evidence.clone();
+                let state = LatestState::Present {
                     value: old_value,
                     size: old_size,
                     revision: old_revision,
                     evidence,
-                }) if old_revision == revision => {
-                    evidence.advance(incoming.get());
-                    let installed = evidence.clone();
-                    let state = LatestState::Present {
-                        value: old_value,
-                        size: old_size,
-                        revision: old_revision,
-                        evidence,
-                    };
-                    (Some(CacheEntry::Latest(state)), None, installed)
-                }
-                old => {
-                    let earlier =
-                        old.zip(kept.and_then(CacheEntry::into_earlier))
-                            .map(|(replaced, kept)| {
-                                Some(CacheEntry::Earlier(
-                                    self.earlier.after_replace(replaced, &kept),
-                                ))
-                            });
-                    let installed = incoming.clone();
-                    let state = LatestState::Present {
-                        value,
-                        size,
-                        revision,
-                        evidence: incoming,
-                    };
-                    (Some(CacheEntry::Latest(state)), earlier, installed)
-                }
+                };
+                (state, None, installed)
+            }
+            old => {
+                let earlier = old
+                    .zip(kept)
+                    .map(|(replaced, kept)| self.earlier.after_replace(replaced, &kept));
+                let installed = incoming.clone();
+                let state = LatestState::Present {
+                    value,
+                    size,
+                    revision,
+                    evidence: incoming,
+                };
+                (state, earlier, installed)
             }
         })
     }
@@ -530,25 +517,15 @@ impl LatestStates {
     /// Installs confirmed absence, merging evidence with an existing absence.
     fn install_absent(&self, path: &str, current_after: SequencePoint) -> Evidence {
         let incoming = Evidence::new(current_after);
-        let installed = self.cache.update_with_result(Slot::Latest, path, |old| {
-            match old.and_then(CacheEntry::into_latest) {
-                Some(LatestState::Absent { evidence }) => {
-                    evidence.advance(current_after);
-                    let installed = evidence.clone();
-                    (
-                        Some(CacheEntry::Latest(LatestState::Absent { evidence })),
-                        installed,
-                    )
-                }
-                _ => {
-                    let installed = incoming.clone();
-                    (
-                        Some(CacheEntry::Latest(LatestState::Absent {
-                            evidence: incoming,
-                        })),
-                        installed,
-                    )
-                }
+        let installed = self.cache.update_latest(path, |old| match old {
+            Some(LatestState::Absent { evidence }) => {
+                evidence.advance(current_after);
+                let installed = evidence.clone();
+                (Some(LatestState::Absent { evidence }), installed)
+            }
+            _ => {
+                let installed = incoming.clone();
+                (Some(LatestState::Absent { evidence: incoming }), installed)
             }
         });
         installed.observed_by_completion(self.timeline.now());

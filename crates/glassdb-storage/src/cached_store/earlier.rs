@@ -2,12 +2,11 @@
 
 use std::sync::Arc;
 
-use crate::cache::Slot;
 use crate::error::StorageError;
 use crate::timeline::{FloorPoint, SequencePoint, ViewFloors};
 
 use super::entry::{
-    CacheEntry, DecodedCache, EarlierState, ErasedValue, LatestState, PathEarlierStates, downcast,
+    DecodedCache, EarlierState, ErasedValue, LatestState, PathEarlierStates, downcast,
 };
 use super::{Codec, Evidence, ObjectKey, Observation, Requirement};
 
@@ -48,14 +47,14 @@ impl EarlierStates {
         if self.earlier(key).is_some() {
             return;
         }
-        self.cache.update(Slot::Earlier, key.as_str(), |old| {
-            old.or_else(|| Some(CacheEntry::Earlier(PathEarlierStates(Arc::from([])))))
+        self.cache.update_earlier(key.as_str(), |old| {
+            old.or_else(|| Some(PathEarlierStates(Arc::from([]))))
         });
     }
 
     /// Removes the earlier states of `key` and its mark.
     pub(super) fn drop(&self, key: &ObjectKey) {
-        self.cache.delete(Slot::Earlier, key.as_str());
+        self.cache.delete_earlier(key.as_str());
     }
 
     /// Returns the earlier states of a path after `replaced` stops being its
@@ -199,14 +198,10 @@ impl EarlierStates {
     }
 
     fn latest(&self, key: &ObjectKey) -> Option<LatestState> {
-        self.cache
-            .get(Slot::Latest, key.as_str())
-            .and_then(CacheEntry::into_latest)
+        self.cache.latest(key.as_str())
     }
 
     fn earlier(&self, key: &ObjectKey) -> Option<PathEarlierStates> {
-        self.cache
-            .get(Slot::Earlier, key.as_str())
-            .and_then(CacheEntry::into_earlier)
+        self.cache.earlier(key.as_str())
     }
 }

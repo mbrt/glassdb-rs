@@ -217,27 +217,6 @@ impl<V: Weighable + Clone> CacheShard<V> {
         self.inner.lock().unwrap().refresh(slot, path).cloned()
     }
 
-    #[cfg(test)]
-    fn set(&self, slot: Slot, path: &str, val: V) {
-        self.update(slot, path, |_| Some(val));
-    }
-
-    #[cfg(test)]
-    fn update<F>(&self, slot: Slot, path: &str, f: F)
-    where
-        F: FnOnce(Option<V>) -> Option<V>,
-    {
-        self.update_with_result(slot, path, |old| (f(old), ()));
-    }
-
-    #[cfg(test)]
-    fn update_with_result<F, R>(&self, slot: Slot, path: &str, f: F) -> R
-    where
-        F: FnOnce(Option<V>) -> (Option<V>, R),
-    {
-        self.update_evicting(slot, path, f).0
-    }
-
     /// Updates one slot and returns the entries that the update evicted for
     /// capacity, including a new value that does not fit.
     fn update_evicting<F, R>(&self, slot: Slot, path: &str, f: F) -> (R, Vec<Evicted<V>>)
@@ -256,10 +235,9 @@ impl<V: Weighable + Clone> CacheShard<V> {
 
     /// Updates both slots of `path` under one lock, and returns the entries
     /// that the update evicted for capacity.
-    #[allow(clippy::type_complexity)]
     fn update_both_evicting<F, R>(&self, path: &str, f: F) -> (R, Vec<Evicted<V>>)
     where
-        F: FnOnce(Option<V>, Option<V>) -> (Option<V>, Option<Option<V>>, R),
+        F: FnOnce(Option<V>, Option<V>) -> (Option<V>, Option<V>, R),
     {
         let mut inner = self.inner.lock().unwrap();
         let mut evicted = Vec::new();
@@ -270,10 +248,8 @@ impl<V: Weighable + Clone> CacheShard<V> {
         let (latest, earlier, result) = f(latest, earlier);
         // The earlier slot goes first, so that the latest state is the most
         // recently used of the two.
-        let mut overflowed = match earlier {
-            Some(earlier) => inner.put(Slot::Earlier, path, earlier_size, earlier, &mut evicted),
-            None => false,
-        };
+        let mut overflowed = earlier.is_some()
+            && inner.put(Slot::Earlier, path, earlier_size, earlier, &mut evicted);
         overflowed |= inner.put(Slot::Latest, path, latest_size, latest, &mut evicted);
         if overflowed {
             overflowed = inner.recompute_weight();
@@ -345,12 +321,6 @@ impl<V: Weighable + Clone> Cache<V> {
         self.shard(path).get(slot, path)
     }
 
-    /// Stores `val` when it fits its shard's budget. Otherwise removes the
-    /// slot.
-    pub fn set(&self, slot: Slot, path: &str, val: V) {
-        self.update_with_result(slot, path, |_| (Some(val), ()));
-    }
-
     /// Updates a slot of `path` while holding the lock. The closure receives
     /// the old value (or `None`) and returns the new value, or `None` to remove
     /// the entry. A new value that exceeds its shard's budget also removes the
@@ -397,10 +367,9 @@ impl<V: Weighable + Clone> Cache<V> {
     /// latest and earlier values. It returns the new latest value, the new
     /// earlier value or `None` to leave the earlier slot as it is, and an
     /// auxiliary result.
-    #[allow(clippy::type_complexity)]
     pub(crate) fn update_both<F, R>(&self, path: &str, f: F) -> R
     where
-        F: FnOnce(Option<V>, Option<V>) -> (Option<V>, Option<Option<V>>, R),
+        F: FnOnce(Option<V>, Option<V>) -> (Option<V>, Option<V>, R),
     {
         let (result, evicted) = self.shard(path).update_both_evicting(path, f);
         self.evicted(evicted);
@@ -421,6 +390,46 @@ mod tests {
     use super::*;
 
     const L: Slot = Slot::Latest;
+
+    /// Shorthands for one-slot updates in the tests.
+    trait TestUpdates<V> {
+        fn update_with_result<R>(
+            &self,
+            slot: Slot,
+            path: &str,
+            f: impl FnOnce(Option<V>) -> (Option<V>, R),
+        ) -> R;
+
+        fn update(&self, slot: Slot, path: &str, f: impl FnOnce(Option<V>) -> Option<V>) {
+            self.update_with_result(slot, path, |old| (f(old), ()));
+        }
+
+        fn set(&self, slot: Slot, path: &str, val: V) {
+            self.update(slot, path, |_| Some(val));
+        }
+    }
+
+    impl<V: Weighable + Clone> TestUpdates<V> for CacheShard<V> {
+        fn update_with_result<R>(
+            &self,
+            slot: Slot,
+            path: &str,
+            f: impl FnOnce(Option<V>) -> (Option<V>, R),
+        ) -> R {
+            self.update_evicting(slot, path, f).0
+        }
+    }
+
+    impl<V: Weighable + Clone> TestUpdates<V> for Cache<V> {
+        fn update_with_result<R>(
+            &self,
+            slot: Slot,
+            path: &str,
+            f: impl FnOnce(Option<V>) -> (Option<V>, R),
+        ) -> R {
+            Cache::update_with_result(self, slot, path, f)
+        }
+    }
 
     #[derive(Clone, PartialEq, Debug)]
     struct TestEntry(String);
@@ -559,7 +568,7 @@ mod tests {
         c.set(Slot::Latest, "p", e("aaa"));
         let (result, evicted) = c.update_both_evicting("p", |latest, earlier| {
             assert_eq!(earlier, None);
-            (Some(e("bbbb")), Some(latest), 7)
+            (Some(e("bbbb")), latest, 7)
         });
         assert_eq!(result, 7);
         assert!(evicted.is_empty());

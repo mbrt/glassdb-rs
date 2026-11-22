@@ -66,7 +66,7 @@ fn filled_cache(keys: &[String]) -> Cache<Payload> {
     let max_size = n * ENTRY_BYTES * n_shards * 2 + n_shards * 1024;
     let cache = Cache::new(max_size);
     for k in keys {
-        cache.set(Slot::Latest, k, Payload::new());
+        cache.update(Slot::Latest, k, |_| Some(Payload::new()));
     }
     cache
 }
@@ -125,7 +125,7 @@ fn bench_churn(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             let mut i = 0usize;
             b.iter(|| {
-                cache.set(Slot::Latest, &keys[i % pool], Payload::new());
+                cache.update(Slot::Latest, &keys[i % pool], |_| Some(Payload::new()));
                 cache.delete(Slot::Latest, &keys[(i + n) % pool]);
                 i = i.wrapping_add(1);
             });
