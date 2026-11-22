@@ -695,6 +695,9 @@ impl Gc {
         // reachability. A crash after the commit point must not leave a dropped
         // collection forever merely because this same record stores a live value
         // in another collection.
+        // Proof: conditional mutation. Only an applied removal goes into
+        // `removed_directories`. A skip from a stale state only delays work,
+        // because the bounded phase below handles the remaining directories.
         let removed_directories = self
             .locker
             .collections()
@@ -729,6 +732,9 @@ impl Gc {
         if self.entries_referenced(tid, record, barrier).await? {
             return Ok(GcOutcome::from_progress(changed));
         }
+        // This bounded phase comes after the early return above. If it moved
+        // before the early return, each check of a record that still stores
+        // live values would read all of its directories.
         // The original record's entry references are clear. Applied directory
         // write-back proves removal even after cache eviction: this
         // committed identity cannot acquire those holders again. Keep every

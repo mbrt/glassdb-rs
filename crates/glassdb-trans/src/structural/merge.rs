@@ -8,10 +8,10 @@
 
 use std::sync::Arc;
 
-use glassdb_data::{CollectionAddress, NodeId, StructuralIntentId, TxId};
+use glassdb_data::{CollectionAddress, NodeId, ObjectPath, StructuralIntentId, TxId};
 use glassdb_storage::{
-    LeafBody, LeafObservation, MergeTarget, Node, NodeBody, NodeSizePolicy, NodeStore, Requirement,
-    StorageError, Timeline, TreeRouter,
+    CasRetries, Converged, Decision, LeafBody, LeafObservation, MergeTarget, Node, NodeBody,
+    NodeSizePolicy, NodeStore, Requirement, StorageError, Timeline, TreeRouter,
 };
 
 use crate::error::TransError;
@@ -72,7 +72,6 @@ pub(super) enum MergeReason {
 /// drain lands.
 pub(super) struct MergePlan {
     left: Node,
-    target: TargetState,
     merge: MergeTarget,
     reclaimed: Vec<TxId>,
 }
@@ -81,7 +80,6 @@ pub(super) struct MergePlan {
 struct TargetState {
     id: NodeId,
     node: Node,
-    observation: LeafObservation,
 }
 
 impl Merger {
@@ -120,6 +118,8 @@ impl Merger {
         source: &NodeId,
         reason: MergeReason,
     ) -> Result<Option<NodeId>, TransError> {
+        // A stale result only delays the merge. `prepare` decides again with
+        // `checked_target`, from the current state under the gate.
         let left = match self
             .nodes
             .load_node(collection, source, Requirement::ANY)
@@ -197,7 +197,6 @@ impl Merger {
             change: ReadyChange::Merge(merge.clone()),
             plan: MergePlan {
                 left,
-                target,
                 merge,
                 reclaimed,
             },
@@ -217,14 +216,10 @@ impl Merger {
     ) -> Result<Applied, TransError> {
         let MergePlan {
             left,
-            target,
             merge,
             reclaimed,
         } = plan;
-        match self
-            .absorb(collection, &merge, &left, intent, target)
-            .await?
-        {
+        match self.absorb(collection, &merge, &left, intent).await? {
             Some(target_reclaimed) => self.reclamation.record(&target_reclaimed, false),
             None => return Ok(Applied::Stopped),
         }
@@ -235,6 +230,9 @@ impl Merger {
             .store_node(collection, source, &drained, Some(observation))
             .await?
         {
+            // Proof: shared local knowledge (same cache) for the reservation
+            // that the absorb CAS set through this store. A drained target or a
+            // newer membership generation does not revert (one-way states).
             self.structural_nodes
                 .abandon_merge(collection, &merge, intent, Requirement::ANY)
                 .await?;
@@ -242,6 +240,8 @@ impl Merger {
         }
         self.reclamation.record(&reclaimed, false);
         self.stats.record_merge();
+        // Proof: shared local knowledge (same cache). The absorb CAS set the
+        // reservation through this store.
         self.structural_nodes
             .remove_merge_reservation(collection, &merge.node_id, intent, Requirement::ANY)
             .await?;
@@ -291,13 +291,9 @@ impl Merger {
             let Some(id) = next else {
                 return Ok(None);
             };
-            let (node, observation) = self.nodes.load_node(collection, &id, requirement).await?;
+            let (node, _) = self.nodes.load_node(collection, &id, requirement).await?;
             if !node.is_drained() {
-                return Ok(Some(TargetState {
-                    id,
-                    node,
-                    observation,
-                }));
+                return Ok(Some(TargetState { id, node }));
             }
             next = node.right_sibling();
         }
@@ -393,53 +389,53 @@ impl Merger {
         merge: &MergeTarget,
         left: &Node,
         intent: &StructuralIntentId,
-        target: TargetState,
     ) -> Result<Option<Vec<TxId>>, TransError> {
-        let mut current = (target.node, target.observation);
-        for attempt in 0..NODE_CAS_ATTEMPTS {
-            if attempt > 0 {
-                current = self
-                    .nodes
-                    .load_node(collection, &merge.node_id, Requirement::ANY)
-                    .await?;
+        let absorbed = self
+            .nodes
+            .converge(
+                &ObjectPath::tree_node(collection, Some(&merge.node_id)),
+                // Proof: conditional mutation for the write. A stop only
+                // delays the merge.
+                Requirement::ANY,
+                CasRetries::Bounded(NODE_CAS_ATTEMPTS),
+                |mut right, _| async move {
+                    // Recovery advances the generation to fence this absorb after
+                    // it deleted the intent.
+                    if right.is_drained()
+                        || right.membership_generation() != merge.generation
+                        || right.drop_intent().is_some()
+                        || right.locks().merge_reservation().is_some()
+                    {
+                        return Ok(Decision::Stop(None));
+                    }
+                    if let Some(holder) = right.structural_gate().holders().first().cloned() {
+                        if !self.mon.tx_status(&holder).await?.is_final() {
+                            return Ok(Decision::Stop(None));
+                        }
+                        right.remove_structural_gate(&holder);
+                    }
+                    // The CAS expects this exact state of R, so it removes only
+                    // tombstones that have no holder when it lands. R's gate is not
+                    // necessary for that (ADR-073).
+                    let reclaimed = reclaim_holder_free_tombstones(&mut right);
+                    right.absorb(left, *intent)?;
+                    let policy = &self.sizes;
+                    if right.content_encoded_len() > policy.content_limit()
+                        || right.encoded_len() > policy.node_max_bytes()
+                    {
+                        return Ok(Decision::Stop(None));
+                    }
+                    Ok::<_, TransError>(Decision::Write(right, Some(reclaimed)))
+                },
+            )
+            .await?;
+        match absorbed {
+            Converged::Written { value, .. } | Converged::Done(value) | Converged::Stop(value) => {
+                Ok(value)
             }
-            let (mut right, observation) = current.clone();
-            // Recovery advances the generation to fence this absorb after it
-            // deleted the intent.
-            if right.is_drained()
-                || right.membership_generation() != merge.generation
-                || right.drop_intent().is_some()
-                || right.locks().merge_reservation().is_some()
-            {
-                return Ok(None);
-            }
-            if let Some(holder) = right.structural_gate().holders().first().cloned() {
-                if !self.mon.tx_status(&holder).await?.is_final() {
-                    return Ok(None);
-                }
-                right.remove_structural_gate(&holder);
-            }
-            // The CAS expects this exact state of R, so it removes only
-            // tombstones that have no holder when it lands. R's gate is not
-            // necessary for that (ADR-073).
-            let reclaimed = reclaim_holder_free_tombstones(&mut right);
-            right.absorb(left, *intent)?;
-            let policy = &self.sizes;
-            if right.content_encoded_len() > policy.content_limit()
-                || right.encoded_len() > policy.node_max_bytes()
-            {
-                return Ok(None);
-            }
-            if self
-                .structural_nodes
-                .store_structural_node(&right, &observation)
-                .await?
-                .is_some()
-            {
-                return Ok(Some(reclaimed));
-            }
+            Converged::Missing => Err(StorageError::NotFound.into()),
+            Converged::Exhausted => Ok(None),
         }
-        Ok(None)
     }
 }
 

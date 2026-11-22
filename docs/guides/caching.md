@@ -176,13 +176,45 @@ result.
 | Later validation | Retain the read or predicate dependency, and validate it before the body outcome is accepted. |
 | Conditional mutation | The change checks the observed revision. This does not justify a branch that skips the CAS. |
 | Stable fact | Reuse only a fact that cannot change, for example final committed contents, or an exact publication marker of a transaction identity that is never reused. Historical contents do not prove that the object is present now. |
-| Shared local knowledge | Use the same cache that completed the acquisition or fencing, or that returned the holder before. A result with no holder must also exclude a later acquisition by that identity. This proof does not transfer to another database instance. |
-| Publication and lifecycle | Show why the caller cannot have cached absence before a later live publication. Nodes exist before their links are published, tree roots exist before collection bindings, and retired identities are not reused. |
+| Shared local knowledge | Use the same cache that completed the acquisition or fencing, or that returned the holder before. A result with no holder must also exclude a later acquisition by that identity. This proof does not transfer to another identity or to another database instance. |
+| Publication and lifecycle | Show why the caller cannot have cached absence before a later live publication, from the facts below. |
 
 Shared local knowledge includes L2. The path lane stops an older reply from
 replacing established knowledge. Invalidation or replacement of older L2
 entries stops an L1 miss from restoring them. If neither cache has a usable
 entry, the backend read starts after the prerequisite work.
+
+Two rules apply to cleanup and recovery:
+
+- **Completion needs a removal CAS or a bounded no-op.** An applied conditional
+  removal proves completion by itself. A state without the holder proves
+  completion only when its evidence meets the caller's requirement. Each object
+  keeps its own completion evidence: key locks, membership locks, directory
+  holders, topology participants, and the collection record. A refresh of one
+  object, or an aggregate progress flag, gives no evidence about another.
+- **A listing gives candidates, not absence.** A listed object that the cache
+  shows as absent is read again under the caller's requirement, so a read error
+  never becomes an empty listing.
+
+### Facts that proofs rely on
+
+The proofs above rely on the facts below. Name the proof and the facts in a
+comment next to the decision, in the form `// Proof: <proof> (<facts>).` When
+the proof covers only one result of the decision, name the result:
+`// Proof for a missing route: <proof> (<facts>).` A decision whose stale
+result only delays work needs no proof, and its comment says so. If a decision
+needs a fact that is not in the list, add it here, or use a barrier.
+
+| Fact | Rule | Enforced by |
+| --- | --- | --- |
+| No reuse | A transaction, node, or collection identity is never used again. | Random identities. `TxId::with_priority` and the `from_bytes` constructors are public, and nothing checks their use. |
+| One acquisition | A final identity does not acquire a holder again. A structural worker that released its gate, or a change that left a topology, does not acquire it again. | Nothing. |
+| Created before seen | No reader caches the address of a node, a tree root, or a collection record before the object exists. Nodes exist before their links are published, and tree roots exist before collection bindings. Readers learn addresses only from published bindings and links, transaction records, and pinned locks. Recovery reads a reserved node only after it fences the source revision of the split, so that the worker can no longer publish the node. | Nothing. It is a property of the call graph. |
+| Nodes outlive links | Only the reclamation of a dropped collection deletes a published node. | Nothing. |
+| Same cache | A cleanup that relies on its own acquisition or fencing reads through the cache that did it. | `CollectionLocker::new` and the structural worker share one store. Elsewhere, only the docs of `KeyLocker::write_back`, `clear_aborted_drops`, and `settle_topology_participant`. |
+| Final before foreign removal | Another identity removes or replaces a directory holder, a drop intent, a topology participant, or a structural gate only after the identity of the holder is final. | GC releases the locks only of an eligible identity. A replacement, and the settlement of a participant during a topology freeze, first get a final status from `resolve_tx_conflict`. `fence_source_writer` keeps the gate of a Pending holder. |
+| One-way states | A structural intent changes only from preparing to ready, and ready contents do not change. An index node never becomes a leaf. A drained node and a membership generation never revert. | The `Node` API has no operation that clears a drain or moves a membership generation back. The index-to-leaf change has a check in `acquire_index_structural_gate`. The intent phase has no check. |
+| Rejected create | A rejected create removes the cached absence, so the next `ANY` read finds the object. | `MutationRound::finish`. |
 
 Fresh identities alone do not prove permanent absence. A retried create can
 restore a deleted path. Structural recovery fences publication before it treats
@@ -194,7 +226,8 @@ Index-node routing from cache uses right links to correct a stale split route,
 and low keys to detect a stale copy of a merge target. The terminal leaf must
 meet the caller's requirement. If a tree root or child is absent, there is no
 terminal leaf to check, and a negative route still needs the publication and
-lifecycle proof.
+lifecycle proof. A tree root cached as a leaf still needs the check, because a
+peer can have changed it into an index node.
 
 If no proof applies, use a requirement from the existing barrier of the policy.
 Capture a new barrier only when the decision needs a later ordering point.
@@ -212,9 +245,9 @@ knows its ordering, so the policy owns the capture point:
 | Transaction validation | After the body, before the key and predicate lock CASes used as validation evidence. |
 | GC eligibility | Before the read of candidate status. |
 | GC checks | After the eligibility checks finish. The earlier status barrier cannot replace this one. |
-| Structural recovery | After all intents in a discovery batch are observed, before their sources and reachability are checked. Later discoveries need a new barrier. |
+| Structural recovery | After all intents in a discovery batch are observed, before their sources and reachability are checked. The barrier stays with its batch: an intent watermark or the discovery bound does not replace it, and later discoveries need a new barrier. A final transaction status does not close the intent namespace, because recursive recovery can create more intents. |
 | Split recovery link check | After a reachability descent that did not reach the created node, before that node is read. A merge can drain the node between an earlier read and the descent. |
-| Merge recovery reservation removal | After the read that shows the drained source, before the target is read to remove its merge reservation. The absorb sets the reservation, so a target state from before the drain can follow the discovery barrier and still have no reservation. |
+| Merge recovery reservation removal | After the read that shows the drained source, before a target state without the merge reservation ends the removal. The absorb sets the reservation, so a target state from before the drain can follow the discovery barrier and still have no reservation. |
 | Parent reconciliation | After the split or merge is observed, before routing and reading its child chain. The barrier stays in use for the whole reconciliation. |
 | Merge check | After the source is gated, before the read of the target for the final merge decision. |
 | Stale merge-target copy | After observing the route that reached a copy whose low key is above the key, before that node is read again. |
@@ -229,10 +262,13 @@ It is not safe when the decision skips the change, or when it changes a
 different object, as the split recovery link check does when it deletes the
 created node. In these cases, capture a new barrier after the read that proves
 the event, and read the second object at that barrier. The split recovery link
-check and the merge recovery reservation removal follow this rule. A skip needs
-no new barrier when the stale state shows a fact that never reverts and that
-alone excludes the event. For example, `abandon_merge` skips a target that is
-drained or that has a different membership generation.
+check and the merge recovery reservation removal follow this rule. A change of
+one node or collection record by a single writer, outside the leaf coordinator
+round, goes through `NodeStore::converge` or `CollectionStore::converge`, with
+the barrier as `proof`. A single CAS at a gated revision, such as the split
+shrink and the merge drain, does not skip: a lost CAS ends the change. A skip
+needs no new barrier when the stale state shows a one-way state that alone
+excludes the event, as in `abandon_merge`.
 
 Transaction validation uses one barrier for every point read, scan, collection
 directory, and transaction-status dependency. Each validation attempt captures
@@ -251,9 +287,9 @@ barrier.
 
 A method that takes a requirement is mechanism. It returns a state, or completes
 an operation, that meets the requirement it gets, and the caller owns the proof
-that the requirement is enough. Lock release is an example. An owner that shares
-the cache of the acquisition can release with `ANY`, so the release interface
-takes a requirement. A method that takes a barrier is part of the policy that
+that the requirement is enough. `clear_aborted_drops` is an example. The owner
+of the drops shares the cache that installed them and passes `ANY`, and GC
+passes its barrier. A method that takes a barrier is part of the policy that
 owns the proof. Its result is a claim that is true only relative to the barrier,
 for example "this transaction is valid" or "this record is unreachable". Only a
 barrier can check evidence that is not a cache entry against that point, such as
@@ -275,16 +311,6 @@ watermark describes one state of one object. A structural gate acquisition
 returns its exact observation instead, and the next mutation checks that
 revision. Parent reconciliation also passes its captured barrier to child
 reads. The parent's watermark does not replace it.
-
-Owner-driven key write-back uses `ANY`, including on rerouted leaves. It is
-safe only in the database instance that acquired the locks. The lock CAS
-installs its state and invalidates older L2 entries before it completes, and
-the path lane stops older backend reads from replacing that state. Thus a later
-cached state without the holder means that the holder is already resolved, and
-a stale state that contains the holder loses its write-back CAS. Write-back is
-not a recovery interface for the locks of another instance. Its result also
-does not authorize deletion of the transaction record. GC checks references
-with its own barrier.
 
 ## CAS receipts
 
@@ -351,7 +377,8 @@ The first leaf load uses `ANY` as a speculative CAS precondition, including for
 lock acquisition. This does not weaken the submitted requirement. Retries load
 against the retained combined bound. A missing initial leaf is checked again
 against the submitted bound before the round returns absence. A cached index
-can still cause rerouting, because an index node never becomes a leaf again.
+can still cause rerouting, because an index node never becomes a leaf again
+([one-way states](#facts-that-proofs-rely-on)).
 
 A plan with changes uses its CAS to confirm the loaded state after the combined
 bound, without a separate leaf read. A plan with no changes has no CAS, so it
@@ -406,59 +433,6 @@ read-only transaction can be ordered before a write that happens after its
 validation. Validation detects a write that invalidates its result. This is why
 a strongly consistent read can execute from cache without treating an arbitrary
 cache hit as current.
-
-## Background work supplies its own proof
-
-Background policies read with `ANY` much more often than the transaction path,
-so each policy owns the argument for why its negative or no-op result is safe.
-Three rules recur:
-
-- **Routing is not evidence.** Index-node descent can use `ANY` and rely on
-  right links to correct stale placement, but the terminal leaf must meet the
-  caller's requirement. A tree root cached as a leaf still needs that check, because
-  a peer can have changed it into an index node.
-- **A missing route needs publication and lifecycle proof.** Children exist
-  before their links are published, tree roots exist before collection bindings,
-  identities are never reused, and published nodes stay until the collection is
-  reclaimed. Recovery can inspect a reserved node before its creation, but only
-  after it fences the exact source revision of the split, so that the fenced
-  worker can no longer publish the node. Reclaimed collections can stay absent.
-- **Completion needs a removal CAS or a bounded no-op.** An applied conditional
-  removal proves completion by itself. A present state without the holder
-  proves completion only when its evidence meets the caller's requirement.
-  Otherwise the caller reads again under that requirement. Key locks,
-  membership locks, directory holders, topology participants, and the
-  collection record each keep their own completion evidence. A refresh of one
-  object gives no evidence about another.
-
-Proof does not transfer across identities or across database instances. An
-aggregate progress flag never justifies skipping an individual object. After
-the removal of a committed identity's claim is applied, cache eviction cannot make that
-completion false, because the identity cannot acquire the holder again.
-
-Committed directory write-back keeps its two phases in order. GC first tries
-write-back with `ANY`, so directory progress continues while a live entry keeps
-the record. It completes the remaining directories under its post-eligibility
-bound only after the live-entry early return. If the bounded phase moved
-earlier, every repeated check of a record that still stores live values would
-read its directories.
-
-Discovery listings follow the same rule. A present cached body is an acceptable
-recovery candidate under `ANY`. A listed body that the cache shows as absent
-must be checked again under the supplied requirement, so a read error is never
-reported as an empty listing. Structural intent identities are never reused,
-and their only phase change is from preparing to ready. Ready contents do not
-change until deletion. Deletion therefore checks the exact observed revision,
-and a rejected CAS invalidates the obsolete cached state. A stale preparing
-observation can delay peer help, but it can never authorize deletion of a ready
-intent.
-
-Structural recovery captures one barrier after a complete discovery batch, and
-keeps it with that batch. Do not replace it with the watermark of an intent or
-with the discovery bound. Do not add observations under the barrier of an
-earlier batch. Participant settlement keeps its final listing bound. A final
-transaction status alone does not close the intent namespace, because
-recursive recovery can create more intents.
 
 ## The persistent cache adds no authority
 

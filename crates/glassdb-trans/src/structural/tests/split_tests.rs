@@ -134,7 +134,7 @@ async fn root_leaf_gate_acquisition_uses_one_coordinator_round() {
 
     sp.changes
         .structural_nodes
-        .release_structural_gate(&collection(), None, &worker)
+        .release_structural_gate(&collection(), None, &worker, Requirement::ANY)
         .await
         .unwrap();
     let (root, _) = s

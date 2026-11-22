@@ -214,14 +214,14 @@ class BenchTest(unittest.TestCase):
             self.root / "main", self.root / "pr", "base", "candidate"
         )
 
-    def test_the_counters_run_once_and_then_the_latency_in_32_runs(self):
+    def test_the_counters_run_three_times_and_then_the_latency_in_32_runs(self):
         output = self.bench("main").stdout
         self.assertEqual(self.order(), [["counters", "main"], ["timing", "main"]])
         timing, counters = self.read("main", "timing"), self.read("main", "counters")
         self.assertIs(timing["latencyJitter"], True)
         self.assertIs(counters["latencyJitter"], False)
         self.assertEqual(len(timing["experiments"][0]["runs"]), 32)
-        self.assertEqual(len(counters["experiments"][0]["runs"]), 1)
+        self.assertEqual(len(counters["experiments"][0]["runs"]), 3)
         # The summary of the main metrics prints at the end.
         self.assertIn("median of 32 runs", output)
         self.assertIn("| a | 100.00", output)
@@ -232,7 +232,7 @@ class BenchTest(unittest.TestCase):
         arguments = self.arguments()
         experiments = f"--experiment={self.root / 'experiments'}"
         for kind, tag, jitter, runs in (
-            ("counters", "--tag=ci/counters", "--latency-jitter=false", "--runs=1"),
+            ("counters", "--tag=ci/counters", "--latency-jitter=false", "--runs=3"),
             ("timing", "--tag=ci/timing", "--latency-jitter=true", "--runs=32"),
         ):
             for argument in ("--time=virtual", "--backend=memory", experiments, tag, jitter, runs):

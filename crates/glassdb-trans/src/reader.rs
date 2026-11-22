@@ -80,6 +80,8 @@ impl Reader {
     /// dropping the future at any `.await` (e.g. via `tokio::time::timeout`).
     pub async fn read(&self, key: &LogicalKey) -> Result<ReadOutcome, StorageError> {
         let mut backoff = self.retry.backoff();
+        // Proof: later validation. `KeyResolver::locate_key` gives the proof
+        // for a missing route.
         for _ in 0..READ_UNAVAILABLE_RETRIES {
             match self.resolve_value(key, Requirement::ANY).await {
                 Err(StorageError::Unavailable(_)) => rt::sleep(backoff.next_delay()).await,

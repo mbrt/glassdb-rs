@@ -14,6 +14,11 @@ records, the cache, evidence types, and the on-the-wire format.
 
 - For decisions based on reads, check
   [the currentness barrier rules](caching.md#currentness-barriers).
+- For a decision from an `ANY` read (an early return, a skipped mutation, or a
+  missing object), check for a `// Proof:` comment that names a proof and its
+  facts from [Decisions from `ANY` reads](caching.md#decisions-from-any-reads),
+  or a comment that says that a stale result only delays work. A new fact goes
+  into the facts table, together with what enforces it.
 - For conditional mutation, check the
   [CAS receipt semantics](caching.md#cas-receipts) and the
   [coordinator rules](caching.md#coordinator-mutation-evidence).

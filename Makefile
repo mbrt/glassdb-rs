@@ -54,15 +54,16 @@ BENCH_ARGS = --backend=memory --delays=s3 --time=virtual --prefix-depth=3 \
 	--drain-timeout=10s --experiment=$(EXPERIMENTS_DIR)
 
 # Run the experiments of the CI comparison for the current tree, as CI runs them
-# for each revision. The counters repeat exactly without latency jitter, so they
-# run once. The latency keeps the jitter of the provider, so that its
-# percentiles are realistic, and each of its 32 runs is one independent sample
-# (hack/perf/README.md explains the number). The results go to OUT, and a
-# summary of the main metrics prints at the end. PERFBENCH runs a perfbench
-# binary instead of building one, and EXPERIMENTS_DIR takes the experiments from
-# another directory. EXTENDED=1 also runs the timing experiments with the tag
-# ci/extended, which take about 80% of the time of the timing process. EXPERIMENT
-# runs other experiment files or directories instead, for example
+# for each revision. Without latency jitter, the counters almost always repeat,
+# so they run three times and the report takes the median of each. The latency
+# keeps the jitter of the provider, so that its percentiles are realistic, and
+# each of its 32 runs is one independent sample (hack/perf/README.md explains
+# the number). The results go to OUT, and a summary of the main metrics prints
+# at the end. PERFBENCH runs a perfbench binary instead of building one, and
+# EXPERIMENTS_DIR takes the experiments from another directory. EXTENDED=1 also
+# runs the timing experiments with the tag ci/extended, which take about 80% of
+# the time of the timing process. EXPERIMENT runs other experiment files or
+# directories instead, for example
 # `make bench EXPERIMENT=hack/perf/experiments/contention.toml`.
 bench:
 ifdef EXPERIMENT
@@ -75,7 +76,7 @@ endif
 # A new directory, so that the results of two runs do not mix.
 	mkdir -p $(dir $(BENCH_OUT)) && mkdir $(BENCH_OUT)
 	$(BENCH_PERFBENCH) $(BENCH_ARGS) --tag=ci/counters \
-		--latency-jitter=false --runs=1 --output=$(BENCH_OUT)/counters.json
+		--latency-jitter=false --runs=3 --output=$(BENCH_OUT)/counters.json
 	$(BENCH_PERFBENCH) $(BENCH_ARGS) --tag=ci/timing \
 		$(if $(filter 1,$(EXTENDED)),,--exclude-tag=ci/extended) \
 		--latency-jitter=true --runs=32 --output=$(BENCH_OUT)/timing.json

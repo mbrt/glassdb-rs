@@ -256,6 +256,20 @@ pub enum ObjectPath {
 }
 
 impl ObjectPath {
+    /// Returns the path of the node `id` in the tree of `collection`, or of
+    /// the tree root when `id` is `None`.
+    pub fn tree_node(collection: &CollectionAddress, id: Option<&NodeId>) -> Self {
+        match id {
+            Some(id) => ObjectPath::Node {
+                collection: collection.clone(),
+                id: *id,
+            },
+            None => ObjectPath::TreeRoot {
+                collection: collection.clone(),
+            },
+        }
+    }
+
     /// Returns the index of the transaction prefix that contains `id`.
     pub fn transaction_prefix_index(id: &TxId) -> usize {
         transaction::prefix_index(id)

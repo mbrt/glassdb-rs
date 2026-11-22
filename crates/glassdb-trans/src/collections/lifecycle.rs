@@ -1,14 +1,16 @@
 //! Physical preparation, fencing, and reclamation of collections.
 
 use std::collections::BTreeSet;
+use std::future::ready;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use glassdb_concurr::{RetrySchedule, rt};
-use glassdb_data::{CollectionAddress, NodeId, TxId};
+use glassdb_concurr::RetrySchedule;
+use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CollectionRecord, CollectionStore, LeafBody, Node, NodeStore, Requirement, StorageError,
+    CasRetries, CollectionRecord, CollectionStore, Converged, Decision, LeafBody, Node, NodeStore,
+    Requirement, StorageError,
 };
 
 use super::{CollectionChange, CollectionOp};
@@ -73,9 +75,10 @@ impl CollectionLifecycle {
             .iter()
             .filter(|change| change.op == CollectionOp::Create)
         {
-            // These fresh identities belong to this active transaction identity. A create
-            // conflict invalidates obsolete local knowledge; success updates
-            // this cache. Both existence checks can therefore use ANY.
+            // Proof: shared local knowledge (rejected create) for both
+            // existence checks. These fresh identities belong to this active
+            // transaction identity, and a successful create updates this
+            // cache.
             if !self
                 .records
                 .create_record(&change.collection, &CollectionRecord::new())
@@ -112,9 +115,10 @@ impl CollectionLifecycle {
             .map(|change| &change.collection)
         {
             self.freeze_topology(collection, id).await?;
-            // Nodes precede their published links and retain their identities.
-            // Completed topology settlement fences abandoned publication;
-            // late creates can only leave unreachable orphans.
+            // Proof: publication and lifecycle (created before seen, nodes
+            // outlive links). Completed topology settlement fences abandoned
+            // publication, so a late create can only leave an unreachable
+            // orphan.
             let nodes = self.nodes.list_nodes(collection, Requirement::ANY).await?;
             for (node_id, _) in nodes {
                 self.fence_node(collection, &node_id, id).await?;
@@ -138,8 +142,9 @@ impl CollectionLifecycle {
     ) -> Result<bool, TransError> {
         let mut changed = false;
         for collection in collections {
-            // Enumeration uses the publication proof from fencing. Each
-            // present body's no-change result must meet requirement below.
+            // Proof for the enumeration: publication and lifecycle (created
+            // before seen, nodes outlive links), as in fencing. The no-change
+            // result of each present body must meet `requirement` below.
             let mut cursor = None;
             loop {
                 let page = self
@@ -167,10 +172,11 @@ impl CollectionLifecycle {
         &self,
         collections: &[CollectionAddress],
     ) -> Result<u64, TransError> {
-        // Present bodies are conditional-delete seeds. Owner cleanup shares
-        // the preparation cache; GC waits for commit or acknowledged abort.
-        // Publication and identity rules exclude cached absence hiding a later
-        // live object, though an abandoned late create can leave an orphan.
+        // Proof: conditional mutation for each delete of a present body.
+        // Publication and lifecycle (created before seen, no reuse) for an
+        // absent object: a cached absence cannot hide a later live object.
+        // Owner cleanup shares the preparation cache, and GC waits for commit
+        // or acknowledged abort. An abandoned late create can leave an orphan.
         let mut deleted = 0;
         for collection in collections {
             let mut cursor = None;
@@ -213,50 +219,51 @@ impl CollectionLifecycle {
         collection: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let mut backoff = self.retry.backoff();
-        loop {
-            let (mut record, observed) = self
-                .records
-                .load_record(collection, Requirement::ANY)
-                .await?;
-            if record.topology_freeze() != Some(id)
-                && let Some(holder) = record.topology_freeze().cloned()
-            {
-                match resolve_tx_conflict(&self.monitor, id, &holder).await? {
-                    TxFinalStatus::Committed => return Err(TransError::StaleCollection),
-                    TxFinalStatus::Aborted => {
-                        record.remove_topology_freeze(&holder);
+        let frozen = self
+            .records
+            .converge(
+                collection,
+                Requirement::ANY,
+                CasRetries::Unbounded(self.retry),
+                |mut record, _| async move {
+                    if record.topology_freeze() != Some(id)
+                        && let Some(holder) = record.topology_freeze().cloned()
+                    {
+                        match resolve_tx_conflict(&self.monitor, id, &holder).await? {
+                            TxFinalStatus::Committed => return Err(TransError::StaleCollection),
+                            TxFinalStatus::Aborted => {
+                                record.remove_topology_freeze(&holder);
+                            }
+                        }
                     }
-                }
+                    if record.topology_freeze().is_none() {
+                        assert!(record.set_topology_freeze(*id));
+                        return Ok(Decision::Advance(record));
+                    }
+                    if record.topology_freeze() != Some(id) {
+                        return Ok(Decision::Reload(Requirement::ANY));
+                    }
+                    let Some(participant) = record.topology_participants().next().cloned() else {
+                        // Proof: shared local knowledge (same cache). This
+                        // cache includes our freeze CAS. While this identity
+                        // can still commit, the freeze prevents admission, so
+                        // participants can only leave.
+                        return Ok(Decision::Done(()));
+                    };
+                    resolve_tx_conflict(&self.monitor, id, &participant).await?;
+                    self.topology
+                        .settle_topology_participant(collection, &participant)
+                        .await?;
+                    Ok::<_, TransError>(Decision::Wait(Requirement::ANY))
+                },
+            )
+            .await?;
+        match frozen {
+            Converged::Done(()) => Ok(()),
+            Converged::Missing => Err(StorageError::NotFound.into()),
+            Converged::Written { .. } | Converged::Stop(()) | Converged::Exhausted => {
+                Err(TransError::Retry)
             }
-            if record.topology_freeze().is_none() {
-                assert!(record.set_topology_freeze(*id));
-                if self.records.store_record(&record, &observed).await? {
-                    continue;
-                }
-                rt::sleep(backoff.next_delay()).await;
-                continue;
-            }
-            if record.topology_freeze() != Some(id) {
-                continue;
-            }
-            if record.topology_participants().next().is_none() {
-                // This cache includes our freeze CAS. While this identity can
-                // still commit, the freeze prevents admission and participants
-                // can only leave. The empty set needs no currentness check.
-                return Ok(());
-            }
-
-            let participant = record
-                .topology_participants()
-                .next()
-                .cloned()
-                .expect("participant presence was checked above");
-            resolve_tx_conflict(&self.monitor, id, &participant).await?;
-            self.topology
-                .settle_topology_participant(collection, &participant)
-                .await?;
-            rt::sleep(backoff.next_delay()).await;
         }
     }
 
@@ -266,43 +273,13 @@ impl CollectionLifecycle {
         node_id: &NodeId,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let mut backoff = self.retry.backoff();
-        loop {
-            let (mut node, observed) = match self
-                .nodes
-                .load_node(collection, node_id, Requirement::ANY)
-                .await
-            {
-                Ok(node) => node,
-                Err(StorageError::NotFound) => return Ok(()),
-                Err(error) => return Err(error.into()),
-            };
-            if node.drop_intent() == Some(id) {
-                // Local retry cleanup updates this same cache. Another owner
-                // can replace our intent only after we can no longer commit.
-                return Ok(());
-            }
-            if let Some(holder) = node.drop_intent().cloned() {
-                self.resolve_drop_intent_holder(&holder, id).await?;
-            }
-            if let Some(holder) = self.pending_node_holder(&node, id).await? {
-                self.resolve_pending_holder(&holder, id).await?;
-                continue;
-            }
-            // The topology freeze has drained structural participants. This
-            // exact-revision rewrite fuses the remaining one-shot structural
-            // exclusion with intent installation: a late node CAS either lands
-            // first and makes us retry, or loses and then observes the intent.
-            node.set_drop_intent(*id);
-            if self
-                .nodes
-                .store_node(collection, node_id, &node, Some(&observed))
-                .await?
-            {
-                return Ok(());
-            }
-            rt::sleep(backoff.next_delay()).await;
-        }
+        // Proof for a missing node, which needs no intent: publication and
+        // lifecycle (created before seen, nodes outlive links). A cached
+        // absence of a listed node comes after the reclamation of its
+        // collection.
+        self.fence(&ObjectPath::tree_node(collection, Some(node_id)), id)
+            .await
+            .map(|_| ())
     }
 
     async fn fence_root(
@@ -310,28 +287,53 @@ impl CollectionLifecycle {
         collection: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
-        let mut backoff = self.retry.backoff();
-        loop {
-            let (mut root, observed) = self.nodes.load_root(collection, Requirement::ANY).await?;
-            if root.drop_intent() == Some(id) {
-                // As for node intents, local cleanup shares this cache and
-                // foreign replacement requires that we can no longer commit.
-                return Ok(());
-            }
-            if let Some(holder) = root.drop_intent().cloned() {
-                self.resolve_drop_intent_holder(&holder, id).await?;
-            }
-            if let Some(holder) = self.pending_node_holder(&root, id).await? {
-                self.resolve_pending_holder(&holder, id).await?;
-                continue;
-            }
-            // As for standalone nodes, the exact-revision rewrite closes the
-            // final race without leaving a separate gate to recover on abort.
-            root.set_drop_intent(*id);
-            if self.nodes.store_root(collection, &root, &observed).await? {
-                return Ok(());
-            }
-            rt::sleep(backoff.next_delay()).await;
+        if self
+            .fence(&ObjectPath::tree_node(collection, None), id)
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(StorageError::NotFound.into())
+        }
+    }
+
+    /// Installs the drop intent of `id` on the node at `path`. Returns `false`
+    /// when the node is missing.
+    async fn fence(&self, path: &ObjectPath, id: &TxId) -> Result<bool, TransError> {
+        let fenced = self
+            .nodes
+            .converge(
+                path,
+                // Proof: shared local knowledge (same cache, final before
+                // foreign removal) for an installed intent of `id`.
+                Requirement::ANY,
+                CasRetries::Unbounded(self.retry),
+                |mut node, _| async move {
+                    if node.drop_intent() == Some(id) {
+                        return Ok(Decision::Done(()));
+                    }
+                    if let Some(holder) = node.drop_intent().cloned() {
+                        self.resolve_drop_intent_holder(&holder, id).await?;
+                    }
+                    if let Some(holder) = self.pending_node_holder(&node, id).await? {
+                        self.resolve_pending_holder(&holder, id).await?;
+                        return Ok(Decision::Reload(Requirement::ANY));
+                    }
+                    // The topology freeze has drained structural participants.
+                    // This exact-revision rewrite fuses the remaining one-shot
+                    // structural exclusion with intent installation: a late node
+                    // CAS either lands first and makes us retry, or loses and then
+                    // observes the intent. No separate gate is left to recover on
+                    // abort.
+                    node.set_drop_intent(*id);
+                    Ok::<_, TransError>(Decision::Write(node, ()))
+                },
+            )
+            .await?;
+        match fenced {
+            Converged::Written { .. } | Converged::Done(()) => Ok(true),
+            Converged::Missing => Ok(false),
+            Converged::Stop(()) | Converged::Exhausted => Err(TransError::Retry),
         }
     }
 
@@ -382,28 +384,47 @@ impl CollectionLifecycle {
         id: &TxId,
         requirement: Requirement,
     ) -> Result<bool, TransError> {
-        let mut read_requirement = Requirement::ANY;
-        loop {
-            let (mut node, observed) = self
-                .nodes
-                .load_node(collection, node_id, read_requirement)
-                .await?;
-            if !node.remove_drop_intent(id) {
-                if observed.satisfies(requirement) {
-                    return Ok(false);
-                }
-                // Enumeration can reuse a body from before the fence. Require
-                // the caller's bound only when no removal CAS proves completion.
-                read_requirement = requirement;
-                continue;
-            }
-            if self
-                .nodes
-                .store_node(collection, node_id, &node, Some(&observed))
-                .await?
-            {
-                return Ok(true);
-            }
+        self.clear_fence(
+            &ObjectPath::tree_node(collection, Some(node_id)),
+            id,
+            requirement,
+        )
+        .await?
+        .ok_or_else(|| StorageError::NotFound.into())
+    }
+
+    /// Removes the drop intent of `id` from the node at `path`. Returns whether
+    /// it removed one, or `None` when the node is missing.
+    ///
+    /// Enumeration can reuse a body from before the fence. So a state without
+    /// the intent ends the call only if it satisfies `requirement`. A removal
+    /// CAS proves completion itself.
+    async fn clear_fence(
+        &self,
+        path: &ObjectPath,
+        id: &TxId,
+        requirement: Requirement,
+    ) -> Result<Option<bool>, TransError> {
+        let cleared = self
+            .nodes
+            .converge(
+                path,
+                requirement,
+                CasRetries::Unbounded(self.retry),
+                |mut node, _| {
+                    ready(Ok::<_, TransError>(if node.remove_drop_intent(id) {
+                        Decision::Write(node, ())
+                    } else {
+                        Decision::Done(())
+                    }))
+                },
+            )
+            .await?;
+        match cleared {
+            Converged::Written { .. } => Ok(Some(true)),
+            Converged::Done(()) => Ok(Some(false)),
+            Converged::Missing => Ok(None),
+            Converged::Stop(()) | Converged::Exhausted => Err(TransError::Retry),
         }
     }
 
@@ -413,47 +434,33 @@ impl CollectionLifecycle {
         id: &TxId,
         requirement: Requirement,
     ) -> Result<bool, TransError> {
-        let mut changed = false;
-        let mut read_requirement = Requirement::ANY;
-        loop {
-            let (mut root, observed) =
-                match self.nodes.load_root(collection, read_requirement).await {
-                    Ok(root) => root,
-                    Err(StorageError::NotFound) => return Ok(changed),
-                    Err(error) => return Err(error.into()),
-                };
-            if !root.remove_drop_intent(id) {
-                if observed.satisfies(requirement) {
-                    break;
-                }
-                read_requirement = requirement;
-                continue;
-            }
-            if self.nodes.store_root(collection, &root, &observed).await? {
-                changed = true;
-                break;
-            }
-        }
+        let Some(changed) = self
+            .clear_fence(&ObjectPath::tree_node(collection, None), id, requirement)
+            .await?
+        else {
+            return Ok(false);
+        };
         // The record needs its own completion evidence, but a cached freeze
         // still permits a removal CAS without a preceding currentness check.
-        let mut read_requirement = Requirement::ANY;
-        loop {
-            let (mut record, observed) =
-                match self.records.load_record(collection, read_requirement).await {
-                    Ok(record) => record,
-                    Err(StorageError::NotFound) => return Ok(changed),
-                    Err(error) => return Err(error.into()),
-                };
-            if !record.remove_topology_freeze(id) {
-                if observed.satisfies(requirement) {
-                    return Ok(changed);
-                }
-                read_requirement = requirement;
-                continue;
-            }
-            if self.records.store_record(&record, &observed).await? {
-                return Ok(true);
-            }
+        let unfrozen = self
+            .records
+            .converge(
+                collection,
+                requirement,
+                CasRetries::Unbounded(self.retry),
+                |mut record, _| {
+                    ready(Ok::<_, TransError>(if record.remove_topology_freeze(id) {
+                        Decision::Write(record, ())
+                    } else {
+                        Decision::Done(())
+                    }))
+                },
+            )
+            .await?;
+        match unfrozen {
+            Converged::Written { .. } => Ok(true),
+            Converged::Done(()) | Converged::Missing => Ok(changed),
+            Converged::Stop(()) | Converged::Exhausted => Err(TransError::Retry),
         }
     }
 }
