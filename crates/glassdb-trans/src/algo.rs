@@ -32,10 +32,9 @@ use glassdb_concurr::{Background, Backoff, RetrySchedule, rt};
 use glassdb_data::{LogicalKey, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord, TxWrite};
 use glassdb_storage::{
-    CollectionRecord, CollectionStore, CurrentnessBarrier, CutKey, CutTarget, FloorPoint,
-    InlinePolicy, LeafObservation, LeafObservationCheck, LockType, MonotonicFloor, Node,
-    NodeSizePolicy, NodeStore, Observation, Requirement, StalenessCutoff, StorageError, Timeline,
-    TreeRouter,
+    CollectionRecord, CollectionStore, CurrentnessBarrier, CutKey, CutTarget, InlinePolicy,
+    LeafObservation, LeafObservationCheck, LockType, MonotonicFloor, NodeSizePolicy, NodeStore,
+    Observation, Requirement, StalenessCutoff, StorageError, Timeline, TreeRouter, ViewRead,
 };
 
 use crate::access::{AccessSet, LeafCoverage, ReadAccess, WriteOp};
@@ -243,9 +242,10 @@ pub struct Handle {
     /// certified read-only pass uses and raises it. Only a stale read-only
     /// transaction has one (ADR-099, ADR-102).
     floor: Option<MonotonicFloor>,
-    /// The floor at which the first body execution reads, when the floor is
-    /// within the bound at the start of the transaction (ADR-103).
-    read_point: Option<FloorPoint>,
+    /// How the body of a stale read-only transaction of a stale view reads:
+    /// the first execution at the floor, when the floor is within the bound at
+    /// the start of the transaction (ADR-103).
+    view_read: Option<ViewRead>,
 }
 
 impl Handle {
@@ -259,12 +259,14 @@ impl Handle {
         self.collections.reservations()
     }
 
-    /// Returns the floor at which the next body execution reads. Only the
-    /// first execution reads at the floor: a replay follows a cut that the
-    /// floor could not give, so it reads the cached states and the floor
-    /// moves (ADR-103).
-    pub(crate) fn take_read_point(&mut self) -> Option<FloorPoint> {
-        self.read_point.take()
+    /// Returns how the next body execution reads, for a stale read-only
+    /// transaction of a stale view. Only the first execution reads at the
+    /// floor: a replay follows a cut that the floor could not give, so it
+    /// reads the latest states and the floor moves (ADR-103).
+    pub(crate) fn next_view_read(&mut self) -> Option<ViewRead> {
+        let view_read = self.view_read;
+        self.view_read = view_read.map(ViewRead::for_replay);
+        view_read
     }
 
     /// Whether this read-only transaction is past optimistic validation and must
@@ -461,31 +463,6 @@ impl CutStates {
     }
 }
 
-/// The state of `key` in one leaf state, for the key interval of a read
-/// (ADR-103): its committed writer, or the membership generation of the leaf
-/// for a key with no writer. A writer does not come back after the key
-/// changes, and the generation only grows, so two leaf states with the same
-/// key state show the key unchanged between them. It is `None` when the leaf
-/// state does not hold the key, or when an exclusive holder can change the key
-/// without a new leaf state.
-fn key_state(node: &Node, key: &[u8]) -> Option<(Option<TxId>, Option<u64>)> {
-    let leaf = node.as_leaf()?;
-    if node.is_below_range(key) || !node.covers(key) {
-        return None;
-    }
-    let entry = leaf.lookup(key);
-    if entry.is_some_and(|entry| {
-        matches!(entry.lock_type(), LockType::Write | LockType::Create)
-            && !entry.lock_holders().is_empty()
-    }) {
-        return None;
-    }
-    match entry.and_then(|entry| entry.current.writer()) {
-        Some(writer) => Some((Some(*writer), None)),
-        None => Some((None, Some(node.membership_generation()))),
-    }
-}
-
 /// Reports whether the observed leaf contains an exclusive holder whose final
 /// state can change the effective writer without rewriting the leaf.
 fn read_observation_has_exclusive_holder(read: &ReadAccess) -> Result<bool, TransError> {
@@ -599,7 +576,7 @@ impl Algo {
     pub fn begin_stale(&self, max_staleness: Duration, floor: MonotonicFloor) -> Handle {
         let mut tx = self.begin(AccessSet::default(), CatalogAccesses::default());
         tx.staleness_cutoff = self.timeline.staleness_cutoff(max_staleness);
-        tx.read_point = floor.point_within(tx.staleness_cutoff);
+        tx.view_read = Some(floor.view_read(tx.staleness_cutoff));
         tx.floor = Some(floor);
         tx
     }
@@ -624,7 +601,7 @@ impl Algo {
             directory_locks: DirectoryLocks::default(),
             staleness_cutoff: self.timeline.staleness_cutoff(Duration::ZERO),
             floor: None,
-            read_point: None,
+            view_read: None,
         }
     }
 
@@ -701,9 +678,7 @@ impl Algo {
         let mut keyed = Vec::new();
         if tx.floor.is_some() {
             for (observed, key) in keys {
-                let cut = self
-                    .nodes
-                    .add_key_to_cut(&mut search, &observed, |node| key_state(node, &key))?;
+                let cut = self.nodes.add_key_to_cut(&mut search, &observed, &key)?;
                 keyed.push((observed, key, cut));
             }
         } else {
@@ -745,32 +720,11 @@ impl Algo {
         keys: &[(LeafObservation, Vec<u8>, CutKey)],
         target: &CutTarget,
     ) -> Result<bool, TransError> {
-        let observations: Vec<_> = keys
+        let keys: Vec<_> = keys
             .iter()
-            .map(|(observed, _, _)| observed.clone())
+            .map(|(observed, key, _)| (observed.clone(), key.clone()))
             .collect();
-        let checks = self
-            .nodes
-            .check_leaves_current(&observations, Requirement::after(target.barrier()))
-            .await;
-        for ((observed, key, _), check) in keys.iter().zip(checks) {
-            match check? {
-                LeafObservationCheck::Current => {}
-                LeafObservationCheck::Changed(current) => {
-                    let unchanged = match (observed.value(), current.value()) {
-                        (Some(before), Some(after)) => {
-                            let before = key_state(before, key);
-                            before.is_some() && before == key_state(after, key)
-                        }
-                        _ => false,
-                    };
-                    if !unchanged {
-                        return Ok(false);
-                    }
-                }
-            }
-        }
-        Ok(true)
+        Ok(self.nodes.refresh_keys_for_cut(&keys, target).await?)
     }
 
     /// Raises the monotonic floor of the stale view after a stale read-only

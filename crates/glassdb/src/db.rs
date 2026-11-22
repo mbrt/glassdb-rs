@@ -771,7 +771,7 @@ impl DbInner {
                 self.clone(),
                 *driver.handle.id(),
                 driver.handle.collection_reservations(),
-                driver.handle.take_read_point(),
+                driver.handle.next_view_read(),
             );
             let body_outcome = f(tx.handle()).await;
 

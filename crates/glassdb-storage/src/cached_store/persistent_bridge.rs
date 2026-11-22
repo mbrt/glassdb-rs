@@ -6,7 +6,8 @@ use std::time::Duration;
 use glassdb_backend as backend;
 use glassdb_concurr::rt;
 
-use super::knowledge::{EvictionSink, Knowledge, PresentSeed};
+use super::entry::EvictionSink;
+use super::latest::{LatestStates, PresentSeed};
 use super::path_lane::{PathCoordinator, PathState};
 use super::{Codec, Evidence, ObjectKey, Revision};
 use crate::cache_stats::CacheMetrics;
@@ -102,7 +103,7 @@ impl PersistentBridge {
     /// Restores and decodes one usable persistent candidate into L1 knowledge.
     pub(super) async fn load<C: Codec>(
         &self,
-        knowledge: &Knowledge,
+        latest: &LatestStates,
         key: &ObjectKey,
         state: &Arc<PathState>,
     ) -> Option<PresentSeed> {
@@ -118,7 +119,7 @@ impl PersistentBridge {
                 return None;
             }
         };
-        self.decode_candidate::<C>(knowledge, key, cache, owner, encoded)
+        self.decode_candidate::<C>(latest, key, cache, owner, encoded)
     }
 
     /// Starts a path-changing L2 transition before its corresponding L1 change.
@@ -136,7 +137,7 @@ impl PersistentBridge {
 
     fn decode_candidate<C: Codec>(
         &self,
-        knowledge: &Knowledge,
+        latest: &LatestStates,
         key: &ObjectKey,
         cache: &PersistentCache,
         owner: Arc<PathOwner>,
@@ -161,7 +162,7 @@ impl PersistentBridge {
         let size = C::size(&decoded);
         let value = Arc::new(decoded);
         let revision = Revision::from_backend(backend::Revision::new(token));
-        let seed = knowledge.install_persistent::<C>(
+        let seed = latest.install_persistent::<C>(
             key.as_str(),
             value,
             size,

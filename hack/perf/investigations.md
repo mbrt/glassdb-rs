@@ -68,11 +68,12 @@ This was not traced. The byte threshold of the report already hides it.
 
 ## 2026-11-20: a stale view that keeps its cut point
 
-Status: a prototype for GLA-65 made the stale view calls of the `stale-reads`
-grid cost almost no backend operation at every writer count, also with the
-bound on each call. It is the evidence
-for [ADR-103](../../docs/adr/103-a-stale-view-keeps-its-cut-point.md). The
-prototype was not committed.
+Status: a prototype made the stale view calls of the `stale-reads` grid cost
+almost no backend operation at every writer count, also with the bound on each
+call. It is the evidence for
+[ADR-103](../../docs/adr/103-a-stale-view-keeps-its-cut-point.md). The
+prototype was not committed. The committed change has the same results (see
+the last section).
 
 ### The question
 
@@ -88,17 +89,16 @@ check.
 The prototype added these parts one at a time. Environment variables switched
 them, so one binary ran all variants:
 
-- **Fixed point** (`GLA65_FIXED`): the bound applies only to the first call of
-  a view. Later calls have no cutoff, and the body reads at the floor of the
-  view.
-- **History** (`GLA65_HISTORY`, `GLA65_DEPTH`): the decoded cache keeps up to
-  eight replaced states for each node path. A read at the floor uses the state
-  whose interval covers the floor.
-- **Early replay** (`GLA65_EARLY`): a call that read an earlier state and then
-  missed the floor replays at the newest states before any check.
-- **Key intervals** (`GLA65_KEYS`): the cut of a view call uses the interval
-  over which each read key kept its writer, from every known state of its leaf.
-  A lagging key passes a check when the new leaf state shows the same writer.
+- **Fixed point**: the bound applies only to the first call of a view. Later
+  calls have no cutoff, and the body reads at the floor of the view.
+- **History**: the decoded cache keeps up to eight replaced states for each
+  node path. A read at the floor uses the state whose interval covers the
+  floor.
+- **Early replay**: a call that read an earlier state and then missed the
+  floor replays at the newest states before any check.
+- **Key intervals**: the cut of a view call uses the interval over which each
+  read key kept its writer, from every known state of its leaf. A lagging key
+  passes a check when the new leaf state shows the same writer.
 
 All runs used `--backend=memory --delays=s3 --prefix-depth=3 --time=virtual`,
 the `stale-reads` experiment, and 30 s measure windows
@@ -200,8 +200,8 @@ every 30 calls.
 ### A bound on each call
 
 The variants above apply the bound only to the first call of a view, which is
-the same as a view with `Duration::MAX`. A last variant (`GLA65_BOUND_EACH`)
-kept the bound on each call: a call reads at the floor only while the floor is
+the same as a view with `Duration::MAX`. A last variant kept the bound on each
+call: a call reads at the floor only while the floor is
 within its cutoff, and otherwise moves the floor. With the 5 s bound of the
 experiment, mean latency in ms (median 0.05 ms or less in every cell):
 
@@ -219,6 +219,46 @@ each call, the views moved their floor 1,886 times in 5.5 million calls. With
 mean of 10.6 ms and a 90th percentile of 35 ms. That is in the range of the
 variant with the bound on the first call only.
 
+### The committed change
+
+The committed change keeps earlier states only for the leaves that a view
+read, and keeps a fixed number of them for each floor, plus the newest one
+while a floor is raised
+([ADR-103](../../docs/adr/103-a-stale-view-keeps-its-cut-point.md)). The
+earlier states of a path are a cache entry of their own. Mean latency in ms on
+the full grid, `5b681e0b8` against the change, one run (median 0.051 ms or
+less for these shapes after the change in every cell):
+
+| Writers of each shape | 1 | 50 | 100 | 200 |
+| --- | --- | --- | --- | --- |
+| `ro-multi-view` | 31 → 0.15 | 100 → 3.0 | 128 → 3.4 | 155 → 4.3 |
+| `ro-single-view` | 10 → 0.02 | 32 → 0.37 | 14 → 0.53 | 55 → 0.67 |
+| `ro-multi-stale` | 32 → 0.11 | 91 → 1.9 | 127 → 1.8 | 158 → 3.4 |
+
+Three earlier versions gave about the same numbers in one run each. Without
+the newest earlier state, `ro-multi-view` had 0.18, 3.9, 3.4, and 4.7 ms. With the
+earlier states of every leaf in the cache entry of its latest state,
+`ro-multi-view` had 0.11, 3.0, 3.1, and 5.0 ms. With the earlier states of
+every leaf in an entry of their own, it had 0.17, 3.8, 3.8, and 5.6 ms.
+
+The `Database::tx` shapes, `ro-single-stale`, and the writers did not change,
+and no cell had failures.
+
+A first version kept, for each floor, only the newest state that started at or
+before it. Two runs of each rule, mean latency in ms:
+
+| Writers | Shape | Every later state | One state for each floor | Two states for each floor |
+| --- | --- | --- | --- | --- |
+| 50 | `ro-multi-view` | 2.7 | 5.2, 4.0 | 2.9, 3.1 |
+| 50 | `ro-single-view` | 0.26 | 0.52, 0.55 | 0.37, 0.30 |
+| 200 | `ro-multi-view` | 5.1 | 4.9, 4.9 | 5.7, 5.2 |
+| 200 | `ro-single-view` | 0.70 | 1.08, 0.95 | 0.68, 0.72 |
+
+The "every later state" column is one run of the rule that ADR-103 first had.
+With one state for each floor, a key that the write after the floor did not
+change loses the end of its interval when a later write changes it, so the view
+moves.
+
 ### Conclusions
 
 - A view needs a point that it keeps, the earlier states of each leaf, and the
@@ -226,8 +266,8 @@ variant with the bound on the first call only.
 - A bound on each call costs almost nothing more than a bound on the first
   call only, so ADR-103 keeps the bound on each call.
 - The prototype kept earlier states for index nodes too, and did not limit
-  their memory. ADR-103 keeps them for leaves only, and evicts them by the
-  floors of the live views.
+  their memory. The committed change keeps them for leaves only, and two for
+  each floor of the live views.
 - A round of checks over the working set of a view right after a move could
   reduce the remaining cost with several instances. It was not tried.
 

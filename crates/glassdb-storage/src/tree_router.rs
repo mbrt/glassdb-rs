@@ -8,7 +8,7 @@
 //! along the right-sibling link (the B-link property) instead of restarting
 //! from the root.
 //!
-//! This layer is pure routing: it reads nodes through the [`NodeStore`] (hence
+//! This layer is pure routing: it reads nodes through [`NodeReads`] (hence
 //! the decoded object store, so index nodes stay cached and off the hot
 //! path) and never mutates the tree. Splitting and locking live above it.
 
@@ -23,8 +23,7 @@ use glassdb_data::{CollectionAddress, LogicalKey, NodeId, ObjectPath};
 use crate::cached_store::Requirement;
 use crate::error::StorageError;
 use crate::node::{Node, NodeBody};
-use crate::node_store::{LeafObservation, NodeStore};
-use crate::timeline::FloorPoint;
+use crate::node_store::{LeafObservation, NodeReads};
 
 /// Bounds a self-correcting right-link walk, which steps right only to pass
 /// splits that moved a key after the descent read its parent, so it is expected
@@ -686,23 +685,17 @@ impl<'a> LeafChain<'a> {
 /// Descends and scans a collection's B-link tree.
 #[derive(Clone)]
 pub struct TreeRouter {
-    nodes: NodeStore,
+    nodes: NodeReads,
     parallelism: NonZeroUsize,
 }
 
 impl TreeRouter {
-    /// Creates a router that reads nodes through `nodes`.
-    pub fn new(nodes: NodeStore, parallelism: NonZeroUsize) -> Self {
-        TreeRouter { nodes, parallelism }
-    }
-
-    /// Returns a router that reads the leaf state that was current at `point`,
-    /// when the cache has one (ADR-103). It routes through the cached index
-    /// nodes.
-    pub fn at(&self, point: FloorPoint) -> Self {
+    /// Creates a router that reads nodes through `nodes`: the reads of a
+    /// [`NodeStore`](crate::NodeStore), or [`NodeReads::for_view`].
+    pub fn new(nodes: impl Into<NodeReads>, parallelism: NonZeroUsize) -> Self {
         TreeRouter {
-            nodes: self.nodes.at(point),
-            parallelism: self.parallelism,
+            nodes: nodes.into(),
+            parallelism,
         }
     }
 

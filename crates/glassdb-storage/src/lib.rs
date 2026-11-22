@@ -53,14 +53,14 @@ pub use node::{
     NodeSizePolicyBuilder,
 };
 pub use node_store::{
-    LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodePage, NodeStore,
+    LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodePage, NodeReads, NodeStore,
 };
 pub use structural_intent::{
     MergeTarget, StructuralChange, StructuralIntent, StructuralIntentPhase,
 };
 pub use structural_intent_store::{StructuralIntentPage, StructuralIntentStore};
 pub use timeline::{
-    CurrentnessBarrier, FloorPoint, MonotonicFloor, Requirement, SequencePoint, StalenessCutoff,
-    Timeline, ViewFloors,
+    CurrentnessBarrier, MonotonicFloor, Requirement, SequencePoint, StalenessCutoff, Timeline,
+    ViewFloors, ViewRead,
 };
 pub use tree_router::{RoutedLeaf, RoutedLeafGroup, TreeRouter};

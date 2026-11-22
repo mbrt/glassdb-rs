@@ -205,6 +205,8 @@ async fn a_view_keeps_its_cut_point_when_only_another_key_of_the_leaf_changes() 
     let pair = create_top(&reader, b"pair").await;
     pair.write(b"a", b"a").await.unwrap();
     pair.write(b"b", b"b").await.unwrap();
+    // A view reads `pair`, so the cache keeps its replaced states (ADR-103).
+    view_read_all(&reader.stale(Duration::MAX), std::slice::from_ref(&pair)).await;
     let other = create_top(&reader, b"other").await;
     other.write(b"k", b"v").await.unwrap();
     // Only the state of `other` has a confirmation after its start, so the
@@ -392,6 +394,44 @@ async fn calls_through_two_views_are_not_ordered() {
     assert_eq!(read_tx_all(&reader, Duration::ZERO, &[x]).await, [b"new"]);
     // A new view has its own floor, so the cached state of `z` serves it.
     assert_eq!(read_tx_all(&reader, Duration::MAX, &[z]).await, [b"old"]);
+}
+
+/// A check that finds a new leaf state with the read key unchanged keeps the
+/// cut at the floor, so the floor does not move to the check.
+#[tokio::test(start_paused = true)]
+async fn a_view_keeps_its_cut_point_when_a_check_finds_only_another_key_changed() {
+    let backend = mem();
+    let reader = Database::open("example", backend.clone()).await.unwrap();
+    let pair = create_top(&reader, b"pair").await;
+    pair.write(b"a", b"a").await.unwrap();
+    pair.write(b"b", b"b").await.unwrap();
+    let other = create_top(&reader, b"other").await;
+    other.write(b"k", b"v").await.unwrap();
+    tx_read_all(&reader, std::slice::from_ref(&other)).await;
+    let view = reader.stale(Duration::MAX);
+    assert_eq!(
+        view_read_all(&view, std::slice::from_ref(&other)).await,
+        [b"v"]
+    );
+
+    // This instance does not see the write.
+    let writer = Database::open("example", backend).await.unwrap();
+    open_top(&writer, b"pair")
+        .await
+        .write(b"b", b"new")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // The state of `pair` has no confirmation after the floor, so the call
+    // checks it once and finds the new state.
+    let before = reader.stats();
+    assert_eq!(view_read_keys(&view, &pair, &[b"a"]).await, [b"a"]);
+    assert_eq!(backend_ops(&reader, &before), (1, 0, 0));
+    let before = reader.stats();
+    assert_eq!(view_read_all(&view, &[other]).await, [b"v"]);
+    assert_eq!(backend_ops(&reader, &before), (0, 0, 0));
+    writer.shutdown().await;
 }
 
 #[tokio::test(start_paused = true)]

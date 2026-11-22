@@ -20,7 +20,7 @@ use crate::error::StorageError;
 use crate::leaf::LeafBody;
 use crate::lock::LockType;
 use crate::node::{Node, NodeLocks};
-use crate::timeline::FloorPoint;
+use crate::timeline::ViewRead;
 
 const NODE_LIST_PAGE_SIZE: usize = 128;
 
@@ -29,6 +29,20 @@ const NODE_LIST_PAGE_SIZE: usize = 128;
 pub struct NodeStore {
     nodes: crate::cached_store::TypedCachedStore<Node>,
     parallelism: NonZeroUsize,
+    reads: NodeReads,
+}
+
+/// Reads B-link nodes, and never writes them. Routing reads through it.
+///
+/// For a stale read-only transaction of a stale view, it reads each leaf at
+/// the floor of the view when the decoded cache has a state that covers the
+/// floor, and marks each leaf that it reads, so that the cache keeps the
+/// earlier states of the leaf (ADR-103). It reads index nodes at their latest
+/// state.
+#[derive(Clone)]
+pub struct NodeReads {
+    nodes: crate::cached_store::TypedCachedStore<Node>,
+    view: Option<ViewRead>,
 }
 
 /// One bounded page of standalone node observations.
@@ -161,35 +175,101 @@ impl Codec for Node {
     fn name() -> &'static str {
         "node"
     }
-
-    /// A stale view reads a key at its floor from the leaf, and routes through
-    /// the cached index nodes (ADR-103).
-    fn keeps_earlier_states(node: &Self::Value) -> bool {
-        node.as_leaf().is_some()
-    }
 }
 
-impl NodeStore {
-    /// Creates a node store that reads and compare-and-swaps through `objects`.
-    pub fn new(objects: CachedStore, parallelism: NonZeroUsize) -> Self {
+impl NodeReads {
+    /// Returns the reads of one stale read-only transaction of a stale view
+    /// over the nodes of `store` (ADR-103).
+    pub fn for_view(store: &NodeStore, view: ViewRead) -> Self {
         Self {
-            nodes: objects.typed(),
-            parallelism,
-        }
-    }
-
-    /// Returns a node store whose reads use the leaf state that was current at
-    /// `point`, when the cache has one (ADR-103).
-    pub fn at(&self, point: FloorPoint) -> Self {
-        Self {
-            nodes: self.nodes.at(point),
-            parallelism: self.parallelism,
+            nodes: store.nodes.clone(),
+            view: Some(view),
         }
     }
 
     /// Captures a currentness barrier after the node observations made so far.
     pub(crate) fn currentness_barrier(&self) -> crate::CurrentnessBarrier {
         self.nodes.currentness_barrier()
+    }
+
+    /// Loads the fixed tree root's exact observation, including absence.
+    pub async fn load_root_state(
+        &self,
+        collection: &CollectionAddress,
+        requirement: Requirement,
+    ) -> Result<LeafObservation, StorageError> {
+        self.load_node_at_state(
+            &ObjectPath::TreeRoot {
+                collection: collection.clone(),
+            },
+            requirement,
+        )
+        .await
+    }
+
+    /// Loads an exact `_r` or `_n/<node-id>` node observation, including absence.
+    pub async fn load_node_at_state(
+        &self,
+        path: &ObjectPath,
+        requirement: Requirement,
+    ) -> Result<LeafObservation, StorageError> {
+        validate_node_path(path)?;
+        let Some(view) = self.view else {
+            return self.nodes.read(path, requirement).await;
+        };
+        let observed = match view.point() {
+            Some(point) => self.nodes.read_at(path, requirement, point).await?,
+            None => self.nodes.read(path, requirement).await?,
+        };
+        match observed.value() {
+            Some(node) if node.as_leaf().is_some() => self.nodes.keep_earlier_states(path),
+            // A split turns the tree root into an index node in place. Its
+            // index states need no earlier states.
+            Some(_) if matches!(path, ObjectPath::TreeRoot { .. }) => {
+                self.nodes.drop_earlier_states(path)
+            }
+            _ => {}
+        }
+        Ok(observed)
+    }
+
+    /// Loads the non-root node's exact observation.
+    pub async fn load_node_state(
+        &self,
+        collection: &CollectionAddress,
+        id: &NodeId,
+        requirement: Requirement,
+    ) -> Result<LeafObservation, StorageError> {
+        let path = ObjectPath::Node {
+            collection: collection.clone(),
+            id: *id,
+        };
+        let observed = self.load_node_at_state(&path, requirement).await?;
+        if observed.is_absent() {
+            return Err(StorageError::NotFound);
+        }
+        Ok(observed)
+    }
+}
+
+impl From<NodeStore> for NodeReads {
+    fn from(store: NodeStore) -> Self {
+        store.reads
+    }
+}
+
+impl NodeStore {
+    /// Creates a node store that reads and compare-and-swaps through `objects`.
+    pub fn new(objects: CachedStore, parallelism: NonZeroUsize) -> Self {
+        let nodes = objects.typed();
+        Self {
+            reads: NodeReads {
+                nodes: nodes.clone(),
+                view: None,
+            },
+            nodes,
+            parallelism,
+        }
     }
 
     /// Checks whether a retained leaf observation satisfies `requirement`.
@@ -218,17 +298,41 @@ impl NodeStore {
         self.nodes.cut_search()
     }
 
-    /// Adds the interval of one read key to a cut search (ADR-103). `key_state`
-    /// returns the state of the key in a leaf state, and must return a value
-    /// that never comes back after the key changes, or `None` when the leaf
-    /// state cannot show the key unchanged.
-    pub fn add_key_to_cut<S: PartialEq>(
+    /// Adds the interval of `key` to a cut search, from the leaf states of the
+    /// path of `observed` that show the key unchanged (ADR-103).
+    pub fn add_key_to_cut(
         &self,
         search: &mut CutSearch,
         observed: &LeafObservation,
-        key_state: impl Fn(&Node) -> Option<S>,
+        key: &[u8],
     ) -> Result<CutKey, StorageError> {
-        self.nodes.add_part_to_cut(search, observed, key_state)
+        self.nodes
+            .add_part_to_cut(search, observed, |node| key_state(node, key))
+    }
+
+    /// Checks the leaf states of `keys`, which do not reach `target`. Reports
+    /// whether every key is unchanged after the barrier of the target: its
+    /// leaf state is still current, or the current leaf state shows the key
+    /// unchanged (ADR-103).
+    pub async fn refresh_keys_for_cut(
+        &self,
+        keys: &[(LeafObservation, Vec<u8>)],
+        target: &CutTarget,
+    ) -> Result<bool, StorageError> {
+        let observations: Vec<_> = keys.iter().map(|(observed, _)| observed.clone()).collect();
+        let checks = self
+            .check_leaves_current(&observations, Requirement::after(target.barrier()))
+            .await;
+        for ((observed, key), check) in keys.iter().zip(checks) {
+            if let LeafObservationCheck::Changed(current) = check? {
+                let before = observed.value().and_then(|node| key_state(node, key));
+                let after = current.value().and_then(|node| key_state(node, key));
+                if before.is_none() || before != after {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Adds retained leaf observations to a cut search (ADR-097).
@@ -257,13 +361,7 @@ impl NodeStore {
         collection: &CollectionAddress,
         requirement: Requirement,
     ) -> Result<LeafObservation, StorageError> {
-        self.load_node_at_state(
-            &ObjectPath::TreeRoot {
-                collection: collection.clone(),
-            },
-            requirement,
-        )
-        .await
+        self.reads.load_root_state(collection, requirement).await
     }
 
     /// Loads an exact `_r` or `_n/<node-id>` node observation, including absence.
@@ -272,8 +370,7 @@ impl NodeStore {
         path: &ObjectPath,
         requirement: Requirement,
     ) -> Result<LeafObservation, StorageError> {
-        validate_node_path(path)?;
-        self.nodes.read(path, requirement).await
+        self.reads.load_node_at_state(path, requirement).await
     }
 
     /// Loads an existing node at an exact `_r` or `_n/<node-id>` path.
@@ -297,20 +394,9 @@ impl NodeStore {
         id: &NodeId,
         requirement: Requirement,
     ) -> Result<LeafObservation, StorageError> {
-        let observed = self
-            .nodes
-            .read(
-                ObjectPath::Node {
-                    collection: collection.clone(),
-                    id: *id,
-                },
-                requirement,
-            )
-            .await?;
-        if observed.is_absent() {
-            return Err(StorageError::NotFound);
-        }
-        Ok(observed)
+        self.reads
+            .load_node_state(collection, id, requirement)
+            .await
     }
 
     /// Loads the non-root node named `id` (`{prefix}/_n/<node-id>`, ADR-031). A
@@ -645,10 +731,38 @@ fn validate_node_path(path: &ObjectPath) -> Result<(), StorageError> {
     }
 }
 
+/// The state of `key` in one leaf state, for the key interval of a read
+/// (ADR-103): its committed writer, or the membership generation of the leaf
+/// for a key with no writer. A writer does not come back after the key
+/// changes, and the generation only grows, so two leaf states with the same
+/// key state show the key unchanged between them. It is `None` when the leaf
+/// state does not hold the key, or when an exclusive holder can change the key
+/// without a new leaf state.
+fn key_state(node: &Node, key: &[u8]) -> Option<(Option<TxId>, Option<u64>)> {
+    let leaf = node.as_leaf()?;
+    if node.is_below_range(key) || !node.covers(key) {
+        return None;
+    }
+    let entry = leaf.lookup(key);
+    if entry.is_some_and(|entry| {
+        matches!(entry.lock_type(), LockType::Write | LockType::Create)
+            && !entry.lock_holders().is_empty()
+    }) {
+        return None;
+    }
+    match entry.and_then(|entry| entry.current.writer()) {
+        Some(writer) => Some((Some(*writer), None)),
+        None => Some((None, Some(node.membership_generation()))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LeafEntry, Timeline};
+    use crate::cached_store::Revision;
+    use crate::node::IndexNode;
+    use crate::timeline::{MonotonicFloor, StalenessCutoff};
+    use crate::{CurrentState, LeafEntry, Timeline};
 
     use glassdb_backend::Backend;
     use glassdb_backend::memory::MemoryBackend;
@@ -704,6 +818,163 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn key_state_is_the_writer_or_the_generation_of_an_absent_key() {
+        let writer = TxId::with_priority(1, b"writer");
+        let holder = TxId::with_priority(2, b"holder");
+        let leaf = |entries: Vec<LeafEntry>| {
+            Node::leaf(LeafBody::from_entries(entries)).with_high_key(Some(b"m".to_vec()))
+        };
+        let written = LeafEntry::new(b"a".to_vec()).with_current(CurrentState::External { writer });
+        let node = leaf(vec![written.clone()]);
+        assert_eq!(key_state(&node, b"a"), Some((Some(writer), None)));
+        // An absent key has the generation of the leaf, which changes with
+        // its key membership.
+        let generation = node.membership_generation();
+        assert_eq!(key_state(&node, b"b"), Some((None, Some(generation))));
+        let mut grown = node.clone();
+        let mut locks = grown.locks().clone();
+        locks.advance_membership_generation();
+        grown.set_locks(locks);
+        assert_ne!(key_state(&grown, b"b"), key_state(&node, b"b"));
+        // The leaf state does not hold a key at or after its high key.
+        assert_eq!(key_state(&node, b"z"), None);
+
+        // A read lock does not change the key, and a write lock can.
+        let mut read_locked = written.clone();
+        read_locked.acquire_read_lock(holder);
+        assert_eq!(
+            key_state(&leaf(vec![read_locked]), b"a"),
+            Some((Some(writer), None))
+        );
+        let mut write_locked = written;
+        write_locked.replace_write_lock(holder);
+        assert_eq!(key_state(&leaf(vec![write_locked]), b"a"), None);
+    }
+
+    /// Writes a leaf, observes it twice, raises a view floor between the two
+    /// observations, and replaces the leaf. When `view_read` is set, the first
+    /// observation is a read through the view. Returns the first revision, the
+    /// reads of the view at the floor, the store, and the floor, which must
+    /// stay live while the test reads.
+    async fn replaced_after_a_floor(
+        view_read: bool,
+    ) -> (Option<Revision>, NodeReads, NodeStore, MonotonicFloor) {
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(
+            Arc::new(MemoryBackend::new()),
+            1 << 20,
+            timeline.clone(),
+            None,
+        );
+        let floor = objects.view_floors().new_floor();
+        let store = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
+        let id = node_id(1);
+        let empty = Node::leaf(LeafBody::new());
+        assert!(
+            store
+                .store_node(&collection(), &id, &empty, None)
+                .await
+                .unwrap()
+        );
+        let fresh = Requirement::after(timeline.currentness_barrier());
+        if view_read {
+            NodeReads::for_view(&store, floor.view_read(StalenessCutoff::ANY))
+                .load_node_state(&collection(), &id, fresh)
+                .await
+                .unwrap();
+        } else {
+            store
+                .load_node_state(&collection(), &id, fresh)
+                .await
+                .unwrap();
+        }
+        // A point between two observations is in the interval of the state.
+        let mid = timeline.now();
+        let observed = store
+            .load_node_state(
+                &collection(),
+                &id,
+                Requirement::after(timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        floor.raise(mid);
+        let written = Node::leaf(LeafBody::from_entries(vec![LeafEntry::new(b"a".to_vec())]));
+        assert!(
+            store
+                .store_node(&collection(), &id, &written, Some(&observed))
+                .await
+                .unwrap()
+        );
+        let reads = NodeReads::for_view(&store, floor.view_read(StalenessCutoff::ANY));
+        (observed.revision().cloned(), reads, store, floor)
+    }
+
+    #[tokio::test]
+    async fn a_view_reads_a_leaf_that_it_read_before_at_its_floor() {
+        let (first, reads, store, _floor) = replaced_after_a_floor(true).await;
+        let by_id = reads
+            .load_node_state(&collection(), &node_id(1), Requirement::ANY)
+            .await
+            .unwrap();
+        let by_path = reads
+            .load_node_at_state(&node_path(1), Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(by_id.revision(), first.as_ref());
+        assert_eq!(by_path.revision(), first.as_ref());
+        let latest = store
+            .load_node_state(&collection(), &node_id(1), Requirement::ANY)
+            .await
+            .unwrap();
+        assert_ne!(latest.revision(), first.as_ref());
+    }
+
+    #[tokio::test]
+    async fn the_cache_keeps_no_earlier_state_of_a_leaf_that_no_view_read() {
+        let (first, reads, _store, _floor) = replaced_after_a_floor(false).await;
+        let read = reads
+            .load_node_state(&collection(), &node_id(1), Requirement::ANY)
+            .await
+            .unwrap();
+        assert_ne!(read.revision(), first.as_ref());
+    }
+
+    #[tokio::test]
+    async fn a_tree_root_that_became_an_index_keeps_no_earlier_states() {
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(
+            Arc::new(MemoryBackend::new()),
+            1 << 20,
+            timeline.clone(),
+            None,
+        );
+        let floor = objects.view_floors().new_floor();
+        let store = NodeStore::new(objects, std::num::NonZeroUsize::MIN);
+        let c = collection();
+        let fresh = || Requirement::after(timeline.currentness_barrier());
+        let view = || NodeReads::for_view(&store, floor.view_read(StalenessCutoff::ANY));
+        assert!(
+            store
+                .create_root(&c, &Node::leaf(LeafBody::new()))
+                .await
+                .unwrap()
+        );
+        let leaf = view().load_root_state(&c, fresh()).await.unwrap();
+        // A split turns the root into an index node in place.
+        let index = |byte| Node::index(IndexNode::from_children([(b"".to_vec(), node_id(byte))]));
+        assert!(store.store_root(&c, &index(1), &leaf).await.unwrap());
+        view().load_root_state(&c, fresh()).await.unwrap();
+        let mid = timeline.now();
+        let first = store.load_root_state(&c, fresh()).await.unwrap();
+        floor.raise(mid);
+        assert!(store.store_root(&c, &index(2), &first).await.unwrap());
+
+        let read = view().load_root_state(&c, Requirement::ANY).await.unwrap();
+        assert_ne!(read.revision(), first.revision());
     }
 
     #[tokio::test]

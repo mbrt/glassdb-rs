@@ -17,7 +17,7 @@ mod read;
 use std::sync::{Arc, Mutex};
 
 use glassdb_data::{CollectionAddress, CollectionName, LogicalKey, TxId};
-use glassdb_storage::FloorPoint;
+use glassdb_storage::ViewRead;
 use glassdb_trans::{AccessSet, CatalogAccesses, CollectionReservations};
 
 use self::access_overlay::{AccessOverlay, OverlayRead};
@@ -44,9 +44,9 @@ pub struct Transaction {
     db: Arc<DbInner>,
     /// The engine identity that commits this body execution.
     identity: TxId,
-    /// The floor at which a stale view call reads, for its first body
-    /// execution (ADR-103).
-    read_point: Option<FloorPoint>,
+    /// How the body execution of a stale view call reads: the first one at
+    /// the floor of the view (ADR-103).
+    view_read: Option<ViewRead>,
     inner: Arc<Mutex<TransactionInner>>,
 }
 
@@ -85,7 +85,7 @@ impl Transaction {
             }
         }
 
-        match self.db.engine.read(&key, self.read_point).await {
+        match self.db.engine.read(&key, self.view_read).await {
             Ok(outcome) => {
                 let (value, evidence) = outcome.into_parts();
                 match value {
@@ -138,7 +138,7 @@ impl Transaction {
         let result = self
             .db
             .engine
-            .scan(c.address(), &range, &overlay, self.read_point)
+            .scan(c.address(), &range, &overlay, self.view_read)
             .await
             .map_err(|e| self.observe_error(Error::from_read(e)))?;
         let keys = result.keys().to_vec();
@@ -324,12 +324,12 @@ impl Transaction {
         db: Arc<DbInner>,
         identity: TxId,
         reservations: CollectionReservations,
-        read_point: Option<FloorPoint>,
+        view_read: Option<ViewRead>,
     ) -> Self {
         Transaction {
             db,
             identity,
-            read_point,
+            view_read,
             inner: Arc::new(Mutex::new(TransactionInner {
                 accesses: AccessOverlay::default(),
                 catalog: CatalogOverlay::new(reservations),
@@ -347,7 +347,7 @@ impl Transaction {
         Transaction {
             db: self.db.clone(),
             identity: self.identity,
-            read_point: self.read_point,
+            view_read: self.view_read,
             inner: self.inner.clone(),
         }
     }

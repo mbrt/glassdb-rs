@@ -94,7 +94,7 @@ impl CutSearch {
     }
 
     /// Adds the interval of one read key, with the start and the watermark
-    /// that [`Knowledge::part_interval`](super::knowledge::Knowledge::part_interval)
+    /// that [`EarlierStates::part_interval`](super::earlier::EarlierStates::part_interval)
     /// found.
     pub(super) fn add_key(
         &mut self,

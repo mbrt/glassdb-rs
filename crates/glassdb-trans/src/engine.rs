@@ -5,15 +5,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_backend::{Backend, BackendError, BackendStats, StatsBackend};
-use glassdb_concurr::{Background, DedupKeySnapshot};
+use glassdb_concurr::{Background, DedupKeySnapshot, RetrySchedule};
 use glassdb_data::{
     CollectionAddress, CollectionId, DatabaseId, DbPrefix, LogicalKey, ObjectPath, TxId,
 };
 use glassdb_storage::transaction::TxRecordStore;
 use glassdb_storage::{
-    CacheStats, CachedStore, CollectionRecord, CollectionStore, FloorPoint, InlinePolicy, LeafBody,
-    MonotonicFloor, Node, NodeSizePolicy, NodeStore, PersistentCache, PersistentCacheConfig,
-    PersistentCacheMedia, Requirement, StorageError, StructuralIntentStore, Timeline, TreeRouter,
+    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, LeafBody,
+    MonotonicFloor, Node, NodeReads, NodeSizePolicy, NodeStore, PersistentCache,
+    PersistentCacheConfig, PersistentCacheMedia, Requirement, StorageError, StructuralIntentStore,
+    Timeline, TreeRouter, ViewRead,
 };
 
 use crate::access::{AccessSet, ScanMutation, ScanRange};
@@ -164,10 +165,10 @@ impl EngineTransaction {
         self.0.collection_reservations()
     }
 
-    /// Returns the floor at which the next body execution reads, for a stale
-    /// read-only transaction (ADR-103). Call it once for each execution.
-    pub fn take_read_point(&mut self) -> Option<FloorPoint> {
-        self.0.take_read_point()
+    /// Returns how the next body execution reads, for a stale read-only
+    /// transaction of a stale view (ADR-103). Call it once for each execution.
+    pub fn next_view_read(&mut self) -> Option<ViewRead> {
+        self.0.next_view_read()
     }
 }
 
@@ -199,6 +200,27 @@ pub struct EngineDiagnostics {
     pub coordinator_dedup: Vec<DedupKeySnapshot>,
 }
 
+/// Builds the readers of one stale read-only transaction of a stale view,
+/// which read leaves through [`NodeReads::for_view`] (ADR-103).
+struct ViewReaders {
+    nodes: NodeStore,
+    key_state: KeyStateResolver,
+    parallelism: NonZeroUsize,
+    timeline: Timeline,
+    wait: RetrySchedule,
+}
+
+impl ViewReaders {
+    fn resolver(&self, view: ViewRead) -> KeyResolver {
+        let router = TreeRouter::new(NodeReads::for_view(&self.nodes, view), self.parallelism);
+        KeyResolver::new(router, self.key_state.clone(), self.parallelism)
+    }
+
+    fn reader(&self, view: ViewRead) -> Reader {
+        Reader::new(self.resolver(view), self.timeline.clone(), self.wait)
+    }
+}
+
 /// Owns and mediates access to one database's transaction runtime.
 pub struct Engine {
     backend: Arc<StatsBackend>,
@@ -206,6 +228,7 @@ pub struct Engine {
     monitor: Monitor,
     reader: Reader,
     resolver: KeyResolver,
+    views: ViewReaders,
     collection_catalog: CollectionCatalog,
     algo: Algo,
     coord: LeafCoordinator,
@@ -249,13 +272,15 @@ impl Engine {
 
     /// Reads one logical key from any usable cached state, for a transaction
     /// body that validates the read later.
+    /// `view` is how a stale read-only transaction of a stale view reads
+    /// (ADR-103).
     pub async fn read(
         &self,
         key: &LogicalKey,
-        at: Option<FloorPoint>,
+        view: Option<ViewRead>,
     ) -> Result<ReadOutcome, StorageError> {
-        match at {
-            Some(point) => self.reader.at(point).read(key).await,
+        match view {
+            Some(view) => self.views.reader(view).read(key).await,
             None => self.reader.read(key).await,
         }
     }
@@ -266,10 +291,10 @@ impl Engine {
         collection: &CollectionAddress,
         range: &ScanRange,
         overlay: &[ScanMutation],
-        at: Option<FloorPoint>,
+        view: Option<ViewRead>,
     ) -> Result<ScanResult, StorageError> {
-        let resolver = match at {
-            Some(point) => self.resolver.at(point),
+        let resolver = match view {
+            Some(view) => self.views.resolver(view),
             None => self.resolver.clone(),
         };
         resolver
@@ -633,6 +658,13 @@ impl DormantEngine {
             topology_policy,
             gc_hints.clone(),
         );
+        let views = ViewReaders {
+            nodes: nodes.clone(),
+            key_state: key_state.clone(),
+            parallelism: transaction_leaf_parallelism,
+            timeline: timeline.clone(),
+            wait: retry.wait,
+        };
         let resolver = KeyResolver::new(router.clone(), key_state, transaction_leaf_parallelism);
         let reader = Reader::new(resolver.clone(), timeline.clone(), retry.wait);
         let locker = Locker::new(
@@ -694,6 +726,7 @@ impl DormantEngine {
             monitor,
             reader,
             resolver,
+            views,
             collection_catalog,
             algo,
             coord,

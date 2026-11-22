@@ -70,16 +70,41 @@ So the bound sets the use of a view:
 
 ### The decoded cache keeps earlier states
 
-When the decoded cache replaces a leaf state with a newer one, it keeps the
-replaced state with its evidence, as an earlier state of the path. The evidence
-keeps growing after the replacement: a CAS of this instance already advances
-the watermark of the state that it replaces to the invocation of the CAS.
+A stale view marks each leaf that one of its calls reads. When the decoded cache
+replaces the state of a marked leaf with a newer one, it keeps the replaced
+state with its evidence, as an earlier state of the path. It keeps no earlier
+state of an object that no view read, so records have none, and index nodes
+have none except the tree root. A split turns the tree root into an index node
+in place. The root keeps its replaced index states until a view reads an index
+node at the root, which removes the mark of the root. The evidence keeps growing
+after the replacement: a CAS of this instance already advances the watermark of
+the state that it replaces to the invocation of the CAS.
 
-The decoded cache keeps an earlier state only while a live stale view can use
-it. For each path, it keeps the newest state that started at or before the
-lowest floor of the live views, and every later state. Earlier states count
-against the size limit of the decoded cache, and the cache evicts them before
-the current states. With no live view, the cache keeps no earlier state.
+For each floor of the live views, a path keeps the newest earlier state that
+started at or before the floor, and the next newer earlier state. While a floor
+is raised, the path also keeps its newest earlier state. When a present state
+replaces the latest state of the path, the cache drops the other earlier states
+of the path. With no live view, the next change of a path drops its earlier
+states.
+
+Only the newest state that started at or before a floor can cover the floor. A
+state that started after the floor cannot cover it, and an older state was
+replaced before that newest state started. The same state gives the key
+intervals of the floor their earliest start. The next newer state gives the end
+of the interval of a key that the write after the floor did not change. When
+the floor is in the gap of that write, the older state has no confirmation
+after the floor, and the key reaches the floor only through the watermark of
+the newer state. The rule uses the floors at the time of the replacement, but a
+call that read the replaced state can raise its floor to it later. While a
+floor is raised, the newest earlier state covers that for one write during the
+call.
+
+The mark and the earlier states of a path are one cache entry, and the latest
+state of the path is another. The two entries share the size limit and the
+least-recently-used order of the decoded cache. Only a read in a view uses the
+earlier states. The cache
+replaces the latest state of a path and updates its earlier states in one
+step, so a read never finds a replaced state in neither entry.
 
 The persistent cache does not store earlier states.
 
@@ -152,7 +177,8 @@ a view with a zero bound.
 - A view whose working set is cached costs no backend operation for a call that
   cuts at the floor. With a finite bound, each move of the floor costs about one
   check for each leaf that the view then reads. The key intervals also help a
-  call through a new view. With writers in other instances, the gain is
+  call through a new view, for the leaves that a view read before. With writers
+  in other instances, the gain is
   smaller. The measurements of a prototype are in
   [the performance investigations](../../hack/perf/investigations.md#2026-11-20-a-stale-view-that-keeps-its-cut-point).
 - The floor still moves when a key that a call reads changed after the floor,
@@ -165,14 +191,34 @@ a view with a zero bound.
   confirmation of its leaf. Writes of other instances do not advance the
   intervals in this instance, so these checks are most of the remaining cost
   with several instances.
-- The decoded cache uses more memory while views live.
+- The first read of a leaf through any view cannot use an earlier state of the
+  leaf. If the leaf changed after the floor, the call checks it, or the floor
+  moves.
+- The decoded cache uses more memory while views live. A mark is a small entry
+  for each leaf that a view read. A path keeps at most
+  two earlier states for each distinct floor of the live views, and one more.
+  A view with `Duration::MAX` costs at most three earlier states for each leaf
+  that changed after its floor.
+- Under memory pressure, earlier states that a view reads can stay while the
+  cache evicts the latest state of an object that nothing reads.
+- After a floor moves, the earlier states that it used stay until their path
+  changes again, or until the cache evicts them. A read of the leaf through a
+  view keeps them in the cache. After the last view that reads a leaf drops,
+  no read refreshes its earlier states, so they are the first to go.
+- When a leaf changes twice during one call, or once during a call while no
+  floor is raised (the first call of a view), the state that the call read can
+  go before the call raises its floor to it. The next call then checks the
+  leaf, or the floor moves.
+- Views with different floors keep different states of the same leaf. A view
+  could move its floor to the floor of another view to share them. This
+  decision does not do that.
 - A large scan through a view is one call. Under writes to the scanned data, a
   leaf state that does not reach the floor is likely, and the call replays the
   whole scan. Range scans use the interval of each leaf state, so any write to
   a covered leaf after the floor can cause it. A scan of data that changes
   rarely does not have this cost.
-- `Database::tx` and the commit path do not change. A database instance with no
-  live view keeps no earlier state.
+- `Database::tx` and the commit path do not change. A database instance that
+  never had a view keeps no earlier state.
 - The simulation history checker must use the new guarantees: a call can miss
   the writes of its own instance.
 - When the decoded cache evicts an earlier state, the key intervals that the
@@ -208,5 +254,27 @@ a view with a zero bound.
 - **Keep the read of the own writes of the instance.** Each write of this
   instance to a leaf of the view would move the floor. With writers in the same
   instance, most of the gain goes.
+- **Keep every earlier state after the lowest floor.** Under writes to a hot
+  leaf, a view with `Duration::MAX` adds one earlier state for each write, and
+  no state goes. Each write also copies the list.
+- **Keep only the newest earlier state that started at or before each
+  floor.** It covers every floor that the cache can cover, but a key that the
+  write after the floor did not change loses the end of its interval. A
+  prototype with this rule moved the floor more often under writes.
+- **A limit on the earlier states of each path.** It adds a constant, and under
+  writes the state that covers an old floor is the first to go.
+- **Earlier states in the cache entry of the latest state.** A read of the
+  latest state then also keeps the earlier states, and the cache evicts them
+  together.
+- **A separate cache for earlier states.** It needs its own size limit, and
+  the memory of that limit is not available to the latest states when no view
+  lives.
+- **Evict earlier states before any latest state.** It needs a second eviction
+  order, which every cache update keeps up to date, also with no live view. No
+  measurement showed the need.
+- **Keep the earlier states of every leaf while a view lives.** It also gives
+  the first read of a leaf through a view its earlier states. But the cache
+  must know which objects are leaves, through a rule of each codec, and it
+  keeps the states of leaves that no view reads.
 - **Earlier states in the persistent cache.** The persistent cache format would
   change, for views that end with the process.

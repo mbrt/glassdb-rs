@@ -492,14 +492,18 @@ not ([ADR-102](adr/102-a-stale-view-orders-its-stale-read-only-transactions.md))
 A view keeps its cut point
 ([ADR-103](adr/103-a-stale-view-keeps-its-cut-point.md)). While the floor is
 within the bound, the first body execution of a call reads each leaf at the
-floor. The decoded cache keeps the replaced leaf states that the floors of the
-live views can use, and it sheds them before it evicts any entry. A point read
-of a view uses the interval of its key, not of its leaf state: the leaf states
-that show the key with the same writer, or an absent key with the same
-membership generation, never have the key changed between them. So a write of
-another key of the leaf does not end the interval. When the floor is older than
-the bound, or a read key changed after it, the call reads the cached states and
-the floor moves.
+floor. A view marks each leaf that it reads. When a marked leaf changes, the
+decoded cache keeps, for each floor of the live views, the newest replaced state
+that started at or before it, and the next newer one. While a floor is raised,
+it also keeps the newest replaced state. The other earlier states of the path go
+at that change. The mark and the earlier states of a path are a
+cache entry of their own, next to the entry of the latest state, in the same
+size limit and least-recently-used order. A point read of a view uses the
+interval of its key, not of its leaf state: the leaf states that show the key
+with the same writer, or an absent key with the same membership generation,
+never have the key changed between them. So a write of another key of the leaf
+does not end the interval. When the floor is older than the bound, or a read
+key changed after it, the call reads the cached states and the floor moves.
 
 ```text
 leaf A   [start ─────────── watermark]
