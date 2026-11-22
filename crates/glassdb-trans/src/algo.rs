@@ -1086,6 +1086,8 @@ impl Algo {
         }
         tx.commit();
 
+        // Best effort from cache. A stale result can skip a directory, and GC
+        // writes back the remaining directories under its own bound.
         if let Err(error) = self
             .locker
             .collections()

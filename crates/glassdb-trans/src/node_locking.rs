@@ -601,6 +601,8 @@ impl LeafOperation for StructuralGateOperation {
     }
 
     fn requirement(&self) -> Requirement {
+        // Proof: conditional mutation for the acquisition. A wait or a
+        // conflict only delays the structural change.
         Requirement::ANY
     }
 

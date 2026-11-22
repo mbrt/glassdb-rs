@@ -169,8 +169,7 @@ impl CollectionLocker {
 
     /// Releases every recorded directory lock held by `id`.
     ///
-    /// A present record with no holder must satisfy `requirement`. Owner
-    /// cleanup can use `ANY` because it shares cache knowledge with acquisition.
+    /// A present record with no holder must satisfy `requirement`.
     pub(crate) async fn release(
         &self,
         id: &TxId,
@@ -215,10 +214,10 @@ impl CollectionLocker {
                     let already_held = lock.contains(id)
                         && (desired == LockType::Read || lock.lock_type() == LockType::Write);
                     if already_held {
-                        // This active identity's releases update the same
-                        // cache; foreign cleanup requires finalization.
-                        // Retained ownership permits this return. Directory
-                        // contents are validated later.
+                        // Proof: shared local knowledge (same cache, final
+                        // before foreign removal) for the held lock, and later
+                        // validation for the directory contents. This active
+                        // identity releases its locks through the same cache.
                         return Ok(Decision::Done(()));
                     }
                     let conflicts = match desired {
@@ -266,6 +265,8 @@ impl CollectionLocker {
             .await?;
         match locked {
             Converged::Written { .. } | Converged::Done(()) => Ok(()),
+            // Proof: publication and lifecycle (created before seen). A cached
+            // absence of the record comes after the drop of the collection.
             Converged::Missing => Err(StorageError::NotFound
                 .classify_collection_absence(parent)
                 .into()),
@@ -539,9 +540,10 @@ impl CollectionStateResolver {
         parent: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
-        // Final-status resolution shares this store and has observed immutable
-        // committed contents. ANY cannot restore an older Pending body; it
-        // still does not prove that the transaction record remains present.
+        // Proof: stable fact (final committed contents). Final-status
+        // resolution observed the committed record through this store, so ANY
+        // cannot return an older pending body. This read does not prove that
+        // the record is still present.
         let observed = self
             .transactions
             .get_at(id, Requirement::ANY)
@@ -559,8 +561,11 @@ impl CollectionStateResolver {
             )));
         }
         let changes = Self::recover_changes(&record.collection_changes);
-        // Resolution observed this holder through the same record cache. A
-        // later no-holder state proves removal; a retained holder seeds CAS.
+        // Proof: shared local knowledge (same cache, one acquisition).
+        // Resolution observed this
+        // holder through the same record cache, so a later state without the
+        // holder proves its removal. A state with the holder starts a
+        // conditional mutation.
         self.apply_committed_write_back(parent, id, &changes, Requirement::ANY)
             .await
             .map(|_| ())

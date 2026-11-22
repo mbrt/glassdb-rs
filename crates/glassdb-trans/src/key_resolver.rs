@@ -84,9 +84,10 @@ impl KeyResolver {
         own_lock_holder: Option<&TxId>,
         cap: Option<&[u8]>,
     ) -> Result<ScanResult, StorageError> {
-        // A transaction scan retains every covered leaf and validates those
-        // observations after its validation barrier. Requiring "now" here
-        // would only duplicate work; stale execution is safe and retryable.
+        // Proof: later validation. A transaction scan retains every covered
+        // leaf and validates those observations after its validation barrier.
+        // Proof for a missing route, which is an error: publication and
+        // lifecycle (created before seen, nodes outlive links).
         self.scan_keys_at(
             collection,
             range,
@@ -467,10 +468,11 @@ impl KeyResolver {
         key: &LogicalKey,
         requirement: Requirement,
     ) -> Result<RoutedLeaf, TransError> {
-        // Right links correct stale split routes; the terminal leaf meets the
-        // caller's requirement. Negative routes rely on nodes being created
-        // before their links, roots before bindings, and no identity reuse.
-        // The same proof applies to batched point routing above.
+        // Right links correct stale split routes, and the terminal leaf meets
+        // the caller's requirement.
+        // Proof for a negative route: publication and lifecycle (created
+        // before seen, nodes outlive links, no reuse). The
+        // same proof applies to batched point routing above.
         let loc = self
             .router
             .route_key_checking_leaf(key.collection(), key.key(), requirement)

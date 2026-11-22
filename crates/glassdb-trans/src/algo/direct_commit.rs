@@ -142,9 +142,10 @@ impl DirectCommit {
                 self.inline_policy,
                 self.structural_hints.clone(),
             );
-            // A leaf is missing only after a drop of its collection. The round
-            // reports an in-doubt CAS as an outcome, so this error proves that
-            // nothing landed (ADR-092).
+            // Proof: publication and lifecycle (created before seen, nodes
+            // outlive links). A cached missing leaf comes after the drop of its
+            // collection. The round reports an in-doubt CAS as an outcome, so
+            // this error proves that nothing landed (ADR-092).
             let outcome = self
                 .coord
                 .coordinate(operation)
@@ -184,6 +185,8 @@ impl DirectCommit {
             .iter()
             .map(|key| (key.key.clone(), ()))
             .collect::<Vec<_>>();
+        // Proof: publication and lifecycle (created before seen, nodes outlive
+        // links) for a missing route, which returns an error.
         let groups = self
             .router
             .route_keys_checking_leaf(keys, Requirement::ANY)
@@ -558,12 +561,16 @@ impl DirectCommitOperation {
 #[async_trait]
 impl MemberPolicy for DirectCommitOperation {
     fn observe_loaded(&self, entries: &BTreeMap<Vec<u8>, LeafEntry>) {
+        // Proof: stable fact (no reuse). An exact output marker of this
+        // identity proves an earlier publication.
         if self.has_marker(entries) {
             self.remember_landed();
         }
     }
 
     async fn resolve(&self, ctx: &ResolveCtx<'_>, staged: &StagedLeaf) -> Result<Step, TransError> {
+        // Proof: stable fact (no reuse). An exact output marker of this
+        // identity proves an earlier publication.
         if self.proven_landed() || self.has_marker(staged.entries()) {
             self.remember_landed();
             return Ok(Step::Skip {
@@ -640,9 +647,9 @@ impl LeafOperation for DirectCommitOperation {
     }
 
     fn requirement(&self) -> Requirement {
-        // New publication requires CAS against the observed revision. An exact
-        // output marker for this non-reused identity instead proves an earlier
-        // publication; it does not need to prove that the output is still current.
+        // Proof: conditional mutation for a new publication. Stable fact (no
+        // reuse) for an exact output marker of this identity, which proves an
+        // earlier publication but not that the output is still current.
         Requirement::ANY
     }
 

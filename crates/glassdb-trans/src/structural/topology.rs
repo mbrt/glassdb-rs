@@ -62,9 +62,10 @@ impl TopologyMembership {
                 Requirement::ANY,
                 CasRetries::Unbounded(self.retry),
                 |mut record, _| async move {
-                    // An admitted participant is the same change's admission;
-                    // its identity is not reused after departure. New
-                    // admission requires the CAS below.
+                    // Proof: shared local knowledge (same cache, one
+                    // acquisition, final before foreign removal). An admitted
+                    // participant is the admission of this change. A new
+                    // admission needs the CAS below.
                     let missing: Vec<TxId> = ids
                         .iter()
                         .filter(|id| {
@@ -100,6 +101,8 @@ impl TopologyMembership {
             .await?;
         match joined {
             Converged::Written { .. } | Converged::Done(()) => Ok(()),
+            // Proof: publication and lifecycle (created before seen). A cached
+            // absence of the record comes after the drop of the collection.
             Converged::Missing => Err(TransError::StaleCollection),
             Converged::Stop(()) | Converged::Exhausted => Err(TransError::Retry),
         }

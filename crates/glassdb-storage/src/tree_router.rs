@@ -532,7 +532,8 @@ impl<'a> DescentCursor<'a> {
             .nodes
             .load_node_at_state(&path, requirement)
             .await?;
-        // Only the reclamation of a dropped collection removes a node.
+        // Proof: publication and lifecycle (nodes outlive links). Only the
+        // reclamation of a dropped collection removes a node.
         if observation.is_absent() {
             return Err(StorageError::NotFound);
         }
@@ -761,8 +762,9 @@ impl TreeRouter {
     /// current lower bound stays where a CAS depends on it.
     ///
     /// The `leaf` requirement applies only after reaching a leaf. An absent
-    /// root or child can come from any cached state, so callers must justify
-    /// negative routes from publication and lifecycle rules.
+    /// root or child can come from any cached state, so a caller must give
+    /// the publication and lifecycle proof (created before seen, nodes outlive
+    /// links) for a negative route.
     ///
     /// With `Requirement::ANY` this is exactly [`route_key`](Self::route_key).
     pub async fn route_key_checking_leaf(

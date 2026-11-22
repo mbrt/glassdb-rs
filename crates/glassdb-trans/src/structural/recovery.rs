@@ -440,7 +440,9 @@ impl StructuralRecovery {
                 Err(error) => ReadyIntentTransition::RecoveryRequired(ready, error),
             },
             Ok(None) => {
-                // The worker acquired the gate through this cache.
+                // Proof: shared local knowledge (same cache, one
+                // acquisition). The worker acquired the gate through this
+                // cache.
                 let error = match self
                     .structural_nodes
                     .release_structural_gate(
@@ -911,8 +913,10 @@ impl StructuralRecovery {
                 .await?;
             if intents.is_empty() {
                 // The listing bound follows final status and completed intent
-                // recovery. Explicit settlement already has local record
-                // evidence from admission or its topology freeze.
+                // recovery.
+                // Proof for explicit settlement: shared local knowledge (same
+                // cache, one acquisition). It has local record
+                // evidence from admission or from its topology freeze.
                 let departure = match mode {
                     SettlementMode::Background => requirement,
                     SettlementMode::Explicit => Requirement::ANY,

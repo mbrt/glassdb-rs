@@ -287,6 +287,8 @@ async fn build_groups(
     // a stale index misroute self-corrects via right-links, and the leaf's own
     // coordination CAS revalidates at the revision, so neither the root `_r` nor
     // the terminal leaf needs a separate validation read.
+    // Proof for a missing route, which fails the grouping: publication and
+    // lifecycle (created before seen, nodes outlive links).
     let grouped = router
         .route_keys_checking_leaf(items, Requirement::ANY)
         .await
@@ -610,9 +612,11 @@ impl LeafOperation for WriteBackOperation {
     }
 
     fn requirement(&self) -> Requirement {
-        // Locking used this cache, so it cannot serve a state from before the
-        // installed hold. A split resolves committed holders before moving
-        // entries. Any remaining write is protected by its revision CAS.
+        // Proof: shared local knowledge (same cache, one acquisition). Locking
+        // used this cache,
+        // so it cannot serve a state from before the installed hold. A split
+        // resolves committed holders before it moves entries. Each remaining
+        // write is a conditional mutation.
         Requirement::ANY
     }
 
@@ -699,9 +703,9 @@ impl MemberPolicy for ReleaseOperation {
     }
 
     fn reroute_outcome(&self, _in_doubt: bool) -> MemberOutcome {
-        // The submitted object is no longer a leaf, so it carries none of this
-        // transaction's holds — the proof a release needs. Retrying the same
-        // path would only rediscover an object that will never be a leaf again.
+        // Proof: stable fact (one-way states). The submitted object is no
+        // longer a leaf, so it has none of the holds of this transaction.
+        // A retry of the same path cannot find a leaf again.
         MemberOutcome::Released {
             superseded: Vec::new(),
         }
@@ -733,8 +737,9 @@ impl LeafOperation for ReleaseOperation {
                 Some(CoordinationEvidence::Observed(observed)) => {
                     ReleaseOutcome::Observed(observed)
                 }
-                // Only index rerouting releases without leaf evidence. A node
-                // cannot become a leaf again, so none of its holds can return.
+                // Only index rerouting releases without leaf evidence. Proof:
+                // stable fact (one-way states), so none of its holds can
+                // return.
                 None => ReleaseOutcome::Released(false),
             }),
             Some(CoordinatedOutcome {
@@ -1108,8 +1113,11 @@ impl KeyLocker {
     /// authoritative and every landed CAS is safe to repeat.
     ///
     /// `locked` must come from this locker's database instance. Locking and
-    /// write-back share cache knowledge; this is not a recovery interface for
-    /// another instance's locks.
+    /// write-back share cache knowledge, so write-back reads at `ANY`, also on
+    /// rerouted leaves. A cached state without the holder shows that the holder
+    /// is resolved, and a stale state with the holder loses its CAS. This is
+    /// not a recovery interface for another instance's locks, and its result
+    /// does not allow GC to delete the transaction record.
     ///
     /// Returns displaced external transaction-record references as GC candidates.
     /// Inline values and tombstones can have direct-commit writers; GC scans discover
@@ -1211,12 +1219,12 @@ impl KeyLocker {
         for items in by_collection.into_values() {
             // Cached indexes are routing hints. Right links and the bounded
             // leaf read correct stale split placement; splits resolve holds
-            // before moving entries. Missing routes and leaves rely on the
-            // identity and publication rules in the cache guide: published
-            // nodes stay until their collection is reclaimed, and reclamation
-            // removes every holder with them. GC releases locks only after
-            // commit or acknowledged abort, so the identity cannot acquire a
-            // lock later under a missing prepared root.
+            // before moving entries.
+            // Proof for a missing route or leaf: publication and lifecycle
+            // (created before seen, nodes outlive links). Reclamation removes
+            // every holder with the nodes. GC releases locks only after commit
+            // or acknowledged abort, so the identity cannot acquire a lock
+            // later under a missing prepared root.
             match self
                 .router
                 .route_keys_checking_leaf(items, requirement)
@@ -1358,6 +1366,10 @@ impl KeyLocker {
                         .await
                     {
                         Ok(groups) => groups,
+                        // Proof for a missing route: publication and
+                        // lifecycle (nodes outlive links). The collection was
+                        // reclaimed, so no leaf is left to write back. Other
+                        // errors are best effort, as for `write_back`.
                         Err(error) => {
                             tracing::warn!(
                                 target: "glassdb::write_back",

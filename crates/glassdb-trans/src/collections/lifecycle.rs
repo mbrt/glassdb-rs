@@ -75,9 +75,10 @@ impl CollectionLifecycle {
             .iter()
             .filter(|change| change.op == CollectionOp::Create)
         {
-            // These fresh identities belong to this active transaction identity. A create
-            // conflict invalidates obsolete local knowledge; success updates
-            // this cache. Both existence checks can therefore use ANY.
+            // Proof: shared local knowledge (rejected create) for both
+            // existence checks. These fresh identities belong to this active
+            // transaction identity, and a successful create updates this
+            // cache.
             if !self
                 .records
                 .create_record(&change.collection, &CollectionRecord::new())
@@ -114,9 +115,10 @@ impl CollectionLifecycle {
             .map(|change| &change.collection)
         {
             self.freeze_topology(collection, id).await?;
-            // Nodes precede their published links and retain their identities.
-            // Completed topology settlement fences abandoned publication;
-            // late creates can only leave unreachable orphans.
+            // Proof: publication and lifecycle (created before seen, nodes
+            // outlive links). Completed topology settlement fences abandoned
+            // publication, so a late create can only leave an unreachable
+            // orphan.
             let nodes = self.nodes.list_nodes(collection, Requirement::ANY).await?;
             for (node_id, _) in nodes {
                 self.fence_node(collection, &node_id, id).await?;
@@ -140,8 +142,9 @@ impl CollectionLifecycle {
     ) -> Result<bool, TransError> {
         let mut changed = false;
         for collection in collections {
-            // Enumeration uses the publication proof from fencing. Each
-            // present body's no-change result must meet requirement below.
+            // Proof for the enumeration: publication and lifecycle (created
+            // before seen, nodes outlive links), as in fencing. The no-change
+            // result of each present body must meet `requirement` below.
             let mut cursor = None;
             loop {
                 let page = self
@@ -169,10 +172,11 @@ impl CollectionLifecycle {
         &self,
         collections: &[CollectionAddress],
     ) -> Result<u64, TransError> {
-        // Present bodies are conditional-delete seeds. Owner cleanup shares
-        // the preparation cache; GC waits for commit or acknowledged abort.
-        // Publication and identity rules exclude cached absence hiding a later
-        // live object, though an abandoned late create can leave an orphan.
+        // Proof: conditional mutation for each delete of a present body.
+        // Publication and lifecycle (created before seen, no reuse) for an
+        // absent object: a cached absence cannot hide a later live object.
+        // Owner cleanup shares the preparation cache, and GC waits for commit
+        // or acknowledged abort. An abandoned late create can leave an orphan.
         let mut deleted = 0;
         for collection in collections {
             let mut cursor = None;
@@ -240,10 +244,10 @@ impl CollectionLifecycle {
                         return Ok(Decision::Reload(Requirement::ANY));
                     }
                     let Some(participant) = record.topology_participants().next().cloned() else {
-                        // This cache includes our freeze CAS. While this
-                        // identity can still commit, the freeze prevents
-                        // admission and participants can only leave. The empty
-                        // set needs no currentness check.
+                        // Proof: shared local knowledge (same cache). This
+                        // cache includes our freeze CAS. While this identity
+                        // can still commit, the freeze prevents admission, so
+                        // participants can only leave.
                         return Ok(Decision::Done(()));
                     };
                     resolve_tx_conflict(&self.monitor, id, &participant).await?;
@@ -269,7 +273,10 @@ impl CollectionLifecycle {
         node_id: &NodeId,
         id: &TxId,
     ) -> Result<(), TransError> {
-        // A missing node needs no intent.
+        // Proof for a missing node, which needs no intent: publication and
+        // lifecycle (created before seen, nodes outlive links). A cached
+        // absence of a listed node comes after the reclamation of its
+        // collection.
         self.fence(&ObjectPath::tree_node(collection, Some(node_id)), id)
             .await
             .map(|_| ())
@@ -297,8 +304,8 @@ impl CollectionLifecycle {
             .nodes
             .converge(
                 path,
-                // Local retry cleanup updates this same cache. Another owner can
-                // replace our intent only after we can no longer commit.
+                // Proof: shared local knowledge (same cache, final before
+                // foreign removal) for an installed intent of `id`.
                 Requirement::ANY,
                 CasRetries::Unbounded(self.retry),
                 |mut node, _| async move {

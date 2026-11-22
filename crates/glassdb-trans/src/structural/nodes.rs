@@ -91,8 +91,9 @@ impl StructuralNodeAccess {
         acquisition: GateAcquisition,
     ) -> Result<Option<(Node, LeafObservation)>, TransError> {
         let path = ObjectPath::tree_node(collection, node_id);
-        // This read selects the acquisition path; missing roots defer work.
-        // Publication still requires the gated observation and a source CAS.
+        // This read only selects the acquisition path. A missing root only
+        // delays the work, so it needs no proof. Publication still needs the
+        // gated observation and a source CAS.
         let (node, _) = match self.nodes.load_node_at(&path, Requirement::ANY).await {
             Ok(loaded) => loaded,
             Err(StorageError::NotFound) if node_id.is_none() => return Ok(None),
@@ -227,7 +228,8 @@ impl StructuralNodeAccess {
         node_id: Option<&NodeId>,
         id: &TxId,
     ) -> Result<(), TransError> {
-        // The worker acquired the gate through this cache.
+        // Proof: shared local knowledge (same cache, one acquisition). The
+        // worker acquired the gate through this cache.
         let release = self
             .release_structural_gate(collection, node_id, id, Requirement::ANY)
             .await;
@@ -279,8 +281,9 @@ impl StructuralNodeAccess {
             .nodes
             .converge(
                 path,
-                // A state with the gate of `id` is a state that `id` wrote, so it
-                // needs no proof.
+                // Proof: conditional mutation. A cached gate of `id` can be
+                // stale, because `fence_source_writer` can remove it. The next
+                // CAS of the source then rejects the stale state.
                 Requirement::ANY,
                 CasRetries::Bounded(NODE_CAS_ATTEMPTS),
                 move |mut node, observation| async move {

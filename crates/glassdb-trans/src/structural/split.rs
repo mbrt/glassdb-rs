@@ -386,6 +386,8 @@ impl Splitter {
         let (SplitReason::SoftCap, ObjectPath::Node { id, .. }) = (reason, path) else {
             return Ok(false);
         };
+        // This result is only a hint. A wait only delays the split, so it
+        // needs no proof.
         let mut node = match self.nodes.load_node(collection, id, Requirement::ANY).await {
             Ok((node, _)) => node,
             Err(StorageError::NotFound) => return Ok(false),

@@ -118,6 +118,8 @@ impl Merger {
         source: &NodeId,
         reason: MergeReason,
     ) -> Result<Option<NodeId>, TransError> {
+        // A stale result only delays the merge. `prepare` decides again with
+        // `checked_target`, from the current state under the gate.
         let left = match self
             .nodes
             .load_node(collection, source, Requirement::ANY)
@@ -228,6 +230,9 @@ impl Merger {
             .store_node(collection, source, &drained, Some(observation))
             .await?
         {
+            // Proof: shared local knowledge (same cache) for the reservation
+            // that the absorb CAS set through this store. A drained target or a
+            // newer membership generation does not revert (one-way states).
             self.structural_nodes
                 .abandon_merge(collection, &merge, intent, Requirement::ANY)
                 .await?;
@@ -235,6 +240,8 @@ impl Merger {
         }
         self.reclamation.record(&reclaimed, false);
         self.stats.record_merge();
+        // Proof: shared local knowledge (same cache). The absorb CAS set the
+        // reservation through this store.
         self.structural_nodes
             .remove_merge_reservation(collection, &merge.node_id, intent, Requirement::ANY)
             .await?;
@@ -387,7 +394,8 @@ impl Merger {
             .nodes
             .converge(
                 &ObjectPath::tree_node(collection, Some(&merge.node_id)),
-                // The absorb either writes or stops, so it needs no proof.
+                // Proof: conditional mutation for the write. A stop only
+                // delays the merge.
                 Requirement::ANY,
                 CasRetries::Bounded(NODE_CAS_ATTEMPTS),
                 |mut right, _| async move {
