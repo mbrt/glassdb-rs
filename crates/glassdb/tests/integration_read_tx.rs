@@ -512,22 +512,46 @@ mod persistent {
         }
     }
 
+    /// Longer than the default open and shutdown timeouts, so that a slow
+    /// disk does not disable the persistent cache. A `fsync` can wait tens of
+    /// seconds for writeback, for example just after a build.
+    const CACHE_TIMEOUT: Duration = Duration::from_secs(300);
+
     async fn open(
         backend: std::sync::Arc<dyn glassdb::Backend>,
         dir: &TempDir,
         l1: usize,
     ) -> Database {
-        Database::builder("example", backend)
+        let db = Database::builder("example", backend)
             .cache_size(l1)
             .persistent_cache(PersistentCacheConfig {
                 directory: dir.0.clone(),
                 capacity_bytes: 256 << 20,
-                open_timeout: PersistentCacheConfig::DEFAULT_OPEN_TIMEOUT,
-                shutdown_timeout: PersistentCacheConfig::DEFAULT_SHUTDOWN_TIMEOUT,
+                open_timeout: CACHE_TIMEOUT,
+                shutdown_timeout: CACHE_TIMEOUT,
             })
             .open()
             .await
-            .unwrap()
+            .unwrap();
+        assert_cache_enabled(&db, "open");
+        db
+    }
+
+    async fn shutdown(db: &Database) {
+        db.shutdown().await;
+        assert_cache_enabled(db, "shutdown");
+    }
+
+    /// Fails when the persistent cache disabled itself. These tests count
+    /// backend reads, so without this check a disabled cache makes them fail
+    /// with more reads than expected, and the cause is not clear.
+    fn assert_cache_enabled(db: &Database, step: &str) {
+        assert_eq!(
+            db.stats().cache.l2_errors,
+            0,
+            "the persistent cache disabled itself before the end of {step}, \
+             probably because a disk operation took longer than its timeout"
+        );
     }
 
     async fn open_collections(db: &Database) -> Vec<Collection> {
@@ -545,7 +569,9 @@ mod persistent {
         let first = backend_ops(db, &before).0;
         let before = db.stats();
         read_tx_all(db, staleness, &collections).await;
-        (first, backend_ops(db, &before).0)
+        let second = backend_ops(db, &before).0;
+        assert_cache_enabled(db, "the reads");
+        (first, second)
     }
 
     /// Opens a fresh instance on `backend` with the persistent cache in
@@ -556,11 +582,11 @@ mod persistent {
         let backend = mem();
         let db = open(backend.clone(), &dir, 512 << 20).await;
         collections_with_one_key(&db).await;
-        db.shutdown().await;
+        shutdown(&db).await;
         drop(db);
         let db = open(backend.clone(), &dir, 512 << 20).await;
         measure(&db, Duration::MAX).await;
-        db.shutdown().await;
+        shutdown(&db).await;
         (dir, backend)
     }
 
@@ -569,12 +595,12 @@ mod persistent {
         let (dir, backend) = seeded("reopen").await;
         let db = open(backend.clone(), &dir, 512 << 20).await;
         assert_eq!(measure(&db, Duration::MAX).await, (0, 0));
-        db.shutdown().await;
+        shutdown(&db).await;
         drop(db);
 
         let db = open(backend, &dir, 512 << 20).await;
         assert_eq!(measure(&db, STALENESS).await, (LEAVES as u64, 0));
-        db.shutdown().await;
+        shutdown(&db).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -583,7 +609,7 @@ mod persistent {
         // An L1 too small to keep a leaf, so every read comes from L2.
         let db = open(backend, &dir, 1).await;
         assert_eq!(measure(&db, STALENESS).await, (LEAVES as u64, 0));
-        db.shutdown().await;
+        shutdown(&db).await;
     }
 }
 

@@ -39,6 +39,7 @@ use glassdb_backend::{self as backend, Backend, BackendError};
 use glassdb_concurr::map_all_bounded;
 use glassdb_data::{ObjectPath, PathError};
 
+mod converge;
 mod cut;
 mod evidence;
 mod knowledge;
@@ -46,6 +47,7 @@ mod mutation;
 mod path_lane;
 mod persistent_bridge;
 
+pub use converge::{CasRetries, Converged, Decision};
 pub use cut::{CutKey, CutSearch, CutTarget};
 use evidence::Evidence;
 pub use evidence::{CasReceipt, CasResult, Observation, ObservationCheck, Revision};

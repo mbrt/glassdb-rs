@@ -194,6 +194,9 @@ impl StructuralIntentStore {
                 ));
             };
             let intent_id = *intent_id;
+            // Proof for a present body: stable fact (no reuse, one-way states).
+            // A stale preparing state can only delay help, and a deletion checks
+            // the exact observed revision.
             let mut observed = self
                 .structural_intents
                 .read(path.clone(), Requirement::ANY)

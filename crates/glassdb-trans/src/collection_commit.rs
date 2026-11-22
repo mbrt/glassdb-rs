@@ -219,8 +219,10 @@ impl CollectionCommit {
             .difference(&active_drops)
             .cloned()
             .collect::<Vec<_>>();
-        // Fencing has stopped. Cleanup shares the cache that installed this
-        // identity's intents and freeze, so no-change results can use ANY.
+        // Proof: shared local knowledge (same cache). Cleanup shares the cache
+        // that installed the intents and the freeze of this identity. A later
+        // replay can install an intent again, but only after this clear, in
+        // the same task and through the same cache.
         self.lifecycle
             .clear_aborted_drops(id, &discarded, Requirement::ANY)
             .await?;
@@ -346,8 +348,10 @@ impl CollectionCommit {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        // Abort runs after fencing stops and shares its cache, as retry cleanup
-        // does. Recovered cleanup needs its separate acknowledgement bound.
+        // Proof: shared local knowledge (same cache, one acquisition). Abort
+        // runs after fencing
+        // stops and shares its cache, as retry cleanup does. Recovered cleanup
+        // needs its separate acknowledgement bound.
         self.lifecycle
             .clear_aborted_drops(id, &drops, Requirement::ANY)
             .await?;

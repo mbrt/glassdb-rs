@@ -9,6 +9,63 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-11-21: seed transactions race the splits of the seed
+
+Status: the seed stays as it is. `ci/counters` now runs three times on each
+side, and `hack/ci/perf_report.py` compares the median of each counter, so a
+run that takes the other path is not reported as a change.
+
+A CI comparison on 2026-11-20 reported `writeBodyBytes` of
+`stale-reads-shared-leaves-counters` 20.9% lower, with the same number of
+backend operations. The base binary gave the other value in one run, so the
+change was not in the code. The counters of `ci/counters` run in virtual time
+without latency jitter, and they should repeat with the same binary.
+
+The seed writes each pool in transactions of 64 keys (`SEED_BATCH` in
+`runner/seed.rs`). It waited for the quiet period only after the last one. A
+transaction that started while the splits of the one before it ran could get
+`Conflict` on its locks and back off. The jitter of that backoff comes from
+the process RNG (`glassdb-concurr` `retry.rs` and `entropy.rs`). In about 2% of
+runs, a transaction got a third conflict and reached `SERIAL_FALLBACK_AFTER`
+in `algo.rs`. It then renewed its identity, and the seed ended with another
+tree. The writer of the cell then wrote more of its CASes to larger leaves.
+Runs with all entropy from a fixed seed repeated exactly. Runs with only the
+backoff jitter from a fixed seed also stopped varying, and runs with only the
+identity bytes from a fixed seed did not.
+
+Rejected fixes:
+
+- A process with fixed entropy. Each run of perfbench is its own process, so
+  all runs of `ci/timing` would repeat. A change that adds or removes one
+  random draw anywhere would also move the seed to another path.
+- A wait of 1 s of model time without splits and merges after each seed
+  transaction. It removes the race, and the counters repeated in 200 of 200
+  runs. But it adds a wait to every seed transaction, which costs about 5
+  minutes for a pool of 20,000 keys in real time, and it changes the tree of
+  the two experiments.
+
+Results with `--time=virtual --latency-jitter=false --runs=1`, 200 runs of
+`stale-reads-shared-leaves-counters` for each seed, the second one with a
+temporary patch of the wait:
+
+| Seed | Distinct `writeBytes` | Seed splits | Transactions in the window | Backend reads per transaction |
+| --- | --- | --- | --- | --- |
+| A wait only after the last transaction | 423166 (196 runs), 534795 (4 runs) | 15 | 28154 | 0.09 |
+| A wait after each transaction | 462716 (200 runs) | 21 | 5674 | 0.51 |
+
+With the wait, each transaction starts on a tree whose splits ended, so the
+leaves of these two experiments are smaller. The other `ci/counters`
+experiments did not change in three runs of the whole set.
+
+With three runs, a side shows the other value only when two of its three runs
+take the other path: about 0.1% instead of about 2%. The three runs of all
+`ci/counters` experiments take 2 s instead of 1 s.
+
+The `rmw-*-counters` experiments also vary by a few bytes of `writeBytes` in
+each run. The likely cause is that model wall time starts at the real time of
+the process (`rt::system_now`), so encoded timestamps change their length.
+This was not traced. The byte threshold of the report already hides it.
+
 ## 2026-11-20: a stale view that keeps its cut point
 
 Status: a prototype for GLA-65 made the stale view calls of the `stale-reads`

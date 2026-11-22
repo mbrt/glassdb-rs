@@ -2,8 +2,9 @@
 """Report meaningful changes between the perfbench results of two revisions.
 
 Each revision has a directory with two results. `counters.json` comes from the
-experiments with the tag `ci/counters`, in one run without latency jitter:
-their counters repeat exactly. `timing.json` comes from the experiments with
+experiments with the tag `ci/counters`, in three runs without latency jitter:
+their counters almost always repeat, and the median of a counter ignores a
+run that does not. `timing.json` comes from the experiments with
 the tag `ci/timing`, in several runs with latency jitter: each run is one
 independent sample of the latency.
 """
@@ -66,8 +67,7 @@ class ReportError(ValueError):
 
 @dataclass
 class Metric:
-    """The values of one metric: one for each run of the timing experiments,
-    or one for the counters."""
+    """The values of one metric: one for each run of its experiments."""
 
     unit: str
     kind: str
@@ -161,10 +161,12 @@ def read_side(directory: Path) -> tuple[dict, list[str]]:
     """Read and validate the results of one revision.
 
     The latency comes from the runs with latency jitter. The counters come from
-    a run without it: jitter moves the count of background operations, such as
+    runs without it: jitter moves the count of background operations, such as
     listings of the garbage collector, and the path of some transactions, which
-    the counters cannot tell from a change. Without jitter, they repeat
-    exactly.
+    the counters cannot tell from a change. Without jitter, they almost always
+    repeat. The backoff of a retry still draws from the process RNG, so a seed
+    can sometimes take another path (hack/perf/investigations.md,
+    2026-11-21).
     """
     metrics, warnings = {}, []
     side = directory.name
@@ -334,8 +336,10 @@ def compare_spread(a: list[float], b: list[float], family_size: int) -> Spread:
 def compare(base: Metric, candidate: Metric, family_size: int = 1) -> Comparison:
     """Distinguish repeatable changes from effects the measurements cannot resolve."""
     if base.kind == "cost":
-        # The counters repeat exactly, so each side has one value.
-        before, after = base.values[0], candidate.values[0]
+        # The counters almost always repeat, so the median of each side is the
+        # value of its usual run.
+        before = statistics.median(base.values)
+        after = statistics.median(candidate.values)
         relative = (after - before) / before if before else None
         noise = BYTES_NOISE_THRESHOLD * max(before, after) if base.unit == "bytes/tx" else 0
         return Comparison(relative, None, abs(after - before) > noise, False)
@@ -395,10 +399,11 @@ def analyze(base_dir: Path, candidate_dir: Path) -> Analysis:
     # side misses is still in the family.
     timings = {name for side in sides for name, m in side.items() if m.kind != "cost"}
     runs = {len(m.values) for side in sides for m in side.values() if m.kind != "cost"}
+    counter_runs = {len(m.values) for side in sides for m in side.values() if m.kind == "cost"}
     family_size = max(1, len(timings))
     for name in sorted(set(base) | set(candidate)):
         a, b = base.get(name), candidate.get(name)
-        expected = 1 if (a or b).kind == "cost" else max(runs, default=0)
+        expected = max(counter_runs if (a or b).kind == "cost" else runs, default=0)
         if (
             a is None
             or b is None
@@ -565,7 +570,7 @@ def summarize(directory: Path) -> str:
             # The counter experiment of a case has the name of the case and a
             # suffix; the table names the case, as the latency table does.
             case = window.removesuffix("/combined").removesuffix("-counters")
-            costs.setdefault(case, {})[counter] = metric.values[0]
+            costs.setdefault(case, {})[counter] = statistics.median(metric.values)
     lines += [
         "",
         "## Backend operations and coordinator rounds per transaction",

@@ -37,8 +37,8 @@ pub mod sim {
 
 pub use cache_stats::CacheStats;
 pub use cached_store::{
-    CachedStore, CasReceipt, CasResult, CutKey, CutSearch, CutTarget, Observation,
-    ObservationCheck, Revision,
+    CachedStore, CasReceipt, CasResult, CasRetries, Converged, CutKey, CutSearch, CutTarget,
+    Decision, Observation, ObservationCheck, Revision,
 };
 pub use collection_store::{CollectionRecord, CollectionStore};
 pub use disk_cache::{

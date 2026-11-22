@@ -782,12 +782,15 @@ impl StructuralChangeAttempt<'_> {
     }
 
     async fn release_gate(&self) -> Result<(), TransError> {
+        // Proof: shared local knowledge (same cache, one acquisition). The
+        // worker acquired the gate through this cache.
         self.lifecycle
             .structural_nodes
             .release_structural_gate(
                 self.change.collection(),
                 self.change.source_node_id(),
                 self.worker,
+                Requirement::ANY,
             )
             .await
     }
@@ -852,7 +855,8 @@ impl<'a> Participants<'a> {
         topology: &TopologyMembership,
         parallelism: NonZeroUsize,
     ) -> RecordResults<'a> {
-        // The local admission permits any record observation.
+        // Proof: shared local knowledge (same cache, one acquisition). `join`
+        // admitted the participants through this cache.
         let leaves: Vec<_> = self
             .by_collection
             .iter()

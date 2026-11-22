@@ -5,6 +5,7 @@
 //! `{prefix}/_r`, so data-path mutations cannot conflict with this record.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -13,7 +14,8 @@ use glassdb_proto as pb;
 use prost::Message;
 
 use crate::cached_store::{
-    CachedStore, CasResult, Codec, CutSearch, CutTarget, Observation, Requirement,
+    CachedStore, CasResult, CasRetries, Codec, Converged, CutSearch, CutTarget, Decision,
+    Observation, Requirement,
 };
 use crate::error::StorageError;
 use crate::lock::SharedExclusiveLock;
@@ -364,6 +366,27 @@ impl CollectionStore {
         }
     }
 
+    /// Changes the record of `collection` with one writer until `decide` gives
+    /// a result, as [`NodeStore::converge`](crate::NodeStore::converge) does
+    /// for a node.
+    pub async fn converge<T, E, F, Fut>(
+        &self,
+        collection: &CollectionAddress,
+        proof: Requirement,
+        retries: CasRetries,
+        decide: F,
+    ) -> Result<Converged<CollectionRecord, T>, E>
+    where
+        E: From<StorageError>,
+        F: FnMut(CollectionRecord, Observation<CollectionRecord>) -> Fut,
+        Fut: Future<Output = Result<Decision<CollectionRecord, T>, E>>,
+    {
+        let path = ObjectPath::CollectionRecord {
+            collection: collection.clone(),
+        };
+        self.records.converge(path, proof, retries, decide).await
+    }
+
     /// Creates a collection record if absent.
     pub async fn create_record(
         &self,
@@ -706,5 +729,59 @@ mod tests {
             record_after_root_write.revision(),
             "data-root mutation must not advance the record revision"
         );
+    }
+
+    // The step works on a collection record as on a node: a cached record
+    // without the freeze proves nothing at a requirement after the freeze.
+    #[tokio::test]
+    async fn converge_proves_a_record_that_needs_no_change() {
+        let backend: Arc<dyn glassdb_backend::Backend> = Arc::new(MemoryBackend::new());
+        let local_timeline = Timeline::new();
+        let store = |timeline| {
+            let objects = CachedStore::new(backend.clone(), 1 << 20, timeline, None);
+            CollectionStore::new(objects, NonZeroUsize::MIN)
+        };
+        let local = store(local_timeline.clone());
+        let peer = store(Timeline::new());
+        let collection = CollectionAddress::root("coll");
+        assert!(
+            local
+                .create_record(&collection, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        let owner = tx_id(&[1]);
+        let (mut record, observed) = peer
+            .load_record(&collection, Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(record.set_topology_freeze(owner));
+        assert!(peer.store_record(&record, &observed).await.unwrap());
+        let unfreeze = async |proof| {
+            local
+                .converge(
+                    &collection,
+                    proof,
+                    CasRetries::Bounded(8),
+                    |mut record, _| {
+                        std::future::ready(Ok::<_, StorageError>(
+                            if record.remove_topology_freeze(&owner) {
+                                Decision::Write(record, ())
+                            } else {
+                                Decision::Done(())
+                            },
+                        ))
+                    },
+                )
+                .await
+                .unwrap()
+        };
+
+        assert!(matches!(
+            unfreeze(Requirement::ANY).await,
+            Converged::Done(())
+        ));
+        let proof = Requirement::after(local_timeline.currentness_barrier());
+        assert!(matches!(unfreeze(proof).await, Converged::Written { .. }));
     }
 }

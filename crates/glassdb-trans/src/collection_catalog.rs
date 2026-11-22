@@ -44,6 +44,8 @@ impl CollectionCatalog {
         // Callers retain directory reads and mutation preconditions as semantic
         // dependencies. Validation checks them after the body before accepting
         // its outcome, so this snapshot can use cached contents.
+        // Proof for a missing record, which validation does not check again:
+        // publication and lifecycle (created before seen).
         let (record, observed) = self
             .state
             .load_resolved(parent, Some(own), Requirement::ANY, PendingHolders::Skip)
