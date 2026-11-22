@@ -3060,7 +3060,7 @@ mod tests {
         .await
         .unwrap();
         for key in [&keyp, &keyp2] {
-            let read = observer.read(key, None).await.unwrap();
+            let read = observer.body_reader(None).read(key).await.unwrap();
             assert_eq!(read.value.unwrap().value.as_ref(), b"v2");
         }
         observer.shutdown().await;

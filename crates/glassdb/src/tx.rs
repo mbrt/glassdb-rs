@@ -17,8 +17,7 @@ mod read;
 use std::sync::{Arc, Mutex};
 
 use glassdb_data::{CollectionAddress, CollectionName, LogicalKey, TxId};
-use glassdb_storage::ViewRead;
-use glassdb_trans::{AccessSet, CatalogAccesses, CollectionReservations};
+use glassdb_trans::{AccessSet, BodyReader, CatalogAccesses, CollectionReservations};
 
 use self::access_overlay::{AccessOverlay, OverlayRead};
 use self::catalog::CatalogOverlay;
@@ -44,9 +43,9 @@ pub struct Transaction {
     db: Arc<DbInner>,
     /// The engine identity that commits this body execution.
     identity: TxId,
-    /// How the body execution of a stale view call reads: the first one at
-    /// the floor of the view (ADR-103).
-    view_read: Option<ViewRead>,
+    /// Reads the keys of this body execution. The first execution of a stale
+    /// view call reads at the floor of the view (ADR-103).
+    reader: BodyReader,
     inner: Arc<Mutex<TransactionInner>>,
 }
 
@@ -85,7 +84,7 @@ impl Transaction {
             }
         }
 
-        match self.db.engine.read(&key, self.view_read).await {
+        match self.reader.read(&key).await {
             Ok(outcome) => {
                 let (value, evidence) = outcome.into_parts();
                 match value {
@@ -136,9 +135,8 @@ impl Transaction {
         }
 
         let result = self
-            .db
-            .engine
-            .scan(c.address(), &range, &overlay, self.view_read)
+            .reader
+            .scan(c.address(), &range, &overlay)
             .await
             .map_err(|e| self.observe_error(Error::from_read(e)))?;
         let keys = result.keys().to_vec();
@@ -324,12 +322,12 @@ impl Transaction {
         db: Arc<DbInner>,
         identity: TxId,
         reservations: CollectionReservations,
-        view_read: Option<ViewRead>,
+        reader: BodyReader,
     ) -> Self {
         Transaction {
             db,
             identity,
-            view_read,
+            reader,
             inner: Arc::new(Mutex::new(TransactionInner {
                 accesses: AccessOverlay::default(),
                 catalog: CatalogOverlay::new(reservations),
@@ -347,7 +345,7 @@ impl Transaction {
         Transaction {
             db: self.db.clone(),
             identity: self.identity,
-            view_read: self.view_read,
+            reader: self.reader.clone(),
             inner: self.inner.clone(),
         }
     }
