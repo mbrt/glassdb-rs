@@ -22,7 +22,8 @@ records, the cache, evidence types, and the on-the-wire format.
 - For conditional mutation, check the
   [CAS receipt semantics](caching.md#cas-receipts) and the
   [coordinator rules](caching.md#coordinator-mutation-evidence).
-- For changes to `crates/glassdb-storage/src/timeline.rs` and
+- For changes to `crates/glassdb-storage/src/timeline.rs`,
+  `crates/glassdb-storage/src/stale_view.rs`, and
   `crates/glassdb-storage/src/cached_store/evidence.rs`, identify which
   [storage evidence rules](storage-consistency.md) each change affects. This
   includes visibility, exports, conversions, tests, and moves. Check that the

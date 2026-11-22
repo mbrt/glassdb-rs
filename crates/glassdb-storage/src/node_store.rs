@@ -20,7 +20,7 @@ use crate::error::StorageError;
 use crate::leaf::LeafBody;
 use crate::lock::LockType;
 use crate::node::{Node, NodeLocks};
-use crate::timeline::ViewRead;
+use crate::stale_view::ViewRead;
 
 const NODE_LIST_PAGE_SIZE: usize = 128;
 
@@ -761,7 +761,8 @@ mod tests {
     use super::*;
     use crate::cached_store::Revision;
     use crate::node::IndexNode;
-    use crate::timeline::{MonotonicFloor, StalenessCutoff};
+    use crate::stale_view::MonotonicFloor;
+    use crate::timeline::StalenessCutoff;
     use crate::{CurrentState, LeafEntry, Timeline};
 
     use glassdb_backend::Backend;

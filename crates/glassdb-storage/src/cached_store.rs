@@ -33,8 +33,9 @@ use std::sync::Arc;
 use crate::cache_stats::{CacheMetrics, CacheStats};
 use crate::disk_cache::PersistentCache;
 use crate::error::StorageError;
+use crate::stale_view::{FloorPoint, ViewFloors};
 pub use crate::timeline::Requirement;
-use crate::timeline::{FloorPoint, SequencePoint, Timeline, ViewFloors};
+use crate::timeline::{SequencePoint, Timeline};
 use glassdb_backend::{self as backend, Backend, BackendError};
 use glassdb_concurr::map_all_bounded;
 use glassdb_data::{ObjectPath, PathError};
@@ -956,7 +957,8 @@ mod tests {
     use crate::disk_cache::PathChanges;
     use crate::disk_cache::PersistentCacheConfig;
     use crate::disk_cache::sim_media::{MediaFaultProfile, SimMedia};
-    use crate::timeline::{MonotonicFloor, StalenessCutoff, TimeSource};
+    use crate::stale_view::MonotonicFloor;
+    use crate::timeline::{StalenessCutoff, TimeSource};
 
     // A trivial identity codec so the concurrency layer can be exercised in
     // isolation from any real object type.

@@ -12,6 +12,7 @@ mod leaf;
 mod lock;
 mod node;
 mod node_store;
+mod stale_view;
 mod structural_intent;
 mod structural_intent_store;
 mod timeline;
@@ -55,12 +56,10 @@ pub use node::{
 pub use node_store::{
     LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodePage, NodeReads, NodeStore,
 };
+pub use stale_view::{MonotonicFloor, ViewFloors, ViewRead};
 pub use structural_intent::{
     MergeTarget, StructuralChange, StructuralIntent, StructuralIntentPhase,
 };
 pub use structural_intent_store::{StructuralIntentPage, StructuralIntentStore};
-pub use timeline::{
-    CurrentnessBarrier, MonotonicFloor, Requirement, SequencePoint, StalenessCutoff, Timeline,
-    ViewFloors, ViewRead,
-};
+pub use timeline::{CurrentnessBarrier, Requirement, SequencePoint, StalenessCutoff, Timeline};
 pub use tree_router::{RoutedLeaf, RoutedLeafGroup, TreeRouter};

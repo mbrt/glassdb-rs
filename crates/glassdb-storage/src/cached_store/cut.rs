@@ -9,9 +9,8 @@ use std::collections::BTreeMap;
 use glassdb_data::ObjectPath;
 
 use super::Observation;
-use crate::timeline::{
-    CurrentnessBarrier, MonotonicFloor, SequencePoint, StalenessCutoff, Timeline,
-};
+use crate::stale_view::MonotonicFloor;
+use crate::timeline::{CurrentnessBarrier, SequencePoint, StalenessCutoff, Timeline};
 
 /// The currentness intervals of the states that one stale read-only
 /// transaction depends on.

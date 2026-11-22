@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use crate::error::StorageError;
-use crate::timeline::{FloorPoint, SequencePoint, ViewFloors};
+use crate::stale_view::{FloorPoint, ViewFloors};
+use crate::timeline::SequencePoint;
 
 use super::entry::{
     DecodedCache, EarlierState, ErasedValue, LatestState, PathEarlierStates, downcast,
