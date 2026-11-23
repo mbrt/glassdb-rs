@@ -360,3 +360,179 @@ fn gc_keeps_the_membership_lock_of_a_committed_delete_before_its_write_back() {
         assert!(scan.keys().is_empty(), "{:?}", scan.keys());
     });
 }
+
+// Regression: a stale view reads a leaf state that names the committed holder
+// T after GC on the same instance deleted the record of T. A writer with a
+// cached leaf from before the write-back wounded T at the empty path. The read
+// must resolve the key again and return its current value, not report that the
+// final status and the record disagree.
+#[test]
+fn a_stale_view_reads_through_a_leaked_wound_of_a_reclaimed_commit() {
+    use std::num::NonZeroUsize;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+
+    fn is_record_delete(operation: &BackendOp<'_>) -> bool {
+        matches!(operation, BackendOp::DeleteIf { path, .. } if path.contains("/_t/"))
+    }
+
+    fn unavailable(fail: bool) -> Result<(), BackendError> {
+        if fail {
+            Err(BackendError::Unavailable("injected".into()))
+        } else {
+            Ok(())
+        }
+    }
+
+    exec::block_on(async {
+        let memory = Arc::new(MemoryBackend::new());
+        let owner_backend = HookBackend::new(memory.clone());
+        let writer_backend = HookBackend::new(memory.clone());
+        // Values stay out of the leaves, so a read needs the record of the
+        // writer (ADR-051).
+        let open = |backend: Arc<dyn Backend>| {
+            Database::builder("leak", backend)
+                .protocol_timing(ProtocolTiming::simulation())
+                .inline_policy(InlinePolicy::none())
+                .open()
+        };
+        let owner = open(owner_backend.clone()).await.unwrap();
+        let writer = open(writer_backend.clone()).await.unwrap();
+        let reader = open(memory.clone()).await.unwrap();
+        owner.root_collection().write(b"key", b"old").await.unwrap();
+
+        // Only the GC of the reader deletes records, so the reader loses the
+        // body of T. The GC scan of the writer does not reach T: its check
+        // reads the current leaf, which would refresh the cache of the writer.
+        writer_backend.set_before(|operation| {
+            let fail = is_record_delete(operation)
+                || matches!(operation, BackendOp::List { path, .. } if path.contains("/_t/"));
+            Box::pin(async move { unavailable(fail) })
+        });
+
+        // The writer starts before T, so it outranks T.
+        let started = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let first = Arc::new(AtomicBool::new(true));
+        let leak = rt::spawn({
+            let writer = writer.clone();
+            let (started, resume, first) = (started.clone(), resume.clone(), first.clone());
+            async move {
+                writer
+                    .tx(|tx| {
+                        let (started, resume, first) =
+                            (started.clone(), resume.clone(), first.clone());
+                        async move {
+                            if first.swap(false, Ordering::SeqCst) {
+                                started.notify_one();
+                                resume.notified().await;
+                            }
+                            let c = tx.root_collection();
+                            // Two blind writes take the locked path, which
+                            // resolves the holders of the cached leaf.
+                            tx.write(&c, b"key", b"writer")?;
+                            tx.write(&c, b"other", b"writer")
+                        }
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        started.notified().await;
+        rt::sleep(Duration::from_millis(1)).await;
+
+        // The owner holds the commit of T while T holds the lock on the key.
+        let held = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let holding = Arc::new(AtomicBool::new(false));
+        let record_path = Arc::new(Mutex::new(String::new()));
+        owner_backend.set_before({
+            let (held, release, holding, record_path) = (
+                held.clone(),
+                release.clone(),
+                holding.clone(),
+                record_path.clone(),
+            );
+            move |operation| {
+                let fail = is_record_delete(operation);
+                let hold = match operation {
+                    BackendOp::WriteIfNotExists { path, value }
+                        if path.contains("/_t/")
+                            && glassdb_storage::txrecord::status(value)
+                                .is_ok_and(|status| status == TxCommitStatus::Committed)
+                            && !holding.swap(true, Ordering::SeqCst) =>
+                    {
+                        *record_path.lock().unwrap() = path.to_string();
+                        true
+                    }
+                    _ => false,
+                };
+                let (held, release) = (held.clone(), release.clone());
+                Box::pin(async move {
+                    if hold {
+                        held.notify_one();
+                        release.notified().await;
+                    }
+                    unavailable(fail)
+                })
+            }
+        });
+        let commit = rt::spawn({
+            let owner = owner.clone();
+            async move { owner.root_collection().write(b"key", b"new").await.unwrap() }
+        });
+        held.notified().await;
+        let path = record_path.lock().unwrap().clone();
+
+        // The writer and the reader cache the leaf with T as the holder, and
+        // the stale view keeps that state.
+        for db in [&writer, &reader] {
+            assert_eq!(
+                db.root_collection().read(b"key").await.unwrap(),
+                Some(b"old".to_vec())
+            );
+        }
+        let view = reader.root_collection().stale(Duration::from_secs(3600));
+        assert_eq!(view.read(b"key").await.unwrap(), Some(b"old".to_vec()));
+
+        release.notify_one();
+        commit.await.unwrap();
+        // The reader resolves T from its cached leaf and learns that T
+        // committed.
+        assert_eq!(
+            reader.root_collection().read(b"key").await.unwrap(),
+            Some(b"new".to_vec())
+        );
+        // A later writer replaces T, so GC can delete the record of T.
+        owner
+            .root_collection()
+            .write(b"key", b"newer")
+            .await
+            .unwrap();
+        loop {
+            if matches!(memory.read(&path).await, Err(BackendError::NotFound)) {
+                break;
+            }
+            let report = reader.collect_garbage(NonZeroUsize::MIN).await.unwrap();
+            let retry_after = report
+                .retry_after
+                .expect("GC did not delete the record of T");
+            rt::sleep(retry_after.max(Duration::from_millis(1))).await;
+        }
+
+        // The writer resolves T from its cached leaf and wounds it.
+        resume.notify_one();
+        leak.await.unwrap();
+        let stored = memory.read(&path).await.unwrap();
+        assert_eq!(
+            glassdb_storage::txrecord::status(&stored.contents).unwrap(),
+            TxCommitStatus::Wounded
+        );
+
+        assert_eq!(view.read(b"key").await.unwrap(), Some(b"writer".to_vec()));
+        owner.shutdown().await;
+        writer.shutdown().await;
+        reader.shutdown().await;
+    });
+}

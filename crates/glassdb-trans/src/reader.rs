@@ -231,7 +231,11 @@ mod tests {
 
     #[tokio::test]
     async fn reclaimed_transaction_bodies_refresh_cached_writers_and_holders() {
-        for (held, operation) in [(false, 0), (true, 0), (true, 1), (true, 2), (true, 3)] {
+        let cases = [(false, 0), (true, 0), (true, 1), (true, 2), (true, 3)];
+        for ((held, operation), wounded) in cases
+            .into_iter()
+            .flat_map(|case| [(case, false), (case, true)])
+        {
             let backend = Arc::new(MemoryBackend::new());
             let local = AssemblyFixture::new(
                 backend.clone(),
@@ -303,6 +307,15 @@ mod tests {
                 local.tx_records.get_at(&old, Requirement::ANY).await,
                 Err(StorageError::NotFound)
             ));
+            if wounded {
+                // A peer that resolves the holder from a leaf observation
+                // older than the write-back finds no record and wounds the
+                // identity (a leaked wound, ADR-079).
+                peer.tx_records
+                    .set(&TxRecord::new(old, TxCommitStatus::Wounded))
+                    .await
+                    .unwrap();
+            }
             match operation {
                 0 => {
                     let (value, _) = reader.read(&key).await.unwrap().into_parts();

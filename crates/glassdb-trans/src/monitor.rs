@@ -1922,38 +1922,24 @@ impl Monitor {
         {
             return Ok(observed);
         }
-        let mut observed = self
+        let observed = self
             .inner
             .tx_records
             .get_at(tid, self.current_requirement())
             .await
             .map_err(|error| match error {
-                // Commit status is permanent, but a reclaimed body means the
-                // referring leaf observation must be resolved again.
                 StorageError::NotFound => TransError::ValidateRetry(self.current_requirement()),
                 error => TransError::Storage(error.context(format!("getting TID {tid}"))),
             })?;
-        if observed
-            .value()
-            .is_some_and(|record| record.status != expected_status)
-        {
-            observed = self
-                .inner
-                .tx_records
-                .get_at(tid, self.current_requirement())
-                .await
-                .map_err(|error| match error {
-                    StorageError::NotFound => TransError::ValidateRetry(self.current_requirement()),
-                    error => TransError::Storage(error.context(format!("refreshing TID {tid}"))),
-                })?;
-        }
         if !observed
             .value()
             .is_some_and(|record| record.status == expected_status)
         {
-            return Err(TransError::other(format!(
-                "final status and transaction record disagree for {tid}"
-            )));
+            // The status is permanent, but GC reclaimed the record: the record
+            // is missing, or another instance wounded the identity at the empty
+            // path (a leaked wound, ADR-079). The referring leaf observation
+            // must be resolved again.
+            return Err(TransError::ValidateRetry(self.current_requirement()));
         }
         Ok(observed)
     }
