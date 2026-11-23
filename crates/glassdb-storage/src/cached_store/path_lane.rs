@@ -7,7 +7,7 @@ use glassdb_concurr::shard::Sharded;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use super::Requirement;
-use super::knowledge::FetchResult;
+use super::latest::FetchResult;
 use super::persistent_bridge::PersistentPath;
 use crate::error::StorageError;
 use crate::timeline::SequencePoint;

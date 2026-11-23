@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use glassdb_backend::BackendError;
 
-use super::knowledge::{Expected, Knowledge};
+use super::latest::{Expected, LatestStates};
 use super::path_lane::PathPermit;
 use super::persistent_bridge::{PersistentBridge, PersistentChange};
 use crate::error::StorageError;
@@ -40,7 +40,7 @@ impl<T> MutationOutcome<T> {
 
 /// Owns one admitted mutation until its knowledge and persistent state agree.
 pub(super) struct MutationRound {
-    knowledge: Knowledge,
+    latest: LatestStates,
     persistent: PersistentBridge,
     path: Arc<str>,
     expected: Expected,
@@ -51,15 +51,15 @@ pub(super) struct MutationRound {
 
 impl MutationRound {
     pub(super) fn new(
-        knowledge: Knowledge,
+        latest: LatestStates,
         persistent: PersistentBridge,
         path: Arc<str>,
         mut expected: Expected,
         permit: PathPermit,
     ) -> Self {
-        knowledge.capture_expected(&path, &mut expected);
+        latest.capture_expected(&path, &mut expected);
         Self {
-            knowledge,
+            latest,
             persistent,
             path,
             expected,
@@ -80,7 +80,7 @@ impl MutationRound {
                 self.begin_path_change();
                 let result = apply_success(value);
                 if let Some(current_at) = current_at {
-                    self.knowledge.advance_expected(&self.expected, current_at);
+                    self.latest.advance_expected(&self.expected, current_at);
                 }
                 self.invalidate_l2();
                 self.complete();
@@ -88,8 +88,7 @@ impl MutationRound {
             }
             MutationOutcome::Rejected => {
                 self.begin_path_change();
-                self.knowledge
-                    .invalidate_expected(&self.path, &self.expected);
+                self.latest.invalidate_expected(&self.path, &self.expected);
                 self.invalidate_l2();
                 self.complete();
                 Ok(None)
@@ -100,7 +99,7 @@ impl MutationRound {
             }
             MutationOutcome::InDoubt(error) => {
                 self.begin_path_change();
-                self.knowledge.invalidate(&self.path);
+                self.latest.invalidate(&self.path);
                 self.invalidate_l2();
                 self.complete();
                 Err(error)
@@ -136,7 +135,7 @@ impl Drop for MutationRound {
     fn drop(&mut self) {
         if self.armed {
             self.begin_path_change();
-            self.knowledge.invalidate(&self.path);
+            self.latest.invalidate(&self.path);
             self.invalidate_l2();
         }
         self.permit.take();

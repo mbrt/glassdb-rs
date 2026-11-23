@@ -33,6 +33,7 @@ use std::sync::Arc;
 use crate::cache_stats::{CacheMetrics, CacheStats};
 use crate::disk_cache::PersistentCache;
 use crate::error::StorageError;
+use crate::stale_view::{FloorPoint, ViewFloors};
 pub use crate::timeline::Requirement;
 use crate::timeline::{SequencePoint, Timeline};
 use glassdb_backend::{self as backend, Backend, BackendError};
@@ -41,18 +42,22 @@ use glassdb_data::{ObjectPath, PathError};
 
 mod converge;
 mod cut;
+mod earlier;
+mod entry;
 mod evidence;
-mod knowledge;
+mod latest;
 mod mutation;
 mod path_lane;
 mod persistent_bridge;
 
 pub use converge::{CasRetries, Converged, Decision};
-pub use cut::{CutSearch, CutTarget};
+pub use cut::{CutKey, CutSearch, CutTarget};
 use evidence::Evidence;
 pub use evidence::{CasReceipt, CasResult, Observation, ObservationCheck, Revision};
 
-use knowledge::{EvictionSink, FetchResult, Knowledge, PresentSeed};
+use earlier::EarlierStates;
+use entry::{DecodedCache, EvictionSink};
+use latest::{FetchResult, LatestStates, PresentSeed};
 use mutation::{MutationOutcome, MutationRound};
 use path_lane::{FlightOutcome, PathCoordinator, PathState, ReadAdmission};
 use persistent_bridge::PersistentBridge;
@@ -162,7 +167,8 @@ pub(crate) trait Codec: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct CachedStore {
     backend: Arc<dyn Backend>,
-    knowledge: Knowledge,
+    latest: LatestStates,
+    earlier: EarlierStates,
     timeline: Timeline,
     coordinator: PathCoordinator,
     metrics: Arc<CacheMetrics>,
@@ -189,14 +195,23 @@ impl CachedStore {
         let sink = persistent
             .is_configured()
             .then(|| Arc::new(persistent.clone()) as Arc<dyn EvictionSink>);
+        let cache = DecodedCache::new(max_size, sink);
+        let earlier = EarlierStates::new(cache.clone(), ViewFloors::default());
         CachedStore {
             backend,
-            knowledge: Knowledge::new(max_size, timeline.clone(), sink),
+            latest: LatestStates::new(cache, earlier.clone(), timeline.clone()),
+            earlier,
             timeline,
             coordinator,
             metrics,
             persistent,
         }
+    }
+
+    /// The floors of the live stale views over this cache. The cache keeps
+    /// earlier states while one of them can use them (ADR-103).
+    pub fn view_floors(&self) -> ViewFloors {
+        self.earlier.view_floors()
     }
 
     /// Starts a cut search on the timeline of this cache (ADR-097).
@@ -213,7 +228,7 @@ impl CachedStore {
     /// drain, it queues the newer watermarks of the states that L1 still has.
     pub async fn shutdown(&self) {
         if self.persistent.is_configured() {
-            let states = self.knowledge.present_states();
+            let states = self.latest.present_states();
             self.persistent.persist_watermarks(
                 states
                     .iter()
@@ -245,7 +260,7 @@ impl CachedStore {
         }
         self.metrics.l1_miss();
         let fetched = self.fetch::<C>(&key, req, None).await?;
-        self.knowledge.to_observation::<C>(key, fetched)
+        self.latest.to_observation::<C>(key, fetched)
     }
 
     /// Returns the cached observation for `path` without contacting the backend,
@@ -281,7 +296,7 @@ impl CachedStore {
             return Ok(ObservationCheck::Changed(current));
         }
         let fetched = self.fetch::<C>(&key, req, Some(obs)).await?;
-        let current = self.knowledge.to_observation::<C>(key, fetched)?;
+        let current = self.latest.to_observation::<C>(key, fetched)?;
         if same_observed_state(obs, &current) {
             let merged = obs.current_after().max(current.current_after());
             obs.evidence.advance(merged);
@@ -305,10 +320,10 @@ impl CachedStore {
         let bytes = C::encode(key.object_path(), &value)?;
         let size = C::size(&value);
         let path = key.encoded().clone();
-        let expected = self.knowledge.expected_absent(expected_absence);
+        let expected = self.latest.expected_absent(expected_absence);
         let permit = self.coordinator.acquire(&path).await;
         let round = MutationRound::new(
-            self.knowledge.clone(),
+            self.latest.clone(),
             self.persistent.clone(),
             path.clone(),
             expected,
@@ -321,7 +336,7 @@ impl CachedStore {
             Err(error) => MutationOutcome::failed(error),
         };
         let applied = round.finish(outcome, |revision| {
-            self.knowledge.install_mutation::<C>(
+            self.latest.install_mutation::<C>(
                 key,
                 value,
                 size,
@@ -356,11 +371,11 @@ impl CachedStore {
             .clone()
             .ok_or_else(|| StorageError::other("replace requires a present observation"))?;
         let expected_state = self
-            .knowledge
+            .latest
             .expected_present(expected_revision.clone(), expected);
         let permit = self.coordinator.acquire(&path).await;
         let round = MutationRound::new(
-            self.knowledge.clone(),
+            self.latest.clone(),
             self.persistent.clone(),
             path.clone(),
             expected_state,
@@ -380,7 +395,7 @@ impl CachedStore {
         let completed = round.finish(outcome, |installed| match installed {
             Some(installed) => CasResult::Applied(CasReceipt {
                 expected_revision: Some(expected_revision),
-                installed: self.knowledge.install_mutation::<C>(
+                installed: self.latest.install_mutation::<C>(
                     key,
                     value,
                     size,
@@ -390,7 +405,7 @@ impl CachedStore {
                 invoked,
             }),
             None => {
-                self.knowledge
+                self.latest
                     .install_absent_observation::<C::Value>(key, invoked);
                 CasResult::Rejected
             }
@@ -412,10 +427,10 @@ impl CachedStore {
             .ok_or_else(|| StorageError::other("delete requires a present observation"))?;
         let key = expected.key.clone();
         let path = key.encoded().clone();
-        let expected_state = self.knowledge.expected_present(revision.clone(), expected);
+        let expected_state = self.latest.expected_present(revision.clone(), expected);
         let permit = self.coordinator.acquire(&path).await;
         let round = MutationRound::new(
-            self.knowledge.clone(),
+            self.latest.clone(),
             self.persistent.clone(),
             path.clone(),
             expected_state,
@@ -430,7 +445,7 @@ impl CachedStore {
         };
         round
             .finish(outcome, |()| {
-                self.knowledge
+                self.latest
                     .install_absent_observation::<C::Value>(key, invoked)
             })?
             .ok_or(StorageError::Precondition)
@@ -460,7 +475,7 @@ impl CachedStore {
         key: &ObjectKey,
         req: Requirement,
     ) -> Result<Option<Observation<C::Value>>, StorageError> {
-        let observed = self.knowledge.peek::<C>(key, req)?;
+        let observed = self.latest.peek::<C>(key, req)?;
         if observed.as_ref().is_some_and(Observation::exists) && self.persistent.is_configured() {
             let state = self.coordinator.state(key.encoded());
             self.persistent.record_present_hit(key.encoded(), &state);
@@ -487,21 +502,19 @@ impl CachedStore {
                     if let Some(observed) = fallback
                         && req.is_satisfied_by(observed.current_after())
                     {
-                        return Ok(self.knowledge.result_from_observation(observed));
+                        return Ok(self.latest.result_from_observation(observed));
                     }
                     if let Some(observed) = self.try_hit::<C>(key, req)? {
-                        return Ok(self.knowledge.result_from_observation(&observed));
+                        return Ok(self.latest.result_from_observation(&observed));
                     }
                     let state = permit.state().clone();
-                    let mut seed = self.knowledge.present_seed::<C>(key, fallback)?;
+                    let mut seed = self.latest.present_seed::<C>(key, fallback)?;
                     if seed.is_none()
-                        && let Some(persistent_seed) = self
-                            .persistent
-                            .load::<C>(&self.knowledge, key, &state)
-                            .await
+                        && let Some(persistent_seed) =
+                            self.persistent.load::<C>(&self.latest, key, &state).await
                     {
                         if req == Requirement::ANY {
-                            return Ok(self.knowledge.result_from_seed(persistent_seed));
+                            return Ok(self.latest.result_from_seed(persistent_seed));
                         }
                         seed = Some(persistent_seed);
                     }
@@ -537,7 +550,7 @@ impl CachedStore {
                     self.publish_present::<C>(key, reply.contents, reply.revision, invoked, state)
                 }
                 Err(BackendError::Precondition) => {
-                    Ok(self.publish_unchanged(key.as_str(), seed, invoked))
+                    Ok(self.publish_unchanged::<C>(key.as_str(), seed, invoked))
                 }
                 Err(BackendError::NotFound) => {
                     Ok(self.publish_absent(key.as_str(), invoked, state))
@@ -569,7 +582,7 @@ impl CachedStore {
             Ok(decoded) => decoded,
             Err(error) => {
                 let change = self.persistent.begin_change(state);
-                self.knowledge.invalidate(key.as_str());
+                self.latest.invalidate(key.as_str());
                 change.invalidate(key.encoded().clone());
                 return Err(error);
             }
@@ -578,13 +591,9 @@ impl CachedStore {
         let value = Arc::new(decoded);
         let revision = Revision::from_backend(revision);
         let change = self.persistent.begin_change(state);
-        let fetched = self.knowledge.install_fetched::<C>(
-            key.as_str(),
-            value,
-            size,
-            revision.clone(),
-            invoked,
-        );
+        let fetched =
+            self.latest
+                .install_fetched::<C>(key.as_str(), value, size, revision.clone(), invoked);
         if change.replace(
             key.encoded().clone(),
             &revision,
@@ -599,13 +608,13 @@ impl CachedStore {
 
     /// Handles a "not modified" response by reusing the body retained for the
     /// conditional request.
-    fn publish_unchanged(
+    fn publish_unchanged<C: Codec>(
         &self,
         path: &str,
         seed: PresentSeed,
         invoked: SequencePoint,
     ) -> FetchResult {
-        self.knowledge.confirm_unchanged(path, seed, invoked)
+        self.latest.confirm_unchanged::<C>(path, seed, invoked)
     }
 
     /// Publishes a confirmed absence.
@@ -616,7 +625,7 @@ impl CachedStore {
         state: &Arc<PathState>,
     ) -> FetchResult {
         let change = self.persistent.begin_change(state);
-        let fetched = self.knowledge.install_absent_result(path, invoked);
+        let fetched = self.latest.install_absent_result(path, invoked);
         change.invalidate(Arc::from(path));
         fetched
     }
@@ -679,6 +688,36 @@ impl<C: Codec> TypedCachedStore<C> {
     ) -> Result<Observation<C::Value>, StorageError> {
         let key = key.into();
         Self::check_path(&key)?;
+        self.store.read::<C>(key, requirement).await
+    }
+
+    /// Makes the decoded cache keep the states of `key` that newer states
+    /// replace, while the floors of the live views can use them (ADR-103).
+    pub(crate) fn keep_earlier_states(&self, key: impl Into<ObjectKey>) {
+        self.store.earlier.keep(&key.into());
+    }
+
+    /// Makes the decoded cache drop the earlier states of `key`, and keep no
+    /// more of them until a view marks it again (ADR-103).
+    pub(crate) fn drop_earlier_states(&self, key: impl Into<ObjectKey>) {
+        self.store.earlier.drop(&key.into());
+    }
+
+    /// Reads the state whose currentness interval covers `point`, for a call
+    /// of a stale view (ADR-103). Reads the current state when the latest
+    /// state started at or before `point`, or when no earlier state covers it.
+    pub(crate) async fn read_at(
+        &self,
+        key: impl Into<ObjectKey>,
+        requirement: Requirement,
+        point: FloorPoint,
+    ) -> Result<Observation<C::Value>, StorageError> {
+        let key = key.into();
+        Self::check_path(&key)?;
+        if let Some(observed) = self.store.earlier.state_at::<C>(&key, requirement, point)? {
+            self.store.metrics.l1_hit();
+            return Ok(observed);
+        }
         self.store.read::<C>(key, requirement).await
     }
 
@@ -794,6 +833,28 @@ impl<C: Codec> TypedCachedStore<C> {
         Ok(())
     }
 
+    /// Adds the interval of the part of `observed` that `part` selects to a cut
+    /// search, from every known state of its path (ADR-103). `part` must
+    /// select a value that never comes back after it changes. Without an
+    /// interval of the part, the search uses the interval of `observed`.
+    pub(crate) fn add_part_to_cut<S: PartialEq>(
+        &self,
+        search: &mut CutSearch,
+        observed: &Observation<C::Value>,
+        part: impl Fn(&C::Value) -> Option<S>,
+    ) -> Result<CutKey, StorageError> {
+        Self::check_path(&observed.key)?;
+        match self.store.earlier.part_interval::<C, S>(observed, part)? {
+            Some(interval) => {
+                Ok(search.add_key(interval.start, interval.watermark, interval.cached_changed))
+            }
+            None => {
+                search.add(std::slice::from_ref(observed));
+                Ok(CutKey::of_state(observed))
+            }
+        }
+    }
+
     /// Checks the states of `observations` that do not reach `target`, with
     /// bounded parallel work. Reports whether every state is still current,
     /// so that `target` is a cut point for them.
@@ -896,7 +957,8 @@ mod tests {
     use crate::disk_cache::PathChanges;
     use crate::disk_cache::PersistentCacheConfig;
     use crate::disk_cache::sim_media::{MediaFaultProfile, SimMedia};
-    use crate::timeline::TimeSource;
+    use crate::stale_view::MonotonicFloor;
+    use crate::timeline::{StalenessCutoff, TimeSource};
 
     // A trivial identity codec so the concurrency layer can be exercised in
     // isolation from any real object type.
@@ -2184,12 +2246,12 @@ mod tests {
             let context = format!("queued {kind:?} cancellation");
             let protocol = ProtocolBackend::new();
             let store = protocol.store();
-            let knowledge = if matches!(kind, MutationKind::Create) {
+            let latest = if matches!(kind, MutationKind::Create) {
                 KnowledgeCase::Absent
             } else {
                 KnowledgeCase::Matching
             };
-            let prepared = prepare_mutation(&protocol, &store, kind, knowledge).await;
+            let prepared = prepare_mutation(&protocol, &store, kind, latest).await;
             let expected_value = if matches!(kind, MutationKind::Create) {
                 ExpectedValue::Absent
             } else {
@@ -2898,7 +2960,7 @@ mod tests {
         let store = bytes_store(backend);
         let expected = create_value(&store, "p", v(b"a")).await;
 
-        store.store.knowledge.invalidate("p");
+        store.store.latest.invalidate("p");
         let reloaded = store.read("p", Requirement::ANY).await.unwrap();
         assert!(expected.same_state(&reloaded));
         assert!(!expected.evidence.is_shared_with(&reloaded.evidence));
@@ -3921,13 +3983,18 @@ mod tests {
         }
         let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
         // A zero budget evicts each state as soon as it is installed.
-        let knowledge = Knowledge::new(0, Timeline::new(), Some(recorder.clone()));
+        let (latest, _) = decoded_states(
+            0,
+            Timeline::new(),
+            ViewFloors::default(),
+            Some(recorder.clone()),
+        );
         let revision = Revision::from_backend(backend::Revision::new("r1".to_owned()));
         let point = SequencePoint::from_raw;
 
-        knowledge.install_fetched::<Bytes>("fetched", v(b"a"), 1, revision.clone(), point(3));
-        knowledge.install_persistent::<Bytes>("loaded", v(b"a"), 1, revision, point(5), None);
-        knowledge.install_absent_result("gone", point(7));
+        latest.install_fetched::<Bytes>("fetched", v(b"a"), 1, revision.clone(), point(3));
+        latest.install_persistent::<Bytes>("loaded", v(b"a"), 1, revision, point(5), None);
+        latest.install_absent_result("gone", point(7));
         assert_eq!(
             *recorder.0.lock().unwrap(),
             vec![
@@ -3937,12 +4004,209 @@ mod tests {
         );
     }
 
+    fn decoded_states(
+        max_size: usize,
+        timeline: Timeline,
+        views: ViewFloors,
+        sink: Option<Arc<dyn EvictionSink>>,
+    ) -> (LatestStates, EarlierStates) {
+        let cache = DecodedCache::new(max_size, sink);
+        let earlier = EarlierStates::new(cache.clone(), views);
+        (LatestStates::new(cache, earlier.clone(), timeline), earlier)
+    }
+
+    /// A codec of plain byte values, for the tests of earlier states (ADR-103).
+    struct Kept;
+
+    impl Codec for Kept {
+        type Value = Vec<u8>;
+        fn decode(_path: &ObjectPath, bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
+            Ok(bytes.to_vec())
+        }
+        fn encode(_path: &ObjectPath, value: &Vec<u8>) -> Result<Vec<u8>, StorageError> {
+            Ok(value.clone())
+        }
+        fn size(value: &Vec<u8>) -> usize {
+            value.len()
+        }
+        fn accepts(_: &ObjectPath) -> bool {
+            true
+        }
+        fn name() -> &'static str {
+            "kept"
+        }
+    }
+
+    /// Installs `value` at `path` with a new revision, as a fetch invoked at
+    /// a new point does, and returns its observation.
+    fn fetch_kept(
+        latest: &LatestStates,
+        timeline: &Timeline,
+        path: &str,
+        value: &[u8],
+    ) -> Observation<Vec<u8>> {
+        let revision = Revision::from_backend(backend::Revision::new(format!("{value:?}")));
+        let fetched =
+            latest.install_fetched::<Kept>(path, v(value), value.len(), revision, timeline.now());
+        latest
+            .to_observation::<Kept>(ObjectKey::from(path), fetched)
+            .unwrap()
+    }
+
+    /// Confirms the cached state of `path` with a check invoked at a new
+    /// point.
+    fn confirm_kept(latest: &LatestStates, timeline: &Timeline, path: &str) {
+        let key = ObjectKey::from(path);
+        let seed = latest.present_seed::<Kept>(&key, None).unwrap().unwrap();
+        latest.confirm_unchanged::<Kept>(path, seed, timeline.now());
+    }
+
+    fn floor_at(views: &ViewFloors, observed: &Observation<Vec<u8>>) -> MonotonicFloor {
+        let floor = views.new_floor();
+        floor.raise(observed.evidence.start().unwrap());
+        floor
+    }
+
+    fn value_at(earlier: &EarlierStates, path: &str, floor: &MonotonicFloor) -> Option<Vec<u8>> {
+        let point = floor.view_read(StalenessCutoff::ANY).point().unwrap();
+        earlier
+            .state_at::<Kept>(&ObjectKey::from(path), Requirement::ANY, point)
+            .unwrap()
+            .map(|observed| observed.value().unwrap().to_vec())
+    }
+
+    #[test]
+    fn a_replaced_state_stays_while_a_live_view_can_use_it() {
+        let timeline = Timeline::new();
+        let views = ViewFloors::default();
+        let (latest, earlier) = decoded_states(1 << 20, timeline.clone(), views.clone(), None);
+        earlier.keep(&ObjectKey::from("p"));
+        let first = fetch_kept(&latest, &timeline, "p", b"a");
+        confirm_kept(&latest, &timeline, "p");
+        let floor = floor_at(&views, &first);
+
+        fetch_kept(&latest, &timeline, "p", b"b");
+        assert_eq!(value_at(&earlier, "p", &floor), Some(b"a".to_vec()));
+        // A newer replacement keeps the state that covers the floor.
+        fetch_kept(&latest, &timeline, "p", b"c");
+        assert_eq!(value_at(&earlier, "p", &floor), Some(b"a".to_vec()));
+
+        // With no live view, the next replacement keeps no earlier state.
+        let point = floor.view_read(StalenessCutoff::ANY).point().unwrap();
+        drop(floor);
+        fetch_kept(&latest, &timeline, "p", b"d");
+        let at_point = earlier
+            .state_at::<Kept>(&ObjectKey::from("p"), Requirement::ANY, point)
+            .unwrap();
+        assert!(at_point.is_none());
+    }
+
+    #[test]
+    fn each_live_floor_keeps_the_newest_state_at_or_before_it_and_the_next_one() {
+        let timeline = Timeline::new();
+        let views = ViewFloors::default();
+        let (latest, earlier) = decoded_states(1 << 20, timeline.clone(), views.clone(), None);
+        earlier.keep(&ObjectKey::from("p"));
+        let first = fetch_kept(&latest, &timeline, "p", b"a");
+        confirm_kept(&latest, &timeline, "p");
+        let low = floor_at(&views, &first);
+        let second = fetch_kept(&latest, &timeline, "p", b"b");
+        confirm_kept(&latest, &timeline, "p");
+        let high = floor_at(&views, &second);
+        let third = fetch_kept(&latest, &timeline, "p", b"c");
+        confirm_kept(&latest, &timeline, "p");
+        let fourth = fetch_kept(&latest, &timeline, "p", b"d");
+        confirm_kept(&latest, &timeline, "p");
+        let fifth = fetch_kept(&latest, &timeline, "p", b"e");
+        confirm_kept(&latest, &timeline, "p");
+
+        fetch_kept(&latest, &timeline, "p", b"f");
+        assert_eq!(value_at(&earlier, "p", &low), Some(b"a".to_vec()));
+        assert_eq!(value_at(&earlier, "p", &high), Some(b"b".to_vec()));
+        // The third state is the next one after the higher floor.
+        assert_eq!(
+            value_at(&earlier, "p", &floor_at(&views, &third)),
+            Some(b"c".to_vec())
+        );
+        // No live floor used the fourth state when the path changed, so a
+        // later floor at it finds nothing.
+        assert_eq!(value_at(&earlier, "p", &floor_at(&views, &fourth)), None);
+        // The newest earlier state stays while a floor is raised, for a call
+        // that read it and has not raised its floor yet.
+        assert_eq!(
+            value_at(&earlier, "p", &floor_at(&views, &fifth)),
+            Some(b"e".to_vec())
+        );
+    }
+
+    #[test]
+    fn an_earlier_state_stays_when_the_latest_state_of_its_path_goes() {
+        let timeline = Timeline::new();
+        let views = ViewFloors::default();
+        let (latest, earlier) = decoded_states(1 << 20, timeline.clone(), views.clone(), None);
+        earlier.keep(&ObjectKey::from("p"));
+        let first = fetch_kept(&latest, &timeline, "p", b"a");
+        confirm_kept(&latest, &timeline, "p");
+        let floor = floor_at(&views, &first);
+        fetch_kept(&latest, &timeline, "p", b"b");
+
+        latest.invalidate("p");
+        assert_eq!(value_at(&earlier, "p", &floor), Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn a_state_with_no_confirmation_after_the_floor_does_not_cover_it() {
+        let timeline = Timeline::new();
+        let views = ViewFloors::default();
+        let (latest, earlier) = decoded_states(1 << 20, timeline.clone(), views.clone(), None);
+        earlier.keep(&ObjectKey::from("p"));
+        // One fetch gives an empty interval, so the state never covers its
+        // own start.
+        let first = fetch_kept(&latest, &timeline, "p", b"a");
+        let floor = floor_at(&views, &first);
+        fetch_kept(&latest, &timeline, "p", b"b");
+        assert_eq!(value_at(&earlier, "p", &floor), None);
+    }
+
+    #[test]
+    fn a_part_interval_spans_the_states_with_the_same_part() {
+        let timeline = Timeline::new();
+        let views = ViewFloors::default();
+        let (latest, earlier) = decoded_states(1 << 20, timeline.clone(), views.clone(), None);
+        earlier.keep(&ObjectKey::from("p"));
+        let first = fetch_kept(&latest, &timeline, "p", b"a1");
+        let _floor = floor_at(&views, &first);
+        let second = fetch_kept(&latest, &timeline, "p", b"a2");
+        let head = |value: &Vec<u8>| Some(value[0]);
+        let tail = |value: &Vec<u8>| Some(value[1]);
+
+        let interval = earlier
+            .part_interval::<Kept, _>(&second, head)
+            .unwrap()
+            .unwrap();
+        assert_eq!(interval.start, first.evidence.start().unwrap());
+        assert!(!interval.cached_changed);
+
+        // The part that changed starts with the newer state, and the cached
+        // state shows the change to the older one.
+        let interval = earlier
+            .part_interval::<Kept, _>(&second, tail)
+            .unwrap()
+            .unwrap();
+        assert_eq!(interval.start, second.evidence.start().unwrap());
+        let interval = earlier
+            .part_interval::<Kept, _>(&first, tail)
+            .unwrap()
+            .unwrap();
+        assert!(interval.cached_changed);
+    }
+
     #[test]
     fn only_watermarks_newer_than_the_persistent_copy_are_unpersisted() {
-        let knowledge = Knowledge::new(1 << 20, Timeline::new(), None);
+        let (latest, _) = decoded_states(1 << 20, Timeline::new(), ViewFloors::default(), None);
         let revision = Revision::from_backend(backend::Revision::new("r1".to_owned()));
         let point = SequencePoint::from_raw;
-        let advanced = knowledge.install_persistent::<Bytes>(
+        let advanced = latest.install_persistent::<Bytes>(
             "advanced",
             v(b"a"),
             1,
@@ -3950,13 +4214,13 @@ mod tests {
             point(5),
             None,
         );
-        knowledge.install_persistent::<Bytes>("same", v(b"a"), 1, revision.clone(), point(5), None);
+        latest.install_persistent::<Bytes>("same", v(b"a"), 1, revision.clone(), point(5), None);
         // The persistent cache has no copy of a fetched state until its
         // publication.
-        knowledge.install_fetched::<Bytes>("fetched", v(b"a"), 1, revision.clone(), point(7));
-        knowledge.confirm_unchanged("advanced", advanced, point(9));
+        latest.install_fetched::<Bytes>("fetched", v(b"a"), 1, revision.clone(), point(7));
+        latest.confirm_unchanged::<Bytes>("advanced", advanced, point(9));
 
-        let unpersisted: BTreeMap<_, _> = knowledge
+        let unpersisted: BTreeMap<_, _> = latest
             .present_states()
             .into_iter()
             .map(|(path, _, evidence)| (path, evidence))

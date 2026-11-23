@@ -10,16 +10,52 @@
 use std::sync::Arc;
 
 use glassdb_concurr::{RetrySchedule, rt};
-use glassdb_data::{LogicalKey, TxId};
+use glassdb_data::{CollectionAddress, LogicalKey, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{Requirement, StorageError, Timeline};
 
-use crate::access::ReadEvidence;
+use crate::access::{ReadEvidence, ScanMutation, ScanRange};
 use crate::error::trans_to_storage;
-use crate::key_resolver::KeyResolver;
+use crate::key_resolver::{KeyResolver, ScanResult};
 use crate::key_state_resolver::ResolvedValue;
 
 const READ_UNAVAILABLE_RETRIES: usize = 5;
+
+/// Reads the keys of one execution of a transaction body. The reader is fixed
+/// for the execution: the first execution of a stale view call reads at the
+/// floor of the view (ADR-103), and a body replay gets another reader.
+#[derive(Clone)]
+pub struct BodyReader {
+    reader: Reader,
+    resolver: KeyResolver,
+}
+
+impl BodyReader {
+    pub(crate) fn new(resolver: KeyResolver, timeline: Timeline, retry: RetrySchedule) -> Self {
+        Self {
+            reader: Reader::new(resolver.clone(), timeline, retry),
+            resolver,
+        }
+    }
+
+    /// Reads one logical key from any usable cached state. The transaction
+    /// validates the read later.
+    pub async fn read(&self, key: &LogicalKey) -> Result<ReadOutcome, StorageError> {
+        self.reader.read(key).await
+    }
+
+    /// Scans one logical key range and returns its validation evidence.
+    pub async fn scan(
+        &self,
+        collection: &CollectionAddress,
+        range: &ScanRange,
+        overlay: &[ScanMutation],
+    ) -> Result<ScanResult, StorageError> {
+        self.resolver
+            .scan_keys(collection, range, overlay, None, None)
+            .await
+    }
+}
 
 /// The result of reading a key: the raw value and its writer. The writer is the
 /// *effective writer* the read resolved through, which optimistic validation

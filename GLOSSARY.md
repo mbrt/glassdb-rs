@@ -363,6 +363,14 @@ A stale read-only transaction that reads only one key.
 The span of sequence points over which one observed state of an object is known to be current: from the completion of the first operation that observed the state to its currentness watermark.
 _Avoid_: Validity window, version lifetime
 
+**Earlier state**:
+An observed state of one object that a newer observed state replaced in the decoded cache, kept with its currentness interval.
+_Avoid_: Version, history entry, old revision
+
+**Key interval**:
+The span of sequence points over which one logical key is known to have kept one committed writer: from the earliest start to the latest currentness watermark among the known leaf states that show the key with that writer.
+_Avoid_: Key version lifetime
+
 **Stale read-only transaction**:
 A read-only transaction that accepts the state of the database at one cut point within a stated age, instead of a cut point after the start of the call.
 _Avoid_: Snapshot transaction, follower read
@@ -372,7 +380,7 @@ The one sequence point at which every state that a read-only transaction depends
 _Avoid_: Snapshot timestamp, read version
 
 **Monotonic floor**:
-The earliest cut point that the next stale read-only transaction of a stale view can use.
+The earliest cut point that the next stale read-only transaction of a stale view can use. The transaction cuts at the floor when it can.
 _Avoid_: Session watermark, read floor
 
 **Stale view**:

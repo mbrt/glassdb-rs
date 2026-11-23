@@ -1,0 +1,16 @@
+# Stale read-only transactions of one and of ten keys with one view for each
+# worker, with a bound of 250 ms, and a writer, on the same leaves of one
+# collection. Most calls use cached leaf states only, so a window of 2 s has
+# about 85,000 transactions of `stale-view-single`. The floors of the views
+# move about eight times in the window. The writer only gives the load, and
+# `stale-reads-shared-leaves` measures it.
+# The CI comparison runs it 32 times with latency jitter.
+tags = ["ci/timing", "area/read"]
+include = ["../configs/ci-timing.toml", "../configs/stale-reads-shared-leaves.toml"]
+
+[cell]
+workload = "stale-view-shared-leaves"
+
+[cell.measure]
+duration = "2s"
+max-duration = "2s"

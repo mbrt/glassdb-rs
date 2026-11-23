@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use glassdb_concurr::shard;
-use glassdb_storage::cache::{Cache, Weighable};
+use glassdb_storage::cache::{Cache, Slot, Weighable};
 
 const WORKING_SET_SIZES: [usize; 3] = [1_000, 10_000, 100_000];
 const ENTRY_BYTES: usize = 64;
@@ -66,7 +66,7 @@ fn filled_cache(keys: &[String]) -> Cache<Payload> {
     let max_size = n * ENTRY_BYTES * n_shards * 2 + n_shards * 1024;
     let cache = Cache::new(max_size);
     for k in keys {
-        cache.set(k, Payload::new());
+        cache.update(Slot::Latest, k, |_| Some(Payload::new()));
     }
     cache
 }
@@ -84,7 +84,7 @@ fn bench_get(c: &mut Criterion) {
             b.iter(|| {
                 let k = &keys[i % n];
                 i = i.wrapping_add(1);
-                cache.get(k)
+                cache.get(Slot::Latest, k)
             });
         });
     }
@@ -104,7 +104,7 @@ fn bench_update(c: &mut Criterion) {
             b.iter(|| {
                 let k = &keys[i % n];
                 i = i.wrapping_add(1);
-                cache.update(k, |old| old.or_else(|| Some(Payload::new())));
+                cache.update(Slot::Latest, k, |old| old.or_else(|| Some(Payload::new())));
             });
         });
     }
@@ -125,8 +125,8 @@ fn bench_churn(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             let mut i = 0usize;
             b.iter(|| {
-                cache.set(&keys[i % pool], Payload::new());
-                cache.delete(&keys[(i + n) % pool]);
+                cache.update(Slot::Latest, &keys[i % pool], |_| Some(Payload::new()));
+                cache.delete(Slot::Latest, &keys[(i + n) % pool]);
                 i = i.wrapping_add(1);
             });
         });

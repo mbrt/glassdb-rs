@@ -12,6 +12,7 @@ mod leaf;
 mod lock;
 mod node;
 mod node_store;
+mod stale_view;
 mod structural_intent;
 mod structural_intent_store;
 mod timeline;
@@ -37,8 +38,8 @@ pub mod sim {
 
 pub use cache_stats::CacheStats;
 pub use cached_store::{
-    CachedStore, CasReceipt, CasResult, CasRetries, Converged, CutSearch, CutTarget, Decision,
-    Observation, ObservationCheck, Revision,
+    CachedStore, CasReceipt, CasResult, CasRetries, Converged, CutKey, CutSearch, CutTarget,
+    Decision, Observation, ObservationCheck, Revision,
 };
 pub use collection_store::{CollectionRecord, CollectionStore};
 pub use disk_cache::{
@@ -53,13 +54,12 @@ pub use node::{
     NodeSizePolicyBuilder,
 };
 pub use node_store::{
-    LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodePage, NodeStore,
+    LeafEdit, LeafObservation, LeafObservationCheck, LoadedLeaf, NodePage, NodeReads, NodeStore,
 };
+pub use stale_view::{MonotonicFloor, ViewFloors, ViewRead};
 pub use structural_intent::{
     MergeTarget, StructuralChange, StructuralIntent, StructuralIntentPhase,
 };
 pub use structural_intent_store::{StructuralIntentPage, StructuralIntentStore};
-pub use timeline::{
-    CurrentnessBarrier, MonotonicFloor, Requirement, SequencePoint, StalenessCutoff, Timeline,
-};
+pub use timeline::{CurrentnessBarrier, Requirement, SequencePoint, StalenessCutoff, Timeline};
 pub use tree_router::{RoutedLeaf, RoutedLeafGroup, TreeRouter};

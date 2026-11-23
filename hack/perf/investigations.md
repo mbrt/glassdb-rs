@@ -66,6 +66,211 @@ each run. The likely cause is that model wall time starts at the real time of
 the process (`rt::system_now`), so encoded timestamps change their length.
 This was not traced. The byte threshold of the report already hides it.
 
+## 2026-11-20: a stale view that keeps its cut point
+
+Status: a prototype made the stale view calls of the `stale-reads` grid cost
+almost no backend operation at every writer count, also with the bound on each
+call. It is the evidence for
+[ADR-103](../../docs/adr/103-a-stale-view-keeps-its-cut-point.md). The
+prototype was not committed. The committed change has the same results (see
+the last section).
+
+### The question
+
+At `5b681e0b8`, a stale view call of 10 keys costs about as much as
+`Database::tx`. After each call, the floor rises to the latest start among the
+states of its cut. A local writer installs a new leaf state almost all the
+time, so the floor follows the present, and the next call checks most of its
+states. The question was what a view needs to cut at a past point with no
+check.
+
+### Variants
+
+The prototype added these parts one at a time. Environment variables switched
+them, so one binary ran all variants:
+
+- **Fixed point**: the bound applies only to the first call of a view. Later
+  calls have no cutoff, and the body reads at the floor of the view.
+- **History**: the decoded cache keeps up to eight replaced states for each
+  node path. A read at the floor uses the state whose interval covers the
+  floor.
+- **Early replay**: a call that read an earlier state and then missed the
+  floor replays at the newest states before any check.
+- **Key intervals**: the cut of a view call uses the interval over which each
+  read key kept its writer, from every known state of its leaf. A lagging key
+  passes a check when the new leaf state shows the same writer.
+
+All runs used `--backend=memory --delays=s3 --prefix-depth=3 --time=virtual`,
+the `stale-reads` experiment, and 30 s measure windows
+(`--set=cell.measure.until="duration" --set=cell.measure.duration="30s"`).
+Runs with one reader shape set
+`workloads.stale-reads.groups.all.shapes`, and runs with more instances set
+`cell.databases`. Temporary counters printed `DBG gla65` lines.
+
+### Results by variant
+
+Mean latency of `ro-multi-view` in ms. A range or a list shows repeated runs:
+
+| Case | Baseline | Fixed point only | + history | + early replay | + key intervals |
+| --- | --- | --- | --- | --- | --- |
+| 1 writer, 1 instance | 36 | 30 | 0.5 | 0.6 | 0.21 |
+| 1 writer, 2 instances | 29 to 40 | - | 3.5 | 0.2 | 0.28 |
+| 50 writers, 1 instance | 39 to 93 | 78 | 102 to 106 | 4 to 46 | 3.1, 4.6 |
+| 50 writers, 2 instances | 48, 65 | - | 34, 65 | 22, 61 | 11, 20 |
+
+The fixed point alone changed little: with no earlier states, a call that
+used a new state still moved the floor. History alone made 50 writers worse.
+A call that missed the floor checked the earlier states that it had read, and
+those checks always found a change, so the call paid a second round. Early
+replay removed the second round.
+
+The cells at 50 writers vary up to two times between runs of the same
+variant, also in the baseline. Compare them only roughly.
+
+### Why leaf intervals miss at 50 writers
+
+With history and early replay, about half of the leaves of each 10-key call
+had no state that covered the floor. The counters sorted these misses on one
+instance, at 50 writers:
+
+| | Depth 8 | Depth 64 |
+| --- | --- | --- |
+| Misses | 3648 | 3822 |
+| Gap shorter than 100 ms | 3162 | 3285 |
+| Gap of 100 ms or more | 481 | 536 |
+| Mean gap | 76 ms | 76 ms |
+| No earlier state left | 1 | 0 |
+
+A local CAS proves that the old state was current until the CAS was invoked,
+and the new state is known current only after it is installed. The write took
+effect at an unknown point between the two, so a floor in this gap has no
+state. The gap is about one write round. The backend writes of the cell give an
+estimate of 6 writes for each leaf in each second, so about 45% of the leaves
+are in a gap at any point. More depth did not help.
+
+### Key intervals
+
+A write changes one or a few of the about 64 keys of a leaf. The committed
+writer of a key never comes back after it changes, so a key with the same
+writer in two leaf states did not change between them. The key interval spans
+the write gaps of the other keys.
+
+With key intervals, at 50 writers on one instance, 96.7% of the calls cut at
+the floor (41,297 of 42,700), and 0.16 checks were needed for each call.
+
+### The full grid
+
+Mean latency in ms on one instance, `5b681e0b8` against the prototype with all
+parts:
+
+| Writers of each shape | 1 | 50 | 100 | 200 |
+| --- | --- | --- | --- | --- |
+| `ro-multi-view` | 31 → 0.12 | 100 → 3.3 | 128 → 3.3 | 155 → 4.8 |
+| `ro-single-view` | 10 → 0.01 | 32 → 0.32 | 14 → 0.51 | 55 → 0.58 |
+| `ro-multi-stale` | 32 → 0.08 | 91 → 1.1 | 127 → 1.7 | 158 → 2.7 |
+
+- The median of these three shapes was 0.05 ms or less in every cell.
+- `ro-single`, `ro-multi`, `ro-single-stale`, and the writers did not change.
+  At 200 writers, the writers committed 54,801 transactions before and 54,621
+  after. No cell had failures.
+- `ro-multi-stale` uses a new view for each call, so its gain comes from the
+  key intervals alone.
+- The earlier states used 75 MB in this run, and 26 to 95 MB in the other runs.
+
+### The remaining cost with several instances
+
+At 50 writers of each shape, the median of `ro-multi-view` was 0.05 ms and the
+90th percentile about 31 ms on 2 and on 4 instances:
+
+| | 2 instances | 4 instances |
+| --- | --- | --- |
+| Calls at the floor | 96.6% | 97.2% |
+| Moves of the floor | 202 | 179 |
+| Moves where a read key changed after the floor | 184 | 154 |
+| Checks for each call | 1.15 | 1.5 |
+| Checks that passed only because the key kept its writer | 78% | 82% |
+
+The floor moves when a call reads a key for the first time after the floor,
+and a foreign writer changed the key before any confirmation after the floor.
+After a move, each leaf needs one confirmation after the new floor, because a
+foreign write does not advance the interval of the state that it replaces. So
+the cost is about one check for each leaf after each move, with a move about
+every 30 calls.
+
+### A bound on each call
+
+The variants above apply the bound only to the first call of a view, which is
+the same as a view with `Duration::MAX`. A last variant kept the bound on each
+call: a call reads at the floor only while the floor is
+within its cutoff, and otherwise moves the floor. With the 5 s bound of the
+experiment, mean latency in ms (median 0.05 ms or less in every cell):
+
+| Writers of each shape | 1 | 50 | 100 | 200 |
+| --- | --- | --- | --- | --- |
+| `ro-multi-view`, first call only | 0.12 | 3.3 | 3.3 | 4.8 |
+| `ro-multi-view`, each call | 0.12 | 3.0 | 3.9 | 5.0 |
+| `ro-single-view`, first call only | 0.01 | 0.32 | 0.51 | 0.58 |
+| `ro-single-view`, each call | 0.02 | 0.43 | 0.47 | 0.70 |
+
+The difference is within the variance between runs. The writers committed the
+same number of transactions in both runs. In the whole grid with the bound on
+each call, the views moved their floor 1,886 times in 5.5 million calls. With
+50 writers of each shape on two instances, two runs of `ro-multi-view` had a
+mean of 10.6 ms and a 90th percentile of 35 ms. That is in the range of the
+variant with the bound on the first call only.
+
+### The committed change
+
+The committed change keeps earlier states only for the leaves that a view
+read, and keeps a fixed number of them for each floor, plus the newest one
+while a floor is raised
+([ADR-103](../../docs/adr/103-a-stale-view-keeps-its-cut-point.md)). The
+earlier states of a path are a cache entry of their own. Mean latency in ms on
+the full grid, `5b681e0b8` against the change, one run (median 0.051 ms or
+less for these shapes after the change in every cell):
+
+| Writers of each shape | 1 | 50 | 100 | 200 |
+| --- | --- | --- | --- | --- |
+| `ro-multi-view` | 31 → 0.15 | 100 → 3.0 | 128 → 3.4 | 155 → 4.3 |
+| `ro-single-view` | 10 → 0.02 | 32 → 0.37 | 14 → 0.53 | 55 → 0.67 |
+| `ro-multi-stale` | 32 → 0.11 | 91 → 1.9 | 127 → 1.8 | 158 → 3.4 |
+
+Three earlier versions gave about the same numbers in one run each. Without
+the newest earlier state, `ro-multi-view` had 0.18, 3.9, 3.4, and 4.7 ms. With the
+earlier states of every leaf in the cache entry of its latest state,
+`ro-multi-view` had 0.11, 3.0, 3.1, and 5.0 ms. With the earlier states of
+every leaf in an entry of their own, it had 0.17, 3.8, 3.8, and 5.6 ms.
+
+The `Database::tx` shapes, `ro-single-stale`, and the writers did not change,
+and no cell had failures.
+
+A first version kept, for each floor, only the newest state that started at or
+before it. Two runs of each rule, mean latency in ms:
+
+| Writers | Shape | Every later state | One state for each floor | Two states for each floor |
+| --- | --- | --- | --- | --- |
+| 50 | `ro-multi-view` | 2.7 | 5.2, 4.0 | 2.9, 3.1 |
+| 50 | `ro-single-view` | 0.26 | 0.52, 0.55 | 0.37, 0.30 |
+| 200 | `ro-multi-view` | 5.1 | 4.9, 4.9 | 5.7, 5.2 |
+| 200 | `ro-single-view` | 0.70 | 1.08, 0.95 | 0.68, 0.72 |
+
+The "every later state" column is one run of the rule that ADR-103 first had.
+With one state for each floor, a key that the write after the floor did not
+change loses the end of its interval when a later write changes it, so the view
+moves.
+
+### Conclusions
+
+- A view needs a point that it keeps, the earlier states of each leaf, and the
+  interval of each key. Each part alone gives little.
+- A bound on each call costs almost nothing more than a bound on the first
+  call only, so ADR-103 keeps the bound on each call.
+- The prototype kept earlier states for index nodes too, and did not limit
+  their memory. The committed change keeps them for leaves only, and two for
+  each floor of the live views.
+- A round of checks over the working set of a view right after a move could
+  reduce the remaining cost with several instances. It was not tried.
+
 ## 2026-11-20: direct structural lock CASes beside coordinator rounds
 
 Status: no coordinator round lost its leaf CAS to a structural change. The

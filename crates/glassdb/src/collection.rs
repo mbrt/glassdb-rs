@@ -192,7 +192,7 @@ impl Collection {
     pub fn stale(&self, max_staleness: Duration) -> StaleCollectionView {
         StaleCollectionView {
             collection: self.clone(),
-            state: StaleViewState::new(max_staleness),
+            state: StaleViewState::new(&self.db.engine, max_staleness),
         }
     }
 

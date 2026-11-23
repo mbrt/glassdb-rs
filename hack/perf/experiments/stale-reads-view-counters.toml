@@ -1,0 +1,11 @@
+# The counters of `stale-reads-view`: one run without latency jitter, in a
+# window of 500 ms, after the warm-up that loads the leaves into the cache.
+tags = ["ci/counters", "area/read"]
+include = ["../configs/default.toml", "../configs/stale-reads-shared-leaves.toml"]
+
+[cell]
+workload = "stale-view-shared-leaves"
+
+[cell.measure]
+duration = "500ms"
+max-duration = "500ms"

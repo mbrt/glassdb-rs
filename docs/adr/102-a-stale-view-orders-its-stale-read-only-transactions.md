@@ -12,6 +12,10 @@ the floor do not change. It also changes the shared floor of
 that a read-only `Database::tx` uses in
 [ADR-099](099-read-only-transactions-certify-at-a-zero-staleness-cut-point.md).
 
+[ADR-103](103-a-stale-view-keeps-its-cut-point.md) keeps the cut point of a
+view while it is within the bound, and removes the guarantees of a view about
+the writes of its own instance.
+
 ## Context
 
 ADR-097 gives each database instance one monotonic floor. After a stale

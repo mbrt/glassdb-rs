@@ -1,5 +1,5 @@
 //! Cut-point search over the currentness intervals of retained observations
-//! (ADR-097).
+//! (ADR-097) and of the keys that they show (ADR-103).
 //!
 //! Changes to this module require the review in
 //! `docs/guides/storage-consistency.md` (E5).
@@ -9,9 +9,8 @@ use std::collections::BTreeMap;
 use glassdb_data::ObjectPath;
 
 use super::Observation;
-use crate::timeline::{
-    CurrentnessBarrier, MonotonicFloor, SequencePoint, StalenessCutoff, Timeline,
-};
+use crate::stale_view::MonotonicFloor;
+use crate::timeline::{CurrentnessBarrier, SequencePoint, StalenessCutoff, Timeline};
 
 /// The currentness intervals of the states that one stale read-only
 /// transaction depends on.
@@ -22,6 +21,31 @@ pub struct CutSearch {
     latest_start: SequencePoint,
     states: usize,
     unknown_start: bool,
+}
+
+/// The interval of one read key in a cut search (ADR-103). It spans every
+/// known state of the leaf of the key that shows the key unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct CutKey {
+    watermark: SequencePoint,
+    cached_changed: bool,
+}
+
+impl CutKey {
+    /// The interval of a key read from `observed` when the key has no
+    /// interval of its own: the interval of the state.
+    pub(super) fn of_state<V>(observed: &Observation<V>) -> Self {
+        Self {
+            watermark: observed.current_after(),
+            cached_changed: false,
+        }
+    }
+
+    /// Reports whether the cached state of the leaf already shows the key
+    /// changed. Then a key that does not reach a target cannot reach it.
+    pub fn cached_changed(&self) -> bool {
+        self.cached_changed
+    }
 }
 
 /// A planned cut point and the barrier for the checks that reach it.
@@ -68,6 +92,23 @@ impl CutSearch {
         }
     }
 
+    /// Adds the interval of one read key, with the start and the watermark
+    /// that [`EarlierStates::part_interval`](super::earlier::EarlierStates::part_interval)
+    /// found.
+    pub(super) fn add_key(
+        &mut self,
+        start: SequencePoint,
+        watermark: SequencePoint,
+        cached_changed: bool,
+    ) -> CutKey {
+        self.states += 1;
+        self.latest_start = self.latest_start.max(start);
+        CutKey {
+            watermark,
+            cached_changed,
+        }
+    }
+
     /// Plans a cut point not before `cutoff` and not before `floor`, if there
     /// is one, or returns `None` when no state can supply one.
     ///
@@ -107,6 +148,11 @@ impl CutTarget {
     /// barrier when the target does not become a cut point.
     pub fn barrier(&self) -> CurrentnessBarrier {
         self.barrier
+    }
+
+    /// Reports whether a key already covers the target without a check.
+    pub fn is_reached_by_key(&self, key: &CutKey) -> bool {
+        key.watermark >= self.target
     }
 
     /// Reports whether a state already covers the target without a check.

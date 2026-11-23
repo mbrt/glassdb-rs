@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use glassdb_concurr::rt;
 
+use crate::stale_view::MonotonicFloor;
+
 /// A point on one database-local [`Timeline`].
 ///
 /// Sequence points may be persisted only to chain cache evidence across opens
@@ -114,31 +116,12 @@ impl StalenessCutoff {
     }
 }
 
-/// The earliest cut point that the next stale read-only transaction of a
-/// stale view can use (ADR-097, ADR-102). Clones share one floor.
-///
-/// It only rises. Use it only with the timeline of the database instance of
-/// its view.
-#[derive(Debug, Clone, Default)]
-pub struct MonotonicFloor(Arc<AtomicU64>);
-
+// The barrier point stays private to this module, so the floor of a stale view
+// rises to a barrier here.
 impl MonotonicFloor {
-    /// Creates a floor that admits every cut point.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Raises the floor to a barrier captured after completed work.
     pub fn raise_to_barrier(&self, barrier: CurrentnessBarrier) {
         self.raise(barrier.point);
-    }
-
-    pub(crate) fn get(&self) -> SequencePoint {
-        SequencePoint(self.0.load(Ordering::SeqCst))
-    }
-
-    pub(crate) fn raise(&self, point: SequencePoint) {
-        self.0.fetch_max(point.0, Ordering::SeqCst);
     }
 }
 

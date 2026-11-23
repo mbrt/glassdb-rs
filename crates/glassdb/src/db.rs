@@ -388,7 +388,8 @@ impl Database {
     /// bound `max_staleness`.
     ///
     /// Each call returns a view with its own order, so the calls through two
-    /// views are not ordered with each other. See
+    /// views are not ordered with each other. While a view lives, the cache
+    /// keeps the earlier states that its cut point can use. See
     /// [`StaleDatabaseView::read_tx`].
     ///
     /// Each collection helper of the view is the same as a
@@ -397,7 +398,7 @@ impl Database {
     pub fn stale(&self, max_staleness: Duration) -> StaleDatabaseView {
         StaleDatabaseView {
             inner: self.inner.clone(),
-            state: StaleViewState::new(max_staleness),
+            state: StaleViewState::new(&self.inner.engine, max_staleness),
         }
     }
 
@@ -495,15 +496,21 @@ impl StaleDatabaseView {
     /// The body sees the state of the database at one instant, its cut point.
     /// The cut point is at most the bound of this view older than the start of
     /// this call, on the clock of this instance, and `Duration::MAX` accepts
-    /// any age. The result is serializable, and it contains every write that
-    /// this instance committed before the call.
+    /// any age. The result is serializable.
     ///
     /// The calls through this view and through its clones are ordered: a call
     /// sees every transaction whose effect an earlier call saw. Calls through
     /// two different views are not ordered. A call through a new view can
     /// miss, on one key, a write that a call through another view saw on
-    /// another key. For each key, a call never returns an older state than an
-    /// earlier transaction of this instance saw.
+    /// another key.
+    ///
+    /// A view keeps the cut point of its earlier calls while that point is
+    /// within the bound and the cache still has the states of that point. So a
+    /// call can miss a write that this instance committed within the bound
+    /// before the call, also a write that an earlier transaction of this
+    /// instance saw. With `Duration::MAX`, the view gives one consistent state
+    /// that changes only when the cache does not have a state at its cut
+    /// point. Use a new view to read newer data.
     ///
     /// With a warm cache, a stale read-only transaction can finish with no
     /// backend operation. When the cache cannot supply a cut point, it
@@ -513,12 +520,9 @@ impl StaleDatabaseView {
     /// With a view whose bound is `Duration::ZERO`, the result and the cost
     /// are the same as those of a read-only [`Database::tx`]. The result
     /// contains every transaction of any instance that committed before the
-    /// call started.
-    ///
-    /// With a bound above zero, a `read_tx` that follows a [`Database::tx`] of
-    /// the same instance can miss a write of another instance that the `tx`
-    /// saw. Use a view with a zero bound, or [`Database::tx`], when the reads
-    /// must follow everything that this instance observed.
+    /// call started. Use a view with a zero bound, or [`Database::tx`], when
+    /// the reads must follow everything that this instance wrote or
+    /// observed.
     pub async fn read_tx<T, F, Fut>(&self, mut f: F) -> Result<T, Error>
     where
         F: FnMut(ReadTransaction) -> Fut + Send,
@@ -563,7 +567,8 @@ impl StaleDatabaseView {
 }
 
 /// The staleness bound and the monotonic floor of one stale view. Clones
-/// share the floor, so they share the order of the view (ADR-102).
+/// share the floor, so they share the order of the view (ADR-102), and read
+/// at the floor while it is within the bound (ADR-103).
 #[derive(Clone)]
 pub(crate) struct StaleViewState {
     max_staleness: Duration,
@@ -571,10 +576,10 @@ pub(crate) struct StaleViewState {
 }
 
 impl StaleViewState {
-    pub(crate) fn new(max_staleness: Duration) -> Self {
+    pub(crate) fn new(engine: &Engine, max_staleness: Duration) -> Self {
         Self {
             max_staleness,
-            floor: MonotonicFloor::new(),
+            floor: engine.new_view_floor(),
         }
     }
 }
@@ -766,6 +771,7 @@ impl DbInner {
                 self.clone(),
                 *driver.handle.id(),
                 driver.handle.collection_reservations(),
+                self.engine.body_reader(driver.handle.next_view_read()),
             );
             let body_outcome = f(tx.handle()).await;
 

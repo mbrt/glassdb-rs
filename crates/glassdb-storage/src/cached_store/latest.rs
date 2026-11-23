@@ -1,55 +1,13 @@
-//! Decoded present/absent knowledge and type-safe cache transitions.
+//! The latest known state of each path, and its type-safe cache transitions.
 
-use std::any::Any;
 use std::sync::Arc;
 
-use crate::cache::{Cache, EvictionHook, Weighable};
 use crate::error::StorageError;
 use crate::timeline::{SequencePoint, Timeline};
 
+use super::earlier::EarlierStates;
+use super::entry::{DecodedCache, ErasedValue, LatestState, downcast};
 use super::{Codec, Evidence, ObjectKey, Observation, Requirement, Revision};
-
-type ErasedValue = Arc<dyn Any + Send + Sync>;
-
-/// Receives each present state that the decoded cache evicts for capacity,
-/// so that the persistent cache can keep its newest watermark (ADR-097).
-pub(super) trait EvictionSink: Send + Sync {
-    fn evicted(&self, path: &str, revision: &Revision, evidence: &Evidence);
-}
-
-/// One entry in the shared decoded LRU: either a present decoded value or a
-/// confirmed absence. A missing object has no entry at all.
-#[derive(Clone)]
-enum EntryState {
-    Present {
-        value: ErasedValue,
-        size: usize,
-        revision: Revision,
-        evidence: Evidence,
-    },
-    Absent {
-        evidence: Evidence,
-    },
-}
-
-#[derive(Clone)]
-struct CacheEntry {
-    state: EntryState,
-}
-
-impl Weighable for CacheEntry {
-    fn size(&self) -> usize {
-        // A present entry weighs its decoded size plus the revision token; an
-        // absent entry costs a small fixed bookkeeping amount.
-        const OVERHEAD: usize = std::mem::size_of::<CacheEntry>();
-        match &self.state {
-            EntryState::Present { size, revision, .. } => {
-                size + revision.serialize().len() + OVERHEAD
-            }
-            EntryState::Absent { .. } => OVERHEAD,
-        }
-    }
-}
 
 /// The type-erased result shared by compatible readers of one flight.
 #[derive(Clone)]
@@ -156,12 +114,12 @@ impl Expected {
         }
     }
 
-    fn capture_cached(&mut self, entry: Option<CacheEntry>) {
-        let cached = match (&self.predicate, entry.map(|entry| entry.state)) {
-            (ExpectedPredicate::Absent, Some(EntryState::Absent { evidence })) => Some(evidence),
+    fn capture_cached(&mut self, state: Option<LatestState>) {
+        let cached = match (&self.predicate, state) {
+            (ExpectedPredicate::Absent, Some(LatestState::Absent { evidence })) => Some(evidence),
             (
                 ExpectedPredicate::Present(revision),
-                Some(EntryState::Present {
+                Some(LatestState::Present {
                     revision: cached_revision,
                     evidence,
                     ..
@@ -178,12 +136,12 @@ impl Expected {
         self.evidence.advance(invoked);
     }
 
-    fn matches(&self, entry: &CacheEntry) -> bool {
-        match (&self.predicate, &entry.state) {
-            (ExpectedPredicate::Absent, EntryState::Absent { .. }) => true,
+    fn matches(&self, state: &LatestState) -> bool {
+        match (&self.predicate, state) {
+            (ExpectedPredicate::Absent, LatestState::Absent { .. }) => true,
             (
                 ExpectedPredicate::Present(revision),
-                EntryState::Present {
+                LatestState::Present {
                     revision: current, ..
                 },
             ) => revision == current,
@@ -192,39 +150,22 @@ impl Expected {
     }
 }
 
-/// Owns all discoverable decoded knowledge for physical object paths.
+/// Owns the latest known state of each physical object path. A replaced leaf
+/// state goes to the earlier states of its path in the same cache update.
 #[derive(Clone)]
-pub(super) struct Knowledge {
-    cache: Arc<Cache<CacheEntry>>,
+pub(super) struct LatestStates {
+    cache: DecodedCache,
+    earlier: EarlierStates,
     /// Marks the completion of the operations that observe a state, for the
     /// start of its currentness interval (ADR-097).
     timeline: Timeline,
 }
 
-impl Knowledge {
-    /// Creates the decoded cache. When `sink` is set, the cache passes to it
-    /// each present state that it evicts for capacity.
-    pub(super) fn new(
-        max_size: usize,
-        timeline: Timeline,
-        sink: Option<Arc<dyn EvictionSink>>,
-    ) -> Self {
-        let cache = match sink {
-            Some(sink) => {
-                let hook: EvictionHook<CacheEntry> = Box::new(move |path, entry| {
-                    if let EntryState::Present {
-                        revision, evidence, ..
-                    } = entry.state
-                    {
-                        sink.evicted(path, &revision, &evidence);
-                    }
-                });
-                Cache::with_eviction(max_size, hook)
-            }
-            None => Cache::new(max_size),
-        };
+impl LatestStates {
+    pub(super) fn new(cache: DecodedCache, earlier: EarlierStates, timeline: Timeline) -> Self {
         Self {
-            cache: Arc::new(cache),
+            cache,
+            earlier,
             timeline,
         }
     }
@@ -233,13 +174,13 @@ impl Knowledge {
     /// evidence.
     pub(super) fn present_states(&self) -> Vec<(String, Revision, Evidence)> {
         self.cache
-            .entries()
+            .latest_states()
             .into_iter()
-            .filter_map(|(path, entry)| match entry.state {
-                EntryState::Present {
+            .filter_map(|(path, state)| match state {
+                LatestState::Present {
                     revision, evidence, ..
                 } => Some((path, revision, evidence)),
-                EntryState::Absent { .. } => None,
+                LatestState::Absent { .. } => None,
             })
             .collect()
     }
@@ -250,11 +191,11 @@ impl Knowledge {
         key: &ObjectKey,
         req: Requirement,
     ) -> Result<Option<Observation<C::Value>>, StorageError> {
-        let Some(entry) = self.cache.get(key.as_str()) else {
+        let Some(state) = self.cache.latest(key.as_str()) else {
             return Ok(None);
         };
-        match entry.state {
-            EntryState::Present {
+        match state {
+            LatestState::Present {
                 value,
                 revision,
                 evidence,
@@ -271,7 +212,7 @@ impl Knowledge {
                     evidence,
                 }))
             }
-            EntryState::Absent { evidence } => {
+            LatestState::Absent { evidence } => {
                 if !req.is_satisfied_by(evidence.get()) {
                     return Ok(None);
                 }
@@ -290,15 +231,12 @@ impl Knowledge {
         key: &ObjectKey,
         fallback: Option<&Observation<C::Value>>,
     ) -> Result<Option<PresentSeed>, StorageError> {
-        if let Some(CacheEntry {
-            state:
-                EntryState::Present {
-                    value,
-                    size,
-                    revision,
-                    evidence,
-                },
-        }) = self.cache.get(key.as_str())
+        if let Some(LatestState::Present {
+            value,
+            size,
+            revision,
+            evidence,
+        }) = self.cache.latest(key.as_str())
         {
             downcast::<C>(key.as_str(), value.clone())?;
             return Ok(Some(PresentSeed {
@@ -382,7 +320,7 @@ impl Knowledge {
         current_after: SequencePoint,
     ) -> FetchResult {
         let erased: ErasedValue = value;
-        let evidence = self.install_observed(
+        let evidence = self.install_observed::<C>(
             path,
             erased.clone(),
             size,
@@ -405,7 +343,7 @@ impl Knowledge {
         current_after: SequencePoint,
     ) -> Observation<C::Value> {
         let erased: ErasedValue = value.clone();
-        let evidence = self.install_observed(
+        let evidence = self.install_observed::<C>(
             key.as_str(),
             erased,
             size,
@@ -446,14 +384,14 @@ impl Knowledge {
         }
     }
 
-    pub(super) fn confirm_unchanged(
+    pub(super) fn confirm_unchanged<C: Codec>(
         &self,
         path: &str,
         seed: PresentSeed,
         current_after: SequencePoint,
     ) -> FetchResult {
         seed.evidence.advance(current_after);
-        let evidence = self.install_observed(
+        let evidence = self.install_observed::<C>(
             path,
             seed.value.clone(),
             seed.size,
@@ -497,7 +435,7 @@ impl Knowledge {
     }
 
     pub(super) fn capture_expected(&self, path: &str, expected: &mut Expected) {
-        expected.capture_cached(self.cache.get(path));
+        expected.capture_cached(self.cache.latest(path));
     }
 
     pub(super) fn advance_expected(&self, expected: &Expected, current_after: SequencePoint) {
@@ -505,20 +443,20 @@ impl Knowledge {
     }
 
     pub(super) fn invalidate_expected(&self, path: &str, expected: &Expected) {
-        self.cache.update(path, |old| match old {
-            Some(entry) if expected.matches(&entry) => None,
-            other => other,
+        self.cache.update_latest(path, |old| match old {
+            Some(state) if expected.matches(&state) => (None, ()),
+            other => (other, ()),
         });
     }
 
     pub(super) fn invalidate(&self, path: &str) {
-        self.cache.delete(path);
+        self.cache.delete_latest(path);
     }
 
     /// Installs a present state that a backend operation of this open
     /// observed. The completion of that operation starts its currentness
     /// interval.
-    fn install_observed(
+    fn install_observed<C: Codec>(
         &self,
         path: &str,
         value: ErasedValue,
@@ -531,8 +469,10 @@ impl Knowledge {
         installed
     }
 
-    /// Installs a present entry, merging evidence when the current entry has the
-    /// same revision.
+    /// Installs a present state, merging evidence when the latest state has
+    /// the same revision. A different revision replaces the latest state. When
+    /// a stale view read the path, the replaced state goes to the earlier
+    /// states of the path in the same cache update (ADR-103).
     fn install_present(
         &self,
         path: &str,
@@ -541,43 +481,35 @@ impl Knowledge {
         revision: Revision,
         incoming: Evidence,
     ) -> Evidence {
-        self.cache.update_with_result(path, |old| match old {
-            Some(CacheEntry {
-                state:
-                    EntryState::Present {
-                        value: old_value,
-                        size: old_size,
-                        revision: old_revision,
-                        evidence,
-                    },
+        self.cache.update_both(path, |old, kept| match old {
+            Some(LatestState::Present {
+                value: old_value,
+                size: old_size,
+                revision: old_revision,
+                evidence,
             }) if old_revision == revision => {
                 evidence.advance(incoming.get());
                 let installed = evidence.clone();
-                (
-                    Some(CacheEntry {
-                        state: EntryState::Present {
-                            value: old_value,
-                            size: old_size,
-                            revision: old_revision,
-                            evidence,
-                        },
-                    }),
-                    installed,
-                )
+                let state = LatestState::Present {
+                    value: old_value,
+                    size: old_size,
+                    revision: old_revision,
+                    evidence,
+                };
+                (state, None, installed)
             }
-            _ => {
+            old => {
+                let earlier = old
+                    .zip(kept)
+                    .map(|(replaced, kept)| self.earlier.after_replace(replaced, &kept));
                 let installed = incoming.clone();
-                (
-                    Some(CacheEntry {
-                        state: EntryState::Present {
-                            value,
-                            size,
-                            revision,
-                            evidence: incoming,
-                        },
-                    }),
-                    installed,
-                )
+                let state = LatestState::Present {
+                    value,
+                    size,
+                    revision,
+                    evidence: incoming,
+                };
+                (state, earlier, installed)
             }
         })
     }
@@ -585,42 +517,18 @@ impl Knowledge {
     /// Installs confirmed absence, merging evidence with an existing absence.
     fn install_absent(&self, path: &str, current_after: SequencePoint) -> Evidence {
         let incoming = Evidence::new(current_after);
-        let installed = self.cache.update_with_result(path, |old| match old {
-            Some(CacheEntry {
-                state: EntryState::Absent { evidence },
-            }) => {
+        let installed = self.cache.update_latest(path, |old| match old {
+            Some(LatestState::Absent { evidence }) => {
                 evidence.advance(current_after);
                 let installed = evidence.clone();
-                (
-                    Some(CacheEntry {
-                        state: EntryState::Absent { evidence },
-                    }),
-                    installed,
-                )
+                (Some(LatestState::Absent { evidence }), installed)
             }
             _ => {
                 let installed = incoming.clone();
-                (
-                    Some(CacheEntry {
-                        state: EntryState::Absent { evidence: incoming },
-                    }),
-                    installed,
-                )
+                (Some(LatestState::Absent { evidence: incoming }), installed)
             }
         });
         installed.observed_by_completion(self.timeline.now());
         installed
     }
-}
-
-/// Downcasts a type-erased cached value to the codec's decoded type. A mismatch
-/// means a path was used through the wrong typed store, which is an internal
-/// error.
-fn downcast<C: Codec>(path: &str, value: ErasedValue) -> Result<Arc<C::Value>, StorageError> {
-    value.downcast::<C::Value>().map_err(|_| {
-        StorageError::other(format!(
-            "cached object at {path} has a different decoded type than {}",
-            C::name()
-        ))
-    })
 }

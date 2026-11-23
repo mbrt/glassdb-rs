@@ -5,7 +5,7 @@
 //! Programs with no writes can also run as stale read-only transactions, with a
 //! zero or an unbounded staleness. An unbounded one runs through the shared view
 //! of its database instance or through a new view. The checker places these at a
-//! past cut point with the rules of ADR-097 and ADR-102.
+//! past cut point with the rules of ADR-097, ADR-102, and ADR-103.
 //! It does not inspect transaction records, cached objects, or other implementation
 //! state, so the oracle cannot accidentally reproduce the protocol it checks.
 
@@ -199,110 +199,20 @@ struct LogicalOp<'a> {
     predecessors: u64,
 }
 
-/// Keys and collection slots of one body execution.
-#[derive(Debug, Default)]
-struct Footprint {
-    keys: BTreeSet<u8>,
-    slots: BTreeSet<u8>,
-    /// Whether the body execution listed the shared collections, or changed
-    /// which ones exist.
-    membership: bool,
-}
-
-impl Footprint {
-    /// The objects whose state the body execution observed.
-    ///
-    /// A scan that returns `limit` keys observes the range only up to its last
-    /// key.
-    fn observed(trace: &BodyTrace) -> Self {
-        let mut footprint = Self::default();
-        for action in &trace.ordered_actions {
-            match action {
-                HistoryAction::Read { key, .. } => {
-                    footprint.keys.insert(*key);
-                }
-                HistoryAction::ReadGroup { observations } => {
-                    footprint.keys.extend(observations.keys());
-                }
-                HistoryAction::Scan {
-                    start,
-                    start_exclusive,
-                    end,
-                    limit,
-                    keys,
-                } => {
-                    let complete = keys.len() < *limit as usize;
-                    footprint
-                        .keys
-                        .extend((0..HISTORY_KEY_COUNT as u8).filter(|key| {
-                            in_scan_range(*key, *start, *start_exclusive, *end)
-                                && (complete || keys.last().is_some_and(|last| key <= last))
-                        }));
-                }
-                HistoryAction::Collection(step) => {
-                    footprint.slots.insert(step.slot);
-                    footprint.membership = true;
-                }
-                HistoryAction::CollectionUpdate(update) => {
-                    footprint.slots.insert(update.slot);
-                }
-                HistoryAction::CatalogRead(_)
-                | HistoryAction::Write { .. }
-                | HistoryAction::Delete { .. } => {}
-            }
-        }
-        footprint
-    }
-
-    /// The objects whose state the body execution changed.
-    fn written(trace: &BodyTrace) -> Self {
-        let mut footprint = Self {
-            keys: trace.final_mutations.keys().copied().collect(),
-            ..Self::default()
-        };
-        for action in &trace.ordered_actions {
-            match action {
-                HistoryAction::Collection(step)
-                    if step.before != step.after || step.members_before != step.members_after =>
-                {
-                    footprint.slots.insert(step.slot);
-                    footprint.membership |= step.members_before != step.members_after;
-                }
-                HistoryAction::CollectionUpdate(update) if update.before.is_some() => {
-                    footprint.slots.insert(update.slot);
-                }
-                _ => {}
-            }
-        }
-        footprint
-    }
-
-    fn intersects(&self, other: &Self) -> bool {
-        !self.keys.is_disjoint(&other.keys)
-            || !self.slots.is_disjoint(&other.slots)
-            || self.membership && other.membership
-    }
-}
-
 /// Reports whether `before`, which completed before `after` started, must
 /// come before `after` in the serial order.
 ///
-/// An operation at a past cut point follows only what ADR-097 and ADR-102
-/// promise within its database instance: the earlier stale read-only
-/// transactions of the same view, through the monotonic floor of the view, and
-/// the writes that it observes. A write that it does not observe gives no
-/// order: that write can follow a foreign commit that the cut point comes
-/// before.
+/// An operation at a past cut point follows only the earlier stale read-only
+/// transactions of the same view, through the monotonic floor of the view
+/// (ADR-102). A write of the same instance gives no order, because a view
+/// keeps its cut point (ADR-103).
 fn orders(before: &LogicalOp<'_>, after: &LogicalOp<'_>) -> bool {
     match after.placement {
         Placement::Current => true,
         Placement::Past => {
             before.public.instance.is_some()
                 && before.public.instance == after.public.instance
-                && (shares_view(before.public.mode, after.public.mode)
-                    || before.mutates
-                        && Footprint::written(before.trace)
-                            .intersects(&Footprint::observed(after.trace)))
+                && shares_view(before.public.mode, after.public.mode)
         }
     }
 }
@@ -2617,35 +2527,39 @@ mod sim_tests {
     }
 
     #[test]
-    fn unbounded_stale_read_can_miss_a_finished_foreign_commit() {
+    fn unbounded_stale_read_can_miss_a_finished_commit_of_any_instance() {
         let initial = state(&[(0, 0)]);
         let committed = state(&[(0, 1)]);
         let writer = on_instance(0, (0, 1), HistoryMode::Strict, 0, vec![write(0, 1)]);
         let stale = |mode, instance| on_instance(1, (2, 3), mode, instance, vec![read(0, 0)]);
-        check_history(&initial, &[writer.clone(), stale(SHARED, 1)], &committed).unwrap();
-        // A zero bound and a write of the same instance both order the read
-        // after the commit.
-        for (mode, instance) in [(HistoryMode::StaleZero, 1), (SHARED, 0)] {
-            assert!(
-                check_history(
-                    &initial,
-                    &[writer.clone(), stale(mode, instance)],
-                    &committed
-                )
-                .is_err()
-            );
+        for instance in [0, 1] {
+            check_history(
+                &initial,
+                &[writer.clone(), stale(SHARED, instance)],
+                &committed,
+            )
+            .unwrap();
         }
+        // A zero bound orders the read after the commit.
+        assert!(
+            check_history(
+                &initial,
+                &[writer, stale(HistoryMode::StaleZero, 1)],
+                &committed
+            )
+            .is_err()
+        );
     }
 
     #[test]
-    fn unbounded_stale_read_follows_only_the_own_writes_that_it_observes() {
+    fn unbounded_stale_read_that_observes_a_write_follows_what_the_write_follows() {
         let initial = state(&[(0, 0), (1, 0)]);
         let committed = state(&[(0, 1), (1, 1)]);
         let foreign = on_instance(0, (0, 1), HistoryMode::Strict, 1, vec![write(1, 1)]);
         let own = on_instance(1, (2, 3), HistoryMode::Strict, 0, vec![write(0, 1)]);
         let stale = |actions| on_instance(2, (4, 5), SHARED, 0, actions);
-        // The own write follows the foreign one, but the read does not observe
-        // it, so the read can come before both.
+        // The own write follows the foreign one. A read that does not observe
+        // it can come before both, and a read that observes it comes after both.
         check_history(
             &initial,
             &[foreign.clone(), own.clone(), stale(vec![read(1, 0)])],
@@ -2704,7 +2618,7 @@ mod sim_tests {
     }
 
     #[test]
-    fn unbounded_stale_listing_observes_the_own_membership_changes() {
+    fn unbounded_stale_listing_can_miss_a_membership_change_of_any_instance() {
         let initial = state(&[]);
         let mut committed = state(&[]);
         committed.collections[1] = Some(CollectionState::default());
@@ -2731,8 +2645,8 @@ mod sim_tests {
                 vec![1],
             )],
         );
-        // The read of slot 0 lists the root, so it observes the creation of
-        // slot 1 by its own instance.
+        // The read of slot 0 lists the root, and does not find slot 1. A
+        // creation of the same instance gives no order (ADR-103).
         let listing = |instance| {
             on_instance(
                 1,
@@ -2742,8 +2656,9 @@ mod sim_tests {
                 vec![step(0, HistoryCollectionOp::Read, None, Vec::new())],
             )
         };
-        assert!(check_history(&initial, &[create.clone(), listing(0)], &committed).is_err());
-        check_history(&initial, &[create, listing(1)], &committed).unwrap();
+        for instance in [0, 1] {
+            check_history(&initial, &[create.clone(), listing(instance)], &committed).unwrap();
+        }
     }
 
     #[test]

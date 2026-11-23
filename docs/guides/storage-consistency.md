@@ -1,11 +1,12 @@
 # Storage evidence rules
 
-Two type modules require stricter correctness review. Paths are relative to
+These type modules require stricter correctness review. Paths are relative to
 `crates/glassdb-storage/src/`:
 
 | Module | Types | Rules |
 | --- | --- | --- |
-| `timeline.rs` | `Timeline`, `SequencePoint`, `CurrentnessBarrier`, `Requirement`, `MonotonicFloor` | E1, E2, E5 |
+| `timeline.rs` | `Timeline`, `SequencePoint`, `CurrentnessBarrier`, `Requirement`, `StalenessCutoff` | E1, E2, E5 |
+| `stale_view.rs` | `MonotonicFloor`, `ViewFloors`, `ViewRead`, `FloorPoint` | E1, E5 |
 | `cached_store/evidence.rs` | `Observation`, `Revision`, `CasReceipt`, and their result and shared evidence types | E3, E4, E5 |
 | `cached_store/cut.rs` | `CutSearch`, `CutTarget` | E5 |
 

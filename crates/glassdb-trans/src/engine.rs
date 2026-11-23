@@ -5,18 +5,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_backend::{Backend, BackendError, BackendStats, StatsBackend};
-use glassdb_concurr::{Background, DedupKeySnapshot};
-use glassdb_data::{
-    CollectionAddress, CollectionId, DatabaseId, DbPrefix, LogicalKey, ObjectPath, TxId,
-};
+use glassdb_concurr::{Background, DedupKeySnapshot, RetrySchedule};
+use glassdb_data::{CollectionAddress, CollectionId, DatabaseId, DbPrefix, ObjectPath, TxId};
 use glassdb_storage::transaction::TxRecordStore;
 use glassdb_storage::{
     CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, LeafBody,
-    MonotonicFloor, Node, NodeSizePolicy, NodeStore, PersistentCache, PersistentCacheConfig,
-    PersistentCacheMedia, Requirement, StorageError, StructuralIntentStore, Timeline, TreeRouter,
+    MonotonicFloor, Node, NodeReads, NodeSizePolicy, NodeStore, PersistentCache,
+    PersistentCacheConfig, PersistentCacheMedia, Requirement, StorageError, StructuralIntentStore,
+    Timeline, TreeRouter, ViewRead,
 };
 
-use crate::access::{AccessSet, ScanMutation, ScanRange};
+use crate::access::AccessSet;
 use crate::algo::{Algo, BodyDecision, DirectCommitStats, Handle};
 use crate::collection_catalog::CollectionCatalog;
 use crate::collection_commit::{CollectionCommit, CollectionReservations};
@@ -24,13 +23,13 @@ use crate::collection_coordination::CollectionStateResolver;
 use crate::collections::{CatalogAccesses, CollectionLifecycle, DirectorySnapshot};
 use crate::error::TransError;
 use crate::gc::{DEFAULT_GC_PARALLELISM, Gc, GcDiagnostics, GcHints, GcLimits, GcReport, GcStats};
-use crate::key_resolver::{KeyResolver, ScanResult};
+use crate::key_resolver::KeyResolver;
 use crate::key_state_resolver::KeyStateResolver;
 use crate::leaf_coord::{
     CoordinatorConfig, CoordinatorStats, DEFAULT_BATCHING_WINDOW, LeafCoordinator,
 };
 use crate::monitor::{Monitor, MonitorStats, ProtocolTiming};
-use crate::reader::{ReadOutcome, Reader};
+use crate::reader::BodyReader;
 use crate::retry_timing::RetryTiming;
 use crate::structural::{Restructurer, TopologyMembership, TopologyPolicy, TopologyStats};
 use crate::tlocker::{Locker, LockerStats};
@@ -163,6 +162,12 @@ impl EngineTransaction {
     pub fn collection_reservations(&self) -> CollectionReservations {
         self.0.collection_reservations()
     }
+
+    /// Returns how the next body execution reads, for a stale read-only
+    /// transaction of a stale view (ADR-103). Call it once for each execution.
+    pub fn next_view_read(&mut self) -> Option<ViewRead> {
+        self.0.next_view_read()
+    }
 }
 
 /// Runtime counters collected from one engine snapshot.
@@ -193,13 +198,31 @@ pub struct EngineDiagnostics {
     pub coordinator_dedup: Vec<DedupKeySnapshot>,
 }
 
+/// Builds the body readers of a stale view, which read leaves through
+/// [`NodeReads::for_view`] (ADR-103).
+struct ViewReaders {
+    nodes: NodeStore,
+    key_state: KeyStateResolver,
+    parallelism: NonZeroUsize,
+    timeline: Timeline,
+    wait: RetrySchedule,
+}
+
+impl ViewReaders {
+    fn body_reader(&self, view: ViewRead) -> BodyReader {
+        let router = TreeRouter::new(NodeReads::for_view(&self.nodes, view), self.parallelism);
+        let resolver = KeyResolver::new(router, self.key_state.clone(), self.parallelism);
+        BodyReader::new(resolver, self.timeline.clone(), self.wait)
+    }
+}
+
 /// Owns and mediates access to one database's transaction runtime.
 pub struct Engine {
     backend: Arc<StatsBackend>,
     objects: CachedStore,
     monitor: Monitor,
-    reader: Reader,
-    resolver: KeyResolver,
+    body: BodyReader,
+    views: ViewReaders,
     collection_catalog: CollectionCatalog,
     algo: Algo,
     coord: LeafCoordinator,
@@ -241,22 +264,20 @@ impl Engine {
         Self::ensure_tree_root(backend, &root_path).await
     }
 
-    /// Reads one logical key from any usable cached state, for a transaction
-    /// body that validates the read later.
-    pub async fn read(&self, key: &LogicalKey) -> Result<ReadOutcome, StorageError> {
-        self.reader.read(key).await
+    /// Returns the reader of one execution of a transaction body. `view` is
+    /// how a stale read-only transaction of a stale view reads (ADR-103).
+    pub fn body_reader(&self, view: Option<ViewRead>) -> BodyReader {
+        match view {
+            Some(view) => self.views.body_reader(view),
+            None => self.body.clone(),
+        }
     }
 
-    /// Scans one logical key range and returns its validation evidence.
-    pub async fn scan(
-        &self,
-        collection: &CollectionAddress,
-        range: &ScanRange,
-        overlay: &[ScanMutation],
-    ) -> Result<ScanResult, StorageError> {
-        self.resolver
-            .scan_keys(collection, range, overlay, None, None)
-            .await
+    /// Creates the monotonic floor of a new stale view. While the view lives,
+    /// the decoded cache keeps the earlier states that its floor can use
+    /// (ADR-103).
+    pub fn new_view_floor(&self) -> MonotonicFloor {
+        self.objects.view_floors().new_floor()
     }
 
     /// Loads a logical snapshot of a collection's direct-child directory.
@@ -608,8 +629,15 @@ impl DormantEngine {
             topology_policy,
             gc_hints.clone(),
         );
+        let views = ViewReaders {
+            nodes: nodes.clone(),
+            key_state: key_state.clone(),
+            parallelism: transaction_leaf_parallelism,
+            timeline: timeline.clone(),
+            wait: retry.wait,
+        };
         let resolver = KeyResolver::new(router.clone(), key_state, transaction_leaf_parallelism);
-        let reader = Reader::new(resolver.clone(), timeline.clone(), retry.wait);
+        let body = BodyReader::new(resolver.clone(), timeline.clone(), retry.wait);
         let locker = Locker::new(
             coord.clone(),
             TreeRouter::new(nodes.clone(), transaction_leaf_parallelism),
@@ -667,8 +695,8 @@ impl DormantEngine {
             backend,
             objects,
             monitor,
-            reader,
-            resolver,
+            body,
+            views,
             collection_catalog,
             algo,
             coord,

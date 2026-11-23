@@ -36,7 +36,7 @@ pub use gc::{GcDiagnostics, GcLimits, GcReport, GcStats};
 pub use key_resolver::ScanResult;
 pub use leaf_coord::CoordinatorStats;
 pub use monitor::{MonitorStats, ProtocolTiming};
-pub use reader::{ReadOutcome, ReadValue};
+pub use reader::{BodyReader, ReadOutcome, ReadValue};
 pub use retry_timing::RetryTiming;
 pub use structural::{MergeStats, SplitCauseStats, SplitStats, TopologyPolicy, TopologyStats};
 pub use tlocker::LockerStats;
