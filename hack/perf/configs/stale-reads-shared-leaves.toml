@@ -1,6 +1,7 @@
-# The body of the `stale-reads-shared-leaves` and `stale-reads-single`
-# experiments: stale read-only transactions (`StaleDatabaseView::read_tx`) of
-# one and of ten keys, and a writer, on the same leaves of one collection.
+# The body of the `stale-reads-shared-leaves`, `stale-reads-single`, and
+# `stale-reads-view` experiments: stale read-only transactions
+# (`StaleDatabaseView::read_tx`) of one and of ten keys, and a writer, on the
+# same leaves of one collection.
 # Each write gives the readers a new leaf state, so the cost of the order
 # between stale read-only transactions shows in the checks of the other leaves. The `stale` readers use
 # a new view for each transaction, and the `stale-view` readers one view for
@@ -45,7 +46,7 @@ kind = "read"
 pool = "stale"
 source = "pool"
 keys = 1
-staleness = "5s"
+staleness = "250ms"
 view = "worker"
 
 [shapes.stale-view-multi]
@@ -53,12 +54,12 @@ kind = "read"
 pool = "stale"
 source = "pool"
 keys = 10
-staleness = "5s"
+staleness = "250ms"
 view = "worker"
 
 [workloads.stale-shared-leaves.groups.all]
 instances = 1
-shapes = { stale-writer = 1, stale-multi = 1, stale-view-single = 1, stale-view-multi = 1 }
+shapes = { stale-writer = 1, stale-multi = 1 }
 
 # `stale-single` alone beside the writer. Each of its transactions uses cached
 # leaf states only, so it commits one transaction for each 5 µs of model time,
@@ -69,6 +70,16 @@ shapes = { stale-writer = 1, stale-multi = 1, stale-view-single = 1, stale-view-
 [workloads.stale-single-shared-leaves.groups.all]
 instances = 1
 shapes = { stale-single = 1 }
+loads = { stale-writer = 1 }
+
+# The `stale-view` readers beside the writer. Most of their calls use cached
+# leaf states only, so `stale-view-single` commits about 40,000 transactions in
+# each second of model time, and their cases have a short window, as
+# `stale-single`. Their bound of 250 ms is shorter than the window, so that
+# their floors move several times in it.
+[workloads.stale-view-shared-leaves.groups.all]
+instances = 1
+shapes = { stale-view-single = 1, stale-view-multi = 1 }
 loads = { stale-writer = 1 }
 
 [cell]

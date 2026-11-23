@@ -369,8 +369,8 @@ fn transactions_with_no_backend_operation_advance_virtual_time() {
             "--set=cell.gc=false",
             "--set=cell.warm-up.timeout=\"0s\"",
             "--set=cell.measure.until=\"duration\"",
-            "--set=cell.measure.duration=\"2s\"",
-            "--set=cell.measure.max-duration=\"5s\"",
+            "--set=cell.measure.duration=\"500ms\"",
+            "--set=cell.measure.max-duration=\"2s\"",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

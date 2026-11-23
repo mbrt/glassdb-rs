@@ -107,8 +107,9 @@ window. Most cases use built-in parts:
 | `read-long-keys` | A read in a collection of 1,024 keys of 256 bytes (`key-bytes = 256`), after its splits. |
 | `rmw-shared-leaf` | Three workers that update their own key of one leaf. |
 | `shapes-shared-leaf` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time on one leaf, with `low-conflict` keys. |
-| `stale-reads-shared-leaves` | Stale read-only transactions (`StaleDatabaseView::read_tx`, 5 s bound) of ten keys with a new view for each transaction (`stale-multi`), and of one key and of ten keys with one view for each worker (`stale-view-single`, `stale-view-multi`), and a writer of one key, all on the keys of one collection with leaves of at most 16 entries. Each write gives the readers a new leaf state, so the case shows what a new state costs the stale reads of the other leaves. |
+| `stale-reads-shared-leaves` | Stale read-only transactions (`StaleDatabaseView::read_tx`, 5 s bound) of ten keys with a new view for each transaction (`stale-multi`), and a writer of one key, all on the keys of one collection with leaves of at most 16 entries. Each write gives the readers a new leaf state, so the case shows what a new state costs the stale reads of the other leaves. |
 | `stale-reads-single` | The same leaves, with the writer and a stale read-only transaction of one key with a new view for each transaction (`stale-single`). The reader uses cached leaf states only, so it commits one transaction for each 5 µs of model time, and in virtual time it costs about as much wall time as model time. Its windows are 500 ms for the counters and 2 s for the latency. The writer only gives the load (`loads`): it has too few transactions in 2 s for its metrics. |
+| `stale-reads-view` | The same leaves, with the writer and stale read-only transactions of one key and of ten keys with one view for each worker (`stale-view-single`, `stale-view-multi`), with a 250 ms bound. Most calls use cached leaf states only, so they have the short windows of `stale-reads-single`. The bound is shorter than the window, so that the floors of the views move in it. The writer only gives the load. |
 
 The CI comparison builds perfbench for both revisions, runs `make bench` with
 each binary, and then compares the results:
@@ -152,8 +153,8 @@ the engine, so the floor scales with the spread. With 32 runs of 300 s, a
 comparison of a revision with itself gave intervals of at most about ±1% for
 the 36 timing metrics of the first nine cases, so an unchanged metric of these
 cases does not stay inconclusive. The metrics of `stale-reads-shared-leaves`
-spread more: up to about 10% in one run for the throughput of `stale-multi` and
-`stale-view-multi`, which can stay inconclusive.
+spread more: up to about 10% in one run for the throughput of `stale-multi`,
+which can stay inconclusive.
 
 The report also compares the spread of one run of each timing metric, with the
 Brown-Forsythe test: a metric that becomes less stable is a change, even if
