@@ -986,8 +986,12 @@ change, so the cache can keep them forever. `Wounded` can still change to
 monitor keeps `Wounded` as well, because both mean that the identity never
 commits. GC reads the durable record. Owner acknowledgement starts from its own
 durable observation of the wound. A cached committed status can outlive the
-cached record body. If the body is missing, the module that owns the referring
-observation reloads at a newer bound and retries. A missing historical body
+cached record body. If the durable record is gone, or another instance wounded
+the identity at the empty path, the monitor drops the cached status. The module
+that owns the referring observation then reloads at a newer bound and retries,
+and resolves the identity as an instance that never knew its status does. A
+current leaf can still name a stray holder of the identity (ADR-095), so a
+retry that kept the cached status would never end. A missing historical body
 never becomes a missing key or a missing collection.
 
 ## Object layout

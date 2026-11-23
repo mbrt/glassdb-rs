@@ -555,6 +555,10 @@ impl FinalStatusCache {
             self.entries.pop_front();
         }
     }
+
+    fn remove(&mut self, tid: &TxId) {
+        self.entries.remove(tid);
+    }
 }
 
 #[derive(Default)]
@@ -1922,26 +1926,33 @@ impl Monitor {
         {
             return Ok(observed);
         }
-        let observed = self
+        match self
             .inner
             .tx_records
             .get_at(tid, self.current_requirement())
             .await
-            .map_err(|error| match error {
-                StorageError::NotFound => TransError::ValidateRetry(self.current_requirement()),
-                error => TransError::Storage(error.context(format!("getting TID {tid}"))),
-            })?;
-        if !observed
-            .value()
-            .is_some_and(|record| record.status == expected_status)
         {
+            Ok(observed)
+                if observed
+                    .value()
+                    .is_some_and(|record| record.status == expected_status) =>
+            {
+                Ok(observed)
+            }
             // The status is permanent, but GC reclaimed the record: the record
             // is missing, or another instance wounded the identity at the empty
             // path (a leaked wound, ADR-079). The referring leaf observation
-            // must be resolved again.
-            return Err(TransError::ValidateRetry(self.current_requirement()));
+            // must be resolved again. A current leaf can still name a stray
+            // holder (ADR-095), so the retry must resolve the identity as an
+            // instance that never knew its status does, or it loops forever.
+            Ok(_) | Err(StorageError::NotFound) => {
+                self.forget_final(tid);
+                Err(TransError::ValidateRetry(self.current_requirement()))
+            }
+            Err(error) => Err(TransError::Storage(
+                error.context(format!("getting TID {tid}")),
+            )),
         }
-        Ok(observed)
     }
 
     /// Starts a transaction-record poll after all status evidence already seen by
@@ -1973,6 +1984,10 @@ impl Monitor {
             TxRuntimeRole::Owned(owned) => TxStatusEvidence::local(owned.record.as_ref()).map(Some),
             TxRuntimeRole::Foreign(_) => Ok(None),
         }
+    }
+
+    fn forget_final(&self, tid: &TxId) {
+        self.inner.final_status.lock().unwrap().remove(tid);
     }
 
     fn cached_final_status(&self, tid: &TxId) -> Option<TxCommitStatus> {
