@@ -1,6 +1,9 @@
 # The cell of `fixed-ranges` on one database instance, for the CI comparison. It
-# measures for a fixed 20 s: the end condition `converged` waits for 1,000
-# commits of each shape, and the shapes of a single worker set its length.
+# measures for a fixed 30 s: the end condition `converged` waits for 1,000
+# commits of each shape, and the shapes of a single worker set its length. The
+# slowest shapes (`fr64-0` to `fr64-5`) commit about 5 transactions in each
+# second, so the window gives them about 155, above the 100 that the CI report
+# needs for a run.
 tags = ["ci/timing", "ci/extended", "area/topology"]
 include = ["../configs/fixed-ranges.toml"]
 
@@ -9,4 +12,4 @@ databases = 1
 
 [cell.measure]
 until = "duration"
-duration = "20s"
+duration = "30s"

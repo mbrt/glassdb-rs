@@ -61,7 +61,7 @@ cell completion deadline, and the run then stops.
 | `false-sharing-spans` | As `false-sharing`, but one more instance writes the two keys on both sides of the four contended keys in each transaction, so its write span crosses them (ADR-088). The default topology policy must still split the contended keys apart. |
 | `fixed-ranges` | Transactions on fixed ranges of 16 and 64 keys, with transactions on single keys (ADR-084). |
 | `random-ranges` | Transactions on ranges of 16 and 64 adjacent keys from random starts, on fixed sets of 3 keys, and on single keys (ADR-084). |
-| `conflict-sweep-short`, `random-ranges-short`, `fixed-ranges-short`, `mixed-short` | Shorter versions of these experiments for the CI comparison: 6 of the 16 pools of `conflict-sweep`; the ranges on one instance for 20 s; `mixed` with low conflict at an affinity of 50 and with high conflict at an affinity of 100. |
+| `conflict-sweep-short`, `random-ranges-short`, `fixed-ranges-short`, `mixed-short` | Shorter versions of these experiments for the CI comparison: 6 of the 16 pools of `conflict-sweep`; the ranges on one instance for 20 s (`random-ranges-short`) and 30 s (`fixed-ranges-short`); `mixed` with low conflict at an affinity of 50 and with high conflict at an affinity of 100. |
 
 The files in `hack/perf/configs` are not experiments:
 
