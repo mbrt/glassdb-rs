@@ -80,7 +80,12 @@ impl TopologyMembership {
                     }
                     if let Some(holder) = record.topology_freeze().copied() {
                         return match self.mon.tx_status(&holder).await? {
-                            TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
+                            // The CAS on the record checks that the freeze is
+                            // current, so a blind wound holds no committed
+                            // effect here.
+                            TxCommitStatus::Aborted
+                            | TxCommitStatus::Wounded
+                            | TxCommitStatus::BlindWounded => {
                                 record.remove_topology_freeze(&holder);
                                 Ok(Decision::Advance(record))
                             }

@@ -15,7 +15,12 @@ pub enum TxCommitStatus {
     Committed,
     Aborted,
     Pending,
+    /// A wound that replaced a pending record. The identity never committed.
     Wounded,
+    /// A wound that created the record at an empty path. The identity cannot
+    /// commit after it, but it can have committed before: GC can have deleted
+    /// that record (ADR-104).
+    BlindWounded,
 }
 
 impl TxCommitStatus {
@@ -23,7 +28,10 @@ impl TxCommitStatus {
     pub fn is_final(self) -> bool {
         matches!(
             self,
-            TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded
+            TxCommitStatus::Committed
+                | TxCommitStatus::Aborted
+                | TxCommitStatus::Wounded
+                | TxCommitStatus::BlindWounded
         )
     }
 
@@ -42,6 +50,7 @@ pub enum TxRecordState {
     Missing,
     Pending,
     Wounded,
+    BlindWounded,
     Committed,
     Aborted,
 }
@@ -55,6 +64,9 @@ pub enum TxLifecycleRelation {
     CanAdvance,
     /// Advancing would contradict an existing durable decision.
     Blocks,
+    /// No write can make this change: a wound that creates the record is
+    /// blind, and a wound that replaces a record is not.
+    Invalid,
 }
 
 impl TxRecordState {
@@ -64,6 +76,7 @@ impl TxRecordState {
             None => Ok(TxRecordState::Missing),
             Some(TxCommitStatus::Pending) => Ok(TxRecordState::Pending),
             Some(TxCommitStatus::Wounded) => Ok(TxRecordState::Wounded),
+            Some(TxCommitStatus::BlindWounded) => Ok(TxRecordState::BlindWounded),
             Some(TxCommitStatus::Committed) => Ok(TxRecordState::Committed),
             Some(TxCommitStatus::Aborted) => Ok(TxRecordState::Aborted),
             Some(TxCommitStatus::Unknown) => Err(StorageError::other(
@@ -87,7 +100,7 @@ impl TxRecordState {
             (
                 TxRecordState::Missing,
                 TxRecordState::Pending
-                | TxRecordState::Wounded
+                | TxRecordState::BlindWounded
                 | TxRecordState::Committed
                 | TxRecordState::Aborted,
             )
@@ -95,10 +108,12 @@ impl TxRecordState {
                 TxRecordState::Pending,
                 TxRecordState::Wounded | TxRecordState::Committed | TxRecordState::Aborted,
             )
-            | (TxRecordState::Wounded, TxRecordState::Aborted)
+            | (TxRecordState::Wounded | TxRecordState::BlindWounded, TxRecordState::Aborted)
             | (TxRecordState::Committed | TxRecordState::Aborted, TxRecordState::Missing) => {
                 TxLifecycleRelation::CanAdvance
             }
+            (TxRecordState::Missing, TxRecordState::Wounded)
+            | (TxRecordState::Pending, TxRecordState::BlindWounded) => TxLifecycleRelation::Invalid,
             _ => TxLifecycleRelation::Blocks,
         }
     }
@@ -194,22 +209,24 @@ mod tests {
 
     #[test]
     fn lifecycle_relation_defines_the_complete_state_graph() {
-        use TxLifecycleRelation::{Blocks, CanAdvance, Same};
-        use TxRecordState::{Aborted, Committed, Missing, Pending, Wounded};
+        use TxLifecycleRelation::{Blocks, CanAdvance, Invalid, Same};
+        use TxRecordState::{Aborted, BlindWounded, Committed, Missing, Pending, Wounded};
 
-        let states = [Missing, Pending, Wounded, Committed, Aborted];
+        let states = [Missing, Pending, Wounded, BlindWounded, Committed, Aborted];
         let advances = [
             (Missing, Pending),
-            (Missing, Wounded),
+            (Missing, BlindWounded),
             (Missing, Committed),
             (Missing, Aborted),
             (Pending, Wounded),
             (Pending, Committed),
             (Pending, Aborted),
             (Wounded, Aborted),
+            (BlindWounded, Aborted),
             (Committed, Missing),
             (Aborted, Missing),
         ];
+        let invalid = [(Missing, Wounded), (Pending, BlindWounded)];
 
         for current in states {
             for desired in states {
@@ -217,6 +234,8 @@ mod tests {
                     Same
                 } else if advances.contains(&(current, desired)) {
                     CanAdvance
+                } else if invalid.contains(&(current, desired)) {
+                    Invalid
                 } else {
                     Blocks
                 };

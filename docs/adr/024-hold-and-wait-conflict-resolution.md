@@ -45,6 +45,9 @@ finite aborted-record fence used by the lazy materialization discussion below.
 A foreign wound of either a missing or pending record is now a pinned wound
 (`Wounded`) until the owner proves retirement and acknowledges `Aborted`.
 
+[ADR-104](104-a-blind-wound-does-not-prove-that-the-identity-never-committed.md)
+states what a wound of a missing record proves (`BlindWounded`).
+
 ## Context
 
 [ADR-020](020-commit-write-back-protocol.md) defines the commit protocol and its

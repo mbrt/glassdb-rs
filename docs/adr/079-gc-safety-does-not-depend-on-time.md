@@ -7,6 +7,9 @@ Accepted — implemented.
 [ADR-095](095-the-record-lists-every-lock-of-the-identity.md) removes the
 causes of stray holders that come from the normal protocol.
 
+[ADR-104](104-a-blind-wound-does-not-prove-that-the-identity-never-committed.md)
+gives the reader rule for leaked wounds and stray holders.
+
 Refines the safety argument of
 [ADR-022](022-garbage-collection-mark-sweep.md) and renames its safety horizon.
 The GC rules of [ADR-059](059-pin-foreign-wounds-until-owner-retirement.md) and

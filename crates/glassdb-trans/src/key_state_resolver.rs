@@ -7,7 +7,7 @@ use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{CurrentState, LeafEntry, LockType, Node, Requirement, StorageError};
 
 use crate::error::{TransError, trans_to_storage};
-use crate::monitor::{KeyCommitStatus, Monitor, TxFinalStatus};
+use crate::monitor::{KeyCommitStatus, Monitor};
 
 /// What is known about the effective writer's value alongside its identity.
 ///
@@ -142,20 +142,20 @@ impl KeyStateResolver {
     }
 
     /// Rejects a node whose drop intent committed, waiting for a
-    /// pending intent and ignoring an aborted one.
-    pub(crate) async fn ensure_collection_live(&self, node: &Node) -> Result<(), StorageError> {
+    /// pending intent and ignoring an aborted one. `requirement` is the
+    /// requirement of the node observation.
+    pub(crate) async fn ensure_collection_live(
+        &self,
+        node: &Node,
+        requirement: Requirement,
+    ) -> Result<(), TransError> {
         let Some(holder) = node.drop_intent() else {
             return Ok(());
         };
-        match self
-            .monitor
-            .await_tx_final(holder)
-            .await
-            .map_err(trans_to_storage)?
-        {
-            TxFinalStatus::Committed => Err(StorageError::StaleCollection),
-            TxFinalStatus::Aborted => Ok(()),
+        if self.monitor.drop_committed_at(holder, requirement).await? {
+            return Err(TransError::StaleCollection);
         }
+        Ok(())
     }
 
     /// Returns foreign pending membership writers represented by `node`.
@@ -284,7 +284,9 @@ impl KeyStateResolver {
             TxCommitStatus::Pending | TxCommitStatus::Unknown => {
                 resolved.pending.push(*holder);
             }
-            TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
+            // The monitor returns a blind wound here only for a leaf
+            // observation after its no-value requirement (ADR-104).
+            TxCommitStatus::Aborted | TxCommitStatus::Wounded | TxCommitStatus::BlindWounded => {}
         }
         Ok(resolved)
     }
@@ -372,6 +374,17 @@ mod tests {
                     value: Arc::from(b"holder-value".as_slice()),
                     deleted,
                 });
+            }
+            if status == TxCommitStatus::Wounded {
+                // A wound over a pending record proves that the holder never
+                // committed. A wound at an empty path is blind (ADR-104).
+                let pending = self
+                    .transactions
+                    .set(&TxRecord::new(*holder, TxCommitStatus::Pending))
+                    .await
+                    .unwrap();
+                self.transactions.set_if(&record, &pending).await.unwrap();
+                return;
             }
             self.transactions.set(&record).await.unwrap();
         }
@@ -692,6 +705,83 @@ mod tests {
             LockType::Create,
         )
         .await;
+    }
+
+    // A blind wound of the holder of a drop intent does not prove that the
+    // drop did not commit. GC deletes the nodes of a dropped collection before
+    // the record of the drop, so only a node observation after the wound can
+    // show that the drop did not happen (ADR-104).
+    #[tokio::test]
+    async fn a_blind_wounded_drop_intent_needs_a_later_node_observation() {
+        let harness = ResolutionHarness::new();
+        let dropper = TxId::with_priority(2, b"dropper");
+        harness
+            .transactions
+            .set(&TxRecord::new(dropper, TxCommitStatus::BlindWounded))
+            .await
+            .unwrap();
+        let mut node = Node::leaf(glassdb_storage::LeafBody::new());
+        node.set_drop_intent(dropper);
+        let (state, _background) = harness.resolver();
+
+        let after = match state.ensure_collection_live(&node, Requirement::ANY).await {
+            Err(TransError::ValidateRetry(after)) => after,
+            other => panic!("an old observation must be checked again: {other:?}"),
+        };
+        state.ensure_collection_live(&node, after).await.unwrap();
+
+        // A committed drop stays a committed drop, from any observation.
+        let committed = TxId::with_priority(3, b"committed-dropper");
+        harness
+            .transactions
+            .set(&TxRecord::new(committed, TxCommitStatus::Committed))
+            .await
+            .unwrap();
+        node.set_drop_intent(committed);
+        assert!(matches!(
+            state.ensure_collection_live(&node, after).await,
+            Err(TransError::StaleCollection)
+        ));
+    }
+
+    // A blind wound proves only that the holder cannot commit after it. An
+    // older leaf observation must be resolved again, and one that reaches the
+    // requirement after the wound drops the holder (ADR-104).
+    #[tokio::test]
+    async fn a_blind_wounded_holder_is_dropped_only_from_a_later_observation() {
+        let harness = ResolutionHarness::new();
+        let key = LogicalKey::new(CollectionAddress::root("db"), b"key");
+        let predecessor = TxId::with_priority(1, b"previous");
+        let holder = TxId::with_priority(2, b"holder");
+        harness
+            .transactions
+            .set(&TxRecord::new(holder, TxCommitStatus::BlindWounded))
+            .await
+            .unwrap();
+        let current = CurrentCase::External.current(&predecessor);
+        let entry = locked_entry(key.key(), current, LockType::Write, vec![holder]);
+        let (state, _background) = harness.resolver();
+
+        let after = match state
+            .resolve_holders(&key, Some(&entry), None, Requirement::ANY)
+            .await
+        {
+            Err(TransError::ValidateRetry(after)) => after,
+            other => panic!("an old observation must be resolved again: {other:?}"),
+        };
+        let holders = state
+            .resolve_holders(&key, Some(&entry), None, after)
+            .await
+            .unwrap();
+        assert_eq!(holders.writer, Some(predecessor));
+        assert!(holders.pending.is_empty());
+        let again = state
+            .resolve_holders(&key, Some(&entry), None, Requirement::ANY)
+            .await;
+        assert!(
+            matches!(again, Err(TransError::ValidateRetry(retry)) if retry == after),
+            "the first requirement stays: {again:?}"
+        );
     }
 
     #[tokio::test]

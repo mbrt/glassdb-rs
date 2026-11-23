@@ -22,6 +22,10 @@ use tokio::sync::oneshot;
 use crate::error::TransError;
 use crate::gc::GcHints;
 
+mod final_status;
+
+use final_status::{FinalStatusCache, KnownFinal};
+
 const FINAL_STATUS_CACHE_SIZE: usize = 16384;
 
 /// How long the identities of the owner operations of this database instance
@@ -193,6 +197,8 @@ enum CommitWrite {
     NotStarted,
     InFlight,
     Finished,
+    /// Commit recovery proved that the commit did not land.
+    Lost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -215,6 +221,7 @@ enum OwnerCloseReason {
 enum OwnerRecordState {
     NotEngaged,
     Wounded,
+    BlindWounded,
     Other,
 }
 
@@ -270,13 +277,17 @@ impl OwnerLifecycle {
         Ok(())
     }
 
-    fn finish_commit_write(&mut self, create_may_land: bool) {
+    fn finish_commit_write(&mut self, create_may_land: bool, lost: bool) {
         debug_assert_eq!(
             self.commit_write,
             CommitWrite::InFlight,
             "commit write finished without a matching begin"
         );
-        self.commit_write = CommitWrite::Finished;
+        self.commit_write = if lost {
+            CommitWrite::Lost
+        } else {
+            CommitWrite::Finished
+        };
         self.commit_create_may_land |= create_may_land;
     }
 
@@ -300,10 +311,13 @@ impl OwnerLifecycle {
             // GC can delete an acknowledged abort, and then a delayed create
             // lands on the empty path (ADR-059).
             _ if self.commit_create_may_land => false,
+            CommitWrite::Lost => true,
             // A wound changes the revision that a conditional commit expects.
             // A create in flight is not fenced by a wound, but its owner
             // operation is still active or unresolved, so the retirement proof
-            // already refuses an acknowledgement.
+            // already refuses an acknowledgement. A blind wound can follow a
+            // landed commit whose record GC reclaimed, so only commit recovery
+            // can prove that it fenced the commit (ADR-104).
             CommitWrite::InFlight | CommitWrite::Finished => record == OwnerRecordState::Wounded,
         };
 
@@ -319,7 +333,11 @@ impl OwnerLifecycle {
                 }
             }
             OwnerCloseReason::OwnerAbort
-                if commit_write_started && record != OwnerRecordState::Wounded =>
+                if commit_write_started
+                    && !matches!(
+                        record,
+                        OwnerRecordState::Wounded | OwnerRecordState::BlindWounded
+                    ) =>
             {
                 if retirement != OwnerRetirementProof::Unavailable {
                     OwnerClosePlan::PreserveCommit
@@ -390,10 +408,10 @@ impl OwnedTxRuntime {
         let record = match self.record.as_mut() {
             Some(record) => {
                 record.refresh_state = RefreshState::Stopped;
-                if record.status == TxCommitStatus::Wounded {
-                    OwnerRecordState::Wounded
-                } else {
-                    OwnerRecordState::Other
+                match record.status {
+                    TxCommitStatus::Wounded => OwnerRecordState::Wounded,
+                    TxCommitStatus::BlindWounded => OwnerRecordState::BlindWounded,
+                    _ => OwnerRecordState::Other,
                 }
             }
             None => OwnerRecordState::NotEngaged,
@@ -481,6 +499,8 @@ struct CommitWriteError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommitResolution {
     Committed,
+    /// The commit landed, and GC reclaimed its record.
+    Reclaimed,
     Retry,
     AlreadyFinalized,
     InDoubt,
@@ -489,76 +509,6 @@ enum CommitResolution {
 struct PendingWrite {
     record: TxRecord,
     expected: Option<Observation<TxRecord>>,
-}
-
-/// A durable final status. Only owner acknowledgement can change it, from
-/// wounded to aborted, and both mean that the identity never commits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FinalStatus {
-    Committed,
-    Wounded,
-    Aborted,
-}
-
-impl FinalStatus {
-    fn from_status(status: TxCommitStatus) -> Option<Self> {
-        match status {
-            TxCommitStatus::Committed => Some(Self::Committed),
-            TxCommitStatus::Wounded => Some(Self::Wounded),
-            TxCommitStatus::Aborted => Some(Self::Aborted),
-            TxCommitStatus::Unknown | TxCommitStatus::Pending => None,
-        }
-    }
-
-    fn status(self) -> TxCommitStatus {
-        match self {
-            Self::Committed => TxCommitStatus::Committed,
-            Self::Wounded => TxCommitStatus::Wounded,
-            Self::Aborted => TxCommitStatus::Aborted,
-        }
-    }
-}
-
-struct FinalStatusCache {
-    capacity: usize,
-    entries: LinkedHashMap<TxId, FinalStatus>,
-    stats: MonitorStats,
-}
-
-impl FinalStatusCache {
-    fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            entries: LinkedHashMap::new(),
-            stats: MonitorStats::default(),
-        }
-    }
-
-    fn get(&mut self, tid: &TxId) -> Option<FinalStatus> {
-        let status = self.entries.to_back(tid).copied();
-        if status.is_some() {
-            self.stats.hits += 1;
-        } else {
-            self.stats.misses += 1;
-        }
-        status
-    }
-
-    fn insert(&mut self, tid: TxId, status: FinalStatus) {
-        // An older observation of an acknowledged wound must not hide the
-        // acknowledgement.
-        if status == FinalStatus::Wounded && self.entries.get(&tid) == Some(&FinalStatus::Aborted) {
-            return;
-        }
-        self.entries.insert(tid, status);
-        while self.entries.len() > self.capacity {
-            self.entries.pop_front();
-        }
-    }
-
-    fn remove(&mut self, tid: &TxId) {
-        self.entries.remove(tid);
-    }
 }
 
 #[derive(Default)]
@@ -775,51 +725,50 @@ pub(crate) struct KeyCommitStatus {
 
 /// Transaction status together with the exact evidence used to resolve it.
 struct TxStatusEvidence {
-    state: TxRecordState,
+    /// The persisted status, or `None` for a missing record.
+    stored: Option<TxCommitStatus>,
     observation: Option<Observation<TxRecord>>,
 }
 
 impl TxStatusEvidence {
     fn local(record: Option<&TxStatusEntry>) -> Result<Self, TransError> {
         match record {
-            Some(record) => Ok(Self {
-                state: TxRecordState::try_from_status(Some(record.status))?,
-                observation: record.last_observation.clone(),
-            }),
+            Some(record) => Self::new(Some(record.status), record.last_observation.clone()),
             // An owner operation may precede entry into the locked commit.
             // Like a freshly observed absent foreign record, it is not yet
             // final and is exposed as pending.
-            None => Ok(Self {
-                state: TxRecordState::Missing,
-                observation: None,
-            }),
+            None => Self::new(None, None),
         }
     }
 
     fn observed(status: TxStatus) -> Result<Self, TransError> {
-        let state = TxRecordState::try_from_observation(&status.observation)?;
-        Ok(Self {
-            state,
-            observation: Some(status.observation),
-        })
+        let stored = status.observation.value().map(|record| record.status);
+        Self::new(stored, Some(status.observation))
     }
 
     fn cached_final(status: TxCommitStatus) -> Result<Self, TransError> {
+        Self::new(Some(status), None)
+    }
+
+    fn new(
+        stored: Option<TxCommitStatus>,
+        observation: Option<Observation<TxRecord>>,
+    ) -> Result<Self, TransError> {
+        // Rejects `Unknown`, which is never a persisted status.
+        TxRecordState::try_from_status(stored)?;
         Ok(Self {
-            state: TxRecordState::try_from_status(Some(status))?,
-            observation: None,
+            stored,
+            observation,
         })
     }
 
     fn status(&self) -> TxCommitStatus {
-        match self.state {
+        match self.stored {
             // Missing is exposed as pending only during the observer-relative
             // appearance grace. Once the grace expires, resolution first pins
             // the identity as wounded and returns that exact observation.
-            TxRecordState::Missing | TxRecordState::Pending => TxCommitStatus::Pending,
-            TxRecordState::Wounded => TxCommitStatus::Wounded,
-            TxRecordState::Committed => TxCommitStatus::Committed,
-            TxRecordState::Aborted => TxCommitStatus::Aborted,
+            None => TxCommitStatus::Pending,
+            Some(status) => status,
         }
     }
 }
@@ -852,7 +801,7 @@ impl Monitor {
 
     /// Returns final-status cache activity since the previous sample.
     pub(crate) fn stats_and_reset(&self) -> MonitorStats {
-        std::mem::take(&mut self.inner.final_status.lock().unwrap().stats)
+        self.inner.final_status.lock().unwrap().take_stats()
     }
 
     pub(crate) fn protocol_timing(&self) -> ProtocolTiming {
@@ -1056,7 +1005,10 @@ impl Monitor {
             self.stop_tx_refresh(&tid);
             let result = self.persist_committed_record(record).await;
             let create_may_land = result.as_ref().is_err_and(|error| error.create_may_land);
-            self.finish_commit_write(&tid, create_may_land);
+            let lost = result
+                .as_ref()
+                .is_err_and(|error| matches!(error.error, TransError::AlreadyFinalized));
+            self.finish_commit_write(&tid, create_may_land, lost);
             // `context` preserves the `AlreadyFinalized` sentinel so the commit
             // path can recognize an abort-side final status, as well as any
             // classification of an escaping error.
@@ -1141,10 +1093,15 @@ impl Monitor {
             let outcome = match status.status {
                 TxCommitStatus::Committed => Some(OwnerAbortOutcome::Committed),
                 TxCommitStatus::Aborted => Some(OwnerAbortOutcome::Acknowledged),
-                TxCommitStatus::Wounded if transition != AbortTransition::Acknowledge => {
+                TxCommitStatus::Wounded | TxCommitStatus::BlindWounded
+                    if transition != AbortTransition::Acknowledge =>
+                {
                     Some(OwnerAbortOutcome::Pinned)
                 }
-                TxCommitStatus::Wounded | TxCommitStatus::Pending | TxCommitStatus::Unknown => None,
+                TxCommitStatus::Wounded
+                | TxCommitStatus::BlindWounded
+                | TxCommitStatus::Pending
+                | TxCommitStatus::Unknown => None,
             };
             if let Some(outcome) = outcome {
                 if outcome == OwnerAbortOutcome::Pinned {
@@ -1183,10 +1140,17 @@ impl Monitor {
             match status.status {
                 TxCommitStatus::Committed => return Ok(TxFinalStatus::Committed),
                 TxCommitStatus::Aborted => return Ok(TxFinalStatus::Aborted),
-                TxCommitStatus::Wounded if transition != AbortTransition::Acknowledge => {
+                // The caller removes the holder with a CAS on the current
+                // object, so a blind wound holds no committed effect there.
+                TxCommitStatus::Wounded | TxCommitStatus::BlindWounded
+                    if transition != AbortTransition::Acknowledge =>
+                {
                     return Ok(TxFinalStatus::Aborted);
                 }
-                TxCommitStatus::Wounded | TxCommitStatus::Pending | TxCommitStatus::Unknown => {}
+                TxCommitStatus::Wounded
+                | TxCommitStatus::BlindWounded
+                | TxCommitStatus::Pending
+                | TxCommitStatus::Unknown => {}
             }
             // Lease expiry must stop here because the refresh proves liveness.
             // Wound-wait is authorized by priority instead, so a refresh only
@@ -1234,9 +1198,11 @@ impl Monitor {
             .tx_records
             .commit_status_at(tid, self.current_requirement())
             .await?;
+        // The owner asks before its commit write, so it has not committed and
+        // a blind wound is a wound of this identity too.
         let wounded = matches!(
             status.status,
-            TxCommitStatus::Wounded | TxCommitStatus::Aborted
+            TxCommitStatus::Wounded | TxCommitStatus::BlindWounded | TxCommitStatus::Aborted
         );
         if wounded {
             self.record_durable_observation(tid, &status.observation);
@@ -1251,7 +1217,12 @@ impl Monitor {
             // precedence over a potentially newer final-status cache entry.
             match self.tx_status(tid).await? {
                 TxCommitStatus::Committed => return Ok(TxFinalStatus::Committed),
-                TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
+                // A blind holder cannot commit any more, so a waiter can go on.
+                // It decides from the current object, which holds no committed
+                // effect of a blind-wounded holder.
+                TxCommitStatus::Aborted
+                | TxCommitStatus::Wounded
+                | TxCommitStatus::BlindWounded => {
                     return Ok(TxFinalStatus::Aborted);
                 }
                 TxCommitStatus::Pending | TxCommitStatus::Unknown => {}
@@ -1260,6 +1231,44 @@ impl Monitor {
             // Notifications and poll failures are only wake-up hints. Resolve
             // again before returning so a cancelled poll cannot decide status.
             self.wait_for_tx_change(tid).await;
+        }
+    }
+
+    /// Reports whether `tid`, the holder of a drop intent in a node observation
+    /// at `requirement`, committed the drop. Waits while the holder is pending.
+    pub(crate) async fn drop_committed_at(
+        &self,
+        tid: &TxId,
+        requirement: Requirement,
+    ) -> Result<bool, TransError> {
+        if self.await_tx_final(tid).await? == TxFinalStatus::Committed {
+            return Ok(true);
+        }
+        if self.tx_status(tid).await? != TxCommitStatus::BlindWounded {
+            return Ok(false);
+        }
+        // GC deletes the nodes of a dropped collection before the record of
+        // the drop. So only a node observation after the blind wound shows
+        // that the drop did not commit (ADR-104).
+        let after = self.inner.final_status.lock().unwrap().no_value_after(tid);
+        self.require_no_value_at(after, Some(requirement))
+            .map(|()| false)
+    }
+
+    /// Applies the no-value rule (ADR-104) to an observation at `requirement`
+    /// that names an identity with the no-value requirement `after`. Returns
+    /// `Ok` when the observation shows no value of the identity, and
+    /// otherwise asks to resolve it again. When this instance lost `after`,
+    /// the next read of the record learns a newer one.
+    fn require_no_value_at(
+        &self,
+        after: Option<Requirement>,
+        requirement: Option<Requirement>,
+    ) -> Result<(), TransError> {
+        let after = after.unwrap_or_else(|| self.current_requirement());
+        match requirement {
+            Some(requirement) if requirement.stricter(after) == requirement => Ok(()),
+            _ => Err(TransError::ValidateRetry(after)),
         }
     }
 
@@ -1362,6 +1371,13 @@ impl Monitor {
         };
 
         let mut create_may_land = false;
+        // Whether this owner saw its own pending record. GC never deletes a
+        // pending record, so a later empty path proves that this commit landed.
+        let mut saw_pending = expected.as_ref().is_some_and(|observed| {
+            observed
+                .value()
+                .is_some_and(|stored| stored.status == TxCommitStatus::Pending)
+        });
         // The block keeps every early return inside it, so every error reports
         // a create that may still land.
         let result: Result<(), TransError> = async {
@@ -1399,9 +1415,24 @@ impl Monitor {
                 };
 
                 let record_state = TxRecordState::try_from_observation(&status.observation)?;
-                match classify_commit_observation(record_state)? {
+                let attempts = CommitAttempts {
+                    saw_pending,
+                    create_may_land,
+                };
+                match classify_commit_observation(record_state, attempts)? {
                     CommitResolution::Committed => {
                         self.record_durable_observation(tid, &status.observation);
+                        return Ok(());
+                    }
+                    CommitResolution::Reclaimed => {
+                        // The blind wound says less than this owner knows: the
+                        // identity committed, and GC reclaimed its record.
+                        let now = self.current_requirement();
+                        self.inner
+                            .final_status
+                            .lock()
+                            .unwrap()
+                            .note_reclaimed(*tid, now);
                         return Ok(());
                     }
                     CommitResolution::AlreadyFinalized => {
@@ -1418,6 +1449,7 @@ impl Monitor {
                         // landed yet. If it lands later, the next write is rejected
                         // and its read-back decides the outcome.
                         expected = Some(status.observation);
+                        saw_pending = true;
                         rt::sleep(backoff.next_delay()).await;
                     }
                 }
@@ -1504,13 +1536,16 @@ impl Monitor {
     fn build_abort_record(&self, tid: &TxId, target: TxCommitStatus) -> TxRecord {
         debug_assert!(matches!(
             target,
-            TxCommitStatus::Aborted | TxCommitStatus::Wounded
+            TxCommitStatus::Aborted | TxCommitStatus::Wounded | TxCommitStatus::BlindWounded
         ));
         let mut abort_record = TxRecord::new(*tid, target);
         // Only the owner writes `Aborted`, and its own manifest is newer than
         // the stored one. GC reads nothing of a `Wounded` record past its
         // status, so a wound holds no manifest (ADR-095).
-        if target == TxCommitStatus::Wounded {
+        if matches!(
+            target,
+            TxCommitStatus::Wounded | TxCommitStatus::BlindWounded
+        ) {
             return abort_record;
         }
         if let Some(TxRuntimeEntry {
@@ -1644,9 +1679,12 @@ impl Monitor {
             .last_observation
             .clone()
             .filter(|observation| {
-                observation
-                    .value()
-                    .is_some_and(|record| record.status == TxCommitStatus::Wounded)
+                observation.value().is_some_and(|record| {
+                    matches!(
+                        record.status,
+                        TxCommitStatus::Wounded | TxCommitStatus::BlindWounded
+                    )
+                })
             })
     }
 
@@ -1675,14 +1713,14 @@ impl Monitor {
         owned.lifecycle.begin_commit_write()
     }
 
-    fn finish_commit_write(&self, tid: &TxId, create_may_land: bool) {
+    fn finish_commit_write(&self, tid: &TxId, create_may_land: bool, lost: bool) {
         let mut st = self.shard_for(tid).lock().unwrap();
         if let Some(TxRuntimeEntry {
             role: TxRuntimeRole::Owned(owned),
             ..
         }) = st.transactions.get_mut(tid)
         {
-            owned.lifecycle.finish_commit_write(create_may_land);
+            owned.lifecycle.finish_commit_write(create_may_land, lost);
         }
     }
 
@@ -1881,11 +1919,26 @@ impl Monitor {
             }
         };
         let status = evidence.status();
-        if status != TxCommitStatus::Committed {
-            return Ok(KeyCommitStatus {
-                status,
-                value: TValue::default(),
-            });
+        let no_value = KeyCommitStatus {
+            status,
+            value: TValue {
+                not_written: status == TxCommitStatus::Committed,
+                ..Default::default()
+            },
+        };
+        if !matches!(
+            status,
+            TxCommitStatus::Committed | TxCommitStatus::BlindWounded
+        ) {
+            return Ok(no_value);
+        }
+        // A blind wound, or a reclaimed committed record, leaves no value of
+        // the identity in a leaf observation that reaches the requirement
+        // after it. An older observation must be resolved again.
+        let after = self.no_value_after(tid, &evidence);
+        if after.is_some() || status == TxCommitStatus::BlindWounded {
+            self.require_no_value_at(after, requirement)?;
+            return Ok(no_value);
         }
 
         let observed = self.final_record(tid, status, evidence.observation).await?;
@@ -1941,13 +1994,19 @@ impl Monitor {
             }
             // The status is permanent, but GC reclaimed the record: the record
             // is missing, or another instance wounded the identity at the empty
-            // path (a leaked wound, ADR-079). The referring leaf observation
-            // must be resolved again. A current leaf can still name a stray
-            // holder (ADR-095), so the retry must resolve the identity as an
-            // instance that never knew its status does, or it loops forever.
+            // path. The referring leaf observation must be resolved again. A
+            // later one that reaches the returned requirement shows no value of
+            // the identity, also when it still names it as a stray holder
+            // (ADR-104).
             Ok(_) | Err(StorageError::NotFound) => {
-                self.forget_final(tid);
-                Err(TransError::ValidateRetry(self.current_requirement()))
+                let now = self.current_requirement();
+                let reclaimed = self
+                    .inner
+                    .final_status
+                    .lock()
+                    .unwrap()
+                    .note_reclaimed(*tid, now);
+                Err(TransError::ValidateRetry(reclaimed))
             }
             Err(error) => Err(TransError::Storage(
                 error.context(format!("getting TID {tid}")),
@@ -1986,8 +2045,15 @@ impl Monitor {
         }
     }
 
-    fn forget_final(&self, tid: &TxId) {
-        self.inner.final_status.lock().unwrap().remove(tid);
+    /// Returns the requirement that a leaf observation must reach to show no
+    /// value of `tid`, for a blind wound or a reclaimed committed record.
+    fn no_value_after(&self, tid: &TxId, evidence: &TxStatusEvidence) -> Option<Requirement> {
+        if let Some(observed) = &evidence.observation {
+            // A fresh observation recorded its requirement in the cache. The
+            // cache can have evicted it since, and then this call records it.
+            self.remember_final(tid, observed);
+        }
+        self.inner.final_status.lock().unwrap().no_value_after(tid)
     }
 
     fn cached_final_status(&self, tid: &TxId) -> Option<TxCommitStatus> {
@@ -1996,17 +2062,23 @@ impl Monitor {
             .lock()
             .unwrap()
             .get(tid)
-            .map(FinalStatus::status)
+            .map(KnownFinal::status)
     }
 
     fn remember_final(&self, tid: &TxId, observed: &Observation<TxRecord>) {
         let Some(stored) = observed.value() else {
             return;
         };
-        let Some(status) = FinalStatus::from_status(stored.status) else {
-            return;
+        let known = match stored.status {
+            TxCommitStatus::BlindWounded => KnownFinal::blind_wound(self.current_requirement()),
+            status => {
+                let Some(known) = KnownFinal::observed(status) else {
+                    return;
+                };
+                known
+            }
         };
-        self.inner.final_status.lock().unwrap().insert(*tid, status);
+        self.inner.final_status.lock().unwrap().insert(*tid, known);
     }
 
     /// Records an exact durable observation in local owner state and in the
@@ -2137,7 +2209,10 @@ impl Monitor {
         match TxRecordState::try_from_observation(&status.observation)? {
             TxRecordState::Missing => self.resolve_missing_tx(tid, status).await,
             TxRecordState::Pending => self.resolve_pending_tx(tid, status).await,
-            TxRecordState::Wounded | TxRecordState::Committed | TxRecordState::Aborted => {
+            TxRecordState::Wounded
+            | TxRecordState::BlindWounded
+            | TxRecordState::Committed
+            | TxRecordState::Aborted => {
                 self.record_durable_observation(tid, &status.observation);
                 TxStatusEvidence::observed(status)
             }
@@ -2236,7 +2311,10 @@ impl Monitor {
         }
         match TxRecordState::try_from_observation(&refreshed.observation)? {
             TxRecordState::Pending => self.resolve_pending_tx(tid, refreshed).await,
-            TxRecordState::Wounded | TxRecordState::Committed | TxRecordState::Aborted => {
+            TxRecordState::Wounded
+            | TxRecordState::BlindWounded
+            | TxRecordState::Committed
+            | TxRecordState::Aborted => {
                 self.record_durable_observation(tid, &refreshed.observation);
                 TxStatusEvidence::observed(refreshed)
             }
@@ -2439,6 +2517,12 @@ fn classify_abort_observation(
 ) -> AbortObservationAction {
     let (desired, target) = match transition {
         AbortTransition::Acknowledge => (TxRecordState::Aborted, TxCommitStatus::Aborted),
+        // A wound that creates the record is blind (ADR-104).
+        AbortTransition::EnsureWounded | AbortTransition::WoundIfPresent
+            if current == TxRecordState::Missing =>
+        {
+            (TxRecordState::BlindWounded, TxCommitStatus::BlindWounded)
+        }
         AbortTransition::EnsureWounded | AbortTransition::WoundIfPresent => {
             (TxRecordState::Wounded, TxCommitStatus::Wounded)
         }
@@ -2447,9 +2531,23 @@ fn classify_abort_observation(
         return AbortObservationAction::Settled;
     }
     match current.relation_to(desired) {
+        // A blind wound and a wound over a pending record both settle a wound.
         TxLifecycleRelation::Same | TxLifecycleRelation::Blocks => AbortObservationAction::Settled,
         TxLifecycleRelation::CanAdvance => AbortObservationAction::Write(target),
+        TxLifecycleRelation::Invalid => {
+            unreachable!("the wound target follows from the observed state")
+        }
     }
+}
+
+/// What the owner knows about its earlier attempts to write the committed
+/// record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommitAttempts {
+    /// The owner saw its own pending record.
+    saw_pending: bool,
+    /// An earlier create of the committed record was in doubt.
+    create_may_land: bool,
 }
 
 /// Classifies what a durable read proves after a committed-record write did not
@@ -2458,13 +2556,31 @@ fn classify_abort_observation(
 /// A missing record is in doubt even after a clean rejection: GC deleted a
 /// final record, and during a commit the only final record that GC can delete
 /// is this owner's own `Committed` record from an earlier attempt that was in
-/// doubt. A peer writes `Wounded`, which GC keeps. An acknowledgement as
+/// doubt. A peer writes a wound, which GC keeps. An acknowledgement as
 /// `Aborted` needs proof that no owner operation is active, and a commit runs
 /// inside one.
-fn classify_commit_observation(current: TxRecordState) -> Result<CommitResolution, TransError> {
+///
+/// A blind wound landed at an empty path (ADR-104). If the owner saw its own
+/// pending record, only the reclaimed `Committed` record of this owner can have
+/// emptied the path. Otherwise the wound landed before the first create of the
+/// committed record, unless a create was in doubt: then it is in doubt, as for a
+/// missing record.
+fn classify_commit_observation(
+    current: TxRecordState,
+    attempts: CommitAttempts,
+) -> Result<CommitResolution, TransError> {
     match (current.relation_to(TxRecordState::Committed), current) {
         (TxLifecycleRelation::Same, TxRecordState::Committed) => Ok(CommitResolution::Committed),
         (TxLifecycleRelation::Blocks, TxRecordState::Aborted | TxRecordState::Wounded) => {
+            Ok(CommitResolution::AlreadyFinalized)
+        }
+        (TxLifecycleRelation::Blocks, TxRecordState::BlindWounded) if attempts.saw_pending => {
+            Ok(CommitResolution::Reclaimed)
+        }
+        (TxLifecycleRelation::Blocks, TxRecordState::BlindWounded) if attempts.create_may_land => {
+            Ok(CommitResolution::InDoubt)
+        }
+        (TxLifecycleRelation::Blocks, TxRecordState::BlindWounded) => {
             Ok(CommitResolution::AlreadyFinalized)
         }
         (TxLifecycleRelation::CanAdvance, TxRecordState::Pending) => Ok(CommitResolution::Retry),
@@ -2549,7 +2665,7 @@ mod tests {
         );
         assert_eq!(
             classify_abort_observation(ensure_wounded, TxRecordState::Missing),
-            AbortObservationAction::Write(TxCommitStatus::Wounded)
+            AbortObservationAction::Write(TxCommitStatus::BlindWounded)
         );
         assert_eq!(
             classify_abort_observation(wound_if_present, TxRecordState::Missing),
@@ -2559,28 +2675,37 @@ mod tests {
 
     #[test]
     fn commit_observation_classification_matches_the_protocol() {
-        assert_eq!(
-            classify_commit_observation(TxRecordState::Committed).unwrap(),
-            CommitResolution::Committed
-        );
-        assert_eq!(
-            classify_commit_observation(TxRecordState::Aborted).unwrap(),
-            CommitResolution::AlreadyFinalized
-        );
-        assert_eq!(
-            classify_commit_observation(TxRecordState::Wounded).unwrap(),
-            CommitResolution::AlreadyFinalized
-        );
-        assert_eq!(
-            classify_commit_observation(TxRecordState::Pending).unwrap(),
-            CommitResolution::Retry
-        );
-        // GC deleted a final record. It can be this owner's own commit from an
-        // earlier attempt, even if the latest attempt was a clean rejection.
-        assert_eq!(
-            classify_commit_observation(TxRecordState::Missing).unwrap(),
-            CommitResolution::InDoubt
-        );
+        use CommitResolution::{AlreadyFinalized, Committed, InDoubt, Reclaimed, Retry};
+        for saw_pending in [false, true] {
+            for create_may_land in [false, true] {
+                let attempts = CommitAttempts {
+                    saw_pending,
+                    create_may_land,
+                };
+                let classify = |state| classify_commit_observation(state, attempts).unwrap();
+                assert_eq!(classify(TxRecordState::Committed), Committed);
+                assert_eq!(classify(TxRecordState::Aborted), AlreadyFinalized);
+                // A wound over a pending record fenced the commit.
+                assert_eq!(classify(TxRecordState::Wounded), AlreadyFinalized);
+                assert_eq!(classify(TxRecordState::Pending), Retry);
+                // GC deleted a final record. It can be this owner's own commit
+                // from an earlier attempt, even if the latest attempt was a
+                // clean rejection.
+                assert_eq!(classify(TxRecordState::Missing), InDoubt);
+                // A blind wound landed at an empty path. GC never deletes a
+                // pending record, so after one only the reclaimed commit of
+                // this owner can have emptied the path. Without one, the wound
+                // is as ambiguous as a missing record if a create was in doubt.
+                let blind = if saw_pending {
+                    Reclaimed
+                } else if create_may_land {
+                    InDoubt
+                } else {
+                    AlreadyFinalized
+                };
+                assert_eq!(classify(TxRecordState::BlindWounded), blind, "{attempts:?}");
+            }
+        }
     }
 
     #[test]
@@ -2646,13 +2771,39 @@ mod tests {
             OwnerClosePlan::Transition(AbortTransition::Acknowledge)
         );
 
+        // A blind wound after a commit write proves a lost commit only when
+        // commit recovery proved it (ADR-104).
+        for (lost, plan) in [
+            (
+                false,
+                OwnerClosePlan::Transition(AbortTransition::EnsureWounded),
+            ),
+            (
+                true,
+                OwnerClosePlan::Transition(AbortTransition::Acknowledge),
+            ),
+        ] {
+            for reason in [OwnerCloseReason::OwnerAbort, OwnerCloseReason::Preemption] {
+                let mut blind = OwnerLifecycle::default();
+                blind.begin_operation().unwrap();
+                blind.finish_operation(false);
+                blind.begin_commit_write().unwrap();
+                blind.finish_commit_write(false, lost);
+                assert_eq!(
+                    blind.close(reason, OwnerRecordState::BlindWounded),
+                    plan,
+                    "lost: {lost}, {reason:?}"
+                );
+            }
+        }
+
         // A delayed create can land after GC deletes an acknowledged abort.
         for reason in [OwnerCloseReason::OwnerAbort, OwnerCloseReason::Preemption] {
             let mut create_in_doubt = OwnerLifecycle::default();
             create_in_doubt.begin_operation().unwrap();
             create_in_doubt.finish_operation(false);
             create_in_doubt.begin_commit_write().unwrap();
-            create_in_doubt.finish_commit_write(true);
+            create_in_doubt.finish_commit_write(true, false);
             assert_eq!(
                 create_in_doubt.close(reason, OwnerRecordState::Wounded),
                 OwnerClosePlan::Transition(AbortTransition::EnsureWounded)
@@ -2793,51 +2944,6 @@ mod tests {
         panic!("transaction did not register {count} waiters");
     }
 
-    #[test]
-    fn final_status_rejects_statuses_that_are_not_final() {
-        for status in [TxCommitStatus::Unknown, TxCommitStatus::Pending] {
-            assert_eq!(FinalStatus::from_status(status), None);
-        }
-        for status in [
-            TxCommitStatus::Committed,
-            TxCommitStatus::Wounded,
-            TxCommitStatus::Aborted,
-        ] {
-            assert_eq!(FinalStatus::from_status(status).unwrap().status(), status);
-        }
-    }
-
-    // Owner acknowledgement changes a wound to aborted, never the other way.
-    #[test]
-    fn final_status_cache_keeps_an_acknowledged_wound() {
-        let mut cache = FinalStatusCache::new(2);
-        let tid = tx_id(b"wounded");
-
-        cache.insert(tid, FinalStatus::Wounded);
-        cache.insert(tid, FinalStatus::Aborted);
-        cache.insert(tid, FinalStatus::Wounded);
-
-        assert_eq!(cache.get(&tid), Some(FinalStatus::Aborted));
-    }
-
-    #[test]
-    fn final_status_cache_is_count_bounded_and_lru() {
-        let mut cache = FinalStatusCache::new(2);
-        let first = tx_id(b"first");
-        let second = tx_id(b"second");
-        let third = tx_id(b"third");
-        let status = FinalStatus::Committed;
-
-        cache.insert(first, status);
-        cache.insert(second, status);
-        assert!(cache.get(&first).is_some());
-        cache.insert(third, status);
-
-        assert!(cache.get(&second).is_none());
-        assert!(cache.get(&first).is_some());
-        assert!(cache.get(&third).is_some());
-    }
-
     #[tokio::test(start_paused = true)]
     async fn stats_count_final_status_lookups_across_clones() {
         let recorded = Arc::new(RecordingBackend::new(Arc::new(MemoryBackend::new())));
@@ -2916,8 +3022,14 @@ mod tests {
         assert_eq!(peer.preempt_tx(&tid).await.unwrap(), TxFinalStatus::Aborted);
         operations.lock().unwrap().clear();
 
-        assert_eq!(peer.known_final_status(&tid), Some(TxCommitStatus::Wounded));
-        assert_eq!(peer.tx_status(&tid).await.unwrap(), TxCommitStatus::Wounded);
+        assert_eq!(
+            peer.known_final_status(&tid),
+            Some(TxCommitStatus::BlindWounded)
+        );
+        assert_eq!(
+            peer.tx_status(&tid).await.unwrap(),
+            TxCommitStatus::BlindWounded
+        );
         assert!(operations.lock().unwrap().is_empty());
 
         operation.complete();
@@ -3291,7 +3403,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status,
-            TxCommitStatus::Wounded
+            TxCommitStatus::BlindWounded
         );
 
         tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
@@ -3555,11 +3667,147 @@ mod tests {
         assert_eq!(commit_writes.load(Ordering::SeqCst), 2);
     }
 
+    /// Makes the first commit write of `tx` land but report `Unavailable`.
+    /// Before the owner reads back, GC deletes the committed record and a peer
+    /// wounds the empty path, so the owner reads a blind wound.
+    fn land_reclaim_and_wound_the_first_commit(
+        backend: &HookBackend,
+        memory: Arc<MemoryBackend>,
+        collector: TxRecordStore,
+        wounder: Monitor,
+        tx: TxId,
+    ) {
+        let delayed = DelayedWrite::default();
+        let landed = Arc::new(AtomicBool::new(false));
+        backend.set_before(move |operation| {
+            let commit = match operation {
+                BackendOp::WriteIf { value, .. } | BackendOp::WriteIfNotExists { value, .. } => {
+                    glassdb_storage::txrecord::status(value)
+                        .is_ok_and(|status| status == TxCommitStatus::Committed)
+                }
+                _ => false,
+            };
+            let first = commit && !landed.swap(true, Ordering::SeqCst);
+            if first {
+                delayed.hold(operation);
+            }
+            let (delayed, memory, collector, wounder) = (
+                delayed.clone(),
+                memory.clone(),
+                collector.clone(),
+                wounder.clone(),
+            );
+            Box::pin(async move {
+                if !first {
+                    return Ok(());
+                }
+                delayed.release(&memory).await.unwrap();
+                let committed = collector.get_at(&tx, Requirement::ANY).await.unwrap();
+                assert_eq!(committed.value().unwrap().status, TxCommitStatus::Committed);
+                collector.delete(&committed).await.unwrap();
+                assert_eq!(
+                    wounder.preempt_tx(&tx).await.unwrap(),
+                    TxFinalStatus::Aborted
+                );
+                Err(BackendError::Unavailable("injected landed write".into()))
+            })
+        });
+    }
+
+    // Regression (ADR-104): the owner replaced its pending record with the
+    // committed one, and the write landed in doubt. GC deleted it, and a peer
+    // wounded the empty path. GC never deletes a pending record, so the blind
+    // wound proves that the commit landed. The owner must not report an abort,
+    // and must not acknowledge the wound as `Aborted`.
+    #[tokio::test(start_paused = true)]
+    async fn a_blind_wound_after_a_pending_record_proves_the_commit() {
+        let memory = Arc::new(MemoryBackend::new());
+        let backend = HookBackend::new(memory.clone());
+        let (owner, owner_ctx) = new_test_monitor(backend.clone());
+        let (_collector, collector_ctx) = new_test_monitor(memory.clone());
+        let (wounder, _wounder_ctx) = new_test_monitor(memory.clone());
+        let tx = tx_id(b"reclaimed-replace");
+        let lock = TxLock::TopologyParticipant {
+            collection: CollectionAddress::root("test"),
+        };
+        owner
+            .begin_persisted_tx(
+                &tx,
+                TxRecoveryManifest {
+                    locks: vec![lock.clone()],
+                    ..TxRecoveryManifest::default()
+                },
+            )
+            .await
+            .unwrap();
+        land_reclaim_and_wound_the_first_commit(
+            &backend,
+            memory.clone(),
+            collector_ctx.tx_records.clone(),
+            wounder,
+            tx,
+        );
+
+        let mut record = TxRecord::new(tx, TxCommitStatus::Committed);
+        record.locks.push(lock);
+        owner.commit_tx(record).await.unwrap();
+        assert_eq!(
+            owner.tx_status(&tx).await.unwrap(),
+            TxCommitStatus::Committed
+        );
+        assert_eq!(
+            owner_ctx
+                .tx_records
+                .commit_status_at(&tx, Requirement::ANY)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::BlindWounded
+        );
+    }
+
+    // Regression (ADR-104): the owner created its committed record, and the
+    // create landed in doubt. GC deleted it, and a peer wounded the empty path.
+    // The blind wound cannot tell this from a wound that came before the
+    // create, so the owner must report the outcome as in doubt and not replay
+    // a body that committed.
+    #[tokio::test(start_paused = true)]
+    async fn a_blind_wound_after_an_in_doubt_create_is_in_doubt() {
+        let memory = Arc::new(MemoryBackend::new());
+        let backend = HookBackend::new(memory.clone());
+        let (owner, _owner_ctx) = new_test_monitor(backend.clone());
+        let (_collector, collector_ctx) = new_test_monitor(memory.clone());
+        let (wounder, _wounder_ctx) = new_test_monitor(memory.clone());
+        let tx = tx_id(b"reclaimed-create");
+        owner.begin_tx(&tx);
+        land_reclaim_and_wound_the_first_commit(
+            &backend,
+            memory.clone(),
+            collector_ctx.tx_records.clone(),
+            wounder,
+            tx,
+        );
+
+        let mut record = TxRecord::new(tx, TxCommitStatus::Committed);
+        record.locks.push(TxLock::TopologyParticipant {
+            collection: CollectionAddress::root("test"),
+        });
+        let result = owner.commit_tx(record).await;
+        assert!(
+            matches!(
+                result,
+                Err(TransError::Storage(StorageError::Unavailable(_)))
+            ),
+            "{result:?}"
+        );
+    }
+
     // Regression (ADR-059): a create of the committed record that is in doubt
     // can land after a peer wounds the empty path. The owner must keep the
     // wound pinned. If it acknowledged the wound, GC could delete `Aborted`,
     // and the delayed create would then commit an identity that peers treat as
-    // aborted.
+    // aborted. The blind wound also cannot show that the commit lost, so the
+    // outcome is in doubt (ADR-104).
     #[tokio::test(start_paused = true)]
     async fn in_doubt_commit_create_keeps_a_later_wound_pinned() {
         let memory = Arc::new(MemoryBackend::new());
@@ -3603,14 +3851,22 @@ mod tests {
         record.locks.push(TxLock::TopologyParticipant {
             collection: CollectionAddress::root("test"),
         });
-        assert!(matches!(
-            owner.commit_tx(record).await,
-            Err(TransError::AlreadyFinalized)
-        ));
+        // The blind wound cannot tell a commit that lost from one that landed
+        // and that GC reclaimed, so the outcome stays in doubt (ADR-104).
+        let result = owner.commit_tx(record).await;
+        assert!(
+            matches!(
+                result,
+                Err(TransError::Storage(StorageError::Unavailable(_)))
+            ),
+            "{result:?}"
+        );
         owner_operation.complete();
+        // The owner writes no abort-side record for a commit in doubt
+        // (ADR-057), so nobody acknowledges the wound.
         assert_eq!(
             owner.abort_owned_tx(&tx).await.unwrap(),
-            OwnerAbortOutcome::Pinned
+            OwnerAbortOutcome::CommitOutcomePreserved
         );
 
         let wounded = owner_ctx
@@ -3618,7 +3874,10 @@ mod tests {
             .get_at(&tx, Requirement::ANY)
             .await
             .unwrap();
-        assert_eq!(wounded.value().unwrap().status, TxCommitStatus::Wounded);
+        assert_eq!(
+            wounded.value().unwrap().status,
+            TxCommitStatus::BlindWounded
+        );
         assert!(matches!(
             delayed.release(&memory).await,
             Err(BackendError::Precondition)
@@ -3630,7 +3889,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status,
-            TxCommitStatus::Wounded
+            TxCommitStatus::BlindWounded
         );
     }
 
@@ -3814,10 +4073,13 @@ mod tests {
         let owner = mon.begin_owner_operation(&tx).unwrap();
         mon.begin_tx(&tx);
         assert_eq!(mon.preempt_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
-        assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Wounded);
+        assert_eq!(
+            mon.tx_status(&tx).await.unwrap(),
+            TxCommitStatus::BlindWounded
+        );
         assert_eq!(
             written.lock().unwrap().as_slice(),
-            [TxCommitStatus::Wounded]
+            [TxCommitStatus::BlindWounded]
         );
 
         owner.complete();
@@ -3827,7 +4089,7 @@ mod tests {
         );
         assert_eq!(
             written.lock().unwrap().as_slice(),
-            [TxCommitStatus::Wounded, TxCommitStatus::Aborted]
+            [TxCommitStatus::BlindWounded, TxCommitStatus::Aborted]
         );
         assert_eq!(
             ctx.tx_records
@@ -3861,7 +4123,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status,
-            TxCommitStatus::Wounded
+            TxCommitStatus::BlindWounded
         );
     }
 
@@ -4109,9 +4371,12 @@ mod tests {
                 .unwrap()
                 .0
                 .status,
-            TxCommitStatus::Wounded
+            TxCommitStatus::BlindWounded
         );
-        assert_eq!(mon.tx_status(&tx).await.unwrap(), TxCommitStatus::Wounded);
+        assert_eq!(
+            mon.tx_status(&tx).await.unwrap(),
+            TxCommitStatus::BlindWounded
+        );
         assert_eq!(
             mon.await_tx_final(&tx).await.unwrap(),
             TxFinalStatus::Aborted

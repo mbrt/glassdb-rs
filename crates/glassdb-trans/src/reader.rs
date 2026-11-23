@@ -312,7 +312,7 @@ mod tests {
                 // older than the write-back finds no record and wounds the
                 // identity (a leaked wound, ADR-079).
                 peer.tx_records
-                    .set(&TxRecord::new(old, TxCommitStatus::Wounded))
+                    .set(&TxRecord::new(old, TxCommitStatus::BlindWounded))
                     .await
                     .unwrap();
             }
@@ -411,9 +411,9 @@ mod tests {
 
     // A late lock CAS leaves a stray holder of a committed identity on a key
     // that it did not write (ADR-095). A current leaf still names it after GC
-    // reclaimed its record. An instance that knows the identity as committed
-    // must resolve the key as an instance without that knowledge does, and
-    // must not resolve the current leaf again and again.
+    // reclaimed its record. A leaf observation after this instance found the
+    // record reclaimed shows no value of the identity (ADR-104), so the key
+    // resolves after one reload and is not resolved again and again.
     #[tokio::test]
     async fn a_stray_holder_of_a_reclaimed_commit_does_not_block_its_key() {
         use crate::access::{AccessSet, WriteAccess};
@@ -437,9 +437,7 @@ mod tests {
             let collection = CollectionAddress::root("db");
             let a = LogicalKey::new(collection.clone(), b"a");
             let b = LogicalKey::new(collection.clone(), b"b");
-            // The writer of the lock case outranks the stray holder, so it
-            // wounds it and does not wait for the missing-record grace.
-            let stray = TxId::with_priority(1, &[1]);
+            let stray = tx_id(&[1]);
             let mut record = TxRecord::new(stray, TxCommitStatus::Committed);
             record.writes.push(TxWrite {
                 key: a.clone(),
@@ -495,7 +493,7 @@ mod tests {
             if wounded {
                 // A leaked wound (ADR-079).
                 peer.tx_records
-                    .set(&TxRecord::new(stray, TxCommitStatus::Wounded))
+                    .set(&TxRecord::new(stray, TxCommitStatus::BlindWounded))
                     .await
                     .unwrap();
             }

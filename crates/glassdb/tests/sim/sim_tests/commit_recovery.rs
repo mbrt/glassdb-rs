@@ -153,6 +153,9 @@ fn a_reclaimed_commit_that_landed_after_a_pending_read_is_in_doubt() {
 // older peer wounds the empty path before the create lands. The owner must
 // keep the wound pinned. Otherwise GC deletes the acknowledged abort and the
 // delayed create commits an identity that peers already treat as aborted.
+// The blind wound cannot show that the commit lost: the create can also have
+// landed, and GC can have reclaimed it. So the owner reports the outcome as in
+// doubt and does not replay the body (ADR-104).
 #[test]
 fn a_delayed_commit_create_cannot_land_after_a_wound() {
     exec::block_on(async {
@@ -210,11 +213,12 @@ fn a_delayed_commit_create_cannot_land_after_a_wound() {
                     // The peer finds the owner's lock and wounds the identity
                     // before the owner reads its record back.
                     owner_locked.notify_one();
-                    while !memory
-                        .read(&path)
-                        .await
-                        .is_ok_and(|r| record_status(&r.contents) == TxCommitStatus::Wounded)
-                    {
+                    while !memory.read(&path).await.is_ok_and(|r| {
+                        matches!(
+                            record_status(&r.contents),
+                            TxCommitStatus::Wounded | TxCommitStatus::BlindWounded
+                        )
+                    }) {
                         rt::sleep(Duration::from_millis(1)).await;
                     }
                     Err(BackendError::Unavailable("injected delayed create".into()))
@@ -222,8 +226,8 @@ fn a_delayed_commit_create_cannot_land_after_a_wound() {
             }
         });
 
-        // The wound makes the owner replay the body under a new identity.
-        owner.root_collection().write(b"key", b"new").await.unwrap();
+        let result = owner.root_collection().write(b"key", b"new").await;
+        assert!(matches!(result, Err(Error::InDoubt(_))), "{result:?}");
         backend.clear_before();
         let peer = peer_write.await.unwrap();
         assert!(held.load(Ordering::SeqCst));
@@ -232,16 +236,24 @@ fn a_delayed_commit_create_cannot_land_after_a_wound() {
         // Give GC more than the safety horizon to delete an acknowledged abort.
         rt::sleep(Duration::from_secs(5)).await;
         let wounded = memory.read(&path).await.unwrap();
-        assert_eq!(record_status(&wounded.contents), TxCommitStatus::Wounded);
+        assert_eq!(
+            record_status(&wounded.contents),
+            TxCommitStatus::BlindWounded
+        );
         assert!(matches!(
             delayed.release(&memory).await,
             Err(BackendError::Precondition)
         ));
         let current = memory.read(&path).await.unwrap();
-        assert_eq!(record_status(&current.contents), TxCommitStatus::Wounded);
+        assert_eq!(
+            record_status(&current.contents),
+            TxCommitStatus::BlindWounded
+        );
+        // The create of the owner never landed, so the write of the peer is
+        // the latest one.
         assert_eq!(
             peer.root_collection().read(b"key").await.unwrap(),
-            Some(b"new".to_vec())
+            Some(b"peer".to_vec())
         );
         owner.shutdown().await;
         peer.shutdown().await;

@@ -11,6 +11,10 @@ message TransactionRecord {
         ABORTED = 2;
         PENDING = 3;
         WOUNDED = 4;
+        // A wound that created the record at an empty path. It proves only
+        // that the identity cannot commit after it. The identity can have
+        // committed before, and GC can have deleted that record.
+        BLIND_WOUNDED = 5;
     }
 
     google.protobuf.Timestamp timestamp = 1;

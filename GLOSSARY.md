@@ -287,6 +287,10 @@ _Avoid_: Serial locking, serial validation, serial mode
 **Wound**:
 The conditional change of a transaction record from pending, or from absent, to wounded, usually by another transaction. After it, the identity can never commit.
 
+**Blind wound**:
+A wound that creates the transaction record because the identity has none. It does not prove that the identity never committed, because GC can have reclaimed a final record of the identity.
+_Avoid_: Fenced wound
+
 **Fence**:
 A durable change that stops earlier work from publishing more effects, even if that work is still running. A wound, for example, fences the owner of the wounded identity.
 

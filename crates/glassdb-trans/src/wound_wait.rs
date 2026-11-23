@@ -36,7 +36,11 @@ pub(crate) async fn resolve_tx_conflict(
 ) -> Result<TxFinalStatus, TransError> {
     match monitor.tx_status(holder).await? {
         TxCommitStatus::Committed => Ok(TxFinalStatus::Committed),
-        TxCommitStatus::Aborted | TxCommitStatus::Wounded => Ok(TxFinalStatus::Aborted),
+        // The caller removes the holder with a CAS on the current object, so a
+        // blind wound holds no committed effect there.
+        TxCommitStatus::Aborted | TxCommitStatus::Wounded | TxCommitStatus::BlindWounded => {
+            Ok(TxFinalStatus::Aborted)
+        }
         TxCommitStatus::Pending => {
             if matches!(
                 try_reclaim(monitor, requester, holder).await?,

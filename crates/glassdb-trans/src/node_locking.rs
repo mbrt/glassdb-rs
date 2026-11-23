@@ -205,7 +205,11 @@ impl<'a> NodeLockReconciler<'a> {
                     }
                 }
                 TxCommitStatus::Unknown => return Ok(Some(GateBlocker::Holder(holder))),
-                TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
+                // The CAS on the node checks that the gate is current.
+                TxCommitStatus::Committed
+                | TxCommitStatus::Aborted
+                | TxCommitStatus::Wounded
+                | TxCommitStatus::BlindWounded => {}
             }
             locks.remove_structural_gate(&holder);
         }
@@ -233,7 +237,10 @@ impl<'a> NodeLockReconciler<'a> {
         }
         match self.monitor.tx_status(&holder).await? {
             TxCommitStatus::Committed => Err(TransError::StaleCollection),
-            TxCommitStatus::Aborted | TxCommitStatus::Wounded => {
+            // The CAS on the node checks that it is current. GC deletes the
+            // nodes of a dropped collection before the record of the drop, so a
+            // current node holds no committed drop of a blind-wounded holder.
+            TxCommitStatus::Aborted | TxCommitStatus::Wounded | TxCommitStatus::BlindWounded => {
                 locks.remove_drop_intent(&holder);
                 Ok(None)
             }
@@ -335,12 +342,11 @@ impl<'a> NodeLockReconciler<'a> {
     async fn remove_membership_writer(
         &self,
         holder: &TxId,
-        status: TxCommitStatus,
+        committed: bool,
         draft: &mut StageDraft<'_>,
         collection: &CollectionAddress,
         requirement: Requirement,
     ) -> Result<(), TransError> {
-        debug_assert!(status.is_final(), "{holder} is not final: {status:?}");
         let exclusive = draft.locks().membership().lock_type() == LockType::Write;
         if exclusive {
             for (key, entry) in draft.staged().entries() {
@@ -351,7 +357,7 @@ impl<'a> NodeLockReconciler<'a> {
                     continue;
                 }
                 let mut released = entry.clone();
-                if status == TxCommitStatus::Committed {
+                if committed {
                     released.current = self
                         .committed_current(holder, key, entry, collection, requirement)
                         .await?;
@@ -459,8 +465,8 @@ impl<'a> NodeLockReconciler<'a> {
             Reclaimed::Final(statuses) => statuses,
             Reclaimed::Wait(holder) => return Ok(Some(holder)),
         };
-        for (holder, status) in holders.iter().zip(statuses) {
-            self.remove_membership_writer(holder, status, draft, collection, requirement)
+        for (holder, committed) in holders.iter().zip(statuses) {
+            self.remove_membership_writer(holder, committed, draft, collection, requirement)
                 .await?;
         }
         Ok(None)
@@ -472,32 +478,44 @@ impl<'a> NodeLockReconciler<'a> {
     /// because the wait makes the caller resolve all holders again. A status
     /// read can still wound a holder whose lease expired.
     async fn reclaim_holders(&self, holders: &[TxId]) -> Result<Reclaimed, TransError> {
-        let mut statuses = self.holder_statuses(holders).await?;
+        let statuses = self.holder_statuses(holders).await?;
         let mut pending = Vec::new();
-        for (index, (holder, status)) in holders.iter().zip(&statuses).enumerate() {
+        for (holder, status) in holders.iter().zip(&statuses) {
             match status {
                 TxCommitStatus::Unknown => return Ok(Reclaimed::Wait(*holder)),
                 TxCommitStatus::Pending if !self.may_wound(holder) => {
                     return Ok(Reclaimed::Wait(*holder));
                 }
-                TxCommitStatus::Pending => pending.push((index, *holder)),
-                TxCommitStatus::Committed | TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
+                TxCommitStatus::Pending => pending.push(*holder),
+                TxCommitStatus::Committed
+                | TxCommitStatus::Aborted
+                | TxCommitStatus::Wounded
+                | TxCommitStatus::BlindWounded => {}
             }
         }
         let reclaimed = map_all_bounded(
             pending,
             HOLDER_RESOLUTION_PARALLELISM,
-            |(index, holder)| async move { (index, holder, self.reclaim(&holder).await) },
+            |holder| async move { (holder, self.reclaim(&holder).await) },
         )
         .await;
-        for (index, holder, reclaimed) in reclaimed {
+        for (holder, reclaimed) in reclaimed {
             match reclaimed? {
                 // The holder committed before the wound landed.
                 Reclaim::Wait => return Ok(Reclaimed::Wait(holder)),
-                Reclaim::Wounded => statuses[index] = TxCommitStatus::Wounded,
+                // The wound fences a later commit of the holder. A blind wound
+                // can follow a reclaimed commit, but the node CAS proves that
+                // the node is current, and GC deleted that record only after no
+                // current object referred to the holder (ADR-104).
+                Reclaim::Wounded => {}
             }
         }
-        Ok(Reclaimed::Final(statuses))
+        Ok(Reclaimed::Final(
+            statuses
+                .into_iter()
+                .map(|status| status == TxCommitStatus::Committed)
+                .collect(),
+        ))
     }
 
     fn may_wound(&self, holder: &TxId) -> bool {
@@ -634,8 +652,9 @@ pub(crate) fn leaf_collection(path: &ObjectPath) -> Result<&CollectionAddress, T
 
 /// Result of giving every holder of a node lock a final status.
 enum Reclaimed {
-    /// The final status of each holder, in order.
-    Final(Vec<TxCommitStatus>),
+    /// Whether each holder committed, in order. Every holder has a final
+    /// status.
+    Final(Vec<bool>),
     /// A live holder that the operation must wait for.
     Wait(TxId),
 }

@@ -870,7 +870,12 @@ fn sweep_aborted_holders(tmon: &Monitor, removed: &BTreeSet<TxId>, draft: &mut S
         .filter(|holder| {
             matches!(
                 tmon.known_final_status(holder),
-                Some(TxCommitStatus::Aborted | TxCommitStatus::Wounded)
+                // The stage CAS checks that the entries are current.
+                Some(
+                    TxCommitStatus::Aborted
+                        | TxCommitStatus::Wounded
+                        | TxCommitStatus::BlindWounded
+                )
             )
         })
         .collect();
@@ -2274,7 +2279,7 @@ mod tests {
         assert_eq!(e.lock_holders(), std::slice::from_ref(&old));
         assert_eq!(
             ctx.monitor.tx_status(&young).await.unwrap(),
-            TxCommitStatus::Wounded
+            TxCommitStatus::BlindWounded
         );
     }
 
@@ -4378,7 +4383,7 @@ mod tests {
         )
         .await;
         let readers = reader_ids(40);
-        seed_membership_readers(&ctx, memory, &readers, TxCommitStatus::Wounded).await;
+        seed_membership_readers(&ctx, memory, &readers, TxCommitStatus::BlindWounded).await;
         let writer = mk_tid(1, "writer");
         ctx.monitor.begin_tx(&writer);
 
@@ -4421,7 +4426,7 @@ mod tests {
         let live = mk_tid(20, "live");
         let mut holders = stale.clone();
         holders.push(live);
-        seed_membership_readers(&ctx, memory, &stale, TxCommitStatus::Wounded).await;
+        seed_membership_readers(&ctx, memory, &stale, TxCommitStatus::BlindWounded).await;
         let mut root = Node::leaf(LeafBody::new());
         for holder in &holders {
             root.add_membership_reader(*holder);
@@ -4493,7 +4498,7 @@ mod tests {
         ));
         assert_eq!(
             ctx.monitor.tx_status(&younger).await.unwrap(),
-            TxCommitStatus::Wounded
+            TxCommitStatus::BlindWounded
         );
     }
 }

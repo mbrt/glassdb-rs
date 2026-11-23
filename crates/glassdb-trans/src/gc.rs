@@ -582,7 +582,7 @@ impl Gc {
             // A wound stays pinned, unless this instance retired the identity
             // with a proof and so acknowledges for its owner (ADR-059). The
             // acknowledgement restarts the retention period.
-            TxRecordState::Wounded => {
+            TxRecordState::Wounded | TxRecordState::BlindWounded => {
                 match self
                     .monitor
                     .acknowledge_retired_wound(tid, &status.observation)
@@ -672,9 +672,10 @@ impl Gc {
                 self.reclaim_committed(tid, record, observed, barrier).await
             }
             TxCommitStatus::Aborted => self.reclaim_aborted(tid, record, observed, barrier).await,
-            TxCommitStatus::Pending | TxCommitStatus::Unknown | TxCommitStatus::Wounded => {
-                Ok(GcOutcome::Retained)
-            }
+            TxCommitStatus::Pending
+            | TxCommitStatus::Unknown
+            | TxCommitStatus::Wounded
+            | TxCommitStatus::BlindWounded => Ok(GcOutcome::Retained),
         }
     }
 

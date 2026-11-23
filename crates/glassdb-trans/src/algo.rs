@@ -1374,7 +1374,9 @@ impl Algo {
     async fn was_wounded(&self, tx: &Handle) -> bool {
         matches!(
             self.mon.tx_status(&tx.id).await,
-            Ok(TxCommitStatus::Aborted | TxCommitStatus::Wounded)
+            // Before its commit write, the owner has not committed, so a blind
+            // wound is a wound of this identity too.
+            Ok(TxCommitStatus::Aborted | TxCommitStatus::Wounded | TxCommitStatus::BlindWounded)
         )
     }
 
@@ -2540,7 +2542,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status,
-            TxCommitStatus::Wounded
+            TxCommitStatus::BlindWounded
         );
 
         acknowledgement.add_permits(1);
