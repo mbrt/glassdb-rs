@@ -427,6 +427,10 @@ The set of logical keys in one leaf whose current state is an inline or external
 A leaf counter that changes when a transaction or a structural change changes, or can change, the key membership of the leaf.
 _Avoid_: Membership version
 
+**Node sequence**:
+The number of changes of one node since its creation. A state of a node never repeats while the node exists.
+_Avoid_: Node version, change count, write generation
+
 **Routing**:
 The resolution of a logical key or range endpoint to a leaf by descent through a collection tree. Its result records observed placement; it does not reserve the key or keep that placement current.
 _Avoid_: Shard calculation, ownership proof

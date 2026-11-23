@@ -1,14 +1,18 @@
 //! End-of-run check that no leaf keeps a stray holder.
 //!
 //! A stray holder is a lock of a transaction whose record GC deleted
-//! (ADR-079). After a full GC, each lock holder in a leaf must still have a
-//! record. A lock CAS that lands after the retention period can still leave a
-//! stray holder (ADR-095), so the harness runs this check only without
-//! transport failures and slow mutations.
+//! (ADR-079). After a full GC, each lock holder in a leaf whose record existed
+//! must still have it. No lock CAS can land after GC deleted the record of its
+//! identity (ADR-105), so the check runs also with transport failures and slow
+//! mutations.
+//!
+//! A holder whose identity never wrote a record is not a stray holder. Its owner
+//! crashed before the record, and a later writer wounds it (ADR-024).
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 
+use glassdb_backend::middleware::OpLog;
 use glassdb_backend::{Backend, BackendError, ListCursor, ListLimit};
 use glassdb_concurr::rt;
 use glassdb_data::{ObjectPath, TxId};
@@ -20,18 +24,27 @@ const LIST_PAGE: ListLimit = NonZeroUsize::new(1000).unwrap();
 const GC_PARALLELISM: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
 /// Runs full GCs on `db` until no garbage is left, then panics if a GC check
-/// failed, or if a leaf in `backend` names a lock holder that has no
-/// transaction record.
-pub(super) async fn assert_no_stray_holders(db: &Database, backend: &dyn Backend, db_name: &str) {
+/// failed, or if a leaf in `backend` names a lock holder without a transaction
+/// record. With `crashes`, the log of every operation on `backend`, a holder
+/// whose identity never wrote a record is allowed.
+pub(super) async fn assert_no_stray_holders(
+    db: &Database,
+    backend: &dyn Backend,
+    db_name: &str,
+    crashes: Option<&OpLog>,
+) {
     collect_all_garbage(db).await;
     let mut stray = Vec::new();
     for (path, holder) in leaf_holders(backend, db_name).await {
         let record = ObjectPath::Transaction {
             db_prefix: path_db_prefix(&path),
             id: holder,
-        };
-        match backend.read(&record.to_string()).await {
+        }
+        .to_string();
+        match backend.read(&record).await {
             Ok(_) => {}
+            Err(BackendError::NotFound)
+                if crashes.is_some_and(|log| !was_written(log, &record)) => {}
             Err(BackendError::NotFound) => stray.push((path.to_string(), holder)),
             Err(error) => panic!("reading the record of holder {holder}: {error}"),
         }
@@ -40,6 +53,16 @@ pub(super) async fn assert_no_stray_holders(db: &Database, backend: &dyn Backend
         stray.is_empty(),
         "leaves keep lock holders without a transaction record: {stray:?}"
     );
+}
+
+/// Reports whether `log` has a write of `path`. Every operation in `log`
+/// reached the faultless backend, and a write of a record path applies unless
+/// the record already exists, so the record existed.
+fn was_written(log: &OpLog, path: &str) -> bool {
+    log.lock()
+        .unwrap()
+        .iter()
+        .any(|op| op.path == path && op.op.starts_with("write"))
 }
 
 /// Repeats full GCs until a GC defers nothing and makes no progress, then

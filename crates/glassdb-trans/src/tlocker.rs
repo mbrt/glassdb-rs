@@ -451,8 +451,12 @@ impl MemberPolicy for AcquireOperation {
             .all(|i| matches!(i.desired, Desired::Read))
     }
 
-    fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
-        MemberOutcome::Conflict
+    fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
+        if in_doubt {
+            MemberOutcome::InDoubt("the lock CAS can still land".into())
+        } else {
+            MemberOutcome::Conflict
+        }
     }
 
     fn leaf_scope_keys(&self) -> Vec<&[u8]> {
@@ -497,6 +501,7 @@ impl LeafOperation for AcquireOperation {
             }
             MemberOutcome::Wait(holder) => Ok(AcquireOutcome::Wait(holder)),
             MemberOutcome::LeafFull => Ok(AcquireOutcome::LeafFull),
+            MemberOutcome::InDoubt(_) => Ok(AcquireOutcome::InDoubt),
             MemberOutcome::Oversized => Err(TransError::InvalidInput(
                 "new keys in one leaf exceed the coordination node size limit".into(),
             )),
@@ -507,8 +512,7 @@ impl LeafOperation for AcquireOperation {
             | MemberOutcome::Reroute
             | MemberOutcome::Landed
             | MemberOutcome::Moved
-            | MemberOutcome::Replay
-            | MemberOutcome::InDoubt(_) => Ok(AcquireOutcome::Conflict),
+            | MemberOutcome::Replay => Ok(AcquireOutcome::Conflict),
         }
     }
 }
@@ -778,6 +782,8 @@ enum AcquireOutcome {
     Wait(TxId),
     Conflict,
     LeafFull,
+    /// The round ended while the lock CAS can still land.
+    InDoubt,
 }
 
 enum ReleaseOutcome {
@@ -979,6 +985,10 @@ pub(crate) enum LockOutcome {
     /// retains other leaf holds, backs off without serial escalation, and
     /// retries after the background split has had an opportunity to run.
     LeafFull,
+    /// A lock CAS can still land, because the round ended before a later CAS
+    /// fenced it. The owner operation must stay unresolved, so that the
+    /// identity is pinned and GC keeps its record (ADR-105).
+    InDoubt,
 }
 
 /// Outcome of acquiring locks across all touched leaves.
@@ -986,6 +996,7 @@ enum LeafSetOutcome {
     Locked(BTreeMap<ObjectPath, LeafHoldProof>),
     Conflict,
     LeafFull,
+    InDoubt,
 }
 
 /// Outcome of acquiring locks on a single leaf (after any hold-and-wait).
@@ -993,6 +1004,7 @@ enum LeafOutcome {
     Locked(LeafHoldProof),
     Conflict,
     LeafFull,
+    InDoubt,
 }
 
 /// How a hold-and-wait wake happened, so the re-poll cadence can be tuned: a
@@ -1104,6 +1116,7 @@ impl KeyLocker {
             LeafSetOutcome::Locked(proofs) => proofs,
             LeafSetOutcome::Conflict => return Ok(LockOutcome::Conflict),
             LeafSetOutcome::LeafFull => return Ok(LockOutcome::LeafFull),
+            LeafSetOutcome::InDoubt => return Ok(LockOutcome::InDoubt),
         };
         Ok(LockOutcome::Locked(LockedTx::from_proofs(groups, proofs)?))
     }
@@ -1311,6 +1324,7 @@ impl KeyLocker {
                     }
                     LeafOutcome::Conflict => return Ok(LeafSetOutcome::Conflict),
                     LeafOutcome::LeafFull => return Ok(LeafSetOutcome::LeafFull),
+                    LeafOutcome::InDoubt => return Ok(LeafSetOutcome::InDoubt),
                 }
             }
         } else {
@@ -1319,6 +1333,14 @@ impl KeyLocker {
                 operations.push(self.lock_leaf(id, group, requirement));
             }
             let outcomes = join_all_bounded(operations, self.parallelism).await;
+            // A lock CAS that can still land decides the outcome before any
+            // conflict, so that the owner learns it.
+            if outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, Ok(LeafOutcome::InDoubt)))
+            {
+                return Ok(LeafSetOutcome::InDoubt);
+            }
             for (group, outcome) in groups.values().zip(outcomes) {
                 match outcome? {
                     LeafOutcome::Locked(proof) => {
@@ -1326,6 +1348,7 @@ impl KeyLocker {
                     }
                     LeafOutcome::Conflict => return Ok(LeafSetOutcome::Conflict),
                     LeafOutcome::LeafFull => return Ok(LeafSetOutcome::LeafFull),
+                    LeafOutcome::InDoubt => unreachable!("checked before"),
                 }
             }
         }
@@ -1470,6 +1493,7 @@ impl KeyLocker {
                 }
                 AcquireOutcome::LeafFull => return Ok(LeafOutcome::LeafFull),
                 AcquireOutcome::Conflict => return Ok(LeafOutcome::Conflict),
+                AcquireOutcome::InDoubt => return Ok(LeafOutcome::InDoubt),
             }
         }
     }
@@ -1751,6 +1775,7 @@ mod tests {
             LeafSetOutcome::Locked(proofs) => proofs,
             LeafSetOutcome::Conflict => panic!("expected lock acquisition to succeed"),
             LeafSetOutcome::LeafFull => panic!("expected leaf to have capacity"),
+            LeafSetOutcome::InDoubt => panic!("expected no lock CAS in doubt"),
         }
     }
 
@@ -2141,6 +2166,56 @@ mod tests {
             .unwrap();
         assert!(loaded.node().membership_lock().holders().is_empty());
         assert_eq!(loaded.node().membership_generation(), 0);
+    }
+
+    // A lock CAS that can still land when its round ends must reach the owner
+    // as in doubt, not as a conflict, so that the owner keeps the identity
+    // pinned (ADR-105). The round ends this way when each CAS and each fence
+    // stays in doubt, or when a load fails after an in-doubt CAS.
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_cas_that_can_still_land_reports_in_doubt() {
+        for failing_reads in [false, true] {
+            let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+            let (locker, ctx) = new_test_locker(backend.clone()).await;
+            let key = b"key";
+            seed_committed(&ctx, key, b"old").await;
+            let tx = mk_tid(1, "holder");
+            ctx.monitor.begin_tx(&tx);
+            let leaf_path = root_path().to_string();
+            backend.set_before(move |op| {
+                let fail = match op {
+                    BackendOp::WriteIf { path, .. } => *path == leaf_path,
+                    BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. } => {
+                        failing_reads && *path == leaf_path
+                    }
+                    _ => false,
+                };
+                let future: HookFuture = Box::pin(async move {
+                    if fail {
+                        return Err(glassdb_backend::BackendError::Unavailable(
+                            "simulated in-doubt leaf operation".into(),
+                        ));
+                    }
+                    Ok(())
+                });
+                future
+            });
+
+            let outcome = locker
+                .keys()
+                .lock_leaves_at(
+                    &tx,
+                    &group_of(key, put_intent(key)),
+                    false,
+                    Requirement::ANY,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, LeafSetOutcome::InDoubt),
+                "failing reads: {failing_reads}"
+            );
+        }
     }
 
     // ADR-026: a release is complete only when the current node proves the

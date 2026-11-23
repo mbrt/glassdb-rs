@@ -760,10 +760,7 @@ async fn direct_commit_blocked_after_in_doubt_cas_stays_in_doubt() {
         let outcome = resolve_outcome(
             &policy,
             &tctx,
-            ReloadCause::Reloaded {
-                in_doubt: true,
-                cas_fenced: false,
-            },
+            ReloadCause::Reloaded { in_doubt: true },
             &staged,
             locks,
         )
@@ -941,7 +938,6 @@ async fn a_blind_put_after_an_in_doubt_cas_never_republishes_over_a_newer_writer
             &tctx,
             ReloadCause::Reloaded {
                 in_doubt: true,
-                cas_fenced: false,
             },
             &staged,
             &locks,
@@ -960,10 +956,7 @@ async fn a_blind_put_after_an_in_doubt_cas_never_republishes_over_a_newer_writer
     let outcome = resolve_outcome(
         &blind,
         &tctx,
-        ReloadCause::Reloaded {
-            in_doubt: true,
-            cas_fenced: false,
-        },
+        ReloadCause::Reloaded { in_doubt: true },
         &superseded,
         &locks,
     )
@@ -974,14 +967,12 @@ async fn a_blind_put_after_an_in_doubt_cas_never_republishes_over_a_newer_writer
     );
 }
 
-// Regression (fuzz `concurrent-tx` with late landings): an unchanged
-// predecessor after an in-doubt CAS proves only that the CAS has not landed
-// yet. A new holder does not fence the CAS, because the holder can release its
-// lock and restore the expected state. So a decision that stages nothing must
-// stay in doubt. When the coordinator reports a fenced CAS, for example after
-// the membership generation advanced, the same state is a definitive loss.
+// Regression (fuzz `concurrent-tx` with late landings): the coordinator plans
+// only on a leaf that fences an in-doubt CAS (ADR-105). So unchanged
+// predecessors under a new holder prove that the CAS never lands, and the
+// member reports a definitive loss.
 #[tokio::test]
-async fn an_unchanged_leaf_does_not_prove_that_an_in_doubt_cas_cannot_land() {
+async fn a_fenced_in_doubt_cas_with_unchanged_predecessors_is_a_loss() {
     let (tm, tctx) = new_algo().await;
     let keyp = logical_key(b"k");
     commit_writes(&tm, vec![wa(&keyp, b"v1")]).await;
@@ -1008,20 +999,12 @@ async fn an_unchanged_leaf_does_not_prove_that_an_in_doubt_cas_cannot_land() {
     let mut held = seed;
     held.replace_write_lock(holder);
     let blocked = BTreeMap::from([(b"k".to_vec(), held)]);
-    let in_doubt = |cas_fenced| ReloadCause::Reloaded {
-        in_doubt: true,
-        cas_fenced,
-    };
+    let in_doubt = ReloadCause::Reloaded { in_doubt: true };
 
-    let outcome = resolve_outcome(&policy, &tctx, in_doubt(false), &blocked, &locks).await;
-    assert!(
-        matches!(outcome, MemberOutcome::InDoubt(_)),
-        "the in-doubt CAS can still land on the expected leaf, got {outcome:?}"
-    );
-    let outcome = resolve_outcome(&policy, &tctx, in_doubt(true), &blocked, &locks).await;
+    let outcome = resolve_outcome(&policy, &tctx, in_doubt, &blocked, &locks).await;
     assert!(
         matches!(outcome, MemberOutcome::Moved),
-        "a moved leaf fences the in-doubt CAS, got {outcome:?}"
+        "the coordinator plans only on a leaf that fences the in-doubt CAS, got {outcome:?}"
     );
 }
 
@@ -1085,10 +1068,7 @@ async fn any_exact_output_marker_proves_a_mixed_member_landed() {
         resolve_step(
             &policy,
             &tctx,
-            ReloadCause::Reloaded {
-                in_doubt: true,
-                cas_fenced: false,
-            },
+            ReloadCause::Reloaded { in_doubt: true },
             &recovered,
             &NodeLocks::default(),
         )
@@ -1133,10 +1113,7 @@ async fn reclaimed_all_absent_delete_markers_leave_recovery_in_doubt() {
         resolve_step(
             &policy,
             &tctx,
-            ReloadCause::Reloaded {
-                in_doubt: true,
-                cas_fenced: false,
-            },
+            ReloadCause::Reloaded { in_doubt: true },
             &empty,
             &NodeLocks::default(),
         )
@@ -1188,7 +1165,6 @@ async fn a_surviving_predecessor_can_still_prove_mixed_deletes_did_not_land() {
             &tctx,
             ReloadCause::Reloaded {
                 in_doubt: true,
-                cas_fenced: false,
             },
             &unchanged,
             &NodeLocks::default(),
@@ -1235,10 +1211,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
     let outcome = resolve_outcome(
         &stale,
         &tctx,
-        ReloadCause::Reloaded {
-            in_doubt: true,
-            cas_fenced: false,
-        },
+        ReloadCause::Reloaded { in_doubt: true },
         &staged,
         &locks,
     )
@@ -1316,10 +1289,7 @@ async fn direct_commit_replays_only_a_certified_superseded_read() {
         resolve_step(
             &budgeted,
             &tctx,
-            ReloadCause::Reloaded {
-                in_doubt: true,
-                cas_fenced: false,
-            },
+            ReloadCause::Reloaded { in_doubt: true },
             &crowded,
             &locks,
         )

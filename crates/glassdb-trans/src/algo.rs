@@ -1356,6 +1356,14 @@ impl Algo {
                         _ = landed_splits.next() => {}
                     }
                 }
+                // A lock CAS can still land. Leave the owner operation
+                // unresolved so end pins the old identity (ADR-105).
+                Ok(LockOutcome::InDoubt) => {
+                    tx.force_serial_acquisition();
+                    return Ok(Acquired::RenewForSerial {
+                        pending_writes: true,
+                    });
+                }
                 // The dropped parallel acquisition can still publish. Leave its
                 // owner operation unresolved so end pins the old identity.
                 Err(TransError::LockTimeout) => {
@@ -3906,6 +3914,7 @@ mod tests {
             LockOutcome::Locked(locked) => locked,
             LockOutcome::Conflict => panic!("holder lock conflicted"),
             LockOutcome::LeafFull => panic!("holder leaf unexpectedly full"),
+            LockOutcome::InDoubt => panic!("holder lock unexpectedly in doubt"),
         };
 
         // The scan observes the pending create as absent and records its

@@ -163,6 +163,10 @@ message Node {
     // first node at its level. A copy with a low key above a routed key is
     // older than a merge (ADR-073).
     bytes low_key = 11;
+    // The number of changes of this node since its creation. Each replace
+    // stores the expected value plus one, so a state of the node never repeats
+    // while the node exists (ADR-105).
+    uint64 node_sequence = 12;
 }
 
 // A structural intent for one split or merge. It lives at

@@ -82,7 +82,7 @@ async fn seed_gated_root(s: &TestStore, sp: &Restructurer, children: &[(&[u8], &
         .await
         .unwrap();
     assert!(s.store_root(COLL, &root, &observation).await.unwrap());
-    root
+    current_root(s).await
 }
 
 async fn current_root(s: &TestStore) -> Node {

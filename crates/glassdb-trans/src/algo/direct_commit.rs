@@ -579,28 +579,18 @@ impl MemberPolicy for DirectCommitOperation {
         }
 
         let resolutions = self.resolve_keys(ctx, staged).await?;
-        let (in_doubt, cas_fenced) = match ctx.cause {
-            ReloadCause::Fresh => (false, true),
-            ReloadCause::Reloaded {
-                in_doubt,
-                cas_fenced,
-            } => (in_doubt, cas_fenced),
+        let in_doubt = match ctx.cause {
+            ReloadCause::Fresh => false,
+            ReloadCause::Reloaded { in_doubt } => in_doubt,
         };
+        // The loaded leaf fences an in-doubt CAS, so unchanged predecessors
+        // prove that it never lands (ADR-105).
         if in_doubt && !self.proves_non_landing(&resolutions) {
             return Ok(Step::Skip {
                 outcome: self.in_doubt_outcome(),
             });
         }
-        let step = self.resolve_fresh(ctx, staged, &resolutions).await?;
-        // Unchanged predecessors prove only that the in-doubt CAS has not
-        // landed yet, while the leaf stays in the state it expected. Only a new
-        // CAS from that state can fence it, so any other decision stays in doubt.
-        if in_doubt && !cas_fenced && !matches!(step, Step::Stage(_)) {
-            return Ok(Step::Skip {
-                outcome: self.in_doubt_outcome(),
-            });
-        }
-        Ok(step)
+        self.resolve_fresh(ctx, staged, &resolutions).await
     }
 
     fn reorderable(&self) -> bool {

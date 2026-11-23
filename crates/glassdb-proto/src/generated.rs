@@ -301,6 +301,11 @@ pub struct Node {
     /// older than a merge (ADR-073).
     #[prost(bytes = "vec", tag = "11")]
     pub low_key: ::prost::alloc::vec::Vec<u8>,
+    /// The number of changes of this node since its creation. Each replace
+    /// stores the expected value plus one, so a state of the node never repeats
+    /// while the node exists (ADR-105).
+    #[prost(uint64, tag = "12")]
+    pub node_sequence: u64,
     #[prost(oneof = "node::Body", tags = "3, 4")]
     pub body: ::core::option::Option<node::Body>,
 }

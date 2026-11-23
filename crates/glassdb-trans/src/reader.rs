@@ -409,8 +409,9 @@ mod tests {
         )
     }
 
-    // A late lock CAS leaves a stray holder of a committed identity on a key
-    // that it did not write (ADR-095). A current leaf still names it after GC
+    // A stray holder of a committed identity is a lock on a key that it did
+    // not write (ADR-095). ADR-105 stops the protocol from leaving one, but the
+    // reader rule does not depend on that. A current leaf still names it after GC
     // reclaimed its record. A leaf observation after this instance found the
     // record reclaimed shows no value of the identity (ADR-104), so the key
     // resolves after one reload and is not resolved again and again.
