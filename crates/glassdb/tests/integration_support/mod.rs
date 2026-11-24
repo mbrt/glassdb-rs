@@ -688,7 +688,12 @@ fn is_leaf_path(path: &str) -> bool {
 /// Reports whether `body` is an abort-side transaction record with a final status.
 fn is_abort_side_tx_record(body: &[u8]) -> bool {
     glassdb_storage::txrecord::status(body)
-        .map(|status| matches!(status, TxCommitStatus::Aborted | TxCommitStatus::Wounded))
+        .map(|status| {
+            matches!(
+                status,
+                TxCommitStatus::Aborted | TxCommitStatus::Wounded | TxCommitStatus::BlindWounded
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -700,9 +705,12 @@ fn is_committed_tx_record(body: &[u8]) -> bool {
     glassdb_storage::txrecord::status(body).is_ok_and(|status| status == TxCommitStatus::Committed)
 }
 
-/// Reports whether `body` is a pinned wound.
+/// Reports whether `body` is a pinned wound, of either kind.
 fn is_wounded_tx_record(body: &[u8]) -> bool {
-    glassdb_storage::txrecord::status(body)
-        .map(|status| status == TxCommitStatus::Wounded)
-        .unwrap_or(false)
+    glassdb_storage::txrecord::status(body).is_ok_and(|status| {
+        matches!(
+            status,
+            TxCommitStatus::Wounded | TxCommitStatus::BlindWounded
+        )
+    })
 }

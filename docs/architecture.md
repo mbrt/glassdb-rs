@@ -538,11 +538,11 @@ Recovery of an in-doubt direct commit uses only local information. Any inline
 value or tombstone with this identity proves that the whole commit landed. If
 there is no marker, unchanged previous states prove that it did not land, but
 only if at least one output could not return to its previous state through
-tombstone reclamation, and only after the leaf changed in a way that cannot be
-undone: a higher membership generation or a new current writer. A different
-revision is not enough, because a released lock can restore it. Until then,
-the CAS can still land, so only a new CAS that lands can resolve it
-([ADR-081](adr/081-in-doubt-cas-stays-in-doubt-until-fenced.md)). Otherwise,
+tombstone reclamation, and only after the leaf changed. Each change of a node
+increases its node sequence, so a state of a node never repeats. Before a
+round plans on a leaf in the state that an in-doubt CAS expected, it writes the
+leaf again to fence that CAS
+([ADR-105](adr/105-a-node-state-never-repeats.md)). Otherwise,
 the transaction can report an in-doubt error.
 If the reads are still valid, the transaction can try a direct commit again. An
 invalidated read causes a body replay. If pruning a holder with a final status
@@ -961,9 +961,11 @@ The cache and the coordinator depend on, and keep, these properties:
 1. Backend single-object reads and conditional mutations are linearizable. A
    read after a definitive mutation sees that mutation or a later state.
 2. A conditional mutation stays safe if its predicate becomes true again,
-   because revisions can repeat (ABA). Create-if-absent is only for permanent
-   idempotent paths, or fresh identity paths whose existence alone cannot
-   publish newer live state.
+   because revisions can repeat (ABA). A node never comes back to an earlier
+   state while it exists, because each change increases its node sequence
+   ([ADR-105](adr/105-a-node-state-never-repeats.md)). Create-if-absent is only
+   for permanent idempotent paths, or fresh identity paths whose existence alone
+   cannot publish newer live state.
 3. In one open database, no two backend point calls on the same path overlap.
    The only exception is a cancelled mutation that can still run remotely.
 4. A call on a path starts only after the earlier definitive result on that path
@@ -983,12 +985,18 @@ A transaction body can use cached state freely, because validation checks every
 dependency at the validation barrier. Committed and aborted statuses never
 change, so the cache can keep them forever. `Wounded` can still change to
 `Aborted`, so the object cache checks it again. The final-status cache of the
-monitor keeps `Wounded` as well, because both mean that the identity never
-commits. GC reads the durable record. Owner acknowledgement starts from its own
+monitor keeps `Wounded` as well, because both mean that the identity cannot
+commit. GC reads the durable record. Owner acknowledgement starts from its own
 durable observation of the wound. A cached committed status can outlive the
-cached record body. If the body is missing, the module that owns the referring
-observation reloads at a newer bound and retries. A missing historical body
-never becomes a missing key or a missing collection.
+cached record body. A blind wound, which created the record at an empty path,
+does not prove that the identity never committed. When the monitor finds a
+committed record reclaimed, or sees a blind wound, it keeps the first
+requirement after that observation. A leaf observation that reaches it shows no
+value of the identity, so the resolver drops the holder. An older observation
+is reloaded at that requirement and resolved again. A decision of the leaf
+coordinator drops the holder at once, because its CAS fails on a stale leaf
+([ADR-104](adr/104-a-blind-wound-does-not-prove-that-the-identity-never-committed.md)).
+A missing historical body never becomes a missing key or a missing collection.
 
 ## Object layout
 
@@ -1050,9 +1058,10 @@ mark-sweep ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
   check cannot miss a writer or a value-bearing lock, and its safety does not
   depend on time ([ADR-079](adr/079-gc-safety-does-not-depend-on-time.md)).
   Before GC deletes a committed record, it releases the locks on keys that the
-  transaction did not write. Only a lock CAS that lands after the retention
-  period can leave a stray holder, which costs a grace wait and a `Wounded`
-  record ([ADR-095](adr/095-the-record-lists-every-lock-of-the-identity.md)).
+  transaction did not write
+  ([ADR-095](adr/095-the-record-lists-every-lock-of-the-identity.md)). A lock
+  CAS cannot land after GC deleted the record of its identity, so no stray
+  holder exists ([ADR-105](adr/105-a-node-state-never-repeats.md)).
 - **Retention period.** GC still waits the pending timeout plus the allowed
   clock skew, from the last update of the record, before it checks a final
   record ([ADR-079](adr/079-gc-safety-does-not-depend-on-time.md)). The wait

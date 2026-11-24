@@ -231,7 +231,11 @@ mod tests {
 
     #[tokio::test]
     async fn reclaimed_transaction_bodies_refresh_cached_writers_and_holders() {
-        for (held, operation) in [(false, 0), (true, 0), (true, 1), (true, 2), (true, 3)] {
+        let cases = [(false, 0), (true, 0), (true, 1), (true, 2), (true, 3)];
+        for ((held, operation), wounded) in cases
+            .into_iter()
+            .flat_map(|case| [(case, false), (case, true)])
+        {
             let backend = Arc::new(MemoryBackend::new());
             let local = AssemblyFixture::new(
                 backend.clone(),
@@ -303,6 +307,15 @@ mod tests {
                 local.tx_records.get_at(&old, Requirement::ANY).await,
                 Err(StorageError::NotFound)
             ));
+            if wounded {
+                // A peer that resolves the holder from a leaf observation
+                // older than the write-back finds no record and wounds the
+                // identity (a leaked wound, ADR-079).
+                peer.tx_records
+                    .set(&TxRecord::new(old, TxCommitStatus::BlindWounded))
+                    .await
+                    .unwrap();
+            }
             match operation {
                 0 => {
                     let (value, _) = reader.read(&key).await.unwrap().into_parts();
@@ -330,33 +343,8 @@ mod tests {
                 }
                 _ => {
                     use crate::access::{AccessSet, WriteAccess};
-                    use crate::collection_coordination::CollectionStateResolver;
-                    use crate::leaf_coord::{
-                        CoordinatorConfig, LeafCoordinator, NoStructuralHints,
-                    };
-                    use crate::tlocker::{LockOutcome, Locker};
-                    let coord = LeafCoordinator::with_hinter(
-                        local.nodes.clone(),
-                        KeyStateResolver::new(local.monitor.clone()),
-                        local.monitor.clone(),
-                        CoordinatorConfig::default(),
-                        Arc::new(NoStructuralHints),
-                    );
-                    let state = CollectionStateResolver::new(
-                        local.records.clone(),
-                        local.tx_records.clone(),
-                        local.timeline.clone(),
-                        local.monitor.clone(),
-                        RetrySchedule::default(),
-                    );
-                    let locker = Locker::new(
-                        coord,
-                        TreeRouter::new(local.nodes.clone(), NonZeroUsize::MIN),
-                        state,
-                        local.monitor.clone(),
-                        RetryTiming::default(),
-                        NonZeroUsize::MIN,
-                    );
+                    use crate::tlocker::LockOutcome;
+                    let locker = new_locker(&local);
                     let writer = tx_id(&[3]);
                     local.monitor.begin_tx(&writer);
                     let accesses = AccessSet::new(
@@ -390,6 +378,162 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    fn new_locker(local: &AssemblyFixture) -> crate::tlocker::Locker {
+        use crate::collection_coordination::CollectionStateResolver;
+        use crate::leaf_coord::{CoordinatorConfig, LeafCoordinator, NoStructuralHints};
+        use crate::tlocker::Locker;
+        let coord = LeafCoordinator::with_hinter(
+            local.nodes.clone(),
+            KeyStateResolver::new(local.monitor.clone()),
+            local.monitor.clone(),
+            CoordinatorConfig::default(),
+            Arc::new(NoStructuralHints),
+        );
+        let state = CollectionStateResolver::new(
+            local.records.clone(),
+            local.tx_records.clone(),
+            local.timeline.clone(),
+            local.monitor.clone(),
+            RetrySchedule::default(),
+        );
+        Locker::new(
+            coord,
+            TreeRouter::new(local.nodes.clone(), NonZeroUsize::MIN),
+            state,
+            local.monitor.clone(),
+            RetryTiming::default(),
+            NonZeroUsize::MIN,
+        )
+    }
+
+    // A stray holder of a committed identity is a lock on a key that it did
+    // not write (ADR-095). ADR-105 stops the protocol from leaving one, but the
+    // reader rule does not depend on that. A current leaf still names it after GC
+    // reclaimed its record. A leaf observation after this instance found the
+    // record reclaimed shows no value of the identity (ADR-104), so the key
+    // resolves after one reload and is not resolved again and again.
+    #[tokio::test]
+    async fn a_stray_holder_of_a_reclaimed_commit_does_not_block_its_key() {
+        use crate::access::{AccessSet, WriteAccess};
+        use crate::tlocker::LockOutcome;
+        use glassdb_backend::middleware::RecordingBackend;
+
+        for (lock, wounded) in [(false, false), (false, true), (true, false), (true, true)] {
+            let backend = Arc::new(MemoryBackend::new());
+            let recording = RecordingBackend::new(backend.clone());
+            let operations = recording.log();
+            let local = AssemblyFixture::new(
+                Arc::new(recording),
+                DbPrefix::try_from("db").unwrap(),
+                &EngineConfig::default(),
+            );
+            let peer = AssemblyFixture::new(
+                backend,
+                DbPrefix::try_from("db").unwrap(),
+                &EngineConfig::default(),
+            );
+            let collection = CollectionAddress::root("db");
+            let a = LogicalKey::new(collection.clone(), b"a");
+            let b = LogicalKey::new(collection.clone(), b"b");
+            let stray = tx_id(&[1]);
+            let mut record = TxRecord::new(stray, TxCommitStatus::Committed);
+            record.writes.push(TxWrite {
+                key: a.clone(),
+                value: Arc::from(&b"a1"[..]),
+                deleted: false,
+            });
+            let local_record = local.tx_records.set(&record).await.unwrap();
+            let mut held = LeafEntry::new(b"b").with_current(CurrentState::Inline {
+                writer: tx_id(&[0]),
+                value: Arc::from(&b"b0"[..]),
+            });
+            held.replace_write_lock(stray);
+            let leaf = Node::leaf(LeafBody::from_entries([
+                LeafEntry::new(b"a").with_current(CurrentState::External { writer: stray }),
+                held.clone(),
+            ]));
+            local.nodes.create_root(&collection, &leaf).await.unwrap();
+            let reader_of = |fixture: &AssemblyFixture| {
+                Reader::new(
+                    KeyResolver::new(
+                        TreeRouter::new(fixture.nodes.clone(), NonZeroUsize::MIN),
+                        KeyStateResolver::new(fixture.monitor.clone()),
+                        NonZeroUsize::MIN,
+                    ),
+                    fixture.timeline.clone(),
+                    RetrySchedule::default(),
+                )
+            };
+            let reader = reader_of(&local);
+            // The instance learns that the identity committed.
+            let (value, _) = reader.read(&a).await.unwrap().into_parts();
+            assert_eq!(value.unwrap().value.as_ref(), b"a1");
+
+            // A later writer replaces the identity on `a`, and GC on this
+            // instance deletes its record. The stray holder on `b` stays.
+            let (_, root) = peer
+                .nodes
+                .load_root(&collection, Requirement::ANY)
+                .await
+                .unwrap();
+            let updated = Node::leaf(LeafBody::from_entries([
+                LeafEntry::new(b"a").with_current(CurrentState::Inline {
+                    writer: tx_id(&[2]),
+                    value: Arc::from(&b"a2"[..]),
+                }),
+                held,
+            ]));
+            peer.nodes
+                .store_root(&collection, &updated, &root)
+                .await
+                .unwrap();
+            local.tx_records.delete(&local_record).await.unwrap();
+            if wounded {
+                // A leaked wound (ADR-079).
+                peer.tx_records
+                    .set(&TxRecord::new(stray, TxCommitStatus::BlindWounded))
+                    .await
+                    .unwrap();
+            }
+            // A peer that does not know the identity reads the value of the
+            // earlier writer.
+            let (value, _) = reader_of(&peer).read(&b).await.unwrap().into_parts();
+            assert_eq!(value.unwrap().value.as_ref(), b"b0");
+
+            operations.lock().unwrap().clear();
+            let timeout = std::time::Duration::from_secs(5);
+            if lock {
+                let writer = tx_id(&[3]);
+                local.monitor.begin_tx(&writer);
+                let accesses = AccessSet::new(
+                    Vec::new(),
+                    vec![WriteAccess::put(b.clone(), Arc::from(&b"next"[..]))],
+                    Vec::new(),
+                );
+                let locker = new_locker(&local);
+                let outcome = tokio::time::timeout(
+                    timeout,
+                    locker
+                        .keys()
+                        .lock_at(&writer, &accesses, false, Requirement::ANY),
+                )
+                .await
+                .expect("the lock of b did not finish")
+                .unwrap();
+                assert!(matches!(outcome, LockOutcome::Locked(_)));
+            } else {
+                let (value, _) = tokio::time::timeout(timeout, reader.read(&b))
+                    .await
+                    .expect("the read of b did not finish")
+                    .unwrap()
+                    .into_parts();
+                assert_eq!(value.unwrap().value.as_ref(), b"b0");
+            }
+            let count = operations.lock().unwrap().len();
+            assert!(count <= 8, "{count} backend operations");
         }
     }
 }

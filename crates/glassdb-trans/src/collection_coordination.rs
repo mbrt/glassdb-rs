@@ -446,7 +446,11 @@ impl CollectionStateResolver {
             PendingHolders::Wait => self.monitor.await_tx_final(holder).await.map(Some),
             PendingHolders::Skip => Ok(match self.monitor.tx_status(holder).await? {
                 TxCommitStatus::Committed => Some(TxFinalStatus::Committed),
-                TxCommitStatus::Aborted | TxCommitStatus::Wounded => Some(TxFinalStatus::Aborted),
+                // The CAS on the collection record checks that the lock is
+                // current, so a blind wound holds no committed effect here.
+                TxCommitStatus::Aborted
+                | TxCommitStatus::Wounded
+                | TxCommitStatus::BlindWounded => Some(TxFinalStatus::Aborted),
                 TxCommitStatus::Pending | TxCommitStatus::Unknown => None,
             }),
         }
@@ -822,7 +826,7 @@ mod tests {
         assert_eq!(holders(&records, &parent).await, vec![writer]);
         assert!(matches!(
             locker.monitor.tx_status(&reader).await.unwrap(),
-            TxCommitStatus::Aborted | TxCommitStatus::Wounded
+            TxCommitStatus::Aborted | TxCommitStatus::Wounded | TxCommitStatus::BlindWounded
         ));
     }
 

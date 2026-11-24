@@ -108,6 +108,10 @@ impl TxRecordStore {
     }
 
     /// Creates a transaction's initial record, failing if one already exists.
+    ///
+    /// A wound created here must be `BlindWounded`. The path can be empty
+    /// because GC deleted a final record, so the wound proves only that the
+    /// identity cannot commit after it.
     pub async fn set(&self, l: &TxRecord) -> Result<Observation<TxRecord>, StorageError> {
         validate_lifecycle_transition(None, Some(l.status))?;
         let ts = l.timestamp.unwrap_or_else(rt::system_now);
@@ -244,6 +248,10 @@ fn validate_lifecycle_transition(
             Ok(())
         }
         TxLifecycleRelation::Same | TxLifecycleRelation::Blocks => Err(StorageError::Precondition),
+        // A caller bug, not a race: a retry cannot make it valid (ADR-104).
+        TxLifecycleRelation::Invalid => Err(StorageError::other(
+            "a wound that creates a record is blind, and one that replaces a record is not",
+        )),
     }
 }
 
@@ -336,7 +344,7 @@ mod tests {
             (1, TxCommitStatus::Pending),
             (2, TxCommitStatus::Committed),
             (3, TxCommitStatus::Aborted),
-            (7, TxCommitStatus::Wounded),
+            (7, TxCommitStatus::BlindWounded),
         ] {
             let id = tx_id(&[9, suffix]);
             let observed = logger.set(&TxRecord::new(id, status)).await.unwrap();
@@ -458,7 +466,7 @@ mod tests {
 
         let wounded_id = tx_id(&[10, 4]);
         let wounded = logger
-            .set(&TxRecord::new(wounded_id, TxCommitStatus::Wounded))
+            .set(&TxRecord::new(wounded_id, TxCommitStatus::BlindWounded))
             .await
             .unwrap();
         assert_operations(&operations, &["write_if_not_exists"]);
@@ -765,6 +773,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_a_wound_that_creates_the_record_is_blind() {
+        let logger = new_tx_record_store();
+        let created = tx_id(&[4, 3, 2, 4]);
+        assert!(
+            logger
+                .set(&TxRecord::new(created, TxCommitStatus::Wounded))
+                .await
+                .is_err()
+        );
+        let blind = logger
+            .set(&TxRecord::new(created, TxCommitStatus::BlindWounded))
+            .await
+            .unwrap();
+        assert_eq!(blind.value().unwrap().status, TxCommitStatus::BlindWounded);
+
+        let replaced = tx_id(&[4, 3, 2, 5]);
+        let pending = logger
+            .set(&TxRecord::new(replaced, TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        assert!(
+            logger
+                .set_if(
+                    &TxRecord::new(replaced, TxCommitStatus::BlindWounded),
+                    &pending,
+                )
+                .await
+                .is_err()
+        );
+        let wounded = logger
+            .set_if(&TxRecord::new(replaced, TxCommitStatus::Wounded), &pending)
+            .await
+            .unwrap();
+        assert_eq!(wounded.value().unwrap().status, TxCommitStatus::Wounded);
+    }
+
+    #[tokio::test]
     async fn wounded_records_are_not_cached_as_immutable() {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
         let operations = backend.log();
@@ -773,7 +818,7 @@ mod tests {
         let logger = TxRecordStore::new(objects, db_prefix());
         let id = tx_id(&[4, 3, 2, 3]);
         logger
-            .set(&TxRecord::new(id, TxCommitStatus::Wounded))
+            .set(&TxRecord::new(id, TxCommitStatus::BlindWounded))
             .await
             .unwrap();
         operations.lock().unwrap().clear();

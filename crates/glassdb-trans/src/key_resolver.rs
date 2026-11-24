@@ -13,6 +13,7 @@ use glassdb_storage::{LeafEntry, Requirement, RoutedLeaf, StorageError, TreeRout
 
 use crate::access::{LeafCoverage, ScanAccess, ScanEvidence, ScanMutation, ScanRange};
 use crate::error::{TransError, trans_to_storage};
+use crate::key_state_resolver::ObservationUse;
 use crate::key_state_resolver::{KeyStateResolver, WriterResolution};
 use crate::monitor::KeyCommitStatus;
 
@@ -261,6 +262,31 @@ impl KeyResolver {
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
     ) -> Result<Vec<LeafCoverage>, StorageError> {
+        let mut requirement = requirement;
+        loop {
+            let result = self
+                .scan_coverage_at(collection, range, frontier, own_lock_holder, requirement)
+                .await;
+            match result {
+                // A leaf state older than a blind wound of its drop intent
+                // holder is checked again after the wound (ADR-104).
+                Err(TransError::ValidateRetry(fresh)) => {
+                    requirement = requirement.stricter(fresh);
+                    glassdb_concurr::rt::yield_now().await;
+                }
+                result => return result.map_err(trans_to_storage),
+            }
+        }
+    }
+
+    async fn scan_coverage_at(
+        &self,
+        collection: &CollectionAddress,
+        range: &ScanRange,
+        frontier: Option<&[u8]>,
+        own_lock_holder: Option<&TxId>,
+        requirement: Requirement,
+    ) -> Result<Vec<LeafCoverage>, TransError> {
         // Only the leaves are validation dependencies. The descent checks the
         // leaf that a cached index node routes to, and moves right from it
         // until the leaf covers the key (ADR-031, ADR-073). So a check of
@@ -299,10 +325,10 @@ impl KeyResolver {
         loc: &RoutedLeaf,
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
-    ) -> Result<LeafCoverage, StorageError> {
+    ) -> Result<LeafCoverage, TransError> {
         let node = loc.node();
         if let Some(node) = node {
-            self.state.ensure_collection_live(node).await?;
+            self.state.ensure_collection_live(node, requirement).await?;
         }
         let pending_membership = match node {
             Some(node) => {
@@ -354,8 +380,8 @@ impl KeyResolver {
                             Err(TransError::other("routed leaf has no decoded node")),
                         )];
                     };
-                    if let Err(error) = self.state.ensure_collection_live(node).await {
-                        return vec![(first_ordinal, Err(TransError::from(error)))];
+                    if let Err(error) = self.state.ensure_collection_live(node, requirement).await {
+                        return vec![(first_ordinal, Err(error))];
                     }
                     let membership_generation = node.membership_generation();
                     let leaf = match node.as_leaf() {
@@ -379,6 +405,7 @@ impl KeyResolver {
                                 leaf.lookup(raw_key),
                                 own_lock_holder,
                                 requirement,
+                                ObservationUse::Read,
                             )
                             .await
                             .map(|resolved| resolved.into_writer());
@@ -447,7 +474,13 @@ impl KeyResolver {
                 let loc = self.locate_key(key, requirement).await?;
                 let writer = self
                     .state
-                    .resolve_effective(key, Self::entry_at(&loc, key.key())?, None, requirement)
+                    .resolve_effective(
+                        key,
+                        Self::entry_at(&loc, key.key())?,
+                        None,
+                        requirement,
+                        ObservationUse::Read,
+                    )
                     .await?
                     .into_writer();
                 Ok((writer, loc))
@@ -479,10 +512,7 @@ impl KeyResolver {
             .await
             .map_err(|error| error.classify_collection_absence(key.collection()))?;
         if let Some(node) = loc.node() {
-            self.state
-                .ensure_collection_live(node)
-                .await
-                .map_err(TransError::from)?;
+            self.state.ensure_collection_live(node, requirement).await?;
         }
         Ok(loc)
     }

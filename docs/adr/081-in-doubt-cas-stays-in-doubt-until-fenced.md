@@ -11,6 +11,9 @@ recovery of the leaf coordinator in
 [ADR-080](080-commit-recovery-does-not-depend-on-gc-retention.md) fixes the
 same mistake for transaction records.
 
+[ADR-105](105-a-node-state-never-repeats.md) makes any leaf change a fence, and
+the coordinator fences an in-doubt CAS before it plans.
+
 ## Context
 
 A backend can apply a request after it reported `Unavailable` to the caller.

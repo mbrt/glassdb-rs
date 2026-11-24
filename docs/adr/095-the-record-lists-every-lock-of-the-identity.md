@@ -9,6 +9,8 @@ causes of stray holders, and it keeps the GC safety rule of that ADR. Refines
 [ADR-059](059-pin-foreign-wounds-until-owner-retirement.md): a `Wounded` record
 holds no recovery manifest.
 
+[ADR-105](105-a-node-state-never-repeats.md) removes causes 4 and 5.
+
 ## Context
 
 A stray holder is a lock of T in a leaf after GC deleted the record of T, on a

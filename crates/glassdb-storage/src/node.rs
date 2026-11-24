@@ -579,6 +579,9 @@ pub struct Node {
     locks: NodeLocks,
     /// Set after a merge moved the range and entries into the right sibling.
     drained: bool,
+    /// The number of changes of the node since its creation (ADR-105). Only
+    /// the node store sets it.
+    node_sequence: u64,
 }
 
 impl Node {
@@ -592,6 +595,7 @@ impl Node {
             body: NodeBody::Leaf(leaf),
             locks: NodeLocks::default(),
             drained: false,
+            node_sequence: 0,
         }
     }
 
@@ -604,6 +608,7 @@ impl Node {
             body: NodeBody::Index(index),
             locks: NodeLocks::default(),
             drained: false,
+            node_sequence: 0,
         }
     }
 
@@ -824,6 +829,12 @@ impl Node {
         self.locks.membership_generation()
     }
 
+    /// Returns the number of changes of the node since its creation. A state
+    /// of the node never repeats while the node exists (ADR-105).
+    pub fn node_sequence(&self) -> u64 {
+        self.node_sequence
+    }
+
     /// Returns the canonical encoded size without transient node locks.
     pub fn content_encoded_len(&self) -> usize {
         let mut content = self.clone();
@@ -984,6 +995,18 @@ impl Node {
         self.locks.clear_holders();
     }
 
+    /// Returns the node as a newly created one.
+    pub(crate) fn created(mut self) -> Self {
+        self.node_sequence = 0;
+        self
+    }
+
+    /// Returns the node as the change that follows `expected`.
+    pub(crate) fn following(mut self, expected: &Node) -> Self {
+        self.node_sequence = expected.node_sequence + 1;
+        self
+    }
+
     pub(crate) fn to_pb(&self) -> pb::Node {
         let body = match &self.body {
             NodeBody::Leaf(leaf) => pb::node::Body::Leaf(leaf.to_pb()),
@@ -1014,6 +1037,7 @@ impl Node {
                 .map(|intent| intent.as_bytes().to_vec())
                 .unwrap_or_default(),
             low_key: self.low_key.clone(),
+            node_sequence: self.node_sequence,
         }
     }
 
@@ -1056,6 +1080,7 @@ impl Node {
                 merge_reservation,
             },
             drained: raw.drained,
+            node_sequence: raw.node_sequence,
         })
     }
 
@@ -1080,6 +1105,7 @@ impl Node {
                 locks
             },
             drained: false,
+            node_sequence: 0,
         };
         // The retained lower half is now bounded by the split key and links to
         // the new sibling.

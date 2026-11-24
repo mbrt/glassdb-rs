@@ -451,8 +451,12 @@ impl MemberPolicy for AcquireOperation {
             .all(|i| matches!(i.desired, Desired::Read))
     }
 
-    fn exhausted_outcome(&self, _in_doubt: bool) -> MemberOutcome {
-        MemberOutcome::Conflict
+    fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
+        if in_doubt {
+            MemberOutcome::InDoubt("the lock CAS can still land".into())
+        } else {
+            MemberOutcome::Conflict
+        }
     }
 
     fn leaf_scope_keys(&self) -> Vec<&[u8]> {
@@ -497,6 +501,7 @@ impl LeafOperation for AcquireOperation {
             }
             MemberOutcome::Wait(holder) => Ok(AcquireOutcome::Wait(holder)),
             MemberOutcome::LeafFull => Ok(AcquireOutcome::LeafFull),
+            MemberOutcome::InDoubt(_) => Ok(AcquireOutcome::InDoubt),
             MemberOutcome::Oversized => Err(TransError::InvalidInput(
                 "new keys in one leaf exceed the coordination node size limit".into(),
             )),
@@ -507,8 +512,7 @@ impl LeafOperation for AcquireOperation {
             | MemberOutcome::Reroute
             | MemberOutcome::Landed
             | MemberOutcome::Moved
-            | MemberOutcome::Replay
-            | MemberOutcome::InDoubt(_) => Ok(AcquireOutcome::Conflict),
+            | MemberOutcome::Replay => Ok(AcquireOutcome::Conflict),
         }
     }
 }
@@ -778,6 +782,8 @@ enum AcquireOutcome {
     Wait(TxId),
     Conflict,
     LeafFull,
+    /// The round ended while the lock CAS can still land.
+    InDoubt,
 }
 
 enum ReleaseOutcome {
@@ -870,7 +876,12 @@ fn sweep_aborted_holders(tmon: &Monitor, removed: &BTreeSet<TxId>, draft: &mut S
         .filter(|holder| {
             matches!(
                 tmon.known_final_status(holder),
-                Some(TxCommitStatus::Aborted | TxCommitStatus::Wounded)
+                // The stage CAS checks that the entries are current.
+                Some(
+                    TxCommitStatus::Aborted
+                        | TxCommitStatus::Wounded
+                        | TxCommitStatus::BlindWounded
+                )
             )
         })
         .collect();
@@ -974,6 +985,10 @@ pub(crate) enum LockOutcome {
     /// retains other leaf holds, backs off without serial escalation, and
     /// retries after the background split has had an opportunity to run.
     LeafFull,
+    /// A lock CAS can still land, because the round ended before a later CAS
+    /// fenced it. The owner operation must stay unresolved, so that the
+    /// identity is pinned and GC keeps its record (ADR-105).
+    InDoubt,
 }
 
 /// Outcome of acquiring locks across all touched leaves.
@@ -981,6 +996,7 @@ enum LeafSetOutcome {
     Locked(BTreeMap<ObjectPath, LeafHoldProof>),
     Conflict,
     LeafFull,
+    InDoubt,
 }
 
 /// Outcome of acquiring locks on a single leaf (after any hold-and-wait).
@@ -988,6 +1004,7 @@ enum LeafOutcome {
     Locked(LeafHoldProof),
     Conflict,
     LeafFull,
+    InDoubt,
 }
 
 /// How a hold-and-wait wake happened, so the re-poll cadence can be tuned: a
@@ -1099,6 +1116,7 @@ impl KeyLocker {
             LeafSetOutcome::Locked(proofs) => proofs,
             LeafSetOutcome::Conflict => return Ok(LockOutcome::Conflict),
             LeafSetOutcome::LeafFull => return Ok(LockOutcome::LeafFull),
+            LeafSetOutcome::InDoubt => return Ok(LockOutcome::InDoubt),
         };
         Ok(LockOutcome::Locked(LockedTx::from_proofs(groups, proofs)?))
     }
@@ -1306,6 +1324,7 @@ impl KeyLocker {
                     }
                     LeafOutcome::Conflict => return Ok(LeafSetOutcome::Conflict),
                     LeafOutcome::LeafFull => return Ok(LeafSetOutcome::LeafFull),
+                    LeafOutcome::InDoubt => return Ok(LeafSetOutcome::InDoubt),
                 }
             }
         } else {
@@ -1314,6 +1333,14 @@ impl KeyLocker {
                 operations.push(self.lock_leaf(id, group, requirement));
             }
             let outcomes = join_all_bounded(operations, self.parallelism).await;
+            // A lock CAS that can still land decides the outcome before any
+            // conflict, so that the owner learns it.
+            if outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, Ok(LeafOutcome::InDoubt)))
+            {
+                return Ok(LeafSetOutcome::InDoubt);
+            }
             for (group, outcome) in groups.values().zip(outcomes) {
                 match outcome? {
                     LeafOutcome::Locked(proof) => {
@@ -1321,6 +1348,7 @@ impl KeyLocker {
                     }
                     LeafOutcome::Conflict => return Ok(LeafSetOutcome::Conflict),
                     LeafOutcome::LeafFull => return Ok(LeafSetOutcome::LeafFull),
+                    LeafOutcome::InDoubt => unreachable!("checked before"),
                 }
             }
         }
@@ -1465,6 +1493,7 @@ impl KeyLocker {
                 }
                 AcquireOutcome::LeafFull => return Ok(LeafOutcome::LeafFull),
                 AcquireOutcome::Conflict => return Ok(LeafOutcome::Conflict),
+                AcquireOutcome::InDoubt => return Ok(LeafOutcome::InDoubt),
             }
         }
     }
@@ -1746,6 +1775,7 @@ mod tests {
             LeafSetOutcome::Locked(proofs) => proofs,
             LeafSetOutcome::Conflict => panic!("expected lock acquisition to succeed"),
             LeafSetOutcome::LeafFull => panic!("expected leaf to have capacity"),
+            LeafSetOutcome::InDoubt => panic!("expected no lock CAS in doubt"),
         }
     }
 
@@ -1873,6 +1903,50 @@ mod tests {
             panic!("repeated acquisition must retain its read observation");
         };
         assert!(observation.is_current_after(observed_at));
+    }
+
+    // Under contention, most wounds are blind, because a short transaction
+    // writes no pending record. A lock CAS fences the decision to drop such a
+    // holder, so a writer whose cached leaf is current takes the lock with one
+    // CAS and no reload (ADR-104).
+    #[tokio::test]
+    async fn a_writer_drops_a_blind_wounded_holder_without_a_reload() {
+        use glassdb_storage::transaction::{TxRecord, TxRecordStore};
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+        let log = recorder.log();
+        let (locker, ctx) = new_test_locker(recorder).await;
+        let holder = mk_tid(1, "holder");
+        let mut held = LeafEntry::new(b"apple");
+        held.replace_write_lock(holder);
+        install_entries(&ctx, [held]).await;
+        TxRecordStore::new(
+            glassdb_storage::CachedStore::new(memory, 1 << 20, Timeline::new(), None),
+            DbPrefix::try_from("test").unwrap(),
+        )
+        .set(&TxRecord::new(holder, TxCommitStatus::BlindWounded))
+        .await
+        .unwrap();
+
+        let tx = mk_tid(2, "tx");
+        ctx.monitor.begin_tx(&tx);
+        log.lock().unwrap().clear();
+        lock_ok_at(
+            &locker,
+            &tx,
+            &group_of_intents(vec![put_intent(b"apple")]),
+            Requirement::ANY,
+        )
+        .await;
+
+        let calls = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| op.path == root_path().to_string())
+            .map(|op| op.op)
+            .collect::<Vec<_>>();
+        assert_eq!(calls, ["write_if"]);
     }
 
     #[tokio::test]
@@ -2138,6 +2212,56 @@ mod tests {
         assert_eq!(loaded.node().membership_generation(), 0);
     }
 
+    // A lock CAS that can still land when its round ends must reach the owner
+    // as in doubt, not as a conflict, so that the owner keeps the identity
+    // pinned (ADR-105). The round ends this way when each CAS and each fence
+    // stays in doubt, or when a load fails after an in-doubt CAS.
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_cas_that_can_still_land_reports_in_doubt() {
+        for failing_reads in [false, true] {
+            let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+            let (locker, ctx) = new_test_locker(backend.clone()).await;
+            let key = b"key";
+            seed_committed(&ctx, key, b"old").await;
+            let tx = mk_tid(1, "holder");
+            ctx.monitor.begin_tx(&tx);
+            let leaf_path = root_path().to_string();
+            backend.set_before(move |op| {
+                let fail = match op {
+                    BackendOp::WriteIf { path, .. } => *path == leaf_path,
+                    BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. } => {
+                        failing_reads && *path == leaf_path
+                    }
+                    _ => false,
+                };
+                let future: HookFuture = Box::pin(async move {
+                    if fail {
+                        return Err(glassdb_backend::BackendError::Unavailable(
+                            "simulated in-doubt leaf operation".into(),
+                        ));
+                    }
+                    Ok(())
+                });
+                future
+            });
+
+            let outcome = locker
+                .keys()
+                .lock_leaves_at(
+                    &tx,
+                    &group_of(key, put_intent(key)),
+                    false,
+                    Requirement::ANY,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(outcome, LeafSetOutcome::InDoubt),
+                "failing reads: {failing_reads}"
+            );
+        }
+    }
+
     // ADR-026: a release is complete only when the current node proves the
     // holder is gone. A spent CAS budget proves nothing, so the release must
     // keep converging — a caller that took exhaustion for a removal would
@@ -2274,7 +2398,7 @@ mod tests {
         assert_eq!(e.lock_holders(), std::slice::from_ref(&old));
         assert_eq!(
             ctx.monitor.tx_status(&young).await.unwrap(),
-            TxCommitStatus::Wounded
+            TxCommitStatus::BlindWounded
         );
     }
 
@@ -4378,7 +4502,7 @@ mod tests {
         )
         .await;
         let readers = reader_ids(40);
-        seed_membership_readers(&ctx, memory, &readers, TxCommitStatus::Wounded).await;
+        seed_membership_readers(&ctx, memory, &readers, TxCommitStatus::BlindWounded).await;
         let writer = mk_tid(1, "writer");
         ctx.monitor.begin_tx(&writer);
 
@@ -4421,7 +4545,7 @@ mod tests {
         let live = mk_tid(20, "live");
         let mut holders = stale.clone();
         holders.push(live);
-        seed_membership_readers(&ctx, memory, &stale, TxCommitStatus::Wounded).await;
+        seed_membership_readers(&ctx, memory, &stale, TxCommitStatus::BlindWounded).await;
         let mut root = Node::leaf(LeafBody::new());
         for holder in &holders {
             root.add_membership_reader(*holder);
@@ -4493,7 +4617,7 @@ mod tests {
         ));
         assert_eq!(
             ctx.monitor.tx_status(&younger).await.unwrap(),
-            TxCommitStatus::Wounded
+            TxCommitStatus::BlindWounded
         );
     }
 }

@@ -7,7 +7,7 @@ use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{CurrentState, LeafEntry, LockType, Node, Requirement, StorageError};
 
 use crate::error::{TransError, trans_to_storage};
-use crate::monitor::{KeyCommitStatus, Monitor, TxFinalStatus};
+use crate::monitor::{CommittedValue, KeyCommitStatus, Monitor, TxFinalStatus};
 
 /// What is known about the effective writer's value alongside its identity.
 ///
@@ -126,36 +126,78 @@ pub(crate) struct KeyStateResolver {
     monitor: Monitor,
 }
 
+/// How a caller uses a decision that it takes from a leaf or node observation
+/// that names a holder (ADR-104).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservationUse {
+    /// A CAS on the object applies each change that the decision makes, so a
+    /// change cannot apply to a stale object. A decision that changes nothing
+    /// only waits, replays, or routes again, and a later round corrects it. A
+    /// blind wound or a reclaimed committed record then shows no value of the
+    /// holder.
+    Cas,
+    /// The caller uses the observation as it is, and it can be stale.
+    Read,
+}
+
+/// Applies the no-value rule (ADR-104) to an observation at `requirement` that
+/// names an identity with the no-value requirement `after`. Returns `Ok` when
+/// the observation shows no value of the identity, and otherwise asks to
+/// resolve it again at `after`.
+fn require_no_value(
+    after: Requirement,
+    requirement: Requirement,
+    usage: ObservationUse,
+) -> Result<(), TransError> {
+    if usage == ObservationUse::Cas || requirement.stricter(after) == requirement {
+        Ok(())
+    } else {
+        Err(TransError::ValidateRetry(after))
+    }
+}
+
 impl KeyStateResolver {
     /// Creates key-state resolution over the transaction monitor.
     pub(crate) fn new(monitor: Monitor) -> Self {
         Self { monitor }
     }
 
-    /// Returns the committed value recorded by `writer` for `key`.
+    /// Returns the committed value recorded by `writer` for `key`. GC does not
+    /// delete the record of a writer that a current leaf names, so a reclaimed
+    /// record means that the observation of the writer is old.
     pub(crate) async fn committed_value(
         &self,
         key: &LogicalKey,
         writer: &TxId,
     ) -> Result<KeyCommitStatus, TransError> {
-        self.monitor.committed_value(key, writer).await
+        match self.monitor.committed_value(key, writer).await? {
+            CommittedValue::Known(value) => Ok(value),
+            CommittedValue::NoValueAfter { after, .. } => Err(TransError::ValidateRetry(after)),
+        }
     }
 
     /// Rejects a node whose drop intent committed, waiting for a
-    /// pending intent and ignoring an aborted one.
-    pub(crate) async fn ensure_collection_live(&self, node: &Node) -> Result<(), StorageError> {
+    /// pending intent and ignoring an aborted one. `requirement` is the
+    /// requirement of the node observation.
+    pub(crate) async fn ensure_collection_live(
+        &self,
+        node: &Node,
+        requirement: Requirement,
+    ) -> Result<(), TransError> {
         let Some(holder) = node.drop_intent() else {
             return Ok(());
         };
-        match self
-            .monitor
-            .await_tx_final(holder)
-            .await
-            .map_err(trans_to_storage)?
-        {
-            TxFinalStatus::Committed => Err(StorageError::StaleCollection),
-            TxFinalStatus::Aborted => Ok(()),
+        if self.monitor.await_tx_final(holder).await? == TxFinalStatus::Committed {
+            return Err(TransError::StaleCollection);
         }
+        // GC deletes the nodes of a dropped collection before the record of
+        // the drop. So only a node observation after a blind wound shows that
+        // the drop did not commit (ADR-104).
+        if self.monitor.tx_status(holder).await? == TxCommitStatus::BlindWounded {
+            let after = self.monitor.no_value_requirement(holder);
+            require_no_value(after, requirement, ObservationUse::Read)?;
+        }
+        Ok(())
     }
 
     /// Returns foreign pending membership writers represented by `node`.
@@ -186,7 +228,8 @@ impl KeyStateResolver {
     }
 
     /// Resolves an entry's effective writer and live foreign holders from one
-    /// status observation per holder.
+    /// status observation per holder, for a decision that the caller uses as
+    /// [`ObservationUse::Cas`] says.
     pub(crate) async fn resolve_holders(
         &self,
         key: &LogicalKey,
@@ -195,7 +238,13 @@ impl KeyStateResolver {
         requirement: Requirement,
     ) -> Result<HolderResolution, TransError> {
         let mut resolved = self
-            .resolve_effective(key, entry, own_lock_holder, requirement)
+            .resolve_effective(
+                key,
+                entry,
+                own_lock_holder,
+                requirement,
+                ObservationUse::Cas,
+            )
             .await?;
         if let Some(entry) = entry
             && entry.lock_type() == LockType::Read
@@ -237,18 +286,26 @@ impl KeyStateResolver {
             return Ok(entry.current.exists());
         }
         Ok(self
-            .resolve_effective(key, Some(entry), own_lock_holder, requirement)
+            .resolve_effective(
+                key,
+                Some(entry),
+                own_lock_holder,
+                requirement,
+                ObservationUse::Read,
+            )
             .await?
             .exists())
     }
 
-    /// Resolves the effective committed state represented by one loaded entry.
+    /// Resolves the effective committed state represented by one loaded entry,
+    /// for a decision that the caller uses as `usage` says.
     pub(crate) async fn resolve_effective(
         &self,
         key: &LogicalKey,
         entry: Option<&LeafEntry>,
         own_lock_holder: Option<&TxId>,
         requirement: Requirement,
+        usage: ObservationUse,
     ) -> Result<EffectiveResolution, TransError> {
         let Some(entry) = entry else {
             return Ok(EffectiveResolution::default());
@@ -269,10 +326,17 @@ impl KeyStateResolver {
             return Ok(resolved);
         }
 
-        let committed = self
+        let committed = match self
             .monitor
             .committed_value_at(key, holder, requirement)
-            .await?;
+            .await?
+        {
+            CommittedValue::Known(committed) => committed,
+            CommittedValue::NoValueAfter { after, .. } => {
+                require_no_value(after, requirement, usage)?;
+                return Ok(resolved);
+            }
+        };
         match committed.status {
             TxCommitStatus::Committed => {
                 if !committed.value.not_written {
@@ -284,7 +348,8 @@ impl KeyStateResolver {
             TxCommitStatus::Pending | TxCommitStatus::Unknown => {
                 resolved.pending.push(*holder);
             }
-            TxCommitStatus::Aborted | TxCommitStatus::Wounded => {}
+            // A blind wound comes as a value after a requirement.
+            TxCommitStatus::Aborted | TxCommitStatus::Wounded | TxCommitStatus::BlindWounded => {}
         }
         Ok(resolved)
     }
@@ -372,6 +437,17 @@ mod tests {
                     value: Arc::from(b"holder-value".as_slice()),
                     deleted,
                 });
+            }
+            if status == TxCommitStatus::Wounded {
+                // A wound over a pending record proves that the holder never
+                // committed. A wound at an empty path is blind (ADR-104).
+                let pending = self
+                    .transactions
+                    .set(&TxRecord::new(*holder, TxCommitStatus::Pending))
+                    .await
+                    .unwrap();
+                self.transactions.set_if(&record, &pending).await.unwrap();
+                return;
             }
             self.transactions.set(&record).await.unwrap();
         }
@@ -555,7 +631,13 @@ mod tests {
         let (state, _background) = harness.resolver();
         harness.clear_operations();
         let writer = state
-            .resolve_effective(key, Some(entry), None, Requirement::ANY)
+            .resolve_effective(
+                key,
+                Some(entry),
+                None,
+                Requirement::ANY,
+                ObservationUse::Read,
+            )
             .await
             .unwrap()
             .into_writer();
@@ -567,7 +649,13 @@ mod tests {
 
         harness.clear_operations();
         let writer = state
-            .resolve_effective(key, Some(entry), None, Requirement::ANY)
+            .resolve_effective(
+                key,
+                Some(entry),
+                None,
+                Requirement::ANY,
+                ObservationUse::Read,
+            )
             .await
             .unwrap()
             .into_writer();
@@ -592,7 +680,13 @@ mod tests {
         harness.clear_operations();
         assert_eq!(
             state
-                .resolve_effective(key, Some(entry), None, Requirement::ANY)
+                .resolve_effective(
+                    key,
+                    Some(entry),
+                    None,
+                    Requirement::ANY,
+                    ObservationUse::Read
+                )
                 .await
                 .unwrap()
                 .exists(),
@@ -692,6 +786,141 @@ mod tests {
             LockType::Create,
         )
         .await;
+    }
+
+    // A blind wound of the holder of a drop intent does not prove that the
+    // drop did not commit. GC deletes the nodes of a dropped collection before
+    // the record of the drop, so only a node observation after the wound can
+    // show that the drop did not happen (ADR-104).
+    #[tokio::test]
+    async fn a_blind_wounded_drop_intent_needs_a_later_node_observation() {
+        let harness = ResolutionHarness::new();
+        let dropper = TxId::with_priority(2, b"dropper");
+        harness
+            .transactions
+            .set(&TxRecord::new(dropper, TxCommitStatus::BlindWounded))
+            .await
+            .unwrap();
+        let mut node = Node::leaf(glassdb_storage::LeafBody::new());
+        node.set_drop_intent(dropper);
+        let (state, _background) = harness.resolver();
+
+        let after = match state.ensure_collection_live(&node, Requirement::ANY).await {
+            Err(TransError::ValidateRetry(after)) => after,
+            other => panic!("an old observation must be checked again: {other:?}"),
+        };
+        state.ensure_collection_live(&node, after).await.unwrap();
+
+        // A committed drop stays a committed drop, from any observation.
+        let committed = TxId::with_priority(3, b"committed-dropper");
+        harness
+            .transactions
+            .set(&TxRecord::new(committed, TxCommitStatus::Committed))
+            .await
+            .unwrap();
+        node.set_drop_intent(committed);
+        assert!(matches!(
+            state.ensure_collection_live(&node, after).await,
+            Err(TransError::StaleCollection)
+        ));
+    }
+
+    // A blind wound proves only that the holder cannot commit after it. An
+    // older leaf observation must be resolved again, and one that reaches the
+    // requirement after the wound drops the holder. A decision that a CAS on
+    // the leaf applies drops the holder at once (ADR-104).
+    #[tokio::test]
+    async fn a_blind_wounded_holder_is_dropped_only_from_a_later_or_fenced_observation() {
+        let harness = ResolutionHarness::new();
+        let key = LogicalKey::new(CollectionAddress::root("db"), b"key");
+        let predecessor = TxId::with_priority(1, b"previous");
+        let holder = TxId::with_priority(2, b"holder");
+        harness
+            .transactions
+            .set(&TxRecord::new(holder, TxCommitStatus::BlindWounded))
+            .await
+            .unwrap();
+        let current = CurrentCase::External.current(&predecessor);
+        let entry = locked_entry(key.key(), current, LockType::Write, vec![holder]);
+        let (state, _background) = harness.resolver();
+        let unfenced = |requirement| {
+            state.resolve_effective(&key, Some(&entry), None, requirement, ObservationUse::Read)
+        };
+
+        let after = match unfenced(Requirement::ANY).await {
+            Err(TransError::ValidateRetry(after)) => after,
+            other => panic!("an old observation must be resolved again: {other:?}"),
+        };
+        let resolved = unfenced(after).await.unwrap();
+        assert_eq!(resolved.into_writer().writer, Some(predecessor));
+        let again = unfenced(Requirement::ANY).await;
+        assert!(
+            matches!(again, Err(TransError::ValidateRetry(retry)) if retry == after),
+            "the first requirement stays: {again:?}"
+        );
+
+        let holders = state
+            .resolve_holders(&key, Some(&entry), None, Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(holders.writer, Some(predecessor));
+        assert!(holders.pending.is_empty());
+    }
+
+    // A committed holder whose record GC reclaimed holds no value in a current
+    // leaf. A decision that a CAS applies drops it at once, and a read of an
+    // older observation resolves it again (ADR-104).
+    #[tokio::test]
+    async fn a_reclaimed_committed_holder_is_dropped_at_once_only_under_a_cas() {
+        let timeline = Timeline::new();
+        let objects = CachedStore::new(
+            Arc::new(MemoryBackend::new()),
+            1 << 20,
+            timeline.clone(),
+            None,
+        );
+        let transactions = TxRecordStore::new(objects, DbPrefix::try_from("db").unwrap());
+        let background = Arc::new(Background::new());
+        let state = KeyStateResolver::new(Monitor::with_config(
+            transactions.clone(),
+            timeline.clone(),
+            Arc::downgrade(&background),
+            RetrySchedule::default(),
+            ProtocolTiming::default(),
+            crate::gc::GcHints::default(),
+        ));
+        let key = LogicalKey::new(CollectionAddress::root("db"), b"key");
+        let predecessor = TxId::with_priority(1, b"previous");
+        let holder = TxId::with_priority(2, b"holder");
+        let mut record = TxRecord::new(holder, TxCommitStatus::Committed);
+        record.writes.push(TxWrite {
+            key: key.clone(),
+            value: Arc::from(&b"v"[..]),
+            deleted: false,
+        });
+        let stored = transactions.set(&record).await.unwrap();
+        let current = CurrentCase::External.current(&predecessor);
+        let entry = locked_entry(key.key(), current, LockType::Write, vec![holder]);
+        let holders = state
+            .resolve_holders(&key, Some(&entry), None, Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(holders.writer, Some(holder));
+
+        transactions.delete(&stored).await.unwrap();
+        let after_delete = Requirement::after(timeline.currentness_barrier());
+        let holders = state
+            .resolve_holders(&key, Some(&entry), None, after_delete)
+            .await
+            .unwrap();
+        assert_eq!(holders.writer, Some(predecessor));
+        let read = state
+            .resolve_effective(&key, Some(&entry), None, after_delete, ObservationUse::Read)
+            .await;
+        assert!(
+            matches!(read, Err(TransError::ValidateRetry(_))),
+            "an observation from before the reclaim must be resolved again: {read:?}"
+        );
     }
 
     #[tokio::test]
@@ -799,7 +1028,13 @@ mod tests {
             harness.clear_operations();
             assert!(
                 state
-                    .resolve_effective(&key, Some(&entry), Some(&holder), Requirement::ANY)
+                    .resolve_effective(
+                        &key,
+                        Some(&entry),
+                        Some(&holder),
+                        Requirement::ANY,
+                        ObservationUse::Read
+                    )
                     .await
                     .unwrap()
                     .exists(),

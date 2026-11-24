@@ -147,6 +147,14 @@ mod tests {
     }
 
     #[test]
+    fn blind_wound_round_trip() {
+        let mut record = TxRecord::new(tx_id(&[9]), TxCommitStatus::BlindWounded);
+        record.timestamp = Some(UNIX_EPOCH + Duration::from_secs(2));
+        let decoded = decode("db", &record.id, &encode(&record).unwrap()).unwrap();
+        assert_eq!(decoded.status, TxCommitStatus::BlindWounded);
+    }
+
+    #[test]
     fn encode_requires_timestamp() {
         let mut record = committed_record();
         record.timestamp = None;

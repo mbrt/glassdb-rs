@@ -22,6 +22,10 @@ pub mod transaction_record {
         Aborted = 2,
         Pending = 3,
         Wounded = 4,
+        /// A wound that created the record at an empty path. It proves only
+        /// that the identity cannot commit after it. The identity can have
+        /// committed before, and GC can have deleted that record.
+        BlindWounded = 5,
     }
     impl Status {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -35,6 +39,7 @@ pub mod transaction_record {
                 Self::Aborted => "ABORTED",
                 Self::Pending => "PENDING",
                 Self::Wounded => "WOUNDED",
+                Self::BlindWounded => "BLIND_WOUNDED",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -45,6 +50,7 @@ pub mod transaction_record {
                 "ABORTED" => Some(Self::Aborted),
                 "PENDING" => Some(Self::Pending),
                 "WOUNDED" => Some(Self::Wounded),
+                "BLIND_WOUNDED" => Some(Self::BlindWounded),
                 _ => None,
             }
         }
@@ -295,6 +301,11 @@ pub struct Node {
     /// older than a merge (ADR-073).
     #[prost(bytes = "vec", tag = "11")]
     pub low_key: ::prost::alloc::vec::Vec<u8>,
+    /// The number of changes of this node since its creation. Each replace
+    /// stores the expected value plus one, so a state of the node never repeats
+    /// while the node exists (ADR-105).
+    #[prost(uint64, tag = "12")]
+    pub node_sequence: u64,
     #[prost(oneof = "node::Body", tags = "3, 4")]
     pub body: ::core::option::Option<node::Body>,
 }

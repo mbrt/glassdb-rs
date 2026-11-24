@@ -170,6 +170,7 @@ fn encode_status(status: TxCommitStatus) -> Result<pb::transaction_record::Statu
         TxCommitStatus::Aborted => Ok(pb::transaction_record::Status::Aborted),
         TxCommitStatus::Pending => Ok(pb::transaction_record::Status::Pending),
         TxCommitStatus::Wounded => Ok(pb::transaction_record::Status::Wounded),
+        TxCommitStatus::BlindWounded => Ok(pb::transaction_record::Status::BlindWounded),
         TxCommitStatus::Unknown => Err(StorageError::other("unsupported commit status")),
     }
 }
@@ -180,6 +181,7 @@ fn decode_status(status: pb::transaction_record::Status) -> Result<TxCommitStatu
         pb::transaction_record::Status::Aborted => Ok(TxCommitStatus::Aborted),
         pb::transaction_record::Status::Pending => Ok(TxCommitStatus::Pending),
         pb::transaction_record::Status::Wounded => Ok(TxCommitStatus::Wounded),
+        pb::transaction_record::Status::BlindWounded => Ok(TxCommitStatus::BlindWounded),
         pb::transaction_record::Status::Default => {
             Err(StorageError::other("unknown commit status"))
         }
@@ -597,6 +599,7 @@ mod tests {
             TxCommitStatus::Aborted,
             TxCommitStatus::Pending,
             TxCommitStatus::Wounded,
+            TxCommitStatus::BlindWounded,
         ] {
             let record = record_with_status(status);
             let bytes = TxRecordCodec::encode(&record).unwrap();

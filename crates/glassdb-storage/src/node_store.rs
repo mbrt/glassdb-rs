@@ -435,10 +435,15 @@ impl NodeStore {
         let res = match expected {
             Some(observed) if observed.path() == &path => {
                 debug_assert!(no_key_lock_outlives_membership(observed, node));
-                self.nodes.replace(observed, Arc::new(node.clone())).await
+                let node = following(observed, node.clone())?;
+                self.nodes.replace(observed, Arc::new(node)).await
             }
             Some(_) => return Err(StorageError::other("node observation path changed")),
-            None => self.nodes.create(path, None, Arc::new(node.clone())).await,
+            None => {
+                self.nodes
+                    .create(path, None, Arc::new(node.clone().created()))
+                    .await
+            }
         };
         match res {
             Ok(CasResult::Applied(_)) => Ok(true),
@@ -464,7 +469,8 @@ impl NodeStore {
             return Err(StorageError::other("node observation path changed"));
         }
         debug_assert!(no_key_lock_outlives_membership(expected, node));
-        match self.nodes.replace(expected, Arc::new(node.clone())).await {
+        let node = following(expected, node.clone())?;
+        match self.nodes.replace(expected, Arc::new(node)).await {
             Ok(CasResult::Applied(receipt)) => Ok(Some(receipt.into_installed())),
             Ok(CasResult::Rejected) | Err(StorageError::NotFound) => Ok(None),
             Err(error) => Err(error),
@@ -507,10 +513,17 @@ impl NodeStore {
                 let decided = decide(node, observation.clone());
                 async move {
                     let decision = decided.await?;
-                    if let Decision::Write(node, _) | Decision::Advance(node) = &decision {
-                        debug_assert!(no_key_lock_outlives_membership(&observation, node));
-                    }
-                    Ok(decision)
+                    Ok(match decision {
+                        Decision::Write(node, value) => {
+                            debug_assert!(no_key_lock_outlives_membership(&observation, &node));
+                            Decision::Write(following(&observation, node)?, value)
+                        }
+                        Decision::Advance(node) => {
+                            debug_assert!(no_key_lock_outlives_membership(&observation, &node));
+                            Decision::Advance(following(&observation, node)?)
+                        }
+                        decision => decision,
+                    })
                 }
             })
             .await
@@ -613,6 +626,7 @@ impl NodeStore {
     pub async fn commit_leaf(&self, edit: LeafEdit) -> Result<CasResult<Node>, StorageError> {
         let LeafEdit { observation, node } = edit;
         debug_assert!(no_key_lock_outlives_membership(&observation, &node));
+        let node = following(&observation, node)?;
         let result = self.nodes.replace(&observation, Arc::new(node)).await;
         match result {
             Ok(result) => Ok(result),
@@ -664,7 +678,11 @@ impl NodeStore {
         let path = ObjectPath::TreeRoot {
             collection: collection.clone(),
         };
-        match self.nodes.create(path, None, Arc::new(root.clone())).await {
+        match self
+            .nodes
+            .create(path, None, Arc::new(root.clone().created()))
+            .await
+        {
             Ok(CasResult::Applied(_)) => Ok(true),
             Ok(CasResult::Rejected) => Ok(false),
             Err(error) => Err(error),
@@ -683,7 +701,7 @@ impl NodeStore {
         };
         match self
             .nodes
-            .create(path, None, Arc::new(root.clone()))
+            .create(path, None, Arc::new(root.clone().created()))
             .await?
         {
             CasResult::Applied(receipt) => Ok(Some(receipt.into_installed())),
@@ -695,6 +713,15 @@ impl NodeStore {
     pub async fn delete_root(&self, expected: &Observation<Node>) -> Result<(), StorageError> {
         self.delete_node(expected).await
     }
+}
+
+/// Returns `node` as the change that follows the observed state, so that the
+/// replace never restores an earlier state of the node (ADR-105).
+fn following(expected: &LeafObservation, node: Node) -> Result<Node, StorageError> {
+    let current = expected
+        .value()
+        .ok_or_else(|| StorageError::other("a node replace needs an observed node"))?;
+    Ok(node.following(current))
 }
 
 /// Tells whether no holder left the membership write lock of the replaced node

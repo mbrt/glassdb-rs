@@ -519,10 +519,17 @@ impl<W: SimWorkload> RunContext<W> {
                 self.faults.failures_enabled() || timed_out,
             )
             .await;
-        // A late lock CAS can still leave a stray holder (ADR-095). Without
-        // failures and slow mutations, every CAS lands before its pass ends.
-        if !self.faults.failures_enabled() && !self.faults.slow_mutations_enabled() && !timed_out {
-            holders::assert_no_stray_holders(&verify_db, self.backbone.as_ref(), DB_NAME).await;
+        // No lock CAS can land after GC deleted the record of its identity
+        // (ADR-105), also with failures and slow mutations. Only a crash can
+        // leave a lock whose owner never wrote a record.
+        if !timed_out {
+            holders::assert_no_stray_holders(
+                &verify_db,
+                self.backbone.as_ref(),
+                DB_NAME,
+                self.faults.failures_enabled().then_some(&self.log),
+            )
+            .await;
         }
         verify_db.shutdown().await;
         drop(self.client_backbone);

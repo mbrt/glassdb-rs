@@ -1306,7 +1306,7 @@ async fn split_wounds_a_younger_entry_holder_and_lands() {
 
     assert_eq!(
         mon.tx_status(&younger).await.unwrap(),
-        TxCommitStatus::Wounded
+        TxCommitStatus::BlindWounded
     );
     let leaves = TreeRouter::new(s.nodes.clone(), std::num::NonZeroUsize::MIN)
         .leaves(

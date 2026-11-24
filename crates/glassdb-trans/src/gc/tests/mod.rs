@@ -3050,7 +3050,7 @@ async fn aborted_drop_gc_keeps_the_record_if_a_fence_check_fails() {
 
 #[tokio::test(start_paused = true)]
 async fn pending_and_wounded_candidates_only_read_their_records() {
-    for (status, age) in [TxCommitStatus::Pending, TxCommitStatus::Wounded]
+    for (status, age) in [TxCommitStatus::Pending, TxCommitStatus::BlindWounded]
         .into_iter()
         .flat_map(|status| [Duration::ZERO, PAST_HORIZON].map(|age| (status, age)))
     {
@@ -3114,7 +3114,7 @@ async fn lock_acquisition_resolves_a_wound_that_gc_leaves_alone() {
 
     let ctx = new_ctx().await;
     let wounded = tx(1);
-    let mut record = TxRecord::new(wounded, TxCommitStatus::Wounded);
+    let mut record = TxRecord::new(wounded, TxCommitStatus::BlindWounded);
     record.timestamp = Some(base() - PAST_HORIZON);
     record.locks = vec![write_lock(b"k")];
     ctx.tx_records.set(&record).await.unwrap();
@@ -3158,7 +3158,7 @@ async fn lock_acquisition_resolves_a_wound_that_gc_leaves_alone() {
         .get_at(&wounded, Requirement::ANY)
         .await
         .unwrap();
-    assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
+    assert_eq!(got.value().unwrap().status, TxCommitStatus::BlindWounded);
 }
 
 // An acknowledged aborted record still within its safety horizon keeps its
@@ -4283,8 +4283,8 @@ async fn gc_acknowledges_a_late_wound_of_an_identity_retired_without_record() {
         }
     };
     assert_eq!(status(retired).await.unwrap(), TxCommitStatus::Aborted);
-    assert_eq!(status(busy).await.unwrap(), TxCommitStatus::Wounded);
-    assert_eq!(status(foreign).await.unwrap(), TxCommitStatus::Wounded);
+    assert_eq!(status(busy).await.unwrap(), TxCommitStatus::BlindWounded);
+    assert_eq!(status(foreign).await.unwrap(), TxCommitStatus::BlindWounded);
 }
 
 #[tokio::test(start_paused = true)]
@@ -4344,7 +4344,7 @@ async fn gc_releases_the_locks_of_a_pinned_identity_once() {
             .is_none_or(|entry| entry.lock_holders().is_empty())
     );
     let got = ctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
-    assert_eq!(got.value().unwrap().status, TxCommitStatus::Wounded);
+    assert_eq!(got.value().unwrap().status, TxCommitStatus::BlindWounded);
 
     // A lock that lands after the release stays. GC releases the set once and
     // does not check the pinned record again.
