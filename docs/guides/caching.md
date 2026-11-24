@@ -215,6 +215,7 @@ needs a fact that is not in the list, add it here, or use a barrier.
 | Final before foreign removal | Another identity removes or replaces a directory holder, a drop intent, a topology participant, or a structural gate only after the identity of the holder is final. | GC releases the locks only of an eligible identity. A replacement, and the settlement of a participant during a topology freeze, first get a final status from `resolve_tx_conflict`. `fence_source_writer` keeps the gate of a Pending holder. |
 | One-way states | A structural intent changes only from preparing to ready, and ready contents do not change. An index node never becomes a leaf. A drained node and a membership generation never revert. | The `Node` API has no operation that clears a drain or moves a membership generation back. The index-to-leaf change has a check in `acquire_index_structural_gate`. The intent phase has no check. |
 | Rejected create | A rejected create removes the cached absence, so the next `ANY` read finds the object. | `MutationRound::finish`. |
+| Cleaners only | After a collection becomes reclaimable, only cleaners change its record, its root, and its nodes. They release the locks of final identities and delete the objects, so each object changes a bounded number of times. A prepared collection of an aborted identity was never published, and drop intents fence a dropped collection. | Nothing. |
 
 Fresh identities alone do not prove permanent absence. A retried create can
 restore a deleted path. Structural recovery fences publication before it treats
