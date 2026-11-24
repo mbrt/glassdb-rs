@@ -993,7 +993,8 @@ does not prove that the identity never committed. When the monitor finds a
 committed record reclaimed, or sees a blind wound, it keeps the first
 requirement after that observation. A leaf observation that reaches it shows no
 value of the identity, so the resolver drops the holder. An older observation
-is reloaded at that requirement and resolved again
+is reloaded at that requirement and resolved again. A decision of the leaf
+coordinator drops the holder at once, because its CAS fails on a stale leaf
 ([ADR-104](adr/104-a-blind-wound-does-not-prove-that-the-identity-never-committed.md)).
 A missing historical body never becomes a missing key or a missing collection.
 

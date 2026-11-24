@@ -723,6 +723,29 @@ pub(crate) struct KeyCommitStatus {
     pub value: TValue,
 }
 
+/// What this database instance knows about the value of a transaction for one
+/// key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommittedValue {
+    /// The status, and the value when the transaction committed.
+    Known(KeyCommitStatus),
+    /// A blind wound, or a committed record that GC reclaimed. The transaction
+    /// holds no value in a current object, or in an observation that reaches
+    /// `after`. An older observation can still name it where it held a value
+    /// (ADR-104).
+    NoValueAfter {
+        status: TxCommitStatus,
+        after: Requirement,
+    },
+}
+
+/// The final record of a transaction, or the requirement after which GC
+/// reclaimed it.
+enum FinalRecord {
+    Present(Observation<TxRecord>),
+    Reclaimed(Requirement),
+}
+
 /// Transaction status together with the exact evidence used to resolve it.
 struct TxStatusEvidence {
     /// The persisted status, or `None` for a missing record.
@@ -1234,63 +1257,76 @@ impl Monitor {
         }
     }
 
-    /// Reports whether `tid`, the holder of a drop intent in a node observation
-    /// at `requirement`, committed the drop. Waits while the holder is pending.
-    pub(crate) async fn drop_committed_at(
-        &self,
-        tid: &TxId,
-        requirement: Requirement,
-    ) -> Result<bool, TransError> {
-        if self.await_tx_final(tid).await? == TxFinalStatus::Committed {
-            return Ok(true);
-        }
-        if self.tx_status(tid).await? != TxCommitStatus::BlindWounded {
-            return Ok(false);
-        }
-        // GC deletes the nodes of a dropped collection before the record of
-        // the drop. So only a node observation after the blind wound shows
-        // that the drop did not commit (ADR-104).
-        let after = self.inner.final_status.lock().unwrap().no_value_after(tid);
-        self.require_no_value_at(after, Some(requirement))
-            .map(|()| false)
+    /// Returns the first requirement at which an observation shows no value
+    /// of `tid`, after this instance saw a blind wound of `tid` or found its
+    /// committed record reclaimed (ADR-104). If this instance lost it, returns
+    /// a requirement after now: the next read of the record learns a newer one.
+    pub(crate) fn no_value_requirement(&self, tid: &TxId) -> Requirement {
+        self.inner
+            .final_status
+            .lock()
+            .unwrap()
+            .no_value_after(tid)
+            .unwrap_or_else(|| self.current_requirement())
     }
 
-    /// Applies the no-value rule (ADR-104) to an observation at `requirement`
-    /// that names an identity with the no-value requirement `after`. Returns
-    /// `Ok` when the observation shows no value of the identity, and
-    /// otherwise asks to resolve it again. When this instance lost `after`,
-    /// the next read of the record learns a newer one.
-    fn require_no_value_at(
-        &self,
-        after: Option<Requirement>,
-        requirement: Option<Requirement>,
-    ) -> Result<(), TransError> {
-        let after = after.unwrap_or_else(|| self.current_requirement());
-        match requirement {
-            Some(requirement) if requirement.stricter(after) == requirement => Ok(()),
-            _ => Err(TransError::ValidateRetry(after)),
-        }
-    }
-
-    /// Returns the committed value a transaction wrote for `key`, reading from
-    /// local storage or the transaction record.
+    /// Returns what this instance knows about the value of `tid` for `key`,
+    /// from a status read after the evidence that this instance has.
     pub(crate) async fn committed_value(
         &self,
         key: &LogicalKey,
         tid: &TxId,
-    ) -> Result<KeyCommitStatus, TransError> {
-        self.committed_value_with_requirement(key, tid, None).await
+    ) -> Result<CommittedValue, TransError> {
+        self.committed_value_at(key, tid, self.current_requirement())
+            .await
     }
 
-    /// Returns a committed value using a caller-provided observation bound.
+    /// Returns what this instance knows about the value of `tid` for `key`.
+    /// The status read reaches `requirement`.
     pub(crate) async fn committed_value_at(
         &self,
         key: &LogicalKey,
         tid: &TxId,
         requirement: Requirement,
-    ) -> Result<KeyCommitStatus, TransError> {
-        self.committed_value_with_requirement(key, tid, Some(requirement))
-            .await
+    ) -> Result<CommittedValue, TransError> {
+        let evidence = self.resolve_tx_status_at(tid, requirement).await?;
+        let status = evidence.status();
+        let known = |value| Ok(CommittedValue::Known(KeyCommitStatus { status, value }));
+        if !matches!(
+            status,
+            TxCommitStatus::Committed | TxCommitStatus::BlindWounded
+        ) {
+            return known(TValue::default());
+        }
+        let after = self.no_value_after(tid, &evidence);
+        if after.is_some() || status == TxCommitStatus::BlindWounded {
+            // Without the requirement of a blind wound, the next read of the
+            // record learns a newer one.
+            let after = after.unwrap_or_else(|| self.current_requirement());
+            return Ok(CommittedValue::NoValueAfter { status, after });
+        }
+
+        let observed = match self.final_record(tid, status, evidence.observation).await? {
+            FinalRecord::Present(observed) => observed,
+            FinalRecord::Reclaimed(after) => {
+                return Ok(CommittedValue::NoValueAfter { status, after });
+            }
+        };
+        let record = observed
+            .value()
+            .ok_or_else(|| TransError::other(format!("missing final record for {tid}")))?;
+        let value = match record.writes.iter().find(|entry| &entry.key == key) {
+            Some(entry) => TValue {
+                value: entry.value.clone(),
+                deleted: entry.deleted,
+                not_written: false,
+            },
+            None => TValue {
+                not_written: true,
+                ..Default::default()
+            },
+        };
+        known(value)
     }
 
     /// Conditionally pins an exact foreign transaction observation as wounded.
@@ -1905,79 +1941,18 @@ impl Monitor {
         }
     }
 
-    async fn committed_value_with_requirement(
-        &self,
-        key: &LogicalKey,
-        tid: &TxId,
-        requirement: Option<Requirement>,
-    ) -> Result<KeyCommitStatus, TransError> {
-        let evidence = match requirement {
-            Some(requirement) => self.resolve_tx_status_at(tid, requirement).await?,
-            None => {
-                self.resolve_tx_status_at(tid, self.current_requirement())
-                    .await?
-            }
-        };
-        let status = evidence.status();
-        let no_value = KeyCommitStatus {
-            status,
-            value: TValue {
-                not_written: status == TxCommitStatus::Committed,
-                ..Default::default()
-            },
-        };
-        if !matches!(
-            status,
-            TxCommitStatus::Committed | TxCommitStatus::BlindWounded
-        ) {
-            return Ok(no_value);
-        }
-        // A blind wound, or a reclaimed committed record, leaves no value of
-        // the identity in a leaf observation that reaches the requirement
-        // after it. An older observation must be resolved again.
-        let after = self.no_value_after(tid, &evidence);
-        if after.is_some() || status == TxCommitStatus::BlindWounded {
-            self.require_no_value_at(after, requirement)?;
-            return Ok(no_value);
-        }
-
-        let observed = self.final_record(tid, status, evidence.observation).await?;
-        let record = observed
-            .value()
-            .ok_or_else(|| TransError::other(format!("missing final record for {tid}")))?;
-        for entry in &record.writes {
-            if &entry.key == key {
-                return Ok(KeyCommitStatus {
-                    status: TxCommitStatus::Committed,
-                    value: TValue {
-                        value: entry.value.clone(),
-                        deleted: entry.deleted,
-                        not_written: false,
-                    },
-                });
-            }
-        }
-        Ok(KeyCommitStatus {
-            status: TxCommitStatus::Committed,
-            value: TValue {
-                not_written: true,
-                ..Default::default()
-            },
-        })
-    }
-
     async fn final_record(
         &self,
         tid: &TxId,
         expected_status: TxCommitStatus,
         known: Option<Observation<TxRecord>>,
-    ) -> Result<Observation<TxRecord>, TransError> {
+    ) -> Result<FinalRecord, TransError> {
         if let Some(observed) = known
             && observed
                 .value()
                 .is_some_and(|record| record.status == expected_status)
         {
-            return Ok(observed);
+            return Ok(FinalRecord::Present(observed));
         }
         match self
             .inner
@@ -1990,14 +1965,13 @@ impl Monitor {
                     .value()
                     .is_some_and(|record| record.status == expected_status) =>
             {
-                Ok(observed)
+                Ok(FinalRecord::Present(observed))
             }
             // The status is permanent, but GC reclaimed the record: the record
             // is missing, or another instance wounded the identity at the empty
-            // path. The referring leaf observation must be resolved again. A
-            // later one that reaches the returned requirement shows no value of
-            // the identity, also when it still names it as a stray holder
-            // (ADR-104).
+            // path. An observation that reaches the returned requirement shows
+            // no value of the identity, also when it still names it as a stray
+            // holder (ADR-104).
             Ok(_) | Err(StorageError::NotFound) => {
                 let now = self.current_requirement();
                 let reclaimed = self
@@ -2006,7 +1980,7 @@ impl Monitor {
                     .lock()
                     .unwrap()
                     .note_reclaimed(*tid, now);
-                Err(TransError::ValidateRetry(reclaimed))
+                Ok(FinalRecord::Reclaimed(reclaimed))
             }
             Err(error) => Err(TransError::Storage(
                 error.context(format!("getting TID {tid}")),
@@ -4235,6 +4209,15 @@ mod tests {
         assert!(final_record.locks.is_empty());
     }
 
+    impl CommittedValue {
+        fn known(self) -> KeyCommitStatus {
+            match self {
+                CommittedValue::Known(value) => value,
+                other => panic!("expected a known value, got {other:?}"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn committed_value() {
         let backend = RecordingBackend::new(Arc::new(MemoryBackend::new()));
@@ -4254,11 +4237,11 @@ mod tests {
         }];
         mon1.commit_tx(record).await.unwrap();
 
-        let cs = mon1.committed_value(&key, &tx).await.unwrap();
+        let cs = mon1.committed_value(&key, &tx).await.unwrap().known();
         assert_eq!(cs.status, TxCommitStatus::Committed);
         assert_eq!(&*cs.value.value, b"val1");
         // From a remote monitor.
-        let cs = mon2.committed_value(&key, &tx).await.unwrap();
+        let cs = mon2.committed_value(&key, &tx).await.unwrap().known();
         assert_eq!(cs.status, TxCommitStatus::Committed);
         assert_eq!(&*cs.value.value, b"val1");
 
@@ -4266,12 +4249,13 @@ mod tests {
         let cs = mon2
             .committed_value_at(&key, &tx, mon2.current_requirement())
             .await
-            .unwrap();
+            .unwrap()
+            .known();
         assert_eq!(&*cs.value.value, b"val1");
 
         // A key the transaction didn't write.
         let key2 = logical_key(b"key2");
-        let cs = mon2.committed_value(&key2, &tx).await.unwrap();
+        let cs = mon2.committed_value(&key2, &tx).await.unwrap().known();
         assert_eq!(cs.status, TxCommitStatus::Committed);
         assert!(cs.value.not_written);
         assert!(

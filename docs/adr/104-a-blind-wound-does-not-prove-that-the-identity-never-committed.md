@@ -82,6 +82,9 @@ record itself:
 
 - wound-wait, and the removal of the locks, freezes, gates, and drop intents of
   a holder, by a writer or by GC;
+- every decision of the leaf coordinator. A CAS on the leaf applies each change
+  that it makes. A decision that changes nothing only waits, replays, or routes
+  again, and a later round corrects it;
 - GC eligibility, which reads the record;
 - an owner before its commit write: it has not committed, so a blind wound of its
   identity is a wound.
@@ -131,8 +134,11 @@ of the record learns a newer one. That costs a reload, and it is still correct.
 
 The rule applies where a holder is resolved from a leaf observation and the
 result is used without a CAS on that leaf: point reads, scans, and the
-effective states of keys. A writer applies it too. Its lock CAS also fails on a
-stale leaf, so the rule only moves the reload earlier.
+effective states of keys. A writer does not apply it, because its lock CAS fails
+on a stale leaf. Under contention, most wounds are blind, because a short
+transaction writes no pending record. A writer often loads a cached leaf that
+is current, and its lock CAS then lands. The rule would add a reload before most
+of these CASes.
 
 It also applies to the drop intent of a node. GC deletes the nodes of a dropped
 collection before the record of the drop, so a node observation that reaches
@@ -172,8 +178,9 @@ an acknowledgement states only what the owner knows.
 
 ## Consequences
 
-- A stale scan, a point read, or a lock acquisition no longer drops a committed
-  holder because of a blind wound, on any database instance.
+- A stale scan or a point read no longer drops a committed holder because of a
+  blind wound, on any database instance. A lock acquisition drops it only with
+  a CAS on a current leaf, where the holder holds no value.
 - An instance that knows a holder as committed resolves a stray holder of it
   after one reload, and not without end.
 - An old leaf observation of a holder with a blind wound, or with a reclaimed

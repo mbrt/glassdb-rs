@@ -1905,6 +1905,50 @@ mod tests {
         assert!(observation.is_current_after(observed_at));
     }
 
+    // Under contention, most wounds are blind, because a short transaction
+    // writes no pending record. A lock CAS fences the decision to drop such a
+    // holder, so a writer whose cached leaf is current takes the lock with one
+    // CAS and no reload (ADR-104).
+    #[tokio::test]
+    async fn a_writer_drops_a_blind_wounded_holder_without_a_reload() {
+        use glassdb_storage::transaction::{TxRecord, TxRecordStore};
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let recorder = Arc::new(RecordingBackend::new(memory.clone()));
+        let log = recorder.log();
+        let (locker, ctx) = new_test_locker(recorder).await;
+        let holder = mk_tid(1, "holder");
+        let mut held = LeafEntry::new(b"apple");
+        held.replace_write_lock(holder);
+        install_entries(&ctx, [held]).await;
+        TxRecordStore::new(
+            glassdb_storage::CachedStore::new(memory, 1 << 20, Timeline::new(), None),
+            DbPrefix::try_from("test").unwrap(),
+        )
+        .set(&TxRecord::new(holder, TxCommitStatus::BlindWounded))
+        .await
+        .unwrap();
+
+        let tx = mk_tid(2, "tx");
+        ctx.monitor.begin_tx(&tx);
+        log.lock().unwrap().clear();
+        lock_ok_at(
+            &locker,
+            &tx,
+            &group_of_intents(vec![put_intent(b"apple")]),
+            Requirement::ANY,
+        )
+        .await;
+
+        let calls = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| op.path == root_path().to_string())
+            .map(|op| op.op)
+            .collect::<Vec<_>>();
+        assert_eq!(calls, ["write_if"]);
+    }
+
     #[tokio::test]
     async fn bounded_acquisition_retries_a_stale_cached_leaf() {
         let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());

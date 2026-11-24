@@ -13,6 +13,7 @@ use glassdb_storage::{LeafEntry, Requirement, RoutedLeaf, StorageError, TreeRout
 
 use crate::access::{LeafCoverage, ScanAccess, ScanEvidence, ScanMutation, ScanRange};
 use crate::error::{TransError, trans_to_storage};
+use crate::key_state_resolver::ObservationUse;
 use crate::key_state_resolver::{KeyStateResolver, WriterResolution};
 use crate::monitor::KeyCommitStatus;
 
@@ -404,6 +405,7 @@ impl KeyResolver {
                                 leaf.lookup(raw_key),
                                 own_lock_holder,
                                 requirement,
+                                ObservationUse::Read,
                             )
                             .await
                             .map(|resolved| resolved.into_writer());
@@ -472,7 +474,13 @@ impl KeyResolver {
                 let loc = self.locate_key(key, requirement).await?;
                 let writer = self
                     .state
-                    .resolve_effective(key, Self::entry_at(&loc, key.key())?, None, requirement)
+                    .resolve_effective(
+                        key,
+                        Self::entry_at(&loc, key.key())?,
+                        None,
+                        requirement,
+                        ObservationUse::Read,
+                    )
                     .await?
                     .into_writer();
                 Ok((writer, loc))
