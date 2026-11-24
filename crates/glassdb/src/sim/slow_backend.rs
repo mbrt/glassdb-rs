@@ -11,6 +11,7 @@ use glassdb_trans::ProtocolTiming;
 
 const MUTATION_WINDOW: u64 = 8;
 const BOUNDARY_EPSILON: Duration = Duration::from_millis(1);
+const LATE_MULTIPLE: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DelayPoint {
@@ -34,10 +35,12 @@ impl SlowMutationPlan {
             DelayPoint::After
         };
         let pending = timing.pending_timeout();
+        // Just before and just after the lease expires, or long after it, when
+        // GC can have deleted records that the delayed mutation depends on.
         let duration = match tape.below(3) {
             0 => pending.saturating_sub(BOUNDARY_EPSILON),
-            1 => pending + BOUNDARY_EPSILON,
-            _ => pending + timing.max_clock_skew() + BOUNDARY_EPSILON,
+            1 => pending + timing.max_clock_skew() + BOUNDARY_EPSILON,
+            _ => pending * LATE_MULTIPLE,
         };
         Self {
             ordinal,

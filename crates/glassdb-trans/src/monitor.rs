@@ -114,9 +114,14 @@ impl ProtocolTiming {
         }
     }
 
-    /// Returns the shortened timing profile used by deterministic simulation.
+    /// Returns the timing profile used by deterministic simulation.
+    ///
+    /// The retention period is short, so that GC deletes transaction records
+    /// while cached leaves, stale views, and late CASes still name them. Clock
+    /// skew is zero because the simulation has one clock, and neither GC
+    /// safety nor commit recovery depends on it (ADR-079, ADR-080).
     pub const fn simulation() -> Self {
-        Self::new(Duration::from_millis(250), Duration::from_millis(500))
+        Self::new(Duration::from_millis(50), Duration::ZERO)
     }
 
     /// Returns the interval after which an unrefreshed transaction is stale.
@@ -2822,9 +2827,9 @@ mod tests {
         assert_eq!(production.refresh_interval(), Duration::from_millis(7_500));
 
         let simulation = ProtocolTiming::simulation();
-        assert_eq!(simulation.pending_timeout(), Duration::from_millis(250));
-        assert_eq!(simulation.max_clock_skew(), Duration::from_millis(500));
-        assert_eq!(simulation.refresh_interval(), Duration::from_millis(125));
+        assert_eq!(simulation.pending_timeout(), Duration::from_millis(50));
+        assert_eq!(simulation.max_clock_skew(), Duration::ZERO);
+        assert_eq!(simulation.refresh_interval(), Duration::from_millis(25));
 
         let refreshed = SystemTime::UNIX_EPOCH;
         let boundary = refreshed + simulation.pending_timeout() + simulation.max_clock_skew();

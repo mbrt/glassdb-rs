@@ -113,7 +113,7 @@ async fn reopening_uses_the_stored_commit_recovery_timeout() {
     let root = reopened.root_collection();
     let result = tokio::time::timeout(Duration::from_secs(2), root.write(b"key", b"value"))
         .await
-        .expect("recovery must use the stored 250 ms timeout, not the default 15 seconds");
+        .expect("recovery must use the stored simulation timeout, not the default 15 seconds");
     assert!(matches!(result, Err(Error::InDoubt(_))), "{result:?}");
     backend.clear_after();
     assert_eq!(root.read(b"key").await.unwrap(), Some(b"value".to_vec()));

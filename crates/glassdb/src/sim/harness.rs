@@ -573,6 +573,13 @@ async fn run_generic<W: SimWorkload>(
     );
 
     let timed_out = clients.join().await;
+    // Only transport failures can keep a client from finishing. A slow
+    // mutation delays one operation by a few lease periods, far below the
+    // foreground limit.
+    assert!(
+        !timed_out || context.faults.failures_enabled(),
+        "a run without transport failures timed out"
+    );
     if let Some(h) = observer {
         h.await.expect("observer task failed");
     }

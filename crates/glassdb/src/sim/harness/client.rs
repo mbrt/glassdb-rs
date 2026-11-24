@@ -472,6 +472,20 @@ mod sim_tests {
     }
 
     #[test]
+    #[should_panic(expected = "a run without transport failures timed out")]
+    fn a_run_without_transport_failures_fails_when_it_times_out() {
+        exec::block_on(async {
+            let workload = RestartWorkload {
+                clients: vec![vec![Step::Write(0), Step::Wait(0), Step::Write(0)]],
+                expected_retired: 0,
+                expected_writes: vec![0],
+            };
+            crate::sim::harness::run_generic(workload, FaultConfig::none(), 1, Vec::new(), None)
+                .await;
+        });
+    }
+
+    #[test]
     fn restart_does_not_resume_a_client_stopped_by_an_error() {
         exec::block_on(async {
             let workload = RestartWorkload {
