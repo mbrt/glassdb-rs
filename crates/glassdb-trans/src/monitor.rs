@@ -1922,11 +1922,25 @@ impl Monitor {
                     return Ok(());
                 }
                 Err(StorageError::Precondition) => {
-                    let status = self
+                    // Proof for a pending record: conditional mutation. The
+                    // rejection keeps a newer cached state, so this load finds
+                    // the write that won without a backend read when it came
+                    // through this instance. Proof for a final record: stable
+                    // fact.
+                    let mut status = self
                         .inner
                         .tx_records
-                        .commit_status_at(tid, self.current_requirement())
+                        .commit_status_at(tid, Requirement::ANY)
                         .await?;
+                    if status.observation.is_absent() {
+                        // Proof for a missing record: a read at the current
+                        // requirement.
+                        status = self
+                            .inner
+                            .tx_records
+                            .commit_status_at(tid, self.current_requirement())
+                            .await?;
+                    }
                     // An absent object was reclaimed rather than never written,
                     // and GC only deletes a final one. This write only ever
                     // stamps `pending`, so it cannot have been the reclaimed
@@ -1937,6 +1951,11 @@ impl Monitor {
                         return Err(TransError::AlreadyFinalized);
                     }
                     self.record_durable_observation(tid, &status.observation);
+                    // Only this owner writes a pending record, so the write
+                    // that won is not contention: write again at once. A
+                    // backoff wait lets the next lease refresh start first,
+                    // and the write can then lose every time.
+                    continue;
                 }
                 Err(StorageError::Unavailable(_)) => {}
                 Err(error) => return Err(error.into()),
@@ -3235,6 +3254,89 @@ mod tests {
         assert_eq!(stored.collection_changes, vec![change]);
         assert_eq!(stored.prepared_collections, vec![created]);
 
+        mon.abort_owned_tx(&tx).await.unwrap();
+    }
+
+    /// A manifest write that starts while a lease refresh of the same owner is
+    /// in flight expects the state that the refresh replaces. It is rejected
+    /// once, and it writes again at once, before the next refresh can start.
+    #[tokio::test(start_paused = true)]
+    async fn a_manifest_write_rejected_by_the_lease_refresh_writes_again_at_once() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let (mon, t) = new_test_monitor(backend.clone());
+        let mon = Arc::new(mon);
+        let tx = tx_id(b"manifest-during-refresh");
+        mon.begin_persisted_tx(&tx, TxRecoveryManifest::default())
+            .await
+            .unwrap();
+
+        let is_pending_write = |operation: &BackendOp<'_>| {
+            matches!(
+                operation,
+                BackendOp::WriteIf { value, .. }
+                    if glassdb_storage::txrecord::status(value)
+                        .is_ok_and(|status| status == TxCommitStatus::Pending)
+            )
+        };
+        let refresh_entered = Arc::new(tokio::sync::Notify::new());
+        let refresh_released = Arc::new(tokio::sync::Notify::new());
+        let hold_next = Arc::new(AtomicBool::new(true));
+        backend.set_before({
+            let refresh_entered = refresh_entered.clone();
+            let refresh_released = refresh_released.clone();
+            move |operation| {
+                if !is_pending_write(operation) || !hold_next.swap(false, Ordering::SeqCst) {
+                    return Box::pin(async { Ok(()) });
+                }
+                refresh_entered.notify_one();
+                let refresh_released = refresh_released.clone();
+                Box::pin(async move {
+                    refresh_released.notified().await;
+                    Ok(())
+                })
+            }
+        });
+        let rejected = Arc::new(AtomicUsize::new(0));
+        backend.set_after({
+            let rejected = rejected.clone();
+            move |operation, outcome| {
+                if is_pending_write(operation) && !outcome.is_success() {
+                    rejected.fetch_add(1, Ordering::SeqCst);
+                }
+                Box::pin(async { Ok(()) })
+            }
+        });
+
+        refresh_entered.notified().await;
+        let created = collection_address(2);
+        let update = tokio::spawn({
+            let mon = mon.clone();
+            let created = created.clone();
+            async move {
+                mon.update_pending_tx(&tx, move |recovery| {
+                    recovery.prepared_collections = vec![created];
+                })
+                .await
+            }
+        });
+        // The paused clock advances only when every task waits, so the
+        // manifest write waits behind the refresh by then.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let released = tokio::time::Instant::now();
+        refresh_released.notify_one();
+        update.await.unwrap().unwrap();
+
+        assert_eq!(rejected.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            released.elapsed(),
+            Duration::ZERO,
+            "the write must not wait"
+        );
+        let observed = t.tx_records.get_at(&tx, Requirement::ANY).await.unwrap();
+        assert_eq!(
+            observed.value().unwrap().prepared_collections,
+            vec![created]
+        );
         mon.abort_owned_tx(&tx).await.unwrap();
     }
 
