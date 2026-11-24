@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, hash_map::Entry};
 use std::ops::{AddAssign, Sub};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -53,10 +54,14 @@ const MAX_RETIRED_WITHOUT_RECORD: usize = 65_536;
 /// its locks stay until a writer on the same key removes them.
 const MAX_PINNED_LOCK_SETS: usize = 4_096;
 
-/// Final-status cache activity for one snapshot or accumulated interval.
+/// Final-status cache activity and the liveness decisions of the monitor, for
+/// one snapshot or accumulated interval.
 ///
 /// Each final-status cache lookup counts once. Reads from local owner state
 /// bypass this cache and do not count.
+///
+/// Each liveness decision that lets this database instance wound a foreign
+/// identity counts once, also when the wound then finds the identity final.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MonitorStats {
     /// Final-status cache lookups that found a committed, wounded, or aborted
@@ -64,14 +69,33 @@ pub struct MonitorStats {
     pub hits: u64,
     /// Final-status cache lookups that found no status.
     pub misses: u64,
+    /// Pending records whose lease expired by its timestamp, which includes
+    /// the allowed clock skew.
+    pub lease_expiries: u64,
+    /// Pending records whose lease had not expired by its timestamp, but that
+    /// this database instance saw unchanged for one pending timeout on its
+    /// own clock.
+    pub observed_lease_expiries: u64,
+    /// Identities that this database instance saw with no transaction record
+    /// for one pending timeout on its own clock.
+    pub missing_record_expiries: u64,
 }
 
 impl AddAssign for MonitorStats {
     fn add_assign(&mut self, rhs: Self) {
         // Destructuring fails to compile when a field is added and not summed.
-        let Self { hits, misses } = rhs;
+        let Self {
+            hits,
+            misses,
+            lease_expiries,
+            observed_lease_expiries,
+            missing_record_expiries,
+        } = rhs;
         self.hits += hits;
         self.misses += misses;
+        self.lease_expiries += lease_expiries;
+        self.observed_lease_expiries += observed_lease_expiries;
+        self.missing_record_expiries += missing_record_expiries;
     }
 }
 
@@ -82,6 +106,13 @@ impl Sub for MonitorStats {
         Self {
             hits: self.hits.saturating_sub(rhs.hits),
             misses: self.misses.saturating_sub(rhs.misses),
+            lease_expiries: self.lease_expiries.saturating_sub(rhs.lease_expiries),
+            observed_lease_expiries: self
+                .observed_lease_expiries
+                .saturating_sub(rhs.observed_lease_expiries),
+            missing_record_expiries: self
+                .missing_record_expiries
+                .saturating_sub(rhs.missing_record_expiries),
         }
     }
 }
@@ -583,6 +614,26 @@ struct Inner {
     // transaction while the role enum prevents owned and foreign state from
     // coexisting.
     shards: Sharded<Mutex<State>>,
+    expiries: ExpiryCounters,
+}
+
+/// The liveness decisions that [`MonitorStats`] reports.
+#[derive(Default)]
+struct ExpiryCounters {
+    lease: AtomicU64,
+    observed_lease: AtomicU64,
+    missing_record: AtomicU64,
+}
+
+impl ExpiryCounters {
+    fn take(&self) -> MonitorStats {
+        MonitorStats {
+            lease_expiries: self.lease.swap(0, Ordering::Relaxed),
+            observed_lease_expiries: self.observed_lease.swap(0, Ordering::Relaxed),
+            missing_record_expiries: self.missing_record.swap(0, Ordering::Relaxed),
+            ..MonitorStats::default()
+        }
+    }
 }
 
 /// Tracks the lifecycle of transactions: commit, abort, status queries, and
@@ -825,13 +876,17 @@ impl Monitor {
                 timing,
                 gc_hints,
                 shards: Sharded::new(|_| Mutex::new(State::default())),
+                expiries: ExpiryCounters::default(),
             }),
         }
     }
 
-    /// Returns final-status cache activity since the previous sample.
+    /// Returns final-status cache activity and liveness decisions since the
+    /// previous sample.
     pub(crate) fn stats_and_reset(&self) -> MonitorStats {
-        self.inner.final_status.lock().unwrap().take_stats()
+        let mut stats = self.inner.final_status.lock().unwrap().take_stats();
+        stats += self.inner.expiries.take();
+        stats
     }
 
     pub(crate) fn protocol_timing(&self) -> ProtocolTiming {
@@ -2233,9 +2288,17 @@ impl Monitor {
         // progress check (one observer clock — no skew) jointly decide whether
         // the holder must be pinned as wounded.
         let observation = if self.inner.timing.is_expired(status.last_update, now) {
+            self.inner.expiries.lease.fetch_add(1, Ordering::Relaxed);
             RemoteLivenessDecision::Expired
         } else {
-            self.observe_remote_pending(tid, status.last_update, now)?
+            let observation = self.observe_remote_pending(tid, status.last_update, now)?;
+            if matches!(observation, RemoteLivenessDecision::Expired) {
+                self.inner
+                    .expiries
+                    .observed_lease
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            observation
         };
         match observation {
             RemoteLivenessDecision::Owned(evidence) => Ok(evidence),
@@ -2310,6 +2373,10 @@ impl Monitor {
             .commit_status_at(tid, self.current_requirement())
             .await?;
         if refreshed.observation.is_absent() {
+            self.inner
+                .expiries
+                .missing_record
+                .fetch_add(1, Ordering::Relaxed);
             let (wounded, _) = self.try_wound_observed(tid, &refreshed.observation).await?;
             return TxStatusEvidence::observed(wounded);
         }
@@ -2967,13 +3034,24 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(reader.tx_status(&tid).await.unwrap(), status);
-            assert_eq!(clone.stats_and_reset(), MonitorStats { hits: 0, misses: 1 });
+            assert_eq!(
+                clone.stats_and_reset(),
+                MonitorStats {
+                    hits: 0,
+                    misses: 1,
+                    ..Default::default()
+                }
+            );
 
             operations.lock().unwrap().clear();
             assert_eq!(clone.tx_status(&tid).await.unwrap(), status);
             assert_eq!(
                 reader.stats_and_reset(),
-                MonitorStats { hits: 1, misses: 0 }
+                MonitorStats {
+                    hits: 1,
+                    misses: 0,
+                    ..Default::default()
+                }
             );
             assert!(operations.lock().unwrap().is_empty());
             assert_eq!(clone.stats_and_reset(), MonitorStats::default());
@@ -3008,7 +3086,63 @@ mod tests {
         }
         assert_eq!(
             reader.stats_and_reset(),
-            MonitorStats { hits: 0, misses: 2 }
+            MonitorStats {
+                hits: 0,
+                misses: 2,
+                ..Default::default()
+            }
+        );
+    }
+
+    // Each check counts the decision that it alone makes. A record timestamp
+    // far in the past expires the lease at once. A record timestamp far in the
+    // future leaves the decision to the observer's clock, as a clock skew can.
+    #[tokio::test]
+    async fn stats_count_each_liveness_decision_by_its_check() {
+        let timing = ProtocolTiming::new(Duration::from_millis(1), Duration::from_millis(1));
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (_writer, writer_ctx) = new_test_monitor_with_timing(backend.clone(), timing);
+        let (reader, _reader_ctx) = new_test_monitor_with_timing(backend, timing);
+        let stale = tx_id(b"stale");
+        let ahead = tx_id(b"ahead");
+        let missing = tx_id(b"missing");
+        let now = rt::system_now();
+        for (tid, timestamp) in [
+            (stale, SystemTime::UNIX_EPOCH),
+            (ahead, now + Duration::from_secs(60 * 60)),
+        ] {
+            let mut record = TxRecord::new(tid, TxCommitStatus::Pending);
+            record.timestamp = Some(timestamp);
+            writer_ctx.tx_records.set(&record).await.unwrap();
+        }
+
+        assert_eq!(
+            reader.tx_status(&stale).await.unwrap(),
+            TxCommitStatus::Wounded
+        );
+        for tid in [ahead, missing] {
+            assert_eq!(
+                reader.tx_status(&tid).await.unwrap(),
+                TxCommitStatus::Pending
+            );
+        }
+        tokio::time::sleep(timing.pending_timeout() * 5).await;
+        for (tid, wounded) in [
+            (ahead, TxCommitStatus::Wounded),
+            (missing, TxCommitStatus::BlindWounded),
+        ] {
+            assert_eq!(reader.tx_status(&tid).await.unwrap(), wounded);
+        }
+
+        assert_eq!(
+            reader.stats_and_reset(),
+            MonitorStats {
+                misses: 5,
+                lease_expiries: 1,
+                observed_lease_expiries: 1,
+                missing_record_expiries: 1,
+                ..Default::default()
+            }
         );
     }
 

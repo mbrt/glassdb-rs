@@ -73,7 +73,7 @@ pub struct Stats {
     pub backend: BackendStats,
     /// Decoded L1 and persistent encoded-body L2 cache activity.
     pub cache: CacheStats,
-    /// Transaction final-status cache activity.
+    /// Transaction final-status cache activity and liveness decisions.
     pub monitor: MonitorStats,
     /// Distributed-locker activity.
     pub locker: LockerStats,
