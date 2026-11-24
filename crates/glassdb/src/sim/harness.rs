@@ -39,9 +39,9 @@ const CACHE_CAPACITY_BYTES: u64 = 2 * 1024 * 1024;
 const CACHE_MEDIA_SEED: u64 = 0xCA43_5EED_D15C_0048;
 
 /// Upper bound on the latency of each request and each reply without transport
-/// failures. It stays far below the pending timeout of
-/// [`ProtocolTiming::simulation`], so that latency alone does not expire the
-/// leases of live transactions.
+/// failures. One round trip stays below the refresh interval of
+/// [`ProtocolTiming::simulation`] (half the pending timeout), so the lease of a
+/// live transaction expires only when several delays add up.
 const FAULTLESS_MAX_DELAY: Duration = Duration::from_millis(10);
 
 /// Identifies one database instance of a simulation run.
