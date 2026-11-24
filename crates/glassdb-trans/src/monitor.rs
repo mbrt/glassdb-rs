@@ -1142,8 +1142,8 @@ impl Monitor {
     /// status that wins.
     ///
     /// A committed transaction is left untouched. A pending refresh does not
-    /// defeat a wound: the refreshed observation is retried until either the
-    /// abort lands or the owner commits.
+    /// defeat a wound: after each rejected wound, the wound is sent again
+    /// until either the abort lands or the owner commits.
     pub(crate) async fn preempt_tx(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
         let transition = self.preemption_plan(tid);
         let mut status = self
@@ -1156,11 +1156,11 @@ impl Monitor {
             })?;
         let mut backoff = self.inner.retry.backoff();
         loop {
-            status = self
+            let settled = self
                 .advance_abort_transition(tid, &status.observation, transition)
                 .await?
                 .0;
-            match status.status {
+            match settled.status {
                 TxCommitStatus::Committed => return Ok(TxFinalStatus::Committed),
                 TxCommitStatus::Aborted => return Ok(TxFinalStatus::Aborted),
                 // The caller removes the holder with a CAS on the current
@@ -1176,9 +1176,13 @@ impl Monitor {
                 | TxCommitStatus::Unknown => {}
             }
             // Lease expiry must stop here because the refresh proves liveness.
-            // Wound-wait is authorized by priority instead, so a refresh only
-            // supplies the next CAS observation.
+            // Wound-wait is authorized by priority instead, so the wound is
+            // sent again. A live owner refreshes its record during the wait,
+            // so the next wound expects a status read after the wait.
             rt::sleep(backoff.next_delay()).await;
+            status = self
+                .read_tx_status_retrying_unavailable(tid, &mut backoff)
+                .await?;
         }
     }
 
@@ -4120,6 +4124,79 @@ mod tests {
             ctx.tx_records.get_at(&tx, Requirement::ANY).await,
             Err(StorageError::NotFound)
         ));
+    }
+
+    /// The owner refreshes its pending record before the first wound CAS and
+    /// again while the wounder waits after each rejected CAS. A wound CAS
+    /// from the status read before the wait would never land.
+    #[tokio::test(start_paused = true)]
+    async fn preempt_tx_lands_while_the_owner_refreshes_during_each_wait() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let backend = HookBackend::new(memory.clone());
+        let (mon, _wounder) = new_test_monitor(backend.clone());
+        let (_owner_mon, owner) = new_test_monitor(memory);
+        let tx = tx_id(b"refresh-during-wait");
+        owner
+            .tx_records
+            .set(&TxRecord::new(tx, TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let refresh = {
+            let tx_records = owner.tx_records.clone();
+            let refreshes = refreshes.clone();
+            move || {
+                let tx_records = tx_records.clone();
+                let n = refreshes.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+                Box::pin(async move {
+                    let observed = tx_records.get_at(&tx, Requirement::ANY).await.unwrap();
+                    let mut record = TxRecord::new(tx, TxCommitStatus::Pending);
+                    record.timestamp = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(n));
+                    tx_records.set_if(&record, &observed).await.unwrap();
+                    Ok(())
+                }) as HookFuture
+            }
+        };
+        let is_wound = |operation: &BackendOp<'_>| {
+            matches!(
+                operation,
+                BackendOp::WriteIf { value, .. }
+                    if glassdb_storage::txrecord::status(value)
+                        .is_ok_and(|status| status == TxCommitStatus::Wounded)
+            )
+        };
+        let wound_writes = Arc::new(AtomicUsize::new(0));
+        backend.set_before({
+            let refresh = refresh.clone();
+            let wound_writes = wound_writes.clone();
+            move |operation| {
+                if is_wound(operation) && wound_writes.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return refresh();
+                }
+                Box::pin(async { Ok(()) })
+            }
+        });
+        let rejected = Arc::new(AtomicBool::new(false));
+        backend.set_after(move |operation, outcome| {
+            if is_wound(operation) && !outcome.is_success() {
+                rejected.store(true, Ordering::SeqCst);
+            }
+            let reads_status = matches!(
+                operation,
+                BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+            );
+            if reads_status && rejected.swap(false, Ordering::SeqCst) {
+                return refresh();
+            }
+            Box::pin(async { Ok(()) })
+        });
+
+        let preempted = tokio::time::timeout(Duration::from_secs(60), mon.preempt_tx(&tx))
+            .await
+            .expect("the wound must land while the owner refreshes");
+        assert_eq!(preempted.unwrap(), TxFinalStatus::Aborted);
+        assert_eq!(wound_writes.load(Ordering::SeqCst), 2);
+        assert_eq!(refreshes.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]
