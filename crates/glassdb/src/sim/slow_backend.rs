@@ -10,7 +10,9 @@ use glassdb_concurr::{Tape, rt};
 use glassdb_trans::ProtocolTiming;
 
 const MUTATION_WINDOW: u64 = 8;
-const BOUNDARY_EPSILON: Duration = Duration::from_millis(1);
+/// How far after a lease expiry check a delay or a wait ends, so that the
+/// check sees it as past.
+pub(super) const BOUNDARY_EPSILON: Duration = Duration::from_millis(1);
 const LATE_MULTIPLE: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

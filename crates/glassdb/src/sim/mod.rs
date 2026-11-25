@@ -55,7 +55,7 @@ pub use harness::{
 };
 pub use history::{
     HistoryCollectionOp, HistoryInstruction, HistoryMode, HistoryTransaction, HistoryView,
-    HistoryWorkload,
+    HistoryWorkload, lease_waits,
 };
 pub use membership::{MembOp, MembershipAcct, MembershipWorkload, MergingMembershipWorkload};
 pub use rmw::{RMW_KEY_COUNT, RmwAcct, RmwOp, RmwWorkload};

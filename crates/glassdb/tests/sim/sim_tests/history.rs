@@ -6,7 +6,7 @@
 use glassdb::exec::{TapeScheduler, block_on_with};
 use glassdb::sim::{
     Covered, FaultConfig, HistoryCollectionOp as C, HistoryInstruction as I, HistoryMode,
-    HistoryTransaction, HistoryView, HistoryWorkload, StructuralCoverage, pct_sweep,
+    HistoryTransaction, HistoryView, HistoryWorkload, StructuralCoverage, lease_waits, pct_sweep,
     run_and_assert, run_and_assert_with_faults,
 };
 
@@ -152,6 +152,56 @@ fn pct_seed_breadth_holds_exact_history() {
     let workload = contended_history();
     let faults = FaultConfig::failures(7);
     pct_sweep(&workload, faults);
+}
+
+/// Increments of the same keys by short transactions, and by long ones that
+/// wait for each of the [`lease_waits`]. A long transaction waits in each
+/// execution of its body, so it keeps its locks for the wait in a locked
+/// replay, and its owner refreshes the lease.
+fn long_and_short_history() -> HistoryWorkload {
+    let [refresh, observer_expiry, lease_expiry] = lease_waits();
+    let increment = |key| {
+        [
+            I::Read { key, register: 0 },
+            I::WriteIncremented { key, register: 0 },
+        ]
+    };
+    let long = |keys: &[u8], wait| {
+        let mut instructions = Vec::new();
+        for &key in keys {
+            instructions.extend(increment(key));
+        }
+        instructions.push(I::Sleep { duration: wait });
+        instructions
+    };
+    let programs: [Vec<Vec<I>>; 4] = [
+        vec![long(&[0, 1], lease_expiry), increment(2).to_vec()],
+        vec![increment(0).to_vec(), long(&[2], observer_expiry)],
+        vec![increment(1).to_vec(), long(&[0, 2], refresh)],
+        vec![increment(2).to_vec(), increment(0).to_vec()],
+    ];
+    HistoryWorkload {
+        clients: programs
+            .into_iter()
+            .enumerate()
+            .map(|(client_id, programs)| {
+                programs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, instructions)| {
+                        transaction((client_id * 2 + index) as u64, client_id, instructions)
+                    })
+                    .collect()
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn pct_seed_breadth_holds_exact_history_of_long_and_short_transactions() {
+    let workload = long_and_short_history();
+    pct_sweep(&workload, FaultConfig::none());
+    pct_sweep(&workload, FaultConfig::failures(7));
 }
 
 #[test]
