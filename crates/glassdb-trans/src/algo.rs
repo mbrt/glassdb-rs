@@ -1899,7 +1899,11 @@ mod tests {
             .expect("retirement never attempted its status read");
 
         let (peer, peer_ctx) = new_algo_from_backend(backend).await;
-        peer_ctx.tmon.preempt_tx(&interrupted).await.unwrap();
+        peer_ctx
+            .tmon
+            .preempt_tx(&interrupted, peer_ctx.tmon.current_requirement())
+            .await
+            .unwrap();
         let mut peer_handle = begin_accesses(&peer, accesses);
         tokio::time::timeout(Duration::from_secs(1), peer.commit(&mut peer_handle))
             .await
@@ -2483,7 +2487,10 @@ mod tests {
         let old_id = *h.id();
         assert!(h.engage());
         tctx.tmon.begin_tx(&old_id);
-        tctx.tmon.preempt_tx(&old_id).await.unwrap();
+        tctx.tmon
+            .preempt_tx(&old_id, tctx.tmon.current_requirement())
+            .await
+            .unwrap();
 
         assert_eq!(tm.commit(&mut h).await.unwrap(), BodyDecision::ReplayBody);
         assert_ne!(*h.id(), old_id);
@@ -2516,7 +2523,11 @@ mod tests {
         assert!(h.engage());
         tctx.tmon.begin_tx(&old_id);
         let (_peer, peer_ctx) = new_algo_from_backend(backend.clone()).await;
-        peer_ctx.tmon.preempt_tx(&old_id).await.unwrap();
+        peer_ctx
+            .tmon
+            .preempt_tx(&old_id, peer_ctx.tmon.current_requirement())
+            .await
+            .unwrap();
         let acknowledgement = Arc::new(tokio::sync::Semaphore::new(0));
         backend.set_before({
             let old_path = ObjectPath::Transaction {
@@ -2592,7 +2603,10 @@ mod tests {
         let old_id = *handle.id();
         tm.mon.begin_tx(&old_id);
         assert!(handle.engage());
-        tctx.tmon.preempt_tx(&old_id).await.unwrap();
+        tctx.tmon
+            .preempt_tx(&old_id, tctx.tmon.current_requirement())
+            .await
+            .unwrap();
         tctx.records
             .load_record(&prepared, Requirement::ANY)
             .await
@@ -2667,7 +2681,10 @@ mod tests {
             .fence(&old_id, &mut handle.collections)
             .await
             .unwrap();
-        tctx.tmon.preempt_tx(&old_id).await.unwrap();
+        tctx.tmon
+            .preempt_tx(&old_id, tctx.tmon.current_requirement())
+            .await
+            .unwrap();
 
         assert_eq!(
             tm.commit(&mut handle).await.unwrap(),

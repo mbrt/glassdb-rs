@@ -199,7 +199,10 @@ async fn gc_preserves_prepared_collections_until_wounded_owner_retires() {
                 let prepared = prepared.clone();
                 Box::pin(async move {
                     if pause {
-                        peer_monitor.preempt_tx(&old_id).await.unwrap();
+                        peer_monitor
+                            .preempt_tx(&old_id, peer_monitor.current_requirement())
+                            .await
+                            .unwrap();
 
                         assert_eq!(
                             check_candidate(&gc, &old_id).await.unwrap(),
@@ -4256,7 +4259,10 @@ async fn gc_acknowledges_a_late_wound_of_an_identity_retired_without_record() {
     // The owner of `foreign` is not this instance.
     for id in [retired, busy, foreign] {
         assert_eq!(
-            peer.monitor.preempt_tx(&id).await.unwrap(),
+            peer.monitor
+                .preempt_tx(&id, peer.monitor.current_requirement())
+                .await
+                .unwrap(),
             crate::monitor::TxFinalStatus::Aborted
         );
     }

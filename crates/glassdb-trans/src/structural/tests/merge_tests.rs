@@ -811,7 +811,10 @@ async fn seed_interrupted_merge(s: &TestStore, sp: &Restructurer, crash: MergeCr
     .unwrap();
     sp.mon.begin_tx(&worker);
     assert_eq!(
-        sp.mon.preempt_tx(&worker).await.unwrap(),
+        sp.mon
+            .preempt_tx(&worker, sp.mon.current_requirement())
+            .await
+            .unwrap(),
         TxFinalStatus::Aborted
     );
     if matches!(crash, MergeCrash::Ready) {
@@ -941,7 +944,11 @@ async fn recovery_fences_a_late_absorb() {
     let left = current_node(&peer, "L0").await;
     let worker = left.structural_gate().holders()[0];
     assert_eq!(
-        recovering.mon.preempt_tx(&worker).await.unwrap(),
+        recovering
+            .mon
+            .preempt_tx(&worker, recovering.mon.current_requirement())
+            .await
+            .unwrap(),
         TxFinalStatus::Aborted
     );
     assert!(recovering.recover_structural_intents().await.unwrap());

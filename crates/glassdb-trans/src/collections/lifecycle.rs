@@ -398,8 +398,19 @@ impl CollectionLifecycle {
     }
 
     async fn resolve_pending_holder(&self, holder: &TxId, id: &TxId) -> Result<(), TransError> {
-        if matches!(try_reclaim(&self.monitor, id, holder).await?, Reclaim::Wait) {
-            self.monitor.await_tx_final(holder).await?;
+        if matches!(
+            try_reclaim(
+                &self.monitor,
+                id,
+                holder,
+                self.monitor.current_requirement(),
+            )
+            .await?,
+            Reclaim::Wait
+        ) {
+            self.monitor
+                .await_tx_final(holder, self.monitor.current_requirement())
+                .await?;
         }
         Ok(())
     }
@@ -763,7 +774,10 @@ mod tests {
         match status {
             TxCommitStatus::Wounded => {
                 assert_eq!(
-                    peer.monitor.preempt_tx(&first).await.unwrap(),
+                    peer.monitor
+                        .preempt_tx(&first, peer.monitor.current_requirement())
+                        .await
+                        .unwrap(),
                     TxFinalStatus::Aborted
                 );
             }

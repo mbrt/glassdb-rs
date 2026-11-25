@@ -443,7 +443,11 @@ impl CollectionStateResolver {
         pending: PendingHolders,
     ) -> Result<Option<TxFinalStatus>, TransError> {
         match pending {
-            PendingHolders::Wait => self.monitor.await_tx_final(holder).await.map(Some),
+            PendingHolders::Wait => self
+                .monitor
+                .await_tx_final(holder, self.monitor.current_requirement())
+                .await
+                .map(Some),
             PendingHolders::Skip => Ok(match self.monitor.tx_status(holder).await? {
                 TxCommitStatus::Committed => Some(TxFinalStatus::Committed),
                 // The CAS on the collection record checks that the lock is
