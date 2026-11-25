@@ -84,3 +84,18 @@ loads = { stale-writer = 1 }
 
 [cell]
 workload = "stale-shared-leaves"
+
+# The `stale-view-shared-leaves` workload with the writer on a second
+# instance. A write of another instance does not advance the watermarks of
+# this instance, so after each move of a floor the readers check each leaf
+# that they read. The experiments that use it set `cell.collections = 1`, so
+# that both instances use the same collection. Only `stale-reads-view-foreign`
+# uses it.
+[workloads.stale-view-foreign-shared-leaves.groups.readers]
+instances = 1
+shapes = { stale-view-single = 1, stale-view-multi = 1 }
+
+[workloads.stale-view-foreign-shared-leaves.groups.writers]
+instances = 1
+shapes = {}
+loads = { stale-writer = 1 }

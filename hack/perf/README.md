@@ -88,8 +88,8 @@ pool.
 The experiments with the tags `ci/counters` and `ci/timing` replace the
 Criterion suite of `glassdb`. Each case of the CI comparison has two files:
 `<case>.toml` with the tag `ci/timing`, and `<case>-counters.toml` with the tag
-`ci/counters`. Except for the last three, each case runs one worker on one
-instance with warm caches. A case warms up for 1250 ms. The counter file
+`ci/counters`. `stale-reads-view-foreign` has only the timing file. Up to
+`read-long-keys`, each case runs one worker on one instance with warm caches. A case warms up for 1250 ms. The counter file
 measures for 10 s of model time, which ends before the first pass of the garbage
 collector. The timing file measures for 300 s. The counter files include
 `hack/perf/configs/default.toml`, which has their settings and their parts, and
@@ -110,6 +110,7 @@ window. Most cases use built-in parts:
 | `stale-reads-shared-leaves` | Stale read-only transactions (`StaleDatabaseView::read_tx`, 5 s bound) of ten keys with a new view for each transaction (`stale-multi`), and a writer of one key, all on the keys of one collection with leaves of at most 16 entries. Each write gives the readers a new leaf state, so the case shows what a new state costs the stale reads of the other leaves. |
 | `stale-reads-single` | The same leaves, with the writer and a stale read-only transaction of one key with a new view for each transaction (`stale-single`). The reader uses cached leaf states only, so it commits one transaction for each 5 µs of model time, and in virtual time it costs about as much wall time as model time. Its windows are 500 ms for the counters and 2 s for the latency. The writer only gives the load (`loads`): it has too few transactions in 2 s for its metrics. |
 | `stale-reads-view` | The same leaves, with the writer and stale read-only transactions of one key and of ten keys with one view for each worker (`stale-view-single`, `stale-view-multi`), with a 250 ms bound. Most calls use cached leaf states only, so they have the short windows of `stale-reads-single`. The bound is shorter than the window, so that the floors of the views move in it. The writer only gives the load. |
+| `stale-reads-view-foreign` | `stale-reads-view` with the writer on a second instance, in the same collection. A write of another instance does not advance the watermarks of the reader instance, so after each move of a floor the readers check each leaf that they read. It has only a timing file: in the 500 ms window of a counters file, the single writer changes too few leaves to show this cost. |
 
 The CI comparison builds perfbench for both revisions, runs `make bench` with
 each binary, and then compares the results:
