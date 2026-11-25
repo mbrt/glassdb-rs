@@ -75,6 +75,16 @@ pub(crate) enum PendingHolders {
     Skip,
 }
 
+/// What the help with the write-back of a committed directory holder found.
+enum HelpedWriteBack {
+    /// The collection record has no lock of the holder now.
+    Applied,
+    /// GC reclaimed the committed record of the holder. The path of the record
+    /// is empty, or holds a blind wound (ADR-104). GC reclaims it only after
+    /// no current collection record names the holder (ADR-079).
+    Reclaimed,
+}
+
 /// Resolves transaction-dependent state in collection records.
 #[derive(Clone)]
 pub(crate) struct CollectionStateResolver {
@@ -224,15 +234,18 @@ impl CollectionLocker {
             {
                 return match resolve_tx_conflict(&self.monitor, id, &holder).await? {
                     TxFinalStatus::Committed => {
-                        match self.state.help_committed_write_back(parent, &holder).await {
-                            Ok(()) => Ok(Decision::Wait(Requirement::ANY)),
+                        match self
+                            .state
+                            .help_committed_write_back(parent, &holder)
+                            .await?
+                        {
+                            HelpedWriteBack::Applied => Ok(Decision::Wait(Requirement::ANY)),
                             // As in `load_resolved`: GC can reclaim the
                             // log after another instance removed the
                             // holder.
-                            Err(TransError::Storage(StorageError::NotFound)) => Ok(Decision::Wait(
-                                Requirement::after(self.state.timeline.currentness_barrier()),
-                            )),
-                            Err(error) => Err(error),
+                            HelpedWriteBack::Reclaimed => Ok(Decision::Wait(Requirement::after(
+                                self.state.timeline.currentness_barrier(),
+                            ))),
                         }
                     }
                     TxFinalStatus::Aborted => {
@@ -419,16 +432,16 @@ impl CollectionStateResolver {
             return Ok(Ok(record));
         };
         match status {
-            TxFinalStatus::Committed => match self.help_committed_write_back(parent, &holder).await
-            {
-                Ok(()) => Ok(Err(Decision::Reload(Requirement::ANY))),
-                // GC can reclaim a log after another instance removes its
-                // directory holder. A cached record must reload.
-                Err(TransError::Storage(StorageError::NotFound)) => Ok(Err(Decision::Wait(
-                    Requirement::after(self.timeline.currentness_barrier()),
-                ))),
-                Err(error) => Err(error),
-            },
+            TxFinalStatus::Committed => {
+                match self.help_committed_write_back(parent, &holder).await? {
+                    HelpedWriteBack::Applied => Ok(Err(Decision::Reload(Requirement::ANY))),
+                    // GC can reclaim a log after another instance removes its
+                    // directory holder. A cached record must reload.
+                    HelpedWriteBack::Reclaimed => Ok(Err(Decision::Wait(Requirement::after(
+                        self.timeline.currentness_barrier(),
+                    )))),
+                }
+            }
             TxFinalStatus::Aborted => {
                 record.remove_directory_holder(&holder);
                 Ok(Err(Decision::Advance(record)))
@@ -540,25 +553,36 @@ impl CollectionStateResolver {
         Ok(true)
     }
 
+    /// Helps the write-back below `parent` of `id`, which this instance knows
+    /// as committed.
     async fn help_committed_write_back(
         &self,
         parent: &CollectionAddress,
         id: &TxId,
-    ) -> Result<(), TransError> {
+    ) -> Result<HelpedWriteBack, TransError> {
         // Proof: stable fact (final committed contents). Final-status
         // resolution observed the committed record through this store, so ANY
         // cannot return an older pending body. This read does not prove that
-        // the record is still present.
-        let observed = self
-            .transactions
-            .get_at(id, Requirement::ANY)
-            .await
-            .map_err(|error| {
-                TransError::Storage(error.context(format!("loading committed transaction {id}")))
-            })?;
+        // the record is still present. A stale absence or a stale blind wound
+        // only delays work: `Reclaimed` makes the caller load the collection
+        // record again at a fresh barrier.
+        let observed = match self.transactions.get_at(id, Requirement::ANY).await {
+            Ok(observed) => observed,
+            Err(StorageError::NotFound) => return Ok(HelpedWriteBack::Reclaimed),
+            Err(error) => {
+                return Err(TransError::Storage(
+                    error.context(format!("loading committed transaction {id}")),
+                ));
+            }
+        };
         let record = observed.value().ok_or_else(|| {
             TransError::other(format!("committed transaction record disappeared for {id}"))
         })?;
+        // ADR-104: a blind wound of a committed identity can land only after
+        // GC reclaimed its committed record.
+        if record.status == TxCommitStatus::BlindWounded {
+            return Ok(HelpedWriteBack::Reclaimed);
+        }
         if record.status != TxCommitStatus::Committed {
             return Err(TransError::other(format!(
                 "transaction {id} resolved as committed but its record has status {:?}",
@@ -572,8 +596,8 @@ impl CollectionStateResolver {
         // holder proves its removal. A state with the holder starts a
         // conditional mutation.
         self.apply_committed_write_back(parent, id, &changes, Requirement::ANY)
-            .await
-            .map(|_| ())
+            .await?;
+        Ok(HelpedWriteBack::Applied)
     }
 
     fn recover_changes(changes: &[TxCollectionChange]) -> Vec<CollectionChange> {
@@ -690,6 +714,20 @@ mod tests {
 
     #[tokio::test]
     async fn reclaimed_record_refreshes_a_cached_directory_holder() {
+        assert_reclaim_refreshes_a_cached_directory_holder(false).await;
+    }
+
+    // ADR-104: after GC reclaims the committed record of a holder, a blind
+    // wound can land at the empty path. It proves the same as the absence.
+    #[tokio::test]
+    async fn blind_wound_after_reclaim_refreshes_a_cached_directory_holder() {
+        assert_reclaim_refreshes_a_cached_directory_holder(true).await;
+    }
+
+    /// Resolves a cached directory writer whose committed record GC reclaimed
+    /// after a peer removed the writer. With `blind_wound`, a blind wound then
+    /// fills the empty path of the record.
+    async fn assert_reclaim_refreshes_a_cached_directory_holder(blind_wound: bool) {
         use crate::engine::{AssemblyFixture, EngineConfig};
         use glassdb_data::{CollectionId, CollectionName};
         use glassdb_storage::transaction::TxRecord;
@@ -740,6 +778,13 @@ mod tests {
             local.tx_records.get_at(&old, Requirement::ANY).await,
             Err(StorageError::NotFound)
         ));
+        if blind_wound {
+            local
+                .tx_records
+                .set(&TxRecord::new(old, TxCommitStatus::BlindWounded))
+                .await
+                .unwrap();
+        }
         let resolver = CollectionStateResolver::new(
             local.records.clone(),
             local.tx_records.clone(),
@@ -891,6 +936,20 @@ mod tests {
     // hold. A writer whose cache still shows the hold must load the record again.
     #[tokio::test]
     async fn a_writer_reloads_a_cached_reader_whose_record_was_reclaimed() {
+        assert_a_writer_reloads_a_reclaimed_cached_reader(false).await;
+    }
+
+    // ADR-104: after GC reclaims the committed record of a reader, a blind
+    // wound can land at the empty path. It proves the same as the absence.
+    #[tokio::test]
+    async fn a_writer_reloads_a_cached_reader_with_a_blind_wound_after_reclaim() {
+        assert_a_writer_reloads_a_reclaimed_cached_reader(true).await;
+    }
+
+    /// Locks a directory whose cached record names a committed reader that a
+    /// peer removed and whose record GC reclaimed. With `blind_wound`, a blind
+    /// wound then fills the empty path of the record.
+    async fn assert_a_writer_reloads_a_reclaimed_cached_reader(blind_wound: bool) {
         use crate::engine::{AssemblyFixture, EngineConfig};
 
         let backend = Arc::new(MemoryBackend::new());
@@ -927,6 +986,13 @@ mod tests {
         record.remove_directory_holder(&reader);
         peer.records.store_record(&record, &observed).await.unwrap();
         local.tx_records.delete(&local_record).await.unwrap();
+        if blind_wound {
+            local
+                .tx_records
+                .set(&TxRecord::new(reader, TxCommitStatus::BlindWounded))
+                .await
+                .unwrap();
+        }
         let locker = CollectionLocker::new(
             CollectionStateResolver::new(
                 local.records.clone(),
