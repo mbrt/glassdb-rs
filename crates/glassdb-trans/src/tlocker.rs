@@ -833,7 +833,7 @@ async fn resolve_and_lock(
         && !matches!(e.lock_type(), LockType::Write | LockType::Create);
     if !compatible {
         for holder in &pending {
-            match try_reclaim(ctx.tmon, id, holder, ctx.tmon.current_requirement()).await? {
+            match try_reclaim(ctx.tmon, id, holder).await? {
                 Reclaim::Wounded => {}
                 Reclaim::Wait => return Ok(EntryResolution::Wait(*holder)),
             }
@@ -1502,9 +1502,7 @@ impl KeyLocker {
     /// `timeout` elapses, whichever comes first, then lets the caller
     /// re-resolve, reporting which woke it.
     async fn wait_for_holder(&self, holder: &TxId, timeout: Duration) -> Result<Woke, TransError> {
-        let wait = self
-            .tmon
-            .await_tx_final(holder, self.tmon.current_requirement());
+        let wait = self.tmon.await_tx_final(holder);
         tokio::select! {
             status = wait => {
                 status?;
@@ -3491,10 +3489,7 @@ mod tests {
         let proofs = lock_ok(&locker, &tx, &groups).await;
         let paths: Vec<_> = groups.keys().cloned().collect();
         let locked = LockedTx::from_proofs(groups, proofs).unwrap();
-        ctx.monitor
-            .preempt_tx(&tx, ctx.monitor.current_requirement())
-            .await
-            .unwrap();
+        ctx.monitor.preempt_tx(&tx).await.unwrap();
         let locks = locked.locked_paths();
 
         gate.arm();

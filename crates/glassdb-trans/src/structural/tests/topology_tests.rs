@@ -102,10 +102,7 @@ async fn finalize_acknowledges_a_wound_of_the_participant() {
     let participant = tx_id(b"participant");
     topology.begin(&collection(), &participant).await.unwrap();
     assert_eq!(
-        peer_mon
-            .preempt_tx(&participant, peer_mon.current_requirement())
-            .await
-            .unwrap(),
+        peer_mon.preempt_tx(&participant).await.unwrap(),
         TxFinalStatus::Aborted
     );
 

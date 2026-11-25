@@ -1206,20 +1206,16 @@ impl Monitor {
     /// A committed transaction is left untouched. A pending refresh does not
     /// defeat a wound: after each rejected wound, the wound is sent again
     /// until either the abort lands or the owner commits.
-    ///
-    /// The first wound expects a status read at `requirement`. A caller that
-    /// just read the status at the same requirement gets it from the cache.
-    /// The reads after a rejected wound are current.
-    pub(crate) async fn preempt_tx(
-        &self,
-        tid: &TxId,
-        requirement: Requirement,
-    ) -> Result<TxFinalStatus, TransError> {
+    pub(crate) async fn preempt_tx(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
         let transition = self.preemption_plan(tid);
+        // Proof: conditional mutation (the wound expects the observed
+        // revision, and a rejection reads the record again at a new barrier).
+        // A final status never changes. A caller usually read the holder just
+        // before, so the cache holds that observation.
         let mut status = self
             .inner
             .tx_records
-            .commit_status_at(tid, requirement)
+            .commit_status_at(tid, Requirement::ANY)
             .await
             .map_err(|e| {
                 TransError::Storage(e.context(format!("reading status of wound target {tid}")))
@@ -1308,16 +1304,12 @@ impl Monitor {
     }
 
     /// Waits for and returns a transaction's durable final status.
-    ///
-    /// The first resolution reads at `requirement`. A caller that just read
-    /// the status at the same requirement gets it from the cache. The
-    /// resolutions after a wait are current.
-    pub(crate) async fn await_tx_final(
-        &self,
-        tid: &TxId,
-        requirement: Requirement,
-    ) -> Result<TxFinalStatus, TransError> {
-        let mut requirement = requirement;
+    pub(crate) async fn await_tx_final(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
+        // A stale pending status only delays the return by one poll, and a
+        // final status never changes. A caller usually read the holder just
+        // before, so the cache holds that observation. The resolutions after a
+        // wait are current.
+        let mut requirement = Requirement::ANY;
         loop {
             // Resolve before registering a waiter so local state retains
             // precedence over a potentially newer final-status cache entry.
@@ -2105,7 +2097,7 @@ impl Monitor {
     /// this monitor. Unlike transaction validation, a remote-holder poll has no
     /// preceding CAS or validation barrier to reuse, so the monitor must create
     /// the lower bound itself.
-    pub(crate) fn current_requirement(&self) -> Requirement {
+    fn current_requirement(&self) -> Requirement {
         Requirement::after(self.inner.timeline.currentness_barrier())
     }
 
@@ -3187,12 +3179,7 @@ mod tests {
         let tid = tx_id(b"wounded");
         let operation = owner.begin_owner_operation(&tid).unwrap();
         owner.begin_tx(&tid);
-        assert_eq!(
-            peer.preempt_tx(&tid, peer.current_requirement())
-                .await
-                .unwrap(),
-            TxFinalStatus::Aborted
-        );
+        assert_eq!(peer.preempt_tx(&tid).await.unwrap(), TxFinalStatus::Aborted);
         operations.lock().unwrap().clear();
 
         assert_eq!(
@@ -3227,12 +3214,7 @@ mod tests {
         let tid = tx_id(b"wounded");
         let operation = owner.begin_owner_operation(&tid).unwrap();
         owner.begin_tx(&tid);
-        assert_eq!(
-            peer.preempt_tx(&tid, peer.current_requirement())
-                .await
-                .unwrap(),
-            TxFinalStatus::Aborted
-        );
+        assert_eq!(peer.preempt_tx(&tid).await.unwrap(), TxFinalStatus::Aborted);
         assert!(owner.has_durable_wound(&tid).await.unwrap());
         operation.complete();
         operations.lock().unwrap().clear();
@@ -3263,12 +3245,7 @@ mod tests {
         let tid = tx_id(b"wounded");
         let operation = owner.begin_owner_operation(&tid).unwrap();
         owner.begin_tx(&tid);
-        assert_eq!(
-            peer.preempt_tx(&tid, peer.current_requirement())
-                .await
-                .unwrap(),
-            TxFinalStatus::Aborted
-        );
+        assert_eq!(peer.preempt_tx(&tid).await.unwrap(), TxFinalStatus::Aborted);
         assert!(owner.has_durable_wound(&tid).await.unwrap());
         operation.complete();
         let wounded = peer_ctx
@@ -3661,10 +3638,7 @@ mod tests {
         owner.begin_persisted_tx(&tx, recovery).await.unwrap();
 
         assert_eq!(
-            wounder
-                .preempt_tx(&tx, wounder.current_requirement())
-                .await
-                .unwrap(),
+            wounder.preempt_tx(&tx).await.unwrap(),
             TxFinalStatus::Aborted
         );
 
@@ -3676,10 +3650,7 @@ mod tests {
         ));
         assert_eq!(owner.tx_status(&tx).await.unwrap(), TxCommitStatus::Wounded);
         assert_eq!(
-            owner
-                .await_tx_final(&tx, owner.current_requirement())
-                .await
-                .unwrap(),
+            owner.await_tx_final(&tx).await.unwrap(),
             TxFinalStatus::Aborted
         );
         assert_eq!(
@@ -3712,10 +3683,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            wounder
-                .preempt_tx(&tx, wounder.current_requirement())
-                .await
-                .unwrap(),
+            wounder.preempt_tx(&tx).await.unwrap(),
             TxFinalStatus::Aborted
         );
 
@@ -3753,10 +3721,7 @@ mod tests {
         let owner_operation = owner.begin_owner_operation(&tx).unwrap();
         owner.begin_tx(&tx);
         assert_eq!(
-            wounder
-                .preempt_tx(&tx, wounder.current_requirement())
-                .await
-                .unwrap(),
+            wounder.preempt_tx(&tx).await.unwrap(),
             TxFinalStatus::Aborted
         );
         assert_eq!(
@@ -4069,10 +4034,7 @@ mod tests {
                 assert_eq!(committed.value().unwrap().status, TxCommitStatus::Committed);
                 collector.delete(&committed).await.unwrap();
                 assert_eq!(
-                    wounder
-                        .preempt_tx(&tx, wounder.current_requirement())
-                        .await
-                        .unwrap(),
+                    wounder.preempt_tx(&tx).await.unwrap(),
                     TxFinalStatus::Aborted
                 );
                 Err(BackendError::Unavailable("injected landed write".into()))
@@ -4205,10 +4167,7 @@ mod tests {
                     }
                     // A peer wounds the identity before the owner reads back.
                     assert_eq!(
-                        wounder
-                            .preempt_tx(&tx, wounder.current_requirement())
-                            .await
-                            .unwrap(),
+                        wounder.preempt_tx(&tx).await.unwrap(),
                         TxFinalStatus::Aborted
                     );
                     Err(BackendError::Unavailable("injected delayed create".into()))
@@ -4354,9 +4313,7 @@ mod tests {
         let pending = tx_id(b"pending");
         mon.begin_tx(&pending);
         assert_eq!(
-            mon.preempt_tx(&pending, mon.current_requirement())
-                .await
-                .unwrap(),
+            mon.preempt_tx(&pending).await.unwrap(),
             TxFinalStatus::Aborted
         );
 
@@ -4369,9 +4326,7 @@ mod tests {
         });
         mon.commit_tx(record).await.unwrap();
         assert_eq!(
-            mon.preempt_tx(&committed, mon.current_requirement())
-                .await
-                .unwrap(),
+            mon.preempt_tx(&committed).await.unwrap(),
             TxFinalStatus::Committed
         );
     }
@@ -4404,12 +4359,7 @@ mod tests {
         mon.begin_tx(&tx);
         owner.complete();
 
-        assert_eq!(
-            mon.preempt_tx(&tx, mon.current_requirement())
-                .await
-                .unwrap(),
-            TxFinalStatus::Aborted
-        );
+        assert_eq!(mon.preempt_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
         assert_eq!(
             written.lock().unwrap().as_slice(),
             [TxCommitStatus::Aborted]
@@ -4450,12 +4400,7 @@ mod tests {
 
         let owner = mon.begin_owner_operation(&tx).unwrap();
         mon.begin_tx(&tx);
-        assert_eq!(
-            mon.preempt_tx(&tx, mon.current_requirement())
-                .await
-                .unwrap(),
-            TxFinalStatus::Aborted
-        );
+        assert_eq!(mon.preempt_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
         assert_eq!(
             mon.tx_status(&tx).await.unwrap(),
             TxCommitStatus::BlindWounded
@@ -4494,12 +4439,7 @@ mod tests {
         mon.begin_tx(&tx);
         drop(owner);
 
-        assert_eq!(
-            mon.preempt_tx(&tx, mon.current_requirement())
-                .await
-                .unwrap(),
-            TxFinalStatus::Aborted
-        );
+        assert_eq!(mon.preempt_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
         assert_eq!(
             mon.abort_owned_tx(&tx).await.unwrap(),
             OwnerAbortOutcome::Pinned
@@ -4601,12 +4541,9 @@ mod tests {
             Box::pin(async { Ok(()) })
         });
 
-        let preempted = tokio::time::timeout(
-            Duration::from_secs(60),
-            mon.preempt_tx(&tx, mon.current_requirement()),
-        )
-        .await
-        .expect("the wound must land while the owner refreshes");
+        let preempted = tokio::time::timeout(Duration::from_secs(60), mon.preempt_tx(&tx))
+            .await
+            .expect("the wound must land while the owner refreshes");
         assert_eq!(preempted.unwrap(), TxFinalStatus::Aborted);
         assert_eq!(wound_writes.load(Ordering::SeqCst), 2);
         assert_eq!(refreshes.load(Ordering::SeqCst), 2);
@@ -4683,12 +4620,7 @@ mod tests {
             }
         });
 
-        assert_eq!(
-            mon.preempt_tx(&tx, mon.current_requirement())
-                .await
-                .unwrap(),
-            TxFinalStatus::Aborted
-        );
+        assert_eq!(mon.preempt_tx(&tx).await.unwrap(), TxFinalStatus::Aborted);
         assert_eq!(wound_writes.load(Ordering::SeqCst), 2);
         assert_eq!(failed_reads.load(Ordering::SeqCst), 1);
         let (_verify_mon, verify) = new_test_monitor(b);
@@ -4768,11 +4700,11 @@ mod tests {
 
         let ch1 = {
             let mon = mon1.clone();
-            rt::spawn(async move { mon.await_tx_final(&tx, mon.current_requirement()).await })
+            rt::spawn(async move { mon.await_tx_final(&tx).await })
         };
         let ch2 = {
             let mon = mon1.clone();
-            rt::spawn(async move { mon.await_tx_final(&tx, mon.current_requirement()).await })
+            rt::spawn(async move { mon.await_tx_final(&tx).await })
         };
         wait_for_waiters(&mon1, &tx, 2).await;
 
@@ -4792,9 +4724,7 @@ mod tests {
         let mut waits = Vec::new();
         for _ in 0..3 {
             let mon = mon2.clone();
-            waits.push(rt::spawn(async move {
-                mon.await_tx_final(&tx, mon.current_requirement()).await
-            }));
+            waits.push(rt::spawn(async move { mon.await_tx_final(&tx).await }));
         }
         wait_for_waiters(&mon2, &tx, 3).await;
 
@@ -4823,9 +4753,7 @@ mod tests {
         operations.lock().unwrap().clear();
 
         assert_eq!(
-            mon.await_tx_final(&tx, mon.current_requirement())
-                .await
-                .unwrap(),
+            mon.await_tx_final(&tx).await.unwrap(),
             TxFinalStatus::Committed
         );
         assert!(
@@ -4861,9 +4789,7 @@ mod tests {
             TxCommitStatus::BlindWounded
         );
         assert_eq!(
-            mon.await_tx_final(&tx, mon.current_requirement())
-                .await
-                .unwrap(),
+            mon.await_tx_final(&tx).await.unwrap(),
             TxFinalStatus::Aborted
         );
     }
@@ -4892,7 +4818,7 @@ mod tests {
         let tx = tx_id(b"remote");
 
         assert!(matches!(
-            mon.await_tx_final(&tx, mon.current_requirement()).await,
+            mon.await_tx_final(&tx).await,
             Err(TransError::Storage(StorageError::Unavailable(_)))
         ));
     }
@@ -4905,12 +4831,9 @@ mod tests {
         mon.begin_tx(&tx);
 
         assert!(
-            rt::timeout(
-                Duration::from_millis(1),
-                mon.await_tx_final(&tx, mon.current_requirement()),
-            )
-            .await
-            .is_err()
+            rt::timeout(Duration::from_millis(1), mon.await_tx_final(&tx),)
+                .await
+                .is_err()
         );
         assert!(
             mon.shard_for(&tx)

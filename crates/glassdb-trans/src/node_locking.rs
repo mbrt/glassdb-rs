@@ -524,15 +524,7 @@ impl<'a> NodeLockReconciler<'a> {
 
     async fn reclaim(&self, holder: &TxId) -> Result<Reclaim, TransError> {
         match self.acquisition {
-            GateAcquisition::WoundWait => {
-                try_reclaim(
-                    self.monitor,
-                    self.id,
-                    holder,
-                    self.monitor.current_requirement(),
-                )
-                .await
-            }
+            GateAcquisition::WoundWait => try_reclaim(self.monitor, self.id, holder).await,
             GateAcquisition::Polite => Ok(Reclaim::Wait),
         }
     }

@@ -1,7 +1,6 @@
 //! Shared wound-wait policy for transaction lock holders.
 
 use glassdb_data::TxId;
-use glassdb_storage::Requirement;
 use glassdb_storage::transaction::TxCommitStatus;
 
 use crate::error::TransError;
@@ -13,18 +12,16 @@ pub(crate) enum Reclaim {
     Wait,
 }
 
-/// Applies transaction priority to one pending holder without waiting. The
-/// wound expects a status read at `requirement`.
+/// Applies transaction priority to one pending holder without waiting.
 pub(crate) async fn try_reclaim(
     monitor: &Monitor,
     requester: &TxId,
     holder: &TxId,
-    requirement: Requirement,
 ) -> Result<Reclaim, TransError> {
     if !requester.older(holder) {
         return Ok(Reclaim::Wait);
     }
-    if monitor.preempt_tx(holder, requirement).await? == TxFinalStatus::Aborted {
+    if monitor.preempt_tx(holder).await? == TxFinalStatus::Aborted {
         Ok(Reclaim::Wounded)
     } else {
         Ok(Reclaim::Wait)
@@ -37,10 +34,7 @@ pub(crate) async fn resolve_tx_conflict(
     requester: &TxId,
     holder: &TxId,
 ) -> Result<TxFinalStatus, TransError> {
-    // The wound or the wait starts from the status read here, which the cache
-    // keeps at this requirement.
-    let requirement = monitor.current_requirement();
-    match monitor.tx_status_at(holder, requirement).await? {
+    match monitor.tx_status(holder).await? {
         TxCommitStatus::Committed => Ok(TxFinalStatus::Committed),
         // The caller removes the holder with a CAS on the current object, so a
         // blind wound holds no committed effect there.
@@ -49,15 +43,15 @@ pub(crate) async fn resolve_tx_conflict(
         }
         TxCommitStatus::Pending => {
             if matches!(
-                try_reclaim(monitor, requester, holder, requirement).await?,
+                try_reclaim(monitor, requester, holder).await?,
                 Reclaim::Wounded
             ) {
                 Ok(TxFinalStatus::Aborted)
             } else {
-                monitor.await_tx_final(holder, requirement).await
+                monitor.await_tx_final(holder).await
             }
         }
-        TxCommitStatus::Unknown => monitor.await_tx_final(holder, requirement).await,
+        TxCommitStatus::Unknown => monitor.await_tx_final(holder).await,
     }
 }
 
@@ -126,9 +120,9 @@ mod tests {
         let monitor = peer.monitor.clone();
         let wait =
             tokio::spawn(async move { resolve_tx_conflict(&monitor, &requester, &holder).await });
-        // The first backoff is at least half the initial retry interval.
-        let initial = crate::RetryTiming::default().wait.initial_interval;
-        tokio::time::sleep(initial / 2 - Duration::from_millis(1)).await;
+        // Paused time advances only when every task waits. The poller then
+        // waits for its first backoff, which is longer than this sleep.
+        tokio::time::sleep(Duration::from_millis(1)).await;
 
         assert!(!wait.is_finished());
         assert_eq!(op_names(&ops), ["read"]);

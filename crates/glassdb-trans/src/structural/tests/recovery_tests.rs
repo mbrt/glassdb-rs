@@ -1737,10 +1737,7 @@ async fn recovery_fences_an_aborted_writer_before_reclaiming_its_sibling() {
     s.write_structural_intent("R", &intent).await.unwrap();
     sp.mon.begin_tx(&id);
     assert_eq!(
-        sp.mon
-            .preempt_tx(&id, sp.mon.current_requirement())
-            .await
-            .unwrap(),
+        sp.mon.preempt_tx(&id).await.unwrap(),
         TxFinalStatus::Aborted
     );
 
@@ -1927,10 +1924,7 @@ async fn a_late_wound_of_a_retired_worker_can_be_acknowledged() {
     sp.changes.structural_nodes.finalize_worker(&worker).await;
     // A peer with an old view of the worker's gate wounds it after that.
     assert_eq!(
-        peer_mon
-            .preempt_tx(&worker, peer_mon.current_requirement())
-            .await
-            .unwrap(),
+        peer_mon.preempt_tx(&worker).await.unwrap(),
         TxFinalStatus::Aborted
     );
 

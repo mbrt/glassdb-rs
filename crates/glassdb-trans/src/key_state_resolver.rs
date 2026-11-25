@@ -187,12 +187,7 @@ impl KeyStateResolver {
         let Some(holder) = node.drop_intent() else {
             return Ok(());
         };
-        if self
-            .monitor
-            .await_tx_final(holder, self.monitor.current_requirement())
-            .await?
-            == TxFinalStatus::Committed
-        {
+        if self.monitor.await_tx_final(holder).await? == TxFinalStatus::Committed {
             return Err(TransError::StaleCollection);
         }
         // GC deletes the nodes of a dropped collection before the record of
