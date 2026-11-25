@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use glassdb_data::{CollectionAddress, CollectionId, TxId};
 use glassdb_storage::{
     CollectionRecord, CurrentnessBarrier, LockType, NodeSizePolicy, Requirement, StorageError,
+    Timeline,
 };
 
 use crate::collection_coordination::{CollectionStateResolver, PendingHolders};
@@ -18,12 +19,13 @@ use crate::error::TransError;
 #[derive(Clone)]
 pub(crate) struct CollectionCatalog {
     state: CollectionStateResolver,
+    timeline: Timeline,
 }
 
 impl CollectionCatalog {
     /// Creates access to transactional collection directories.
-    pub(crate) fn new(state: CollectionStateResolver) -> Self {
-        CollectionCatalog { state }
+    pub(crate) fn new(state: CollectionStateResolver, timeline: Timeline) -> Self {
+        CollectionCatalog { state, timeline }
     }
 
     /// Loads a direct-child directory for a transaction body of the identity
@@ -44,12 +46,20 @@ impl CollectionCatalog {
         // Callers retain directory reads and mutation preconditions as semantic
         // dependencies. Validation checks them after the body before accepting
         // its outcome, so this snapshot can use cached contents.
-        // Proof for a missing record, which validation does not check again:
-        // publication and lifecycle (created before seen).
-        let (record, observed) = self
-            .state
-            .load_resolved(parent, Some(own), Requirement::ANY, PendingHolders::Skip)
-            .await?;
+        let load = |requirement| {
+            self.state
+                .load_resolved(parent, Some(own), requirement, PendingHolders::Skip)
+        };
+        let (record, observed) = match load(Requirement::ANY).await {
+            // A missing record can be a cached absence, and validation does
+            // not check it again. Load it again after a new barrier
+            // (missing-object retries), so that only a bounded absence reports
+            // a dropped collection.
+            Err(TransError::Storage(StorageError::NotFound | StorageError::StaleCollection)) => {
+                load(Requirement::after(self.timeline.currentness_barrier())).await?
+            }
+            loaded => loaded?,
+        };
         // A topology freeze or a directory writer can change the bindings
         // without a new record state, so only a record without them is exact
         // evidence for a cut point.
@@ -227,7 +237,7 @@ mod tests {
             monitor.clone(),
             RetrySchedule::default(),
         );
-        let catalog = CollectionCatalog::new(state);
+        let catalog = CollectionCatalog::new(state, timeline.clone());
         (catalog, records, monitor, timeline, background)
     }
 

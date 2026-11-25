@@ -225,10 +225,10 @@ reference, or for completion of participant departure.
 
 Index-node routing from cache uses right links to correct a stale split route,
 and low keys to detect a stale copy of a merge target. The terminal leaf must
-meet the caller's requirement. If a tree root or child is absent, there is no
-terminal leaf to check, and a negative route still needs the publication and
-lifecycle proof. A tree root cached as a leaf still needs the check, because a
-peer can have changed it into an index node.
+meet the caller's requirement. An absent tree root or child ends the route, so
+it must also meet the caller's requirement. A negative route at `ANY` thus
+needs a proof, or a route again at a bound. A tree root cached as a leaf still
+needs the check, because a peer can have changed it into an index node.
 
 If no proof applies, use a requirement from the existing barrier of the policy.
 Capture a new barrier only when the decision needs a later ordering point.

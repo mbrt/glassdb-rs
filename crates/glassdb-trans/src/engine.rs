@@ -606,11 +606,16 @@ impl DormantEngine {
             monitor.clone(),
             retry.contention,
         );
-        let collection_catalog = CollectionCatalog::new(collection_state.clone());
+        let collection_catalog = CollectionCatalog::new(collection_state.clone(), timeline.clone());
         let key_state = KeyStateResolver::new(monitor.clone());
         let router = TreeRouter::new(nodes.clone(), transaction_leaf_parallelism);
         // Structural changes and GC remove the same topology participants.
-        let topology = TopologyMembership::new(records.clone(), monitor.clone(), retry.contention);
+        let topology = TopologyMembership::new(
+            records.clone(),
+            monitor.clone(),
+            timeline.clone(),
+            retry.contention,
+        );
         let (coord, restructurer) = Restructurer::with_coordinator(
             background_weak.clone(),
             topology.clone(),

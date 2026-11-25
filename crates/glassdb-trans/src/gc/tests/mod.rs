@@ -326,7 +326,12 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         structural_intents,
         timeline.clone(),
         locker.clone(),
-        TopologyMembership::new(records.clone(), mon.clone(), RetrySchedule::default()),
+        TopologyMembership::new(
+            records.clone(),
+            mon.clone(),
+            timeline.clone(),
+            RetrySchedule::default(),
+        ),
         CollectionLifecycle::new(
             records.clone(),
             nodes.clone(),

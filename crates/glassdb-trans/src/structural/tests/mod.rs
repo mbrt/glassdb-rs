@@ -361,7 +361,12 @@ fn restructurer_with_parts(
     );
     Restructurer::with_parts(
         Arc::downgrade(bg),
-        TopologyMembership::new(store.records.clone(), mon.clone(), RetrySchedule::default()),
+        TopologyMembership::new(
+            store.records.clone(),
+            mon.clone(),
+            store.timeline.clone(),
+            RetrySchedule::default(),
+        ),
         store.nodes.clone(),
         store.intent_store.clone(),
         store.timeline.clone(),

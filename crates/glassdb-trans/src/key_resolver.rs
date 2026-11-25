@@ -87,8 +87,8 @@ impl KeyResolver {
     ) -> Result<ScanResult, StorageError> {
         // Proof: later validation. A transaction scan retains every covered
         // leaf and validates those observations after its validation barrier.
-        // Proof for a missing route, which is an error: publication and
-        // lifecycle (created before seen, nodes outlive links).
+        // A missing route is an error that can come from a cached absence.
+        // The caller proves it, as `BodyReader::scan` does.
         self.scan_keys_at(
             collection,
             range,
@@ -501,11 +501,10 @@ impl KeyResolver {
         key: &LogicalKey,
         requirement: Requirement,
     ) -> Result<RoutedLeaf, TransError> {
-        // Right links correct stale split routes, and the terminal leaf meets
-        // the caller's requirement.
-        // Proof for a negative route: publication and lifecycle (created
-        // before seen, nodes outlive links, no reuse). The
-        // same proof applies to batched point routing above.
+        // Right links correct stale split routes, and the terminal leaf or the
+        // absent node meets the caller's requirement. At `ANY`, the caller
+        // proves a negative route, as `Reader::read` does. The same applies to
+        // batched point routing above.
         let loc = self
             .router
             .route_key_checking_leaf(key.collection(), key.key(), requirement)

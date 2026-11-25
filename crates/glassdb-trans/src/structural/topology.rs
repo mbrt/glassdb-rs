@@ -5,7 +5,9 @@ use std::future::ready;
 use glassdb_concurr::RetrySchedule;
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord};
-use glassdb_storage::{CasRetries, CollectionStore, Converged, Decision, Requirement};
+use glassdb_storage::{
+    CasRetries, CollectionRecord, CollectionStore, Converged, Decision, Requirement, Timeline,
+};
 
 use crate::error::TransError;
 use crate::monitor::{Monitor, OwnerAbortOutcome, TxRecoveryManifest};
@@ -15,16 +17,23 @@ use crate::monitor::{Monitor, OwnerAbortOutcome, TxRecoveryManifest};
 pub(crate) struct TopologyMembership {
     records: CollectionStore,
     mon: Monitor,
+    timeline: Timeline,
     // Paces collection-record CAS retries. Transaction-status polling remains
     // entirely owned by Monitor.
     retry: RetrySchedule,
 }
 
 impl TopologyMembership {
-    pub(crate) fn new(records: CollectionStore, mon: Monitor, retry: RetrySchedule) -> Self {
+    pub(crate) fn new(
+        records: CollectionStore,
+        mon: Monitor,
+        timeline: Timeline,
+        retry: RetrySchedule,
+    ) -> Self {
         Self {
             records,
             mon,
+            timeline,
             retry,
         }
     }
@@ -55,59 +64,62 @@ impl TopologyMembership {
         collection: &CollectionAddress,
         ids: &[TxId],
     ) -> Result<(), TransError> {
-        let joined = self
-            .records
-            .converge(
+        let decide = |mut record: CollectionRecord, _| async move {
+            // Proof: shared local knowledge (same cache, one
+            // acquisition, final before foreign removal). An admitted
+            // participant is the admission of this change. A new
+            // admission needs the CAS below.
+            let missing: Vec<TxId> = ids
+                .iter()
+                .filter(|id| {
+                    !record
+                        .topology_participants()
+                        .any(|admitted| admitted == *id)
+                })
+                .copied()
+                .collect();
+            if missing.is_empty() {
+                return Ok(Decision::Done(()));
+            }
+            if let Some(holder) = record.topology_freeze().copied() {
+                return match self.mon.tx_status(&holder).await? {
+                    // The CAS on the record checks that the freeze is
+                    // current, so a blind wound holds no committed
+                    // effect here.
+                    TxCommitStatus::Aborted
+                    | TxCommitStatus::Wounded
+                    | TxCommitStatus::BlindWounded => {
+                        record.remove_topology_freeze(&holder);
+                        Ok(Decision::Advance(record))
+                    }
+                    TxCommitStatus::Committed => Err(TransError::StaleCollection),
+                    TxCommitStatus::Pending | TxCommitStatus::Unknown => Err(TransError::Retry),
+                };
+            }
+            for id in missing {
+                if !record.add_topology_participant(id) {
+                    return Err(TransError::Retry);
+                }
+            }
+            Ok::<_, TransError>(Decision::Write(record, ()))
+        };
+        let converge = |proof| {
+            self.records.converge(
                 collection,
-                Requirement::ANY,
+                proof,
                 CasRetries::Unbounded(self.retry),
-                |mut record, _| async move {
-                    // Proof: shared local knowledge (same cache, one
-                    // acquisition, final before foreign removal). An admitted
-                    // participant is the admission of this change. A new
-                    // admission needs the CAS below.
-                    let missing: Vec<TxId> = ids
-                        .iter()
-                        .filter(|id| {
-                            !record
-                                .topology_participants()
-                                .any(|admitted| admitted == *id)
-                        })
-                        .copied()
-                        .collect();
-                    if missing.is_empty() {
-                        return Ok(Decision::Done(()));
-                    }
-                    if let Some(holder) = record.topology_freeze().copied() {
-                        return match self.mon.tx_status(&holder).await? {
-                            // The CAS on the record checks that the freeze is
-                            // current, so a blind wound holds no committed
-                            // effect here.
-                            TxCommitStatus::Aborted
-                            | TxCommitStatus::Wounded
-                            | TxCommitStatus::BlindWounded => {
-                                record.remove_topology_freeze(&holder);
-                                Ok(Decision::Advance(record))
-                            }
-                            TxCommitStatus::Committed => Err(TransError::StaleCollection),
-                            TxCommitStatus::Pending | TxCommitStatus::Unknown => {
-                                Err(TransError::Retry)
-                            }
-                        };
-                    }
-                    for id in missing {
-                        if !record.add_topology_participant(id) {
-                            return Err(TransError::Retry);
-                        }
-                    }
-                    Ok::<_, TransError>(Decision::Write(record, ()))
-                },
+                &decide,
             )
-            .await?;
+        };
+        let mut joined = converge(Requirement::ANY).await?;
+        if matches!(joined, Converged::Missing) {
+            // A missing record can be a cached absence. Read it again after a
+            // new barrier (missing-object retries), so that only a bounded
+            // absence reports a dropped collection.
+            joined = converge(Requirement::after(self.timeline.currentness_barrier())).await?;
+        }
         match joined {
             Converged::Written { .. } | Converged::Done(()) => Ok(()),
-            // Proof: publication and lifecycle (created before seen). A cached
-            // absence of the record comes after the drop of the collection.
             Converged::Missing => Err(TransError::StaleCollection),
             Converged::Stop(()) | Converged::Exhausted => Err(TransError::Retry),
         }

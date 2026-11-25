@@ -15,7 +15,8 @@ async fn departure_backs_off_after_a_rejected_cas() {
         crate::monitor::ProtocolTiming::default(),
     );
     let retry = RetryTiming::default().contention;
-    let topology = TopologyMembership::new(store.records.clone(), mon, retry);
+    let topology =
+        TopologyMembership::new(store.records.clone(), mon, store.timeline.clone(), retry);
     let (departing, admitted) = (tx_id(b"departing"), tx_id(b"admitted"));
     let mut record = CollectionRecord::new();
     assert!(record.add_topology_participant(departing));
@@ -97,6 +98,7 @@ async fn finalize_acknowledges_a_wound_of_the_participant() {
     let topology = TopologyMembership::new(
         owner.records.clone(),
         mon,
+        owner.timeline.clone(),
         RetryTiming::default().contention,
     );
     let participant = tx_id(b"participant");
@@ -124,4 +126,48 @@ async fn finalize_acknowledges_a_wound_of_the_participant() {
     assert!(record.locks.contains(&TxLock::TopologyParticipant {
         collection: collection(),
     }));
+}
+
+// Instance `b` caches the absence of a record, and instance `a` then creates
+// it. The admission reads past the cached absence, so it does not report a
+// dropped collection.
+#[tokio::test(start_paused = true)]
+async fn admission_reads_past_a_cached_absence() {
+    let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let a = store_with_backend(memory.clone());
+    let b = store_with_backend(memory);
+    let bg = Arc::new(Background::new());
+    let mon = b.foundation.monitor_for(
+        &bg,
+        RetrySchedule::default(),
+        crate::monitor::ProtocolTiming::default(),
+    );
+    let topology = TopologyMembership::new(
+        b.records.clone(),
+        mon,
+        b.timeline.clone(),
+        RetryTiming::default().contention,
+    );
+    let collection = CollectionAddress::new("db", glassdb_data::CollectionId::from_bytes([7; 16]));
+    assert!(matches!(
+        b.records.load_record(&collection, Requirement::ANY).await,
+        Err(StorageError::NotFound)
+    ));
+    let record = CollectionRecord::new();
+    assert!(a.records.create_record(&collection, &record).await.unwrap());
+    let participant = tx_id(b"participant");
+
+    topology
+        .join(&collection, std::slice::from_ref(&participant))
+        .await
+        .unwrap();
+    let (record, _) = a
+        .records
+        .load_record(
+            &collection,
+            Requirement::after(a.timeline.currentness_barrier()),
+        )
+        .await
+        .unwrap();
+    assert!(record.topology_participants().any(|id| *id == participant));
 }

@@ -271,28 +271,39 @@ async fn build_groups(
     // Collect before descending so the returned future does not close over a
     // borrowing iterator (which would not be higher-ranked / `Send` when a
     // caller spawns the lock).
-    let items: Vec<(LogicalKey, (LogicalKey, Desired))> = accesses
-        .points()
-        .map(|point| {
-            let desired = match point.write.map(|write| write.operation()) {
-                Some(WriteOp::Delete) => Desired::Delete,
-                Some(WriteOp::Put(_)) => Desired::Put,
-                None => Desired::Read,
-            };
-            let key = point.key.clone();
-            (key.clone(), (key, desired))
-        })
-        .collect();
+    let items = || -> Vec<(LogicalKey, (LogicalKey, Desired))> {
+        accesses
+            .points()
+            .map(|point| {
+                let desired = match point.write.map(|write| write.operation()) {
+                    Some(WriteOp::Delete) => Desired::Delete,
+                    Some(WriteOp::Put(_)) => Desired::Put,
+                    None => Desired::Read,
+                };
+                let key = point.key.clone();
+                (key.clone(), (key, desired))
+            })
+            .collect()
+    };
     // Route with index nodes served from cache (ADR-031 hot-path invariant):
     // a stale index misroute self-corrects via right-links, and the leaf's own
     // coordination CAS revalidates at the revision, so neither the root `_r` nor
     // the terminal leaf needs a separate validation read.
-    // Proof for a missing route, which fails the grouping: publication and
-    // lifecycle (created before seen, nodes outlive links).
-    let grouped = router
-        .route_keys_checking_leaf(items, Requirement::ANY)
+    let grouped = match router
+        .route_keys_checking_leaf(items(), Requirement::ANY)
         .await
-        .map_err(|error| TransError::from(error).context("grouping keys by leaf"))?;
+    {
+        // For a missing route, route again at the barrier of the policy. The
+        // caller captures it after the body, which learned the collection
+        // after its creation, so an absence at it proves the drop.
+        Err(StorageError::NotFound | StorageError::StaleCollection) => {
+            router
+                .route_keys_checking_leaf(items(), scan_requirement)
+                .await
+        }
+        grouped => grouped,
+    }
+    .map_err(|error| TransError::from(error).context("grouping keys by leaf"))?;
 
     let mut groups: BTreeMap<ObjectPath, RoutedLockGroup> = BTreeMap::new();
     for group in grouped {
@@ -1101,6 +1112,10 @@ impl Locker {
 impl KeyLocker {
     /// Acquires a transaction's locks while resolving predicate-lock coverage
     /// against the supplied pre-lock requirement barrier.
+    ///
+    /// A missing route ends the acquisition only at `scan_requirement`. For a
+    /// proven absence, its barrier must follow the body, which learned the
+    /// collections of the keys.
     pub(crate) async fn lock_at(
         &self,
         id: &TxId,
