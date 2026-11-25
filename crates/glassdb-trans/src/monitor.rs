@@ -1208,10 +1208,11 @@ impl Monitor {
     /// until either the abort lands or the owner commits.
     pub(crate) async fn preempt_tx(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
         let transition = self.preemption_plan(tid);
-        // Proof: conditional mutation (the wound expects the observed
-        // revision, and a rejection reads the record again at a new barrier).
-        // A final status never changes. A caller usually read the holder just
-        // before, so the cache holds that observation.
+        // Proof for a pending or missing record: conditional mutation
+        // (Rejected create). A rejected wound reads the record again at a new
+        // barrier. Proof for a final record: stable fact (Transaction
+        // lifecycle). A caller usually read the holder just before, so the
+        // cache holds that observation.
         let mut status = self
             .inner
             .tx_records
@@ -1305,8 +1306,11 @@ impl Monitor {
 
     /// Waits for and returns a transaction's durable final status.
     pub(crate) async fn await_tx_final(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
-        // A stale pending status only delays the return by one poll, and a
-        // final status never changes. A caller usually read the holder just
+        // A stale pending or missing status only delays the return by one
+        // poll, or leads to a wound of an expired lease. Proof for that wound:
+        // conditional mutation. The lease expiry counter then counts a lease
+        // that the owner can have refreshed. Proof for a final status: stable
+        // fact (Transaction lifecycle). A caller usually read the holder just
         // before, so the cache holds that observation. The resolutions after a
         // wait are current.
         let mut requirement = Requirement::ANY;

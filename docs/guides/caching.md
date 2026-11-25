@@ -215,6 +215,7 @@ needs a fact that is not in the list, add it here, or use a barrier.
 | Final before foreign removal | Another identity removes or replaces a directory holder, a drop intent, a topology participant, or a structural gate only after the identity of the holder is final. | GC releases the locks only of an eligible identity. A replacement, and the settlement of a participant during a topology freeze, first get a final status from `resolve_tx_conflict`. `fence_source_writer` keeps the gate of a Pending holder. |
 | One-way states | A structural intent changes only from preparing to ready, and ready contents do not change. An index node never becomes a leaf. A drained node and a membership generation never revert. | The `Node` API has no operation that clears a drain or moves a membership generation back. The index-to-leaf change has a check in `acquire_index_structural_gate`. The intent phase has no check. |
 | Rejected create | A rejected create removes the cached absence, so the next `ANY` read finds the object. | `MutationRound::finish`. |
+| Transaction lifecycle | A final transaction record never becomes pending again. A wound changes only to `Aborted`. A committed or aborted record does not change until GC deletes it. | `validate_lifecycle_transition` in `TxRecordStore`. |
 | Cleaners only | After a collection becomes reclaimable, only cleaners change its record, its root, and its nodes. They release the locks of final identities and delete the objects, so each object changes a bounded number of times. A prepared collection of an aborted identity was never published, and drop intents fence a dropped collection. | Nothing. |
 
 Fresh identities alone do not prove permanent absence. A retried create can
@@ -225,10 +226,10 @@ reference, or for completion of participant departure.
 
 Index-node routing from cache uses right links to correct a stale split route,
 and low keys to detect a stale copy of a merge target. The terminal leaf must
-meet the caller's requirement. An absent tree root or child ends the route, so
-it must also meet the caller's requirement. A negative route at `ANY` thus
-needs a proof, or a route again at a bound. A tree root cached as a leaf still
-needs the check, because a peer can have changed it into an index node.
+meet the caller's requirement. If a tree root or child is absent, there is no
+terminal leaf to check, and a negative route still needs the publication and
+lifecycle proof. A tree root cached as a leaf still needs the check, because a
+peer can have changed it into an index node.
 
 If no proof applies, use a requirement from the existing barrier of the policy.
 Capture a new barrier only when the decision needs a later ordering point.
