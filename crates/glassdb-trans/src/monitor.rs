@@ -1505,6 +1505,7 @@ impl Monitor {
                     }
                     Err(error) => return Err(error.into()),
                 };
+                let rejected = matches!(failure, CommitWriteFailure::Rejected);
                 let status = match failure {
                     CommitWriteFailure::Rejected => {
                         self.read_tx_status_retrying_unavailable(tid, &mut backoff)
@@ -1552,7 +1553,16 @@ impl Monitor {
                         // and its read-back decides the outcome.
                         expected = Some(status.observation);
                         saw_pending = true;
-                        rt::sleep(backoff.next_delay()).await;
+                        // Only this owner writes a pending record, and its
+                        // lease refresh stopped before the first attempt. So a
+                        // rejection lost to an earlier pending write of this
+                        // owner: a refresh in flight, or an in-doubt write that
+                        // landed late. No refresh follows, so write again at
+                        // once. A backoff wait lets the lease expire, and a
+                        // peer then wounds the transaction.
+                        if !rejected {
+                            rt::sleep(backoff.next_delay()).await;
+                        }
                     }
                 }
             }
@@ -3479,6 +3489,91 @@ mod tests {
             vec![created]
         );
         mon.abort_owned_tx(&tx).await.unwrap();
+    }
+
+    /// A commit write that starts while a lease refresh of the same owner is
+    /// in flight expects the state that the refresh replaces. It is rejected
+    /// once, and it writes again at once, because no refresh keeps the lease
+    /// during a wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_commit_write_rejected_by_the_lease_refresh_writes_again_at_once() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let (mon, t) = new_test_monitor(backend.clone());
+        let mon = Arc::new(mon);
+        let tx = tx_id(b"commit-during-refresh");
+        mon.begin_persisted_tx(&tx, TxRecoveryManifest::default())
+            .await
+            .unwrap();
+
+        let is_record_write = |operation: &BackendOp<'_>| {
+            matches!(
+                operation,
+                BackendOp::WriteIf { value, .. }
+                    if glassdb_storage::txrecord::status(value).is_ok()
+            )
+        };
+        let refresh_entered = Arc::new(tokio::sync::Notify::new());
+        let refresh_released = Arc::new(tokio::sync::Notify::new());
+        let hold_next = Arc::new(AtomicBool::new(true));
+        backend.set_before({
+            let refresh_entered = refresh_entered.clone();
+            let refresh_released = refresh_released.clone();
+            move |operation| {
+                if !is_record_write(operation) || !hold_next.swap(false, Ordering::SeqCst) {
+                    return Box::pin(async { Ok(()) });
+                }
+                refresh_entered.notify_one();
+                let refresh_released = refresh_released.clone();
+                Box::pin(async move {
+                    refresh_released.notified().await;
+                    Ok(())
+                })
+            }
+        });
+        let rejected = Arc::new(AtomicUsize::new(0));
+        backend.set_after({
+            let rejected = rejected.clone();
+            move |operation, outcome| {
+                if is_record_write(operation) && !outcome.is_success() {
+                    rejected.fetch_add(1, Ordering::SeqCst);
+                }
+                Box::pin(async { Ok(()) })
+            }
+        });
+
+        refresh_entered.notified().await;
+        let commit = tokio::spawn({
+            let mon = mon.clone();
+            async move {
+                let mut record = TxRecord::new(tx, TxCommitStatus::Committed);
+                record.locks = vec![TxLock::Key {
+                    key: logical_key(b"key"),
+                    typ: LockType::Write,
+                }];
+                mon.commit_tx(record).await
+            }
+        });
+        // The paused clock advances only when every task waits, so the commit
+        // write waits behind the refresh by then.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let released = tokio::time::Instant::now();
+        refresh_released.notify_one();
+        commit.await.unwrap().unwrap();
+
+        assert_eq!(rejected.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            released.elapsed(),
+            Duration::ZERO,
+            "the write must not wait"
+        );
+        assert_eq!(
+            t.tx_records
+                .commit_status_at(&tx, Requirement::ANY)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Committed
+        );
     }
 
     #[tokio::test]
