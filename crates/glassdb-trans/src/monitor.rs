@@ -1208,10 +1208,14 @@ impl Monitor {
     /// until either the abort lands or the owner commits.
     pub(crate) async fn preempt_tx(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
         let transition = self.preemption_plan(tid);
+        // Proof: conditional mutation (the wound expects the observed
+        // revision, and a rejection reads the record again at a new barrier).
+        // A final status never changes. A caller usually read the holder just
+        // before, so the cache holds that observation.
         let mut status = self
             .inner
             .tx_records
-            .commit_status_at(tid, self.current_requirement())
+            .commit_status_at(tid, Requirement::ANY)
             .await
             .map_err(|e| {
                 TransError::Storage(e.context(format!("reading status of wound target {tid}")))
@@ -1301,10 +1305,15 @@ impl Monitor {
 
     /// Waits for and returns a transaction's durable final status.
     pub(crate) async fn await_tx_final(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
+        // A stale pending status only delays the return by one poll, and a
+        // final status never changes. A caller usually read the holder just
+        // before, so the cache holds that observation. The resolutions after a
+        // wait are current.
+        let mut requirement = Requirement::ANY;
         loop {
             // Resolve before registering a waiter so local state retains
             // precedence over a potentially newer final-status cache entry.
-            match self.tx_status(tid).await? {
+            match self.tx_status_at(tid, requirement).await? {
                 TxCommitStatus::Committed => return Ok(TxFinalStatus::Committed),
                 // A blind holder cannot commit any more, so a waiter can go on.
                 // It decides from the current object, which holds no committed
@@ -1320,6 +1329,7 @@ impl Monitor {
             // Notifications and poll failures are only wake-up hints. Resolve
             // again before returning so a cancelled poll cannot decide status.
             self.wait_for_tx_change(tid).await;
+            requirement = self.current_requirement();
         }
     }
 
@@ -2444,10 +2454,16 @@ impl Monitor {
     /// equivalent of the per-call cancellation contexts the Go original used.
     ///
     /// [`Monitor::await_tx_final`] re-resolves after every wake, so the poller
-    /// only needs to wake its waiters when it stops.
+    /// only needs to wake its waiters when it stops. Each waiter resolved the
+    /// status just before it registered, so the first fetch comes after one
+    /// backoff.
     async fn poll_tx_status_with_liveness(&self, tid: &TxId) {
         let mut backoff = self.inner.retry.backoff();
         let finalized = loop {
+            rt::sleep(backoff.next_delay()).await;
+            if !self.retain_live_waiters(tid) {
+                break false;
+            }
             let evidence = match self.fetch_remote_tx_status(tid).await {
                 Err(_) => break false,
                 Ok(evidence) => evidence,
@@ -2455,10 +2471,6 @@ impl Monitor {
             if evidence.status().is_final() {
                 break true;
             }
-            if !self.retain_live_waiters(tid) {
-                break false;
-            }
-            rt::sleep(backoff.next_delay()).await;
         };
         self.finish_status_poll(tid, finalized);
     }
