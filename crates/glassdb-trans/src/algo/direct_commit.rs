@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use glassdb_data::{CollectionAddress, LogicalKey, ObjectPath, TxId};
+use glassdb_data::{LogicalKey, ObjectPath, TxId};
 use glassdb_storage::{
     CurrentState, InlinePolicy, LeafEntry, Requirement, StorageError, TreeRouter,
 };
@@ -142,15 +142,19 @@ impl DirectCommit {
                 self.inline_policy,
                 self.structural_hints.clone(),
             );
-            // Proof: publication and lifecycle (created before seen, nodes
-            // outlive links). A cached missing leaf comes after the drop of its
-            // collection. The round reports an in-doubt CAS as an outcome, so
-            // this error proves that nothing landed (ADR-092).
-            let outcome = self
-                .coord
-                .coordinate(operation)
-                .await
-                .map_err(|error| error.classify_collection_absence(member.collection()))?;
+            // `route_member` found the leaf in the same cache, so a missing
+            // leaf here is a later read, for example after a reclamation. The
+            // locking path decides the absence at its barrier, so direct
+            // commit needs no proof for it. The round reports an in-doubt CAS
+            // as an outcome, so this error proves that nothing landed
+            // (ADR-092).
+            let outcome = match self.coord.coordinate(operation).await {
+                Ok(outcome) => outcome,
+                Err(TransError::Storage(
+                    StorageError::NotFound | StorageError::StaleCollection,
+                )) => return Ok(DirectOutcome::Locked),
+                Err(error) => return Err(error),
+            };
             match outcome {
                 DirectMutationOutcome::Landed(predecessors) => {
                     self.counters.completed.fetch_add(1, Ordering::Relaxed);
@@ -185,12 +189,17 @@ impl DirectCommit {
             .iter()
             .map(|key| (key.key.clone(), ()))
             .collect::<Vec<_>>();
-        // Proof: publication and lifecycle (created before seen, nodes outlive
-        // links) for a missing route, which returns an error.
-        let groups = self
+        // A missing route can come from a cached absence. The locking path
+        // proves it at its barrier, so the caller falls back to it.
+        let groups = match self
             .router
             .route_keys_checking_leaf(keys, Requirement::ANY)
-            .await?;
+            .await
+        {
+            Ok(groups) => groups,
+            Err(StorageError::NotFound | StorageError::StaleCollection) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         Ok(match groups.as_slice() {
             [group] => Some(group.path().clone()),
             _ => None,
@@ -224,12 +233,6 @@ struct DirectMember {
 impl DirectMember {
     fn output_keys(&self) -> impl Iterator<Item = &DirectKey> {
         self.keys.iter().filter(|key| key.write.is_some())
-    }
-
-    /// Returns the collection of the leaf, which holds every key of the
-    /// member. A member has at least one write, so it has a key.
-    fn collection(&self) -> &CollectionAddress {
-        self.keys[0].key.collection()
     }
 }
 

@@ -92,6 +92,8 @@ impl<T> RoutedItem<T> {
 #[derive(Clone, Copy)]
 enum RouteStage {
     Index,
+    /// The next node ends the descent: a leaf, or a node that a load showed
+    /// as absent.
     Leaf,
 }
 
@@ -213,6 +215,16 @@ impl<T> BatchRouting<T> {
             .expect("every completed load has an active path batch");
         let observation = match result {
             Ok(observation) if observation.exists() => observation,
+            // An absent node ends the route only at the `leaf` requirement.
+            // An index read at `ANY` can find an absence from any cached
+            // state.
+            Ok(observation) if !observation.satisfies(self.leaf) => {
+                for mut item in batch.items {
+                    item.stage = RouteStage::Leaf;
+                    self.enqueue(path.clone(), item);
+                }
+                return;
+            }
             Ok(_) => {
                 self.record_load_error(path, &batch, StorageError::NotFound);
                 return;
@@ -765,10 +777,10 @@ impl TreeRouter {
     /// grown tree thus never checks the root `_r` on every key coordination; a
     /// current lower bound stays where a CAS depends on it.
     ///
-    /// The `leaf` requirement applies only after reaching a leaf. An absent
-    /// root or child can come from any cached state, so a caller must give
-    /// the publication and lifecycle proof (created before seen, nodes outlive
-    /// links) for a negative route.
+    /// The `leaf` requirement applies to the node that ends the descent: the
+    /// leaf, or an absent root or child. A negative route thus proves the
+    /// absence at `leaf`. With `Requirement::ANY`, a caller must give its own
+    /// proof for a negative route.
     ///
     /// With `Requirement::ANY` this is exactly [`route_key`](Self::route_key).
     pub async fn route_key_checking_leaf(
@@ -777,14 +789,24 @@ impl TreeRouter {
         key: &[u8],
         leaf: Requirement,
     ) -> Result<RoutedLeaf, StorageError> {
-        let mut cursor = self
-            .leaf_cursor(collection, key, Requirement::ANY)
-            .await?
-            .ok_or(StorageError::NotFound)?;
+        let descent = self.leaf_cursor(collection, key, Requirement::ANY).await;
         // An `ANY` leaf requirement needs no terminal refresh.
         if leaf == Requirement::ANY {
-            return Ok(cursor.into_locator());
+            return Ok(descent?.ok_or(StorageError::NotFound)?.into_locator());
         }
+        let mut cursor = match descent {
+            Ok(Some(cursor)) => cursor,
+            // The absence comes from an index read at `ANY`. Descend again at
+            // `leaf`, which also checks the leaf.
+            Ok(None) | Err(StorageError::NotFound) => {
+                return self
+                    .leaf_cursor(collection, key, leaf)
+                    .await?
+                    .map(DescentCursor::into_locator)
+                    .ok_or(StorageError::NotFound);
+            }
+            Err(error) => return Err(error),
+        };
         // Check the terminal node at the stricter requirement and resume the
         // descent from it: the cached index read may have routed us to `_r`
         // as a leaf while a concurrent split has since rewritten `_r` into an
@@ -1036,8 +1058,8 @@ impl TreeRouter {
     }
 }
 
-/// Index nodes route from any cached state (ADR-031). Only the terminal leaf
-/// must meet the caller's requirement.
+/// Index nodes route from any cached state (ADR-031). Only the node that ends
+/// the descent, a leaf or an absent node, must meet the caller's requirement.
 fn route_requirement(stage: RouteStage, leaf: Requirement) -> Requirement {
     match stage {
         RouteStage::Index => Requirement::ANY,
@@ -2016,6 +2038,50 @@ mod tests {
             take_reads(&log),
             [read("read", root_path()), read("read", node_path(1))]
         );
+    }
+
+    // Instance `b` caches the absence of the root and of a leaf, and instance
+    // `a` then creates the tree. A route at `ANY` gives the cached absence. A
+    // route at a bound after the creation finds the leaf, also in a batch.
+    #[tokio::test]
+    async fn a_bounded_route_reads_past_a_cached_absence() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let a = store_over(backend.clone());
+        let b = store_over(backend);
+        for path in [root_path(), node_path(1)] {
+            let cached = b.nodes.load_node_at_state(&path, Requirement::ANY).await;
+            assert!(cached.unwrap().is_absent());
+        }
+        seed_two_level(&a.nodes).await;
+        let router = TreeRouter::new(b.nodes.clone(), NonZeroUsize::new(2).unwrap());
+        let key = |raw: &[u8]| (LogicalKey::new(collection(), raw), ());
+
+        assert!(matches!(
+            router
+                .route_key_checking_leaf(&collection(), b"pear", Requirement::ANY)
+                .await,
+            Err(StorageError::NotFound)
+        ));
+        assert!(matches!(
+            router
+                .route_keys_checking_leaf([key(b"apple"), key(b"pear")], Requirement::ANY)
+                .await,
+            Err(StorageError::NotFound)
+        ));
+
+        let bound = Requirement::after(b.timeline.currentness_barrier());
+        let routed = router
+            .route_key_checking_leaf(&collection(), b"pear", bound)
+            .await
+            .unwrap();
+        assert_eq!(routed.path, node_path(1));
+        let groups = router
+            .route_keys_checking_leaf([key(b"apple"), key(b"pear")], bound)
+            .await
+            .unwrap();
+        let mut paths: Vec<_> = groups.iter().map(|group| group.path().clone()).collect();
+        paths.sort();
+        assert_eq!(paths, [node_path(0), node_path(1)]);
     }
 
     #[tokio::test]

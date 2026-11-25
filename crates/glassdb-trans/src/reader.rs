@@ -51,9 +51,22 @@ impl BodyReader {
         range: &ScanRange,
         overlay: &[ScanMutation],
     ) -> Result<ScanResult, StorageError> {
-        self.resolver
+        match self
+            .resolver
             .scan_keys(collection, range, overlay, None, None)
             .await
+        {
+            // A missing route can be a cached absence. Scan again after a new
+            // barrier (missing-object retries), so that only a bounded absence
+            // reports a dropped collection.
+            Err(StorageError::StaleCollection) => {
+                let fresh = Requirement::after(self.reader.timeline.currentness_barrier());
+                self.resolver
+                    .scan_keys_at(collection, range, overlay, None, None, fresh)
+                    .await
+            }
+            result => result,
+        }
     }
 }
 
@@ -116,8 +129,7 @@ impl Reader {
     /// dropping the future at any `.await` (e.g. via `tokio::time::timeout`).
     pub async fn read(&self, key: &LogicalKey) -> Result<ReadOutcome, StorageError> {
         let mut backoff = self.retry.backoff();
-        // Proof: later validation. `KeyResolver::locate_key` gives the proof
-        // for a missing route.
+        // Proof: later validation. `resolve_value` proves a missing route.
         for _ in 0..READ_UNAVAILABLE_RETRIES {
             match self.resolve_value(key, Requirement::ANY).await {
                 Err(StorageError::Unavailable(_)) => rt::sleep(backoff.next_delay()).await,
@@ -139,12 +151,24 @@ impl Reader {
         let mut requirement = requirement;
         // The last writer whose record GC deleted after the leaf named it.
         let mut reclaimed = None;
+        let mut missing_retried = false;
         loop {
             let (resolved, leaf) = match self.resolver.resolve_key(key, requirement).await {
                 Ok(resolved) => resolved,
                 Err(crate::error::TransError::ValidateRetry(fresh)) => {
                     requirement = requirement.stricter(fresh);
                     rt::yield_now().await;
+                    continue;
+                }
+                // A missing route can be a cached absence. Route again after a
+                // new barrier (missing-object retries), so that only a bounded
+                // absence reports a dropped collection.
+                Err(crate::error::TransError::Storage(StorageError::StaleCollection))
+                    if !missing_retried =>
+                {
+                    missing_retried = true;
+                    requirement = requirement
+                        .stricter(Requirement::after(self.timeline.currentness_barrier()));
                     continue;
                 }
                 Err(error) => return Err(trans_to_storage(error)),

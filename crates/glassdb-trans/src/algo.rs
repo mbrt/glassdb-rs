@@ -4361,4 +4361,54 @@ mod tests {
             "root split CAS must win"
         );
     }
+
+    // Instance `b` caches the absence of four collections, and instance `a`
+    // then creates them. A commit, a point read, and a scan on `b` read past
+    // the cached absence, so they do not report a dropped collection.
+    #[tokio::test]
+    async fn transaction_path_reads_past_a_cached_absence() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        // The cache must keep the absences.
+        let (algo, b) = new_algo_from_backend_with_cache(backend.clone(), 1 << 20).await;
+        let collection =
+            |byte| CollectionAddress::new(TEST_DB, CollectionId::from_bytes([byte; 16]));
+        let (written, written_twice, read, scanned) =
+            (collection(7), collection(8), collection(9), collection(10));
+        let all = [&written, &written_twice, &read, &scanned];
+        for collection in all {
+            assert!(matches!(
+                b.records.load_record(collection, Requirement::ANY).await,
+                Err(StorageError::NotFound)
+            ));
+            let root = b.nodes.load_root_state(collection, Requirement::ANY).await;
+            assert!(root.unwrap().is_absent());
+        }
+        let (_creator, a) = new_algo_from_backend(backend).await;
+        for collection in all {
+            let record = CollectionRecord::new();
+            assert!(a.records.create_record(collection, &record).await.unwrap());
+            let root = Node::leaf(LeafBody::new());
+            assert!(a.nodes.create_root(collection, &root).await.unwrap());
+        }
+
+        commit_writes(&algo, vec![wa(&LogicalKey::new(written, b"k"), b"v")]).await;
+        commit_writes(
+            &algo,
+            vec![
+                wa(&LogicalKey::new(written_twice.clone(), b"k1"), b"v"),
+                wa(&LogicalKey::new(written_twice, b"k2"), b"v"),
+            ],
+        )
+        .await;
+        let outcome = read_outcome(&b, &LogicalKey::new(read, b"k")).await;
+        assert!(outcome.value.is_none());
+        let resolver = KeyResolver::new(
+            TreeRouter::new(b.nodes.clone(), std::num::NonZeroUsize::MIN),
+            KeyStateResolver::new(b.tmon.clone()),
+            std::num::NonZeroUsize::MIN,
+        );
+        let body =
+            crate::reader::BodyReader::new(resolver, b.timeline.clone(), RetrySchedule::default());
+        body.scan(&scanned, &ScanRange::all(), &[]).await.unwrap();
+    }
 }
