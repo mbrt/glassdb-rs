@@ -1,0 +1,17 @@
+# `stale-reads-view` with the writer on a second database instance. A write
+# of another instance does not advance the watermarks of the reader instance,
+# so after each move of a floor the readers check each leaf that they read.
+# The case shows the cost of the writes of other instances to a stale view.
+# It has no counters file: in the 500 ms window of the counters, the single
+# writer changes too few leaves to show this cost.
+# The CI comparison runs it 32 times with latency jitter.
+tags = ["ci/timing", "area/read"]
+include = ["../configs/ci-timing.toml", "../configs/stale-reads-shared-leaves.toml"]
+
+[cell]
+workload = "stale-view-foreign-shared-leaves"
+collections = 1
+
+[cell.measure]
+duration = "2s"
+max-duration = "2s"

@@ -9,6 +9,138 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-11-25: a round of checks after a stale view moves its floor
+
+Status: rejected. With writers on another instance, most leaves change between
+two confirmations, so a round of checks after a move of the floor does not
+remove the checks of the later calls, and it adds backend reads. The
+measurement also found a stale call that hangs for up to 28 s under 200
+writers on another instance. That is a separate bug. The new CI case
+`stale-reads-view-foreign` runs `stale-reads-view` with the writer on a second
+instance.
+
+### The question
+
+After a move of the floor of a view, each leaf needs a confirmation after the
+new floor before a call can cut at it. A write of another instance does not
+advance any watermark of the reader instance, so the calls after a move check
+the leaves that they read, one call at a time. The proposal was one parallel
+round of checks over the working set of the view right after each move.
+[ADR-103](../../docs/adr/103-a-stale-view-keeps-its-cut-point.md) rejected
+the round for 50 local writers. No measurement had all writers on another
+instance.
+
+### Setup
+
+All runs used `c5ad9d644`, `--backend=memory --delays=s3 --prefix-depth=3
+--time=virtual`, and a measure window of 30 s. perfbench divides the window
+into 20 throughput windows of 1.5 s. The shapes are those of the `stale-reads`
+grid (wide pool of 20,000 keys, about 314 leaves, 5 s bound). A temporary
+experiment had two workloads:
+
+- `foreign`: one instance with the readers, and a second instance with
+  `rw-single` and `rw-many` as loads, both on one collection
+  (`cell.collections = 1`).
+- `local`: the same shapes on one instance.
+
+Variants with `-mv` ran only `ro-multi-view` on the reader instance. With
+`ro-multi-stale` beside it, the checks of `ro-multi-stale` refresh the shared
+cache for the view and hide its cost.
+
+Temporary counters split the time of each view call between the body and the
+cut, and counted the calls with a check, the moves of the floor and their
+cause, and the leaves that a round would check.
+
+### Where the time goes
+
+`ro-multi-view` alone (`-mv`), 50 writers of each shape, 2 runs with the
+counters and without the prototype:
+
+| | Local writers | Writers on a second instance |
+| --- | --- | --- |
+| Mean, p90 (ms) | 6.5, 21; 5.6, 17 | 12.4, 34; 11.5, 36 |
+| Share of the call time in the cut | 99.7% | 96% to 97% |
+| Calls with a check | 14%, 12% | 35%, 32% |
+| Moves of the floor | 50, 55 | 34, 29 |
+
+Almost all the time is in the checks of the cut. With foreign writers, the
+reader spends about 29 s of the 30 s window in about 900 calls that each wait
+about 32 ms for a check. The mean then shows only how many fast calls fit
+between them, so it varies a lot between runs: from 4.7 to 17.4 ms in the 4
+base runs of the next section.
+
+No move came from a key that started after the floor. All moves came from a
+floor older than the bound (20 to 31 in 30 s) or from a failed check (5 to
+52). A move raises the floor to the latest start among the states of the cut.
+With foreign writers those states are old, so the new floor expires again
+after about 1 s on average, not after the 5 s of the bound. Three other
+proposals do not act on these causes: key intervals for range scans, key
+starts that survive the eviction of earlier states, and a move of the floor to
+the floor of another view.
+
+### The prototype
+
+The view recorded the leaves that its calls read. After a move, a round
+checked each recorded leaf whose cached state did not reach the new floor (the
+watermark filter), at the parallelism of point-leaf work (16). Switches
+selected the variants:
+
+- the round in a background task, or in the call that moved the floor;
+- the floor raised to a barrier near the present: alone, or to the barrier of
+  the round after the round;
+- the working set kept across moves;
+- a round also after a failed check.
+
+At today's move rate, a round with the watermark filter checks 1.04 to 1.22
+times the leaves that the calls check. Without the filter it checks up to 1.8
+times as many.
+
+Results of `ro-multi-view` alone at 50 writers of each shape. Each variant
+ran 2 times in each of two sets of runs, and a row gives the range over the
+runs of its variants:
+
+| Variant | Writers | Mean (ms) | p90 (ms) | Calls with a check | Reader backend reads |
+| --- | --- | --- | --- | --- | --- |
+| Base | Foreign | 4.7 to 17.4 | 24 to 40 | 916 to 934 | 11,400 to 13,600 |
+| Raise only | Foreign | 16.3, 19.0 | 40, 41 | 919, 923 | 11,600, 12,700 |
+| Rounds, all variants | Foreign | 3.2 to 9.0 | 0.1 to 29 | 662 to 888 | 14,900 to 26,000 |
+| Base | Local | 4.5 to 5.6 | 11 to 17 | 600 to 668 | 8,400 to 8,800 |
+| Raise only | Local | 6.8, 8.0 | 20, 26 | 600, 604 | 8,700, 9,300 |
+| Rounds, all variants | Local | 2.9 to 5.1 | 0.1 | 337 to 650 | 10,200 to 16,700 |
+
+With foreign writers, 86% of the leaves that a round checked had changed
+since their last confirmation (2,822 of 3,289 in one cell). The round then
+pays full reads, and a key that changed still moves the floor. In the first
+set of runs, the floor moved 42 to 56 times in 30 s with rounds, against 34
+without. The second set changed the counter of the moves, so its counts do
+not compare. The calls with a check dropped by at most 29%. No variant reached
+the target of a mean of at most 3 ms and a p90 of at most 1 ms without more
+backend reads.
+
+With local writers, the rounds removed the p90 tail, but the mean gained only
+about 1 ms, for more backend reads.
+
+### A stale call that hangs under 200 foreign writers
+
+At 200 writers of each shape on the second instance, the reader committed all
+its calls in the first throughput windows, and then nothing for up to 19 of
+the 20 windows. It happened with the binary without counters, for
+`ro-multi-stale` and `ro-multi-view`, in every run. It never happened with local writers or at
+50 writers. The counters showed that the call that hangs does not reach the
+cut, so it waits in the body or before it. The 200-writer cells are therefore
+not in the results above.
+
+### Conclusions
+
+- With writers on another instance, the cost of a stale view comes from the
+  write rate: most leaves change between two confirmations, and a round of
+  checks does not make them cheaper.
+- A floor that a move raises to the latest start of the cut expires again
+  soon with foreign writers. A raise to the present alone made the calls
+  slower, because each leaf then needs a check.
+- The hang under 200 foreign writers is a bug to fix before more measurements
+  at that load.
+
 ## 2026-11-21: seed transactions race the splits of the seed
 
 Status: the seed stays as it is. `ci/counters` now runs three times on each
