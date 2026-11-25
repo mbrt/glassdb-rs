@@ -171,6 +171,7 @@ impl From<TransError> for Error {
             TransError::AlreadyFinalized => Error::AlreadyFinalized,
             TransError::StaleCollection => Error::StaleCollection,
             TransError::InvalidInput(msg) => Error::InvalidInput(msg),
+            TransError::MutationInDoubt(msg) => Error::InDoubt(msg),
             TransError::Other { msg, source } => Error::Internal { msg, source },
             TransError::Retry
             | TransError::Wounded

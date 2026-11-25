@@ -341,6 +341,17 @@ enum PassOutcome {
     },
 }
 
+/// Reports whether a write of the identity of a pass can still land after the
+/// pass ends with `result`.
+fn pass_has_pending_writes(result: &Result<PassOutcome, TransError>) -> bool {
+    match result {
+        Ok(outcome) => outcome.has_pending_writes(),
+        // A CAS on a collection record can still land (ADR-106).
+        Err(TransError::MutationInDoubt(_)) => true,
+        Err(_) => false,
+    }
+}
+
 impl PassOutcome {
     fn has_pending_writes(&self) -> bool {
         matches!(
@@ -771,7 +782,7 @@ impl Algo {
         let result = self.resolve_reclaimed_resources(tx, result).await;
         // Completing the guard proves that no old-identity write can land
         // after retirement. Dropping it records the opposite fact.
-        if !result.as_ref().is_ok_and(PassOutcome::has_pending_writes) {
+        if !pass_has_pending_writes(&result) {
             owner_operation.complete();
         }
         result
@@ -786,7 +797,7 @@ impl Algo {
         let result = self.resolve_reclaimed_resources(tx, result).await;
         // Completing the guard proves that no old-identity write can land
         // after retirement. Dropping it records the opposite fact.
-        if !result.as_ref().is_ok_and(PassOutcome::has_pending_writes) {
+        if !pass_has_pending_writes(&result) {
             owner_operation.complete();
         }
         result
@@ -2620,6 +2631,64 @@ mod tests {
         }
         assert!(reclaimed, "the prepared collection was not reclaimed");
         tm.end(&mut handle).await.unwrap();
+    }
+
+    // ADR-106: a directory lock CAS whose fence is in doubt too can still
+    // land. The pass keeps its owner operation unresolved, so the identity
+    // ends pinned as wounded, and GC keeps its record.
+    #[tokio::test(start_paused = true)]
+    async fn an_in_doubt_directory_lock_pins_the_identity() {
+        let backend = Arc::new(HookBackend::new(Arc::new(MemoryBackend::new())));
+        let (tm, tctx) = new_algo_from_backend_with_cache_policy_and_retirement(
+            backend.clone(),
+            1024,
+            NodeSizePolicy::default(),
+            true,
+        )
+        .await;
+        let created = CollectionAddress::new(TEST_DB, CollectionId::from_bytes([4; 16]));
+        let mut handle = tm.begin(
+            AccessSet::default(),
+            CatalogAccesses {
+                reads: Vec::new(),
+                changes: vec![CollectionChange {
+                    parent: test_collection(),
+                    name: CollectionName::new("created").unwrap(),
+                    collection: created,
+                    expected: None,
+                    op: CollectionOp::Create,
+                }],
+                missing_collection: false,
+            },
+        );
+        let id = *handle.id();
+        backend.set_before({
+            let parent = ObjectPath::CollectionRecord {
+                collection: test_collection(),
+            }
+            .to_string();
+            move |op| {
+                let refused = matches!(op, BackendOp::WriteIf { path, .. } if *path == parent);
+                let future: HookFuture = Box::pin(async move {
+                    if refused {
+                        Err(glassdb_backend::BackendError::Unavailable("refused".into()))
+                    } else {
+                        Ok(())
+                    }
+                });
+                future
+            }
+        });
+
+        let committed = tm.commit(&mut handle).await;
+        assert!(
+            matches!(committed, Err(TransError::MutationInDoubt(_))),
+            "{committed:?}"
+        );
+        backend.clear_before();
+        let _ = tm.end(&mut handle).await;
+
+        await_tx_status(&tctx, &id, TxCommitStatus::Wounded).await;
     }
 
     // The background acknowledgement also clears the drop intents and the

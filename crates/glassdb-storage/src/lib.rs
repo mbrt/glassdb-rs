@@ -41,7 +41,7 @@ pub use cached_store::{
     CachedStore, CasReceipt, CasResult, CasRetries, Converged, CutKey, CutSearch, CutTarget,
     Decision, Observation, ObservationCheck, Revision,
 };
-pub use collection_store::{CollectionRecord, CollectionStore};
+pub use collection_store::{CollectionRecord, CollectionStore, Fenced};
 pub use disk_cache::{
     OpenedPersistentCache, PersistentCache, PersistentCacheConfig, PersistentCacheMedia,
 };

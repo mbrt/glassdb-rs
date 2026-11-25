@@ -10,8 +10,8 @@ use glassdb_storage::transaction::{
     TxCollectionChange, TxCollectionOp, TxCommitStatus, TxLock, TxRecordStore,
 };
 use glassdb_storage::{
-    CasRetries, CollectionRecord, CollectionStore, Converged, Decision, LockType, Observation,
-    Requirement, StorageError, Timeline,
+    CasRetries, CollectionRecord, CollectionStore, Converged, Decision, Fenced, LockType,
+    Observation, Requirement, StorageError, Timeline,
 };
 
 use crate::collections::{CollectionChange, CollectionOp, DirectoryRead};
@@ -265,9 +265,19 @@ impl CollectionLocker {
             }
             Ok::<_, TransError>(Decision::Write(record, ()))
         };
-        let converge = |proof| {
-            self.records
+        let converge = |proof| async move {
+            // A lock CAS adds a holder, so the owner must know whether it can
+            // still land (ADR-106).
+            match self
+                .records
                 .converge(parent, proof, CasRetries::Unbounded(self.retry), &decide)
+                .await?
+            {
+                Fenced::Converged(converged) => Ok(converged),
+                Fenced::InDoubt => Err(TransError::MutationInDoubt(format!(
+                    "directory lock of {id} on {parent:?}"
+                ))),
+            }
         };
         let mut locked = converge(Requirement::ANY).await?;
         if matches!(locked, Converged::Missing) {
@@ -310,7 +320,8 @@ impl CollectionLocker {
                     }))
                 },
             )
-            .await?;
+            .await?
+            .or_unavailable()?;
         match released {
             Converged::Written { .. } => Ok(true),
             Converged::Done(()) | Converged::Missing => Ok(false),
@@ -376,7 +387,8 @@ impl CollectionStateResolver {
                     )
                 },
             )
-            .await?;
+            .await?
+            .or_unavailable()?;
         match resolved {
             Converged::Done(resolved) => Ok(resolved),
             Converged::Missing => Err(StorageError::NotFound
@@ -497,7 +509,8 @@ impl CollectionStateResolver {
                     )
                 },
             )
-            .await?;
+            .await?
+            .or_unavailable()?;
         match applied {
             Converged::Written { .. } => Ok(true),
             Converged::Done(()) | Converged::Missing => Ok(false),

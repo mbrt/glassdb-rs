@@ -9,8 +9,8 @@ use glassdb_concurr::RetrySchedule;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CasRetries, CollectionRecord, CollectionStore, Converged, Decision, LeafBody, LeafObservation,
-    Node, NodeStore, Requirement, StorageError,
+    CasRetries, CollectionRecord, CollectionStore, Converged, Decision, Fenced, LeafBody,
+    LeafObservation, Node, NodeStore, Requirement, StorageError,
 };
 
 use super::{CollectionChange, CollectionOp};
@@ -254,6 +254,8 @@ impl CollectionLifecycle {
         collection: &CollectionAddress,
         id: &TxId,
     ) -> Result<(), TransError> {
+        // A freeze adds a holder, so its owner must know whether it can still
+        // land (ADR-106).
         let frozen = self
             .records
             .converge(
@@ -293,6 +295,14 @@ impl CollectionLifecycle {
                 },
             )
             .await?;
+        let frozen = match frozen {
+            Fenced::Converged(frozen) => frozen,
+            Fenced::InDoubt => {
+                return Err(TransError::MutationInDoubt(format!(
+                    "topology freeze of {id} on {collection:?}"
+                )));
+            }
+        };
         match frozen {
             Converged::Done(()) => Ok(()),
             Converged::Missing => Err(StorageError::NotFound.into()),
@@ -491,7 +501,8 @@ impl CollectionLifecycle {
                     }))
                 },
             )
-            .await?;
+            .await?
+            .or_unavailable()?;
         match unfrozen {
             Converged::Written { .. } => Ok(true),
             Converged::Done(()) | Converged::Missing => Ok(changed),

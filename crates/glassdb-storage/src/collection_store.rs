@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use glassdb_data::{CollectionAddress, CollectionId, CollectionName, ObjectPath, TxId};
 use glassdb_proto as pb;
@@ -32,6 +32,7 @@ pub struct CollectionRecord {
     directory_generation: u64,
     topology_freeze: Option<TxId>,
     topology_participants: BTreeSet<TxId>,
+    record_sequence: u64,
 }
 
 impl CollectionRecord {
@@ -43,7 +44,20 @@ impl CollectionRecord {
             directory_generation: 0,
             topology_freeze: None,
             topology_participants: BTreeSet::new(),
+            record_sequence: 0,
         }
+    }
+
+    /// Returns the record as a newly created one.
+    fn created(mut self) -> Self {
+        self.record_sequence = 0;
+        self
+    }
+
+    /// Returns the record as the change that follows `expected`.
+    fn following(mut self, expected: &CollectionRecord) -> Self {
+        self.record_sequence = expected.record_sequence + 1;
+        self
     }
 
     /// Returns the collection ID bound to direct child `name`.
@@ -221,6 +235,7 @@ impl CollectionRecord {
                 .iter()
                 .map(|id| decode_id(id, "collection record has an invalid topology participant"))
                 .collect::<Result<_, _>>()?,
+            record_sequence: raw.record_sequence,
         })
     }
 
@@ -247,6 +262,7 @@ impl CollectionRecord {
                 .iter()
                 .map(|id| id.as_bytes().to_vec())
                 .collect(),
+            record_sequence: self.record_sequence,
         }
     }
 }
@@ -355,11 +371,8 @@ impl CollectionStore {
         record: &CollectionRecord,
         expected: &Observation<CollectionRecord>,
     ) -> Result<bool, StorageError> {
-        match self
-            .records
-            .replace(expected, Arc::new(record.clone()))
-            .await
-        {
+        let record = following(expected, record.clone())?;
+        match self.records.replace(expected, Arc::new(record)).await {
             Ok(CasResult::Applied(_)) => Ok(true),
             Ok(CasResult::Rejected) | Err(StorageError::NotFound) => Ok(false),
             Err(error) => Err(error),
@@ -368,14 +381,22 @@ impl CollectionStore {
 
     /// Changes the record of `collection` with one writer until `decide` gives
     /// a result, as [`NodeStore::converge`](crate::NodeStore::converge) does
-    /// for a node.
+    /// for a node. Each CAS that comes back in doubt is fenced before the
+    /// convergence decides again (ADR-106).
+    ///
+    /// Returns [`Fenced::InDoubt`] when the fence of a CAS is in doubt too, so
+    /// that CAS can still land. Any other error comes from a read or from
+    /// `decide`, and no CAS of the convergence can land after it.
+    ///
+    /// `retries` applies to each run between two fences. A fence starts a new
+    /// run, so a [`CasRetries::Bounded`] budget can lose more CASes in total.
     pub async fn converge<T, E, F, Fut>(
         &self,
         collection: &CollectionAddress,
         proof: Requirement,
         retries: CasRetries,
-        decide: F,
-    ) -> Result<Converged<CollectionRecord, T>, E>
+        mut decide: F,
+    ) -> Result<Fenced<T>, E>
     where
         E: From<StorageError>,
         F: FnMut(CollectionRecord, Observation<CollectionRecord>) -> Fut,
@@ -384,7 +405,87 @@ impl CollectionStore {
         let path = ObjectPath::CollectionRecord {
             collection: collection.clone(),
         };
-        self.records.converge(path, proof, retries, decide).await
+        loop {
+            // The state that the last CAS of the convergence expected. A new
+            // decision clears it: the convergence decides again only after its
+            // last CAS was applied or lost.
+            let expected = Mutex::new(None);
+            let converged = self
+                .records
+                .converge(path.clone(), proof, retries, |record, observation| {
+                    *expected.lock().unwrap() = None;
+                    let decided = decide(record, observation.clone());
+                    let expected = &expected;
+                    async move {
+                        let decision = decided.await.map_err(Failure::Decide)?;
+                        let decision = match decision {
+                            Decision::Write(record, value) => {
+                                Decision::Write(following(&observation, record)?, value)
+                            }
+                            Decision::Advance(record) => {
+                                Decision::Advance(following(&observation, record)?)
+                            }
+                            decision => return Ok(decision),
+                        };
+                        *expected.lock().unwrap() = Some(observation);
+                        Ok(decision)
+                    }
+                })
+                .await;
+            let in_doubt = match converged {
+                Ok(converged) => return Ok(Fenced::Converged(converged)),
+                Err(Failure::Decide(error)) => return Err(error),
+                Err(Failure::Storage(StorageError::Unavailable(error))) => {
+                    match expected.into_inner().unwrap() {
+                        Some(expected) => expected,
+                        None => return Err(StorageError::Unavailable(error).into()),
+                    }
+                }
+                Err(Failure::Storage(error)) => return Err(error.into()),
+            };
+            // An error of a read after an applied `Decision::Advance` also gets
+            // here. The fence then finds a changed record sequence.
+            if !self.fence(&path, &in_doubt).await? {
+                return Ok(Fenced::InDoubt);
+            }
+        }
+    }
+
+    /// Makes sure that a CAS that expected `expected` can never land. Returns
+    /// `false` when the result is in doubt.
+    ///
+    /// The record sequence of `expected` changes with each change of the
+    /// record, so a loaded record with another record sequence fences the CAS.
+    /// A loaded record with the same one is in the state that the CAS
+    /// expected: a write of that state again changes only the record sequence,
+    /// and a lost write is a change too.
+    async fn fence(
+        &self,
+        path: &ObjectPath,
+        expected: &Observation<CollectionRecord>,
+    ) -> Result<bool, StorageError> {
+        let fresh = Requirement::after(self.records.currentness_barrier());
+        let loaded = match self.records.read(path.clone(), fresh).await {
+            Ok(loaded) => loaded,
+            Err(StorageError::Unavailable(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let (Some(expected), Some(current)) = (expected.value(), loaded.value()) else {
+            // A collection record path is created once, so a CAS cannot land
+            // on a deleted record.
+            return Ok(true);
+        };
+        if current.record_sequence != expected.record_sequence {
+            return Ok(true);
+        }
+        let again = current.as_ref().clone().following(current);
+        match self.records.replace(&loaded, Arc::new(again)).await {
+            Ok(CasResult::Applied(_) | CasResult::Rejected) | Err(StorageError::NotFound) => {
+                Ok(true)
+            }
+            Err(StorageError::Unavailable(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Creates a collection record if absent.
@@ -410,7 +511,7 @@ impl CollectionStore {
         };
         match self
             .records
-            .create(path, None, Arc::new(record.clone()))
+            .create(path, None, Arc::new(record.clone().created()))
             .await?
         {
             CasResult::Applied(receipt) => Ok(Some(receipt.into_installed())),
@@ -428,11 +529,65 @@ impl CollectionStore {
     }
 }
 
+/// The end of a [`CollectionStore::converge`].
+// One value exists for each convergence, and only until its caller reads it.
+#[allow(clippy::large_enum_variant)]
+pub enum Fenced<T> {
+    /// The convergence ended, and none of its CASes can land later.
+    Converged(Converged<CollectionRecord, T>),
+    /// A CAS of the convergence can still land.
+    InDoubt,
+}
+
+impl<T> Fenced<T> {
+    /// Returns the end of the convergence, or [`StorageError::Unavailable`]
+    /// when a CAS can still land. A caller whose CAS adds no holder uses it.
+    /// Such a CAS can land only on the state that it expected, and there it
+    /// makes only the change that its caller decided, so no pin is necessary
+    /// (ADR-106).
+    pub fn or_unavailable(self) -> Result<Converged<CollectionRecord, T>, StorageError> {
+        match self {
+            Fenced::Converged(converged) => Ok(converged),
+            Fenced::InDoubt => Err(StorageError::Unavailable(
+                "a CAS on a collection record stays in doubt".into(),
+            )),
+        }
+    }
+}
+
+/// An error of a convergence: from the store, or from its decision.
+enum Failure<E> {
+    Storage(StorageError),
+    Decide(E),
+}
+
+impl<E> From<StorageError> for Failure<E> {
+    fn from(error: StorageError) -> Self {
+        Failure::Storage(error)
+    }
+}
+
+/// Returns `record` as the change that follows the observed state, so that the
+/// replace never restores an earlier state of the record (ADR-106).
+fn following(
+    expected: &Observation<CollectionRecord>,
+    record: CollectionRecord,
+) -> Result<CollectionRecord, StorageError> {
+    let current = expected.value().ok_or_else(|| {
+        StorageError::other("a collection record replace needs an observed record")
+    })?;
+    Ok(record.following(current))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::future::ready;
+
     use glassdb_backend::memory::MemoryBackend;
+    use glassdb_backend::middleware::{BackendOp, HookBackend, HookFuture};
+    use glassdb_backend::{Backend, BackendError};
     use glassdb_data::TxId;
 
     use crate::{LeafBody, Node, NodeStore, Timeline};
@@ -775,6 +930,8 @@ mod tests {
                 )
                 .await
                 .unwrap()
+                .or_unavailable()
+                .unwrap()
         };
 
         assert!(matches!(
@@ -783,5 +940,175 @@ mod tests {
         ));
         let proof = Requirement::after(local_timeline.currentness_barrier());
         assert!(matches!(unfreeze(proof).await, Converged::Written { .. }));
+    }
+
+    /// A collection store over `backend`, with its own cache.
+    fn store_over(backend: Arc<dyn glassdb_backend::Backend>) -> CollectionStore {
+        let objects = CachedStore::new(backend, 1 << 20, Timeline::new(), None);
+        CollectionStore::new(objects, std::num::NonZeroUsize::MIN)
+    }
+
+    /// Adds `reader` as a directory reader, unless it already reads.
+    async fn add_reader(
+        records: &CollectionStore,
+        collection: &CollectionAddress,
+        reader: TxId,
+    ) -> Result<Fenced<()>, StorageError> {
+        records
+            .converge(
+                collection,
+                Requirement::ANY,
+                CasRetries::Bounded(1),
+                |mut record, _| async move {
+                    if record.directory_lock().contains(&reader) {
+                        return Ok::<_, StorageError>(Decision::Done(()));
+                    }
+                    record.add_directory_reader(reader);
+                    Ok(Decision::Write(record, ()))
+                },
+            )
+            .await
+    }
+
+    // ADR-106: a lock that is taken and released does not restore the earlier
+    // state of the record.
+    #[tokio::test]
+    async fn each_change_increases_the_record_sequence() {
+        let records = store_over(Arc::new(MemoryBackend::new()));
+        let collection = CollectionAddress::new("db", collection_id(1));
+        let reader = tx_id(&[1]);
+        let mut seeded = CollectionRecord::new();
+        seeded.add_directory_reader(reader);
+        // A create stores 0, also for a record copied from a changed one.
+        let prior = seeded.clone();
+        seeded = seeded.following(&prior);
+        assert!(records.create_record(&collection, &seeded).await.unwrap());
+        let (created, first) = records
+            .load_record(&collection, Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(created.record_sequence, 0);
+
+        let mut released = created.clone();
+        released.remove_directory_holder(&reader);
+        assert!(records.store_record(&released, &first).await.unwrap());
+        assert!(matches!(
+            add_reader(&records, &collection, reader).await.unwrap(),
+            Fenced::Converged(Converged::Written { .. })
+        ));
+
+        let (taken_again, last) = records
+            .load_record(&collection, Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(taken_again.record_sequence, 2);
+        assert!(!records.store_record(&released, &first).await.unwrap());
+        assert_ne!(last.revision(), first.revision());
+    }
+
+    // ADR-106: an in-doubt CAS that did not land yet is fenced, so it cannot
+    // land later on the state that it expected.
+    #[tokio::test]
+    async fn an_in_doubt_cas_is_fenced_before_the_convergence_decides_again() {
+        let inner = Arc::new(MemoryBackend::new());
+        let hook = HookBackend::new(inner.clone());
+        let records = store_over(hook.clone());
+        let collection = CollectionAddress::new("db", collection_id(2));
+        let path = ObjectPath::CollectionRecord {
+            collection: collection.clone(),
+        }
+        .to_string();
+        assert!(
+            records
+                .create_record(&collection, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        // The first CAS does not reach the backend now. The test sends it
+        // later, as a backend can.
+        let late = Arc::new(Mutex::new(None));
+        hook.set_before({
+            let late = late.clone();
+            move |op| {
+                let mut late = late.lock().unwrap();
+                let held = match op {
+                    BackendOp::WriteIf {
+                        value, expected, ..
+                    } if late.is_none() => {
+                        *late = Some((value.to_vec(), (*expected).clone()));
+                        true
+                    }
+                    _ => false,
+                };
+                Box::pin(ready(if held {
+                    Err(BackendError::Unavailable("held".into()))
+                } else {
+                    Ok(())
+                })) as HookFuture
+            }
+        });
+
+        let reader = tx_id(&[1]);
+        assert!(matches!(
+            add_reader(&records, &collection, reader).await.unwrap(),
+            Fenced::Converged(Converged::Written { .. })
+        ));
+
+        let (value, expected) = late.lock().unwrap().take().unwrap();
+        assert!(matches!(
+            inner.write_if(&path, value, &expected).await,
+            Err(BackendError::Precondition)
+        ));
+        let (record, _) = records
+            .load_record(&collection, Requirement::ANY)
+            .await
+            .unwrap();
+        assert_eq!(
+            record.directory_lock().holders(),
+            std::slice::from_ref(&reader)
+        );
+    }
+
+    // ADR-106: when the fence is in doubt too, the owner learns that its CAS
+    // can still land. A caller whose CAS adds no holder, for example a
+    // release, reports it as unavailable.
+    #[tokio::test]
+    async fn a_cas_whose_fence_is_in_doubt_stays_in_doubt() {
+        let hook = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let records = store_over(hook.clone());
+        let collection = CollectionAddress::new("db", collection_id(3));
+        let held = tx_id(&[9]);
+        let mut record = CollectionRecord::new();
+        record.add_directory_reader(held);
+        assert!(records.create_record(&collection, &record).await.unwrap());
+        hook.set_before(|op| {
+            let refused = matches!(op, BackendOp::WriteIf { .. });
+            Box::pin(ready(if refused {
+                Err(BackendError::Unavailable("refused".into()))
+            } else {
+                Ok(())
+            })) as HookFuture
+        });
+
+        assert!(matches!(
+            add_reader(&records, &collection, tx_id(&[1]))
+                .await
+                .unwrap(),
+            Fenced::InDoubt
+        ));
+        let release = records
+            .converge(
+                &collection,
+                Requirement::ANY,
+                CasRetries::Bounded(1),
+                |mut record, _| async move {
+                    record.remove_directory_holder(&held);
+                    Ok::<_, StorageError>(Decision::Write(record, ()))
+                },
+            )
+            .await
+            .unwrap()
+            .or_unavailable();
+        assert!(matches!(release, Err(StorageError::Unavailable(_))));
     }
 }
