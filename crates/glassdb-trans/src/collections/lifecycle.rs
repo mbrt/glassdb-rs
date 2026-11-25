@@ -9,8 +9,8 @@ use glassdb_concurr::RetrySchedule;
 use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
-    CasRetries, CollectionRecord, CollectionStore, Converged, Decision, LeafBody, Node, NodeStore,
-    Requirement, StorageError,
+    CasRetries, CollectionRecord, CollectionStore, Converged, Decision, LeafBody, LeafObservation,
+    Node, NodeStore, Requirement, StorageError,
 };
 
 use super::{CollectionChange, CollectionOp};
@@ -175,8 +175,11 @@ impl CollectionLifecycle {
         // Proof: conditional mutation for each delete of a present body.
         // Publication and lifecycle (created before seen, no reuse) for an
         // absent object: a cached absence cannot hide a later live object.
-        // Owner cleanup shares the preparation cache, and GC waits for commit
-        // or acknowledged abort. An abandoned late create can leave an orphan.
+        // GC starts after a commit or an acknowledged abort, so the owner and
+        // GC can reclaim the same collection at the same time. Each delete
+        // therefore retries on the current state of its object until the
+        // object is gone (Cleaners only). An abandoned late create can leave
+        // an orphan.
         let mut deleted = 0;
         for collection in collections {
             let mut cursor = None;
@@ -186,32 +189,64 @@ impl CollectionLifecycle {
                     .scan_nodes(collection, cursor.as_ref(), Requirement::ANY)
                     .await?;
                 for (_, observed) in page.nodes {
-                    self.nodes.delete_node(&observed).await?;
-                    deleted += 1;
+                    deleted += u64::from(self.delete_current_node(observed).await?);
                 }
                 match page.next {
                     Some(next) => cursor = Some(next),
                     None => break,
                 }
             }
-            let observed = self
+            let root = self
                 .nodes
                 .load_root_state(collection, Requirement::ANY)
                 .await?;
-            if observed.exists() {
-                self.nodes.delete_root(&observed).await?;
-                deleted += 1;
+            deleted += u64::from(self.delete_current_node(root).await?);
+            deleted += u64::from(self.delete_current_record(collection).await?);
+        }
+        Ok(deleted)
+    }
+
+    /// Deletes the node of `observed`, or its current state if another
+    /// cleaner changed it, and returns whether the node existed.
+    async fn delete_current_node(&self, mut observed: LeafObservation) -> Result<bool, TransError> {
+        while observed.exists() {
+            match self.nodes.delete_node(&observed).await {
+                Ok(()) => return Ok(true),
+                // Another cleaner changed the node after this instance cached
+                // it. The rejected delete removed the old state from the cache,
+                // so the load at `ANY` reads the current state.
+                Err(StorageError::Precondition) => {}
+                Err(error) => return Err(error.into()),
             }
+            observed = self
+                .nodes
+                .load_node_at_state(observed.path(), Requirement::ANY)
+                .await?;
+        }
+        Ok(false)
+    }
+
+    /// Deletes the current record of `collection`, and returns whether it
+    /// existed.
+    async fn delete_current_record(
+        &self,
+        collection: &CollectionAddress,
+    ) -> Result<bool, TransError> {
+        loop {
             let observed = self
                 .records
                 .load_record_state(collection, Requirement::ANY)
                 .await?;
-            if observed.exists() {
-                self.records.delete_record(&observed).await?;
-                deleted += 1;
+            if !observed.exists() {
+                return Ok(false);
+            }
+            match self.records.delete_record(&observed).await {
+                Ok(()) => return Ok(true),
+                // As for a node, the next load reads the current record.
+                Err(StorageError::Precondition) => {}
+                Err(error) => return Err(error.into()),
             }
         }
-        Ok(deleted)
     }
 
     async fn freeze_topology(
@@ -584,6 +619,33 @@ mod tests {
         }
     }
 
+    fn monitor_over(store: &TestStore) -> (Monitor, Arc<Background>) {
+        let background = Arc::new(Background::new());
+        let monitor = Monitor::with_config(
+            TxRecordStore::new(store.objects.clone(), DbPrefix::try_from("db").unwrap()),
+            store.timeline.clone(),
+            Arc::downgrade(&background),
+            RetrySchedule::default(),
+            crate::monitor::ProtocolTiming::default(),
+            crate::gc::GcHints::default(),
+        );
+        (monitor, background)
+    }
+
+    fn lifecycle_over(
+        store: &TestStore,
+        monitor: &Monitor,
+        retry: RetrySchedule,
+    ) -> CollectionLifecycle {
+        CollectionLifecycle::new(
+            store.records.clone(),
+            store.nodes.clone(),
+            monitor.clone(),
+            retry,
+            Arc::new(UnexpectedTopologySettler),
+        )
+    }
+
     fn live_entry(key: &[u8]) -> LeafEntry {
         LeafEntry::new(key).with_current(CurrentState::External {
             writer: tx_id(&[9]),
@@ -849,33 +911,13 @@ mod tests {
         let backend: Arc<dyn Backend> = backend;
         let primary = store(backend.clone());
         let peer = store(backend.clone());
-        let background = Arc::new(Background::new());
-        let monitor = Monitor::with_config(
-            TxRecordStore::new(primary.objects.clone(), DbPrefix::try_from("db").unwrap()),
-            primary.timeline.clone(),
-            Arc::downgrade(&background),
-            RetrySchedule::default(),
-            crate::monitor::ProtocolTiming::default(),
-            crate::gc::GcHints::default(),
-        );
+        let (monitor, _background) = monitor_over(&primary);
         let retry = RetrySchedule {
             initial_interval: Duration::ZERO,
             max_interval: Duration::ZERO,
         };
-        let primary_lifecycle = CollectionLifecycle::new(
-            primary.records.clone(),
-            primary.nodes.clone(),
-            monitor.clone(),
-            retry,
-            Arc::new(UnexpectedTopologySettler),
-        );
-        let peer_lifecycle = CollectionLifecycle::new(
-            peer.records.clone(),
-            peer.nodes.clone(),
-            monitor.clone(),
-            retry,
-            Arc::new(UnexpectedTopologySettler),
-        );
+        let primary_lifecycle = lifecycle_over(&primary, &monitor, retry);
+        let peer_lifecycle = lifecycle_over(&peer, &monitor, retry);
         let split_id = tx_id(&[2]);
         let drop_id = tx_id(&[1]);
 
@@ -966,22 +1008,8 @@ mod tests {
     async fn reclamation_deletes_each_page_before_listing_more_nodes() {
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let primary = store(backend.clone());
-        let background = Arc::new(Background::new());
-        let monitor = Monitor::with_config(
-            TxRecordStore::new(primary.objects.clone(), DbPrefix::try_from("db").unwrap()),
-            primary.timeline.clone(),
-            Arc::downgrade(&background),
-            RetrySchedule::default(),
-            crate::monitor::ProtocolTiming::default(),
-            crate::gc::GcHints::default(),
-        );
-        let lifecycle = CollectionLifecycle::new(
-            primary.records.clone(),
-            primary.nodes.clone(),
-            monitor,
-            RetrySchedule::default(),
-            Arc::new(UnexpectedTopologySettler),
-        );
+        let (monitor, _background) = monitor_over(&primary);
+        let lifecycle = lifecycle_over(&primary, &monitor, RetrySchedule::default());
         let collection = collection();
         primary
             .records
@@ -1051,5 +1079,86 @@ mod tests {
         assert_eq!(deleted.len(), 259);
         assert!(deleted[257].ends_with("/_r"));
         assert!(deleted[258].ends_with("/_i"));
+    }
+
+    #[tokio::test]
+    async fn reclamation_deletes_objects_that_another_cleaner_changed() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let owner = store(backend.clone());
+        let (monitor, _background) = monitor_over(&owner);
+        let lifecycle = lifecycle_over(&owner, &monitor, RetrySchedule::default());
+        let collection = collection();
+        let mut record = CollectionRecord::new();
+        record.add_directory_reader(tx_id(&[1]));
+        owner
+            .records
+            .create_record(&collection, &record)
+            .await
+            .unwrap();
+        owner
+            .nodes
+            .create_root(&collection, &Node::leaf(LeafBody::new()))
+            .await
+            .unwrap();
+        owner
+            .nodes
+            .store_node(&collection, &SOURCE, &Node::leaf(LeafBody::new()), None)
+            .await
+            .unwrap();
+
+        // Another cleaner, for example GC on another instance, changes each
+        // object after the owner cached it.
+        let cleaner = store(backend.clone());
+        let (mut changed, observed) = cleaner
+            .records
+            .load_record(&collection, Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(changed.remove_directory_holder(&tx_id(&[1])));
+        assert!(
+            cleaner
+                .records
+                .store_record(&changed, &observed)
+                .await
+                .unwrap()
+        );
+        for path in [
+            ObjectPath::TreeRoot {
+                collection: collection.clone(),
+            },
+            ObjectPath::Node {
+                collection: collection.clone(),
+                id: SOURCE,
+            },
+        ] {
+            let (node, observed) = cleaner
+                .nodes
+                .load_node_at(&path, Requirement::ANY)
+                .await
+                .unwrap();
+            cleaner
+                .nodes
+                .store_node_at(&path, &node, &observed)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        assert_eq!(
+            lifecycle
+                .reclaim(std::slice::from_ref(&collection))
+                .await
+                .unwrap(),
+            3
+        );
+        let left = backend
+            .list(
+                &format!("{COLLECTION}/"),
+                None,
+                glassdb_backend::ListLimit::new(10).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(left.objects.is_empty(), "left {:?}", left.objects);
     }
 }

@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, hash_map::Entry};
 use std::ops::{AddAssign, Sub};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
@@ -53,10 +54,14 @@ const MAX_RETIRED_WITHOUT_RECORD: usize = 65_536;
 /// its locks stay until a writer on the same key removes them.
 const MAX_PINNED_LOCK_SETS: usize = 4_096;
 
-/// Final-status cache activity for one snapshot or accumulated interval.
+/// Final-status cache activity and the liveness decisions of the monitor, for
+/// one snapshot or accumulated interval.
 ///
 /// Each final-status cache lookup counts once. Reads from local owner state
 /// bypass this cache and do not count.
+///
+/// Each liveness decision that lets this database instance wound a foreign
+/// identity counts once, also when the wound then finds the identity final.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MonitorStats {
     /// Final-status cache lookups that found a committed, wounded, or aborted
@@ -64,14 +69,33 @@ pub struct MonitorStats {
     pub hits: u64,
     /// Final-status cache lookups that found no status.
     pub misses: u64,
+    /// Pending records whose lease expired by its timestamp, which includes
+    /// the allowed clock skew.
+    pub lease_expiries: u64,
+    /// Pending records whose lease had not expired by its timestamp, but that
+    /// this database instance saw unchanged for one pending timeout on its
+    /// own clock.
+    pub observed_lease_expiries: u64,
+    /// Identities that this database instance saw with no transaction record
+    /// for one pending timeout on its own clock.
+    pub missing_record_expiries: u64,
 }
 
 impl AddAssign for MonitorStats {
     fn add_assign(&mut self, rhs: Self) {
         // Destructuring fails to compile when a field is added and not summed.
-        let Self { hits, misses } = rhs;
+        let Self {
+            hits,
+            misses,
+            lease_expiries,
+            observed_lease_expiries,
+            missing_record_expiries,
+        } = rhs;
         self.hits += hits;
         self.misses += misses;
+        self.lease_expiries += lease_expiries;
+        self.observed_lease_expiries += observed_lease_expiries;
+        self.missing_record_expiries += missing_record_expiries;
     }
 }
 
@@ -82,6 +106,13 @@ impl Sub for MonitorStats {
         Self {
             hits: self.hits.saturating_sub(rhs.hits),
             misses: self.misses.saturating_sub(rhs.misses),
+            lease_expiries: self.lease_expiries.saturating_sub(rhs.lease_expiries),
+            observed_lease_expiries: self
+                .observed_lease_expiries
+                .saturating_sub(rhs.observed_lease_expiries),
+            missing_record_expiries: self
+                .missing_record_expiries
+                .saturating_sub(rhs.missing_record_expiries),
         }
     }
 }
@@ -114,9 +145,16 @@ impl ProtocolTiming {
         }
     }
 
-    /// Returns the shortened timing profile used by deterministic simulation.
+    /// Returns the timing profile used by deterministic simulation.
+    ///
+    /// The retention period is short, so that GC deletes transaction records
+    /// while cached leaves, stale views, and late CASes still name them.
+    /// Neither GC safety nor commit recovery depends on these values (ADR-079,
+    /// ADR-080). The skew is not zero, so that the lease check on the foreign
+    /// timestamp and the check on the observer's clock expire at different
+    /// times, as they do in production.
     pub const fn simulation() -> Self {
-        Self::new(Duration::from_millis(250), Duration::from_millis(500))
+        Self::new(Duration::from_millis(50), Duration::from_millis(50))
     }
 
     /// Returns the interval after which an unrefreshed transaction is stale.
@@ -576,6 +614,26 @@ struct Inner {
     // transaction while the role enum prevents owned and foreign state from
     // coexisting.
     shards: Sharded<Mutex<State>>,
+    expiries: ExpiryCounters,
+}
+
+/// The liveness decisions that [`MonitorStats`] reports.
+#[derive(Default)]
+struct ExpiryCounters {
+    lease: AtomicU64,
+    observed_lease: AtomicU64,
+    missing_record: AtomicU64,
+}
+
+impl ExpiryCounters {
+    fn take(&self) -> MonitorStats {
+        MonitorStats {
+            lease_expiries: self.lease.swap(0, Ordering::Relaxed),
+            observed_lease_expiries: self.observed_lease.swap(0, Ordering::Relaxed),
+            missing_record_expiries: self.missing_record.swap(0, Ordering::Relaxed),
+            ..MonitorStats::default()
+        }
+    }
 }
 
 /// Tracks the lifecycle of transactions: commit, abort, status queries, and
@@ -818,13 +876,17 @@ impl Monitor {
                 timing,
                 gc_hints,
                 shards: Sharded::new(|_| Mutex::new(State::default())),
+                expiries: ExpiryCounters::default(),
             }),
         }
     }
 
-    /// Returns final-status cache activity since the previous sample.
+    /// Returns final-status cache activity and liveness decisions since the
+    /// previous sample.
     pub(crate) fn stats_and_reset(&self) -> MonitorStats {
-        self.inner.final_status.lock().unwrap().take_stats()
+        let mut stats = self.inner.final_status.lock().unwrap().take_stats();
+        stats += self.inner.expiries.take();
+        stats
     }
 
     pub(crate) fn protocol_timing(&self) -> ProtocolTiming {
@@ -1142,8 +1204,8 @@ impl Monitor {
     /// status that wins.
     ///
     /// A committed transaction is left untouched. A pending refresh does not
-    /// defeat a wound: the refreshed observation is retried until either the
-    /// abort lands or the owner commits.
+    /// defeat a wound: after each rejected wound, the wound is sent again
+    /// until either the abort lands or the owner commits.
     pub(crate) async fn preempt_tx(&self, tid: &TxId) -> Result<TxFinalStatus, TransError> {
         let transition = self.preemption_plan(tid);
         let mut status = self
@@ -1156,11 +1218,11 @@ impl Monitor {
             })?;
         let mut backoff = self.inner.retry.backoff();
         loop {
-            status = self
+            let settled = self
                 .advance_abort_transition(tid, &status.observation, transition)
                 .await?
                 .0;
-            match status.status {
+            match settled.status {
                 TxCommitStatus::Committed => return Ok(TxFinalStatus::Committed),
                 TxCommitStatus::Aborted => return Ok(TxFinalStatus::Aborted),
                 // The caller removes the holder with a CAS on the current
@@ -1176,9 +1238,13 @@ impl Monitor {
                 | TxCommitStatus::Unknown => {}
             }
             // Lease expiry must stop here because the refresh proves liveness.
-            // Wound-wait is authorized by priority instead, so a refresh only
-            // supplies the next CAS observation.
+            // Wound-wait is authorized by priority instead, so the wound is
+            // sent again. A live owner refreshes its record during the wait,
+            // so the next wound expects a status read after the wait.
             rt::sleep(backoff.next_delay()).await;
+            status = self
+                .read_tx_status_retrying_unavailable(tid, &mut backoff)
+                .await?;
         }
     }
 
@@ -1439,6 +1505,7 @@ impl Monitor {
                     }
                     Err(error) => return Err(error.into()),
                 };
+                let rejected = matches!(failure, CommitWriteFailure::Rejected);
                 let status = match failure {
                     CommitWriteFailure::Rejected => {
                         self.read_tx_status_retrying_unavailable(tid, &mut backoff)
@@ -1486,7 +1553,16 @@ impl Monitor {
                         // and its read-back decides the outcome.
                         expected = Some(status.observation);
                         saw_pending = true;
-                        rt::sleep(backoff.next_delay()).await;
+                        // Only this owner writes a pending record, and its
+                        // lease refresh stopped before the first attempt. So a
+                        // rejection lost to an earlier pending write of this
+                        // owner: a refresh in flight, or an in-doubt write that
+                        // landed late. No refresh follows, so write again at
+                        // once. A backoff wait lets the lease expire, and a
+                        // peer then wounds the transaction.
+                        if !rejected {
+                            rt::sleep(backoff.next_delay()).await;
+                        }
                     }
                 }
             }
@@ -1918,11 +1994,25 @@ impl Monitor {
                     return Ok(());
                 }
                 Err(StorageError::Precondition) => {
-                    let status = self
+                    // Proof for a pending record: conditional mutation. The
+                    // rejection keeps a newer cached state, so this load finds
+                    // the write that won without a backend read when it came
+                    // through this instance. Proof for a final record: stable
+                    // fact.
+                    let mut status = self
                         .inner
                         .tx_records
-                        .commit_status_at(tid, self.current_requirement())
+                        .commit_status_at(tid, Requirement::ANY)
                         .await?;
+                    if status.observation.is_absent() {
+                        // Proof for a missing record: a read at the current
+                        // requirement.
+                        status = self
+                            .inner
+                            .tx_records
+                            .commit_status_at(tid, self.current_requirement())
+                            .await?;
+                    }
                     // An absent object was reclaimed rather than never written,
                     // and GC only deletes a final one. This write only ever
                     // stamps `pending`, so it cannot have been the reclaimed
@@ -1933,6 +2023,11 @@ impl Monitor {
                         return Err(TransError::AlreadyFinalized);
                     }
                     self.record_durable_observation(tid, &status.observation);
+                    // Only this owner writes a pending record, so the write
+                    // that won is not contention: write again at once. A
+                    // backoff wait lets the next lease refresh start first,
+                    // and the write can then lose every time.
+                    continue;
                 }
                 Err(StorageError::Unavailable(_)) => {}
                 Err(error) => return Err(error.into()),
@@ -2203,9 +2298,17 @@ impl Monitor {
         // progress check (one observer clock — no skew) jointly decide whether
         // the holder must be pinned as wounded.
         let observation = if self.inner.timing.is_expired(status.last_update, now) {
+            self.inner.expiries.lease.fetch_add(1, Ordering::Relaxed);
             RemoteLivenessDecision::Expired
         } else {
-            self.observe_remote_pending(tid, status.last_update, now)?
+            let observation = self.observe_remote_pending(tid, status.last_update, now)?;
+            if matches!(observation, RemoteLivenessDecision::Expired) {
+                self.inner
+                    .expiries
+                    .observed_lease
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            observation
         };
         match observation {
             RemoteLivenessDecision::Owned(evidence) => Ok(evidence),
@@ -2280,6 +2383,10 @@ impl Monitor {
             .commit_status_at(tid, self.current_requirement())
             .await?;
         if refreshed.observation.is_absent() {
+            self.inner
+                .expiries
+                .missing_record
+                .fetch_add(1, Ordering::Relaxed);
             let (wounded, _) = self.try_wound_observed(tid, &refreshed.observation).await?;
             return TxStatusEvidence::observed(wounded);
         }
@@ -2799,9 +2906,9 @@ mod tests {
         assert_eq!(production.refresh_interval(), Duration::from_millis(7_500));
 
         let simulation = ProtocolTiming::simulation();
-        assert_eq!(simulation.pending_timeout(), Duration::from_millis(250));
-        assert_eq!(simulation.max_clock_skew(), Duration::from_millis(500));
-        assert_eq!(simulation.refresh_interval(), Duration::from_millis(125));
+        assert_eq!(simulation.pending_timeout(), Duration::from_millis(50));
+        assert_eq!(simulation.max_clock_skew(), Duration::from_millis(50));
+        assert_eq!(simulation.refresh_interval(), Duration::from_millis(25));
 
         let refreshed = SystemTime::UNIX_EPOCH;
         let boundary = refreshed + simulation.pending_timeout() + simulation.max_clock_skew();
@@ -2937,13 +3044,24 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(reader.tx_status(&tid).await.unwrap(), status);
-            assert_eq!(clone.stats_and_reset(), MonitorStats { hits: 0, misses: 1 });
+            assert_eq!(
+                clone.stats_and_reset(),
+                MonitorStats {
+                    hits: 0,
+                    misses: 1,
+                    ..Default::default()
+                }
+            );
 
             operations.lock().unwrap().clear();
             assert_eq!(clone.tx_status(&tid).await.unwrap(), status);
             assert_eq!(
                 reader.stats_and_reset(),
-                MonitorStats { hits: 1, misses: 0 }
+                MonitorStats {
+                    hits: 1,
+                    misses: 0,
+                    ..Default::default()
+                }
             );
             assert!(operations.lock().unwrap().is_empty());
             assert_eq!(clone.stats_and_reset(), MonitorStats::default());
@@ -2978,7 +3096,63 @@ mod tests {
         }
         assert_eq!(
             reader.stats_and_reset(),
-            MonitorStats { hits: 0, misses: 2 }
+            MonitorStats {
+                hits: 0,
+                misses: 2,
+                ..Default::default()
+            }
+        );
+    }
+
+    // Each check counts the decision that it alone makes. A record timestamp
+    // far in the past expires the lease at once. A record timestamp far in the
+    // future leaves the decision to the observer's clock, as a clock skew can.
+    #[tokio::test]
+    async fn stats_count_each_liveness_decision_by_its_check() {
+        let timing = ProtocolTiming::new(Duration::from_millis(1), Duration::from_millis(1));
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let (_writer, writer_ctx) = new_test_monitor_with_timing(backend.clone(), timing);
+        let (reader, _reader_ctx) = new_test_monitor_with_timing(backend, timing);
+        let stale = tx_id(b"stale");
+        let ahead = tx_id(b"ahead");
+        let missing = tx_id(b"missing");
+        let now = rt::system_now();
+        for (tid, timestamp) in [
+            (stale, SystemTime::UNIX_EPOCH),
+            (ahead, now + Duration::from_secs(60 * 60)),
+        ] {
+            let mut record = TxRecord::new(tid, TxCommitStatus::Pending);
+            record.timestamp = Some(timestamp);
+            writer_ctx.tx_records.set(&record).await.unwrap();
+        }
+
+        assert_eq!(
+            reader.tx_status(&stale).await.unwrap(),
+            TxCommitStatus::Wounded
+        );
+        for tid in [ahead, missing] {
+            assert_eq!(
+                reader.tx_status(&tid).await.unwrap(),
+                TxCommitStatus::Pending
+            );
+        }
+        tokio::time::sleep(timing.pending_timeout() * 5).await;
+        for (tid, wounded) in [
+            (ahead, TxCommitStatus::Wounded),
+            (missing, TxCommitStatus::BlindWounded),
+        ] {
+            assert_eq!(reader.tx_status(&tid).await.unwrap(), wounded);
+        }
+
+        assert_eq!(
+            reader.stats_and_reset(),
+            MonitorStats {
+                misses: 5,
+                lease_expiries: 1,
+                observed_lease_expiries: 1,
+                missing_record_expiries: 1,
+                ..Default::default()
+            }
         );
     }
 
@@ -3232,6 +3406,174 @@ mod tests {
         assert_eq!(stored.prepared_collections, vec![created]);
 
         mon.abort_owned_tx(&tx).await.unwrap();
+    }
+
+    /// A manifest write that starts while a lease refresh of the same owner is
+    /// in flight expects the state that the refresh replaces. It is rejected
+    /// once, and it writes again at once, before the next refresh can start.
+    #[tokio::test(start_paused = true)]
+    async fn a_manifest_write_rejected_by_the_lease_refresh_writes_again_at_once() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let (mon, t) = new_test_monitor(backend.clone());
+        let mon = Arc::new(mon);
+        let tx = tx_id(b"manifest-during-refresh");
+        mon.begin_persisted_tx(&tx, TxRecoveryManifest::default())
+            .await
+            .unwrap();
+
+        let is_pending_write = |operation: &BackendOp<'_>| {
+            matches!(
+                operation,
+                BackendOp::WriteIf { value, .. }
+                    if glassdb_storage::txrecord::status(value)
+                        .is_ok_and(|status| status == TxCommitStatus::Pending)
+            )
+        };
+        let refresh_entered = Arc::new(tokio::sync::Notify::new());
+        let refresh_released = Arc::new(tokio::sync::Notify::new());
+        let hold_next = Arc::new(AtomicBool::new(true));
+        backend.set_before({
+            let refresh_entered = refresh_entered.clone();
+            let refresh_released = refresh_released.clone();
+            move |operation| {
+                if !is_pending_write(operation) || !hold_next.swap(false, Ordering::SeqCst) {
+                    return Box::pin(async { Ok(()) });
+                }
+                refresh_entered.notify_one();
+                let refresh_released = refresh_released.clone();
+                Box::pin(async move {
+                    refresh_released.notified().await;
+                    Ok(())
+                })
+            }
+        });
+        let rejected = Arc::new(AtomicUsize::new(0));
+        backend.set_after({
+            let rejected = rejected.clone();
+            move |operation, outcome| {
+                if is_pending_write(operation) && !outcome.is_success() {
+                    rejected.fetch_add(1, Ordering::SeqCst);
+                }
+                Box::pin(async { Ok(()) })
+            }
+        });
+
+        refresh_entered.notified().await;
+        let created = collection_address(2);
+        let update = tokio::spawn({
+            let mon = mon.clone();
+            let created = created.clone();
+            async move {
+                mon.update_pending_tx(&tx, move |recovery| {
+                    recovery.prepared_collections = vec![created];
+                })
+                .await
+            }
+        });
+        // The paused clock advances only when every task waits, so the
+        // manifest write waits behind the refresh by then.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let released = tokio::time::Instant::now();
+        refresh_released.notify_one();
+        update.await.unwrap().unwrap();
+
+        assert_eq!(rejected.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            released.elapsed(),
+            Duration::ZERO,
+            "the write must not wait"
+        );
+        let observed = t.tx_records.get_at(&tx, Requirement::ANY).await.unwrap();
+        assert_eq!(
+            observed.value().unwrap().prepared_collections,
+            vec![created]
+        );
+        mon.abort_owned_tx(&tx).await.unwrap();
+    }
+
+    /// A commit write that starts while a lease refresh of the same owner is
+    /// in flight expects the state that the refresh replaces. It is rejected
+    /// once, and it writes again at once, because no refresh keeps the lease
+    /// during a wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_commit_write_rejected_by_the_lease_refresh_writes_again_at_once() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let (mon, t) = new_test_monitor(backend.clone());
+        let mon = Arc::new(mon);
+        let tx = tx_id(b"commit-during-refresh");
+        mon.begin_persisted_tx(&tx, TxRecoveryManifest::default())
+            .await
+            .unwrap();
+
+        let is_record_write = |operation: &BackendOp<'_>| {
+            matches!(
+                operation,
+                BackendOp::WriteIf { value, .. }
+                    if glassdb_storage::txrecord::status(value).is_ok()
+            )
+        };
+        let refresh_entered = Arc::new(tokio::sync::Notify::new());
+        let refresh_released = Arc::new(tokio::sync::Notify::new());
+        let hold_next = Arc::new(AtomicBool::new(true));
+        backend.set_before({
+            let refresh_entered = refresh_entered.clone();
+            let refresh_released = refresh_released.clone();
+            move |operation| {
+                if !is_record_write(operation) || !hold_next.swap(false, Ordering::SeqCst) {
+                    return Box::pin(async { Ok(()) });
+                }
+                refresh_entered.notify_one();
+                let refresh_released = refresh_released.clone();
+                Box::pin(async move {
+                    refresh_released.notified().await;
+                    Ok(())
+                })
+            }
+        });
+        let rejected = Arc::new(AtomicUsize::new(0));
+        backend.set_after({
+            let rejected = rejected.clone();
+            move |operation, outcome| {
+                if is_record_write(operation) && !outcome.is_success() {
+                    rejected.fetch_add(1, Ordering::SeqCst);
+                }
+                Box::pin(async { Ok(()) })
+            }
+        });
+
+        refresh_entered.notified().await;
+        let commit = tokio::spawn({
+            let mon = mon.clone();
+            async move {
+                let mut record = TxRecord::new(tx, TxCommitStatus::Committed);
+                record.locks = vec![TxLock::Key {
+                    key: logical_key(b"key"),
+                    typ: LockType::Write,
+                }];
+                mon.commit_tx(record).await
+            }
+        });
+        // The paused clock advances only when every task waits, so the commit
+        // write waits behind the refresh by then.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let released = tokio::time::Instant::now();
+        refresh_released.notify_one();
+        commit.await.unwrap().unwrap();
+
+        assert_eq!(rejected.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            released.elapsed(),
+            Duration::ZERO,
+            "the write must not wait"
+        );
+        assert_eq!(
+            t.tx_records
+                .commit_status_at(&tx, Requirement::ANY)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Committed
+        );
     }
 
     #[tokio::test]
@@ -4120,6 +4462,79 @@ mod tests {
             ctx.tx_records.get_at(&tx, Requirement::ANY).await,
             Err(StorageError::NotFound)
         ));
+    }
+
+    /// The owner refreshes its pending record before the first wound CAS and
+    /// again while the wounder waits after each rejected CAS. A wound CAS
+    /// from the status read before the wait would never land.
+    #[tokio::test(start_paused = true)]
+    async fn preempt_tx_lands_while_the_owner_refreshes_during_each_wait() {
+        let memory: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let backend = HookBackend::new(memory.clone());
+        let (mon, _wounder) = new_test_monitor(backend.clone());
+        let (_owner_mon, owner) = new_test_monitor(memory);
+        let tx = tx_id(b"refresh-during-wait");
+        owner
+            .tx_records
+            .set(&TxRecord::new(tx, TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let refresh = {
+            let tx_records = owner.tx_records.clone();
+            let refreshes = refreshes.clone();
+            move || {
+                let tx_records = tx_records.clone();
+                let n = refreshes.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+                Box::pin(async move {
+                    let observed = tx_records.get_at(&tx, Requirement::ANY).await.unwrap();
+                    let mut record = TxRecord::new(tx, TxCommitStatus::Pending);
+                    record.timestamp = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(n));
+                    tx_records.set_if(&record, &observed).await.unwrap();
+                    Ok(())
+                }) as HookFuture
+            }
+        };
+        let is_wound = |operation: &BackendOp<'_>| {
+            matches!(
+                operation,
+                BackendOp::WriteIf { value, .. }
+                    if glassdb_storage::txrecord::status(value)
+                        .is_ok_and(|status| status == TxCommitStatus::Wounded)
+            )
+        };
+        let wound_writes = Arc::new(AtomicUsize::new(0));
+        backend.set_before({
+            let refresh = refresh.clone();
+            let wound_writes = wound_writes.clone();
+            move |operation| {
+                if is_wound(operation) && wound_writes.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return refresh();
+                }
+                Box::pin(async { Ok(()) })
+            }
+        });
+        let rejected = Arc::new(AtomicBool::new(false));
+        backend.set_after(move |operation, outcome| {
+            if is_wound(operation) && !outcome.is_success() {
+                rejected.store(true, Ordering::SeqCst);
+            }
+            let reads_status = matches!(
+                operation,
+                BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+            );
+            if reads_status && rejected.swap(false, Ordering::SeqCst) {
+                return refresh();
+            }
+            Box::pin(async { Ok(()) })
+        });
+
+        let preempted = tokio::time::timeout(Duration::from_secs(60), mon.preempt_tx(&tx))
+            .await
+            .expect("the wound must land while the owner refreshes");
+        assert_eq!(preempted.unwrap(), TxFinalStatus::Aborted);
+        assert_eq!(wound_writes.load(Ordering::SeqCst), 2);
+        assert_eq!(refreshes.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]

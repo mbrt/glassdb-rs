@@ -627,7 +627,7 @@ async fn aborted_retry_orphan_is_reclaimed_from_the_prepared_manifest() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn rejected_collection_reclamation_keeps_the_recovery_manifest() {
+async fn failed_collection_reclamation_keeps_the_recovery_manifest() {
     let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
     let ctx = new_ctx_with(backend.clone()).await;
     let id = tx(1);
@@ -659,7 +659,7 @@ async fn rejected_collection_reclamation_keeps_the_recovery_manifest() {
             );
             let future: HookFuture = Box::pin(async move {
                 if fail {
-                    Err(BackendError::Precondition)
+                    Err(BackendError::Unavailable("injected".into()))
                 } else {
                     Ok(())
                 }
@@ -673,7 +673,7 @@ async fn rejected_collection_reclamation_keeps_the_recovery_manifest() {
 
     assert!(
         !is_gone(&ctx.tx_records, &id).await,
-        "rejected reclamation CASes must retain the only durable orphan manifest"
+        "a failed reclamation must keep the only durable orphan manifest"
     );
     assert!(
         ctx.records

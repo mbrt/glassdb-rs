@@ -4603,7 +4603,10 @@ mod tests {
                     .await
             }
         });
-        rt::sleep(Duration::from_millis(50)).await;
+        // Wait less than the first lease refresh (half the pending timeout),
+        // so that the readers still have no pending record and the wound of
+        // the younger one is blind.
+        rt::sleep(ProtocolTiming::simulation().pending_timeout() / 4).await;
 
         assert!(!waiting.is_finished());
         assert_eq!(

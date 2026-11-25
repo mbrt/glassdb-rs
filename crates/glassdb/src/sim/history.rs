@@ -21,10 +21,11 @@ use glassdb_concurr::rt;
 
 use crate::{
     Collection, CollectionIter, CollectionPath, Database, Error, InlinePolicy, KeyPage, KeyScan,
-    ReadTransaction, StaleDatabaseView, Transaction,
+    ProtocolTiming, ReadTransaction, StaleDatabaseView, Transaction,
 };
 
 use super::harness::{InstanceId, SimWorkload, open_det_db};
+use super::slow_backend::BOUNDARY_EPSILON;
 use super::{CLIENT_COUNT, SimMedia, key_name, tiny_node_size_policy};
 
 mod collections;
@@ -667,6 +668,10 @@ pub enum HistoryInstruction {
     Abort,
     /// Add a deterministic scheduling point without changing semantics.
     Yield,
+    /// Wait on the simulated clock without changing semantics. In a locked
+    /// replay, the transaction keeps its locks while it waits, and its owner
+    /// refreshes the lease.
+    Sleep { duration: Duration },
 }
 
 /// How a history program runs.
@@ -783,11 +788,35 @@ fn arbitrary_instructions(
         HistoryMode::Strict => arbitrary_program(u)?,
         HistoryMode::StaleZero | HistoryMode::StaleMax(_) => arbitrary_stale_program(u)?,
     };
-    if u.arbitrary::<u8>()? % 3 == 0 {
+    let point = u.arbitrary::<u8>()?;
+    if point % 3 == 0 {
         let at = u.arbitrary::<u8>()? as usize % (instructions.len() + 1);
-        instructions.insert(at, HistoryInstruction::Yield);
+        // The same byte selects the wait, so that the other bytes of an input
+        // decode as before.
+        let waits = lease_waits();
+        let instruction = match mode {
+            HistoryMode::Strict if point % 2 == 1 => HistoryInstruction::Sleep {
+                duration: waits[usize::from(point / 6) % waits.len()],
+            },
+            _ => HistoryInstruction::Yield,
+        };
+        instructions.insert(at, instruction);
     }
     Ok(instructions)
+}
+
+/// The waits of a generated [`HistoryInstruction::Sleep`]: half the pending
+/// timeout, and just after each lease expiry check of
+/// [`ProtocolTiming::simulation`]. A live owner refreshes its lease during
+/// each wait, so a wait makes a long transaction, not an expired one.
+pub fn lease_waits() -> [Duration; 3] {
+    let timing = ProtocolTiming::simulation();
+    let pending = timing.pending_timeout();
+    [
+        pending / 2,
+        pending + BOUNDARY_EPSILON,
+        pending + timing.max_clock_skew() + BOUNDARY_EPSILON,
+    ]
 }
 
 /// Generates one or two reads, so that a cut point can need the currentness
@@ -1364,6 +1393,10 @@ async fn interpret_body(
             HistoryInstruction::Abort => tx.abort(),
             HistoryInstruction::Yield => {
                 rt::yield_now().await;
+                Ok(())
+            }
+            HistoryInstruction::Sleep { duration } => {
+                rt::sleep(*duration).await;
                 Ok(())
             }
         };
@@ -2116,6 +2149,36 @@ mod sim_tests {
                 }
             }
         }
+    }
+
+    // A strict program can wait past each lease check, and a stale program,
+    // which takes no lock, only yields.
+    #[test]
+    fn a_strict_program_decodes_a_sleep_for_each_lease_wait_and_a_stale_program_a_yield() {
+        let decode = |mode, bytes: &[u8]| {
+            arbitrary_instructions(&mut Unstructured::new(bytes), mode).unwrap()
+        };
+        let delete = HistoryInstruction::Delete { key: 0 };
+        for (point, duration) in [3, 9, 15].into_iter().zip(lease_waits()) {
+            assert_eq!(
+                decode(HistoryMode::Strict, &[0, 0, 4, point, 0]),
+                [HistoryInstruction::Sleep { duration }, delete.clone()]
+            );
+        }
+        assert_eq!(
+            decode(HistoryMode::Strict, &[0, 0, 4, 6, 0]),
+            [HistoryInstruction::Yield, delete]
+        );
+        assert_eq!(
+            decode(HistoryMode::StaleZero, &[0, 0, 0, 0, 2, 3, 0]),
+            [
+                HistoryInstruction::Yield,
+                HistoryInstruction::Read {
+                    key: 0,
+                    register: 0
+                },
+            ]
+        );
     }
 
     #[test]

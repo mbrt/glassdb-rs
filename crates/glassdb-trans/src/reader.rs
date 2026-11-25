@@ -137,7 +137,8 @@ impl Reader {
         requirement: glassdb_storage::Requirement,
     ) -> Result<ReadOutcome, StorageError> {
         let mut requirement = requirement;
-        let mut refreshed = false;
+        // The last writer whose record GC deleted after the leaf named it.
+        let mut reclaimed = None;
         loop {
             let (resolved, leaf) = match self.resolver.resolve_key(key, requirement).await {
                 Ok(resolved) => resolved,
@@ -152,6 +153,11 @@ impl Reader {
             let Some(writer) = resolved.writer else {
                 return Ok(ReadOutcome::new(None, ReadEvidence::new(None, leaf)));
             };
+            debug_assert_ne!(
+                Some(writer),
+                reclaimed,
+                "a leaf load after the record of the writer was deleted names it again"
+            );
             let last_writer = Some(writer);
             // An inline value or tombstone in the leaf is the writer's own
             // authoritative evidence, so the transaction record adds nothing
@@ -178,23 +184,20 @@ impl Reader {
                 Err(error) => return Err(trans_to_storage(error)),
             };
             if cv.status != TxCommitStatus::Committed {
-                // The resolved writer's transaction record is not authoritatively
-                // committed. A staleness-tolerant resolution can name a writer
-                // whose committed record was already garbage-collected: it read a
-                // cached leaf still pointing at a `current_writer` that newer
-                // commits superseded, and GC reclaimed that record once no *fresh*
-                // leaf referenced it (ADR-022). That is a stale-leaf signal, not
-                // a genuine absence, so re-resolve once against fresh evidence,
-                // which sees the key's current writer whose record still exists. A
-                // writer that is still unresolvable under fresh evidence is truly
-                // in-doubt: report absence so transaction validation replays the
-                // body rather than trusting an empty placeholder.
-                if !refreshed {
-                    requirement = Requirement::after(self.timeline.currentness_barrier());
-                    refreshed = true;
-                    continue;
-                }
-                return Ok(ReadOutcome::new(None, ReadEvidence::new(last_writer, leaf)));
+                // The resolver names only a committed writer: the current
+                // writer of the entry, or a holder whose status it read as
+                // committed. So another status means that GC deleted the
+                // record after the leaf load, and the monitor reads an empty
+                // record path. GC deletes the record of a committed writer
+                // only after no leaf names it, and a node state never repeats
+                // (ADR-105). So a leaf load after this status read names a
+                // newer writer. The read must not report no value here:
+                // validation compares only the writer, so it would accept the
+                // read.
+                reclaimed = Some(writer);
+                requirement = Requirement::after(self.timeline.currentness_barrier());
+                rt::yield_now().await;
+                continue;
             }
             if cv.value.not_written {
                 // The writer committed but wrote no value for this key: a genuine
@@ -535,5 +538,110 @@ mod tests {
             let count = operations.lock().unwrap().len();
             assert!(count <= 8, "{count} backend operations");
         }
+    }
+
+    /// Reads a key whose writer GC reclaims before each status read, so a
+    /// read never names a writer that it can resolve. Each reclaim needs a
+    /// newer writer on the leaf, so a later load names the next writer.
+    #[tokio::test]
+    async fn a_read_resolves_again_while_gc_reclaims_each_writer_that_it_names() {
+        let inner = Arc::new(MemoryBackend::new());
+        let hooked = glassdb_backend::middleware::HookBackend::new(inner.clone());
+        let local = AssemblyFixture::new(
+            hooked.clone(),
+            DbPrefix::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        );
+        let peer = Arc::new(AssemblyFixture::new(
+            inner,
+            DbPrefix::try_from("db").unwrap(),
+            &EngineConfig::default(),
+        ));
+        let collection = CollectionAddress::root("db");
+        let key = LogicalKey::new(collection.clone(), b"key");
+        let writers = [tx_id(&[1]), tx_id(&[2]), tx_id(&[3])];
+        for (i, writer) in writers.iter().enumerate() {
+            let mut record = TxRecord::new(*writer, TxCommitStatus::Committed);
+            record.writes.push(TxWrite {
+                key: key.clone(),
+                value: Arc::from(format!("v{i}").as_bytes()),
+                deleted: false,
+            });
+            peer.tx_records.set(&record).await.unwrap();
+        }
+        let leaf_of = |writer: TxId| {
+            Node::leaf(LeafBody::from_entries([
+                LeafEntry::new(b"key").with_current(CurrentState::External { writer })
+            ]))
+        };
+        peer.nodes
+            .create_root(&collection, &leaf_of(writers[0]))
+            .await
+            .unwrap();
+
+        // Before this instance reads the record of the first two writers,
+        // the next writer replaces it on the leaf and GC deletes its record.
+        let record_paths: Vec<String> = writers
+            .iter()
+            .map(|id| {
+                glassdb_data::ObjectPath::Transaction {
+                    db_prefix: DbPrefix::try_from("db").unwrap(),
+                    id: *id,
+                }
+                .to_string()
+            })
+            .collect();
+        let reclaimed = Arc::new(std::sync::Mutex::new(0));
+        hooked.set_before(move |op| {
+            let path = op.path().to_string();
+            let peer = peer.clone();
+            let reclaimed = reclaimed.clone();
+            let record_paths = record_paths.clone();
+            let collection = collection.clone();
+            Box::pin(async move {
+                let next = {
+                    let mut reclaimed = reclaimed.lock().unwrap();
+                    let n = *reclaimed;
+                    if n < 2 && path == record_paths[n] {
+                        *reclaimed += 1;
+                        Some(n)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(n) = next {
+                    let (_, root) = peer
+                        .nodes
+                        .load_root(&collection, Requirement::ANY)
+                        .await
+                        .unwrap();
+                    peer.nodes
+                        .store_root(&collection, &leaf_of(writers[n + 1]), &root)
+                        .await
+                        .unwrap();
+                    let observed = peer
+                        .tx_records
+                        .get_at(&writers[n], Requirement::ANY)
+                        .await
+                        .unwrap();
+                    peer.tx_records.delete(&observed).await.unwrap();
+                }
+                Ok(())
+            })
+        });
+
+        let reader = Reader::new(
+            KeyResolver::new(
+                TreeRouter::new(local.nodes.clone(), NonZeroUsize::MIN),
+                KeyStateResolver::new(local.monitor.clone()),
+                NonZeroUsize::MIN,
+            ),
+            local.timeline.clone(),
+            RetrySchedule::default(),
+        );
+        let (value, _) = reader.read(&key).await.unwrap().into_parts();
+        let value = value.expect("the key has a committed value");
+        assert_eq!(value.value.as_ref(), b"v2");
+        assert_eq!(value.writer, writers[2]);
     }
 }

@@ -8,12 +8,29 @@ use glassdb_concurr::{exec, rt};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_trans::ProtocolTiming;
 
+/// A timing whose retention period, 750 ms, is longer than that of
+/// [`ProtocolTiming::simulation`], for the tests that check the horizon.
+fn long_retention_timing() -> ProtocolTiming {
+    ProtocolTiming::new(Duration::from_millis(250), Duration::from_millis(500))
+}
+
+/// How far before and after the retention period of
+/// [`long_retention_timing`] the horizon tests check the record.
+const HORIZON_MARGIN: Duration = Duration::from_millis(50);
+
+/// Waits until just before the retention period of
+/// [`long_retention_timing`] ends.
+async fn sleep_until_before_the_horizon() {
+    let timing = long_retention_timing();
+    rt::sleep(timing.pending_timeout() + timing.max_clock_skew() - HORIZON_MARGIN).await;
+}
+
 #[test]
 fn reopening_retains_the_stored_gc_safety_horizon() {
     exec::block_on(async {
         let backend = Arc::new(MemoryBackend::new());
         let creator = Database::builder("timing", backend.clone())
-            .protocol_timing(ProtocolTiming::simulation())
+            .protocol_timing(long_retention_timing())
             .inline_policy(InlinePolicy::none())
             .open()
             .await
@@ -45,9 +62,9 @@ fn reopening_retains_the_stored_gc_safety_horizon() {
             .write(b"key", b"new")
             .await
             .unwrap();
-        rt::sleep(Duration::from_millis(700)).await;
+        sleep_until_before_the_horizon().await;
         assert!(backend.read(old_path).await.is_ok());
-        rt::sleep(Duration::from_millis(100)).await;
+        rt::sleep(2 * HORIZON_MARGIN).await;
         assert!(matches!(
             backend.read(old_path).await,
             Err(BackendError::NotFound)
@@ -148,7 +165,7 @@ fn a_hint_survives_the_safety_horizon_without_successful_gc_scans() {
         let after_write_back = window + Duration::from_millis(1);
         let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
         let db = Database::builder("gc", backend.clone())
-            .protocol_timing(ProtocolTiming::simulation())
+            .protocol_timing(long_retention_timing())
             .batching_window(window)
             .open()
             .await
@@ -191,9 +208,9 @@ fn a_hint_survives_the_safety_horizon_without_successful_gc_scans() {
         let gc = db.diagnostics().gc;
         assert!(gc.deferred > 0, "{gc:?}");
         assert!(backend.read(&old_path).await.is_ok());
-        rt::sleep(Duration::from_millis(700)).await;
+        sleep_until_before_the_horizon().await;
         assert!(backend.read(&old_path).await.is_ok());
-        rt::sleep(Duration::from_millis(100)).await;
+        rt::sleep(2 * HORIZON_MARGIN).await;
         assert!(matches!(
             backend.read(&old_path).await,
             Err(BackendError::NotFound)

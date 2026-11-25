@@ -10,7 +10,10 @@ use glassdb_concurr::{Tape, rt};
 use glassdb_trans::ProtocolTiming;
 
 const MUTATION_WINDOW: u64 = 8;
-const BOUNDARY_EPSILON: Duration = Duration::from_millis(1);
+/// How far after a lease expiry check a delay or a wait ends, so that the
+/// check sees it as past.
+pub(super) const BOUNDARY_EPSILON: Duration = Duration::from_millis(1);
+const LATE_MULTIPLE: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DelayPoint {
@@ -34,10 +37,18 @@ impl SlowMutationPlan {
             DelayPoint::After
         };
         let pending = timing.pending_timeout();
-        let duration = match tape.below(3) {
+        // The expiry of a lease by its foreign timestamp. The retention period
+        // of a final record has the same value.
+        let lease_expiry = pending + timing.max_clock_skew();
+        // Near the two lease expiry checks: just before and just after the
+        // check on the observer's clock, just after the check on the foreign
+        // timestamp, or long after both, when GC can have deleted records
+        // that the delayed mutation depends on.
+        let duration = match tape.below(4) {
             0 => pending.saturating_sub(BOUNDARY_EPSILON),
             1 => pending + BOUNDARY_EPSILON,
-            _ => pending + timing.max_clock_skew() + BOUNDARY_EPSILON,
+            2 => lease_expiry + BOUNDARY_EPSILON,
+            _ => lease_expiry * LATE_MULTIPLE,
         };
         Self {
             ordinal,
