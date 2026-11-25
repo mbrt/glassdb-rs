@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Deploy, inspect, and tear down the private real-S3 perfbench runner.
+# Deploy, inspect, and tear down the private real-S3 benchmark runner.
 #
 # Usage:
-#   deploy.sh deploy        build perfbench, provision the stack, and upload it
+#   deploy.sh deploy        build the benchmarks, provision the stack, and upload them
 #   deploy.sh logs          stream the bootstrap and benchmark log over SSM
 #   deploy.sh results [ts]  download one result set (the newest by default)
 #   deploy.sh teardown      empty the bucket and delete the complete stack
@@ -12,8 +12,8 @@
 # credentials and AWS CLI v2; AWS_REGION is optional when the CLI has a default.
 #   https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html
 #
-# `deploy` cross-compiles a statically linked perfbench binary so it can run on
-# the bare Amazon Linux 2023 instance. Install the target and a musl C toolchain
+# `deploy` cross-compiles statically linked perfbench and backendbench binaries
+# so they can run on the bare Amazon Linux 2023 instance. Install the target and a musl C toolchain
 # first, for example:
 #
 #   rustup target add x86_64-unknown-linux-musl
@@ -29,16 +29,24 @@
 #                    (default: x86_64-unknown-linux-musl)
 #   AUTO_STOP        stop the instance after the run (default: true)
 #   OUT_DIR          downloaded result directory     (default: hack/aws-bench/out)
-#   BINARY_S3_KEY    uploaded perfbench key           (default: bin/perfbench)
-#   RUNNER_S3_KEY    uploaded runner-script key       (default: bin/run-perfbench)
-#   CONFIG_S3_KEY    uploaded configuration key       (default: bin/perfbench.env)
+#   PERFBENCH_S3_KEY uploaded perfbench key           (default: bin/perfbench)
+#   BACKENDBENCH_S3_KEY uploaded backendbench key     (default: bin/backendbench)
+#   RUNNER_S3_KEY    uploaded runner-script key       (default: bin/run-benchmarks)
+#   CONFIG_S3_KEY    uploaded configuration key       (default: bin/benchmarks.env)
 #
-# Shared benchmark lifecycle:
+# Benchmarks:
+#   BENCHMARKS       tools to run, comma-separated, in this order
+#                    (default: perfbench):
+#                    perfbench     the experiments below
+#                    backendbench  the latency of single backend requests;
+#                                  writes out/backendbench.md
+#
+# perfbench lifecycle:
 #   RUNS             repetitions of each scenario    (default: 1)
 #   RUN_COOLDOWN     cooldown between repetitions    (default: 60s)
 #   DRAIN_TIMEOUT    worker/shutdown deadline         (default: 90s)
 #
-# Experiments:
+# perfbench experiments:
 #   EXPERIMENTS      names of the experiments to run, comma-separated; each
 #                    one writes out/<experiment>.json. A name is a file of
 #                    hack/aws-bench/experiments, or else of
@@ -49,8 +57,8 @@
 #                    crates/glassdb-bench-scale/README.md.
 #   CONTENTION_DURATION measured window of each contention cell (default: 20s)
 #
-# The provisioned instance polls S3 for the three uploaded artifacts, runs the
-# experiments, uploads versioned JSON and its bootstrap log, and optionally
+# The provisioned instance polls S3 for the four uploaded artifacts, runs the
+# benchmarks, uploads their results and its bootstrap log, and optionally
 # stops itself. User data
 # runs only when the instance is first provisioned; tear down a completed stack
 # before starting another run. The bucket and VPC endpoints continue to incur
@@ -65,9 +73,12 @@ INSTANCE_TYPE="${INSTANCE_TYPE:-c7i.8xlarge}"
 RUST_TARGET="${RUST_TARGET:-x86_64-unknown-linux-musl}"
 AUTO_STOP="${AUTO_STOP:-true}"
 OUT_DIR="${OUT_DIR:-$SCRIPT_DIR/out}"
-BINARY_S3_KEY="${BINARY_S3_KEY:-bin/perfbench}"
-RUNNER_S3_KEY="${RUNNER_S3_KEY:-bin/run-perfbench}"
-CONFIG_S3_KEY="${CONFIG_S3_KEY:-bin/perfbench.env}"
+PERFBENCH_S3_KEY="${PERFBENCH_S3_KEY:-bin/perfbench}"
+BACKENDBENCH_S3_KEY="${BACKENDBENCH_S3_KEY:-bin/backendbench}"
+RUNNER_S3_KEY="${RUNNER_S3_KEY:-bin/run-benchmarks}"
+CONFIG_S3_KEY="${CONFIG_S3_KEY:-bin/benchmarks.env}"
+
+BENCHMARKS="${BENCHMARKS:-perfbench}"
 
 RUNS="${RUNS:-1}"
 RUN_COOLDOWN="${RUN_COOLDOWN:-60s}"
@@ -88,8 +99,31 @@ stack_output() {
     --output text
 }
 
-# Fails unless each name of EXPERIMENTS is one experiment file, so that a wrong
-# name fails before the stack starts to cost.
+# Fails unless each name of BENCHMARKS is a tool, and each name of EXPERIMENTS
+# is one experiment file when perfbench runs, so that a wrong name fails before
+# the stack starts to cost.
+check_benchmarks() {
+  local name names perfbench=false
+  IFS=',' read -r -a names <<<"$BENCHMARKS"
+  if [[ ${#names[@]} -eq 0 ]]; then
+    echo "BENCHMARKS: no benchmark" >&2
+    return 1
+  fi
+  for name in "${names[@]}"; do
+    case "$name" in
+      perfbench) perfbench=true ;;
+      backendbench) ;;
+      *)
+        echo "BENCHMARKS: $name is not perfbench or backendbench" >&2
+        return 1
+        ;;
+    esac
+  done
+  if [[ "$perfbench" == true ]]; then
+    check_experiments
+  fi
+}
+
 check_experiments() {
   local name names
   IFS=',' read -r -a names <<<"$EXPERIMENTS"
@@ -107,7 +141,8 @@ write_config() {
   local path="$1" name config="" files
   # aws.toml is always a layer, so it travels in the environment file too.
   printf 'AWS_CONFIG=%q\n' "$(<"$SCRIPT_DIR/aws.toml")" >"$path"
-  for name in RUNS RUN_COOLDOWN DRAIN_TIMEOUT EXPERIMENTS CONTENTION_DURATION; do
+  for name in BENCHMARKS RUNS RUN_COOLDOWN DRAIN_TIMEOUT EXPERIMENTS \
+    CONTENTION_DURATION; do
     printf '%s=%q\n' "$name" "${!name}" >>"$path"
   done
   if [[ -n "$PERFBENCH_CONFIG" ]]; then
@@ -122,17 +157,19 @@ write_config() {
 }
 
 deploy() {
-  local temp_dir binary config bucket
+  local temp_dir release config bucket
   temp_dir="$(mktemp -d)"
   trap 'rm -rf "$temp_dir"' EXIT
-  binary="$temp_dir/perfbench"
-  config="$temp_dir/perfbench.env"
-  check_experiments
+  config="$temp_dir/benchmarks.env"
+  check_benchmarks
 
-  echo ">> building static perfbench binary for $RUST_TARGET"
+  # The stack always fetches both binaries, so that BENCHMARKS selects the
+  # tools on the instance alone.
+  echo ">> building static perfbench and backendbench binaries for $RUST_TARGET"
   cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" \
-    --package glassdb-bench-scale --bin perfbench --target "$RUST_TARGET"
-  cp "$REPO_ROOT/target/$RUST_TARGET/release/perfbench" "$binary"
+    --package glassdb-bench-scale --bin perfbench --bin backendbench \
+    --target "$RUST_TARGET"
+  release="$REPO_ROOT/target/$RUST_TARGET/release"
   write_config "$config"
 
   echo ">> deploying stack $STACK_NAME"
@@ -143,14 +180,18 @@ deploy() {
     --parameter-overrides \
     "InstanceType=$INSTANCE_TYPE" \
     "AutoStop=$AUTO_STOP" \
-    "BinaryS3Key=$BINARY_S3_KEY" \
+    "PerfbenchS3Key=$PERFBENCH_S3_KEY" \
+    "BackendbenchS3Key=$BACKENDBENCH_S3_KEY" \
     "RunnerS3Key=$RUNNER_S3_KEY" \
     "ConfigS3Key=$CONFIG_S3_KEY"
 
   bucket="$(stack_output BucketName)"
-  echo ">> uploading perfbench artifacts to s3://$bucket/bin/"
-  aws s3 cp "${region_args[@]}" "$binary" "s3://$bucket/$BINARY_S3_KEY"
-  aws s3 cp "${region_args[@]}" "$SCRIPT_DIR/run_perfbench.sh" \
+  echo ">> uploading benchmark artifacts to s3://$bucket/bin/"
+  aws s3 cp "${region_args[@]}" "$release/perfbench" \
+    "s3://$bucket/$PERFBENCH_S3_KEY"
+  aws s3 cp "${region_args[@]}" "$release/backendbench" \
+    "s3://$bucket/$BACKENDBENCH_S3_KEY"
+  aws s3 cp "${region_args[@]}" "$SCRIPT_DIR/run_benchmarks.sh" \
     "s3://$bucket/$RUNNER_S3_KEY"
   aws s3 cp "${region_args[@]}" "$config" "s3://$bucket/$CONFIG_S3_KEY"
 
@@ -166,7 +207,7 @@ logs() {
   aws ssm start-session "${region_args[@]}" \
     --target "$instance" \
     --document-name AWS-StartInteractiveCommand \
-    --parameters command="sudo tail -n +1 -F /var/log/perfbench-bootstrap.log"
+    --parameters command="sudo tail -n +1 -F /var/log/benchmarks-bootstrap.log"
 }
 
 results() {

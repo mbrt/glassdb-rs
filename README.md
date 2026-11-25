@@ -172,14 +172,15 @@ Neither seem cost effective in the scenario. We are talking about $10 a month,
 which is not huge, but can we do better?
 
 Yes. With GlassDB you only pay for each query and long term storage. In the case
-of GCS (as of 2023) we are talking about:
+of S3 Standard in `us-east-1` (as of November 2026) we are talking about:
 
-- $0.020 per GB per month
+- $0.023 per GB per month
 - $0.05 per 10k write / list ops
 - $0.004 per 10k read ops
 
-At a rate of one write per minute this would be around $2 a month. Less usage?
-Even less money.
+A read-modify-write transaction of one key with a warm cache makes one write
+request. At a rate of one write per minute this would be around $0.22 a month,
+plus storage. Less usage? Even less money.
 
 ### Example 3: Analytics
 
@@ -197,24 +198,40 @@ linearly (See [Performance](#performance)).
 
 ## Performance
 
-We are obviously bound by object storage's latencies which are typically:
+We are bound by the latency of object storage. These are the latencies of single
+requests to S3 Standard from an EC2 instance in the same region
+(`eu-central-1`), measured with `backendbench` for 60 s each ([raw
+output](hack/aws-bench/out/backendbench.md), [how to
+run](hack/aws-bench/README.md)):
 
-| Operation | Size    | Mean (ms) | Std Dev (ms) | Median (ms) | 90th % (ms) |
-| --------- | ------- | --------- | ------------ | ----------- | ----------- |
-| Download  | 1 KiB   | 57.4      | 6.6          | 56.8        | 64.8        |
-| Download  | 100 KiB | 55.4      | 6.7          | 53.3        | 63.1        |
-| Download  | 1 MiB   | 56.7      | 3.8          | 57.7        | 59.9        |
-| Metadata  | 1 KiB   | 31.5      | 8.0          | 28.1        | 41.3        |
-| Upload    | 1 KiB   | 70.4      | 17.3         | 64.7        | 88.8        |
-| Upload    | 100 KiB | 88.9      | 14.6         | 83.1        | 105.0       |
-| Upload    | 1 MiB   | 117.5     | 12.6         | 115.9       | 131.0       |
+| Operation                  | Size     | Mean (ms) | p50 (ms) | p90 (ms) | p99 (ms) |
+| -------------------------- | -------- | --------- | -------- | -------- | -------- |
+| Read                       | 1 KiB    | 23.6      | 23.2     | 29.8     | 35.4     |
+| Read                       | 16 KiB   | 24.0      | 24.0     | 30.0     | 36.4     |
+| Read                       | 256 KiB  | 28.6      | 29.4     | 34.4     | 40.7     |
+| Read                       | 1 MiB    | 32.6      | 31.5     | 39.7     | 48.9     |
+| Read unchanged             | 1 KiB    | 10.1      | 9.5      | 11.8     | 27.5     |
+| Write                      | 1 KiB    | 41.2      | 40.4     | 45.3     | 67.8     |
+| Write                      | 16 KiB   | 41.9      | 41.1     | 46.5     | 66.4     |
+| Write                      | 256 KiB  | 46.6      | 44.9     | 51.1     | 107.3    |
+| Write                      | 1 MiB    | 50.0      | 49.0     | 55.7     | 74.9     |
+| Write precondition failure | 1 KiB    | 21.9      | 21.3     | 25.3     | 41.5     |
+| List                       | 10 paths | 15.6      | 15.2     | 18.0     | 30.7     |
+
+All writes are conditional. A read of an unchanged object is a conditional read
+that returns no body. The sizes match the objects that GlassDB writes with the
+default settings: a leaf with one value at the inline limit or a small
+transaction record (1 KiB), a leaf that is full at its inline limit (16 KiB), a
+leaf at its split size (256 KiB), and a transaction record with the largest
+value (1 MiB).
 
 This is a lot slower than most databases, but still has a few advantages:
 
 1. Throughput: we can leverage object storage scalability by reading and writing
    many objects in parallel. In this way we can perform many transactions per
-   second (scale linearly). We would only be limited by bandwidth (see [GCS
-   quotas](https://cloud.google.com/storage/quotas#bandwidth)).
+   second (scale linearly). We would only be limited by bandwidth and by the
+   request rate of each prefix (see [S3 performance
+   guidelines](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html)).
 
 1. Size scalability: object storage scales to petabytes and probably more, as
    cloud providers keep working on making them faster and more scalable.

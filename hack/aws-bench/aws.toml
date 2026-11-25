@@ -1,6 +1,6 @@
 # The perfbench configuration of the real-S3 runner. Real S3 is slower than
 # the local model, so the cells run longer than the built-in defaults. An
-# experiment that sets these values itself keeps its own; run_perfbench.sh
+# experiment that sets these values itself keeps its own; run_benchmarks.sh
 # gives contention its real-S3 duration on the command line.
 
 [seed]

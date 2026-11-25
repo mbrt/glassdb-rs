@@ -1,9 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Private GlassDB S3 performance runner. Creates a VPC, S3 and SSM endpoints,
-  an encrypted result bucket, and an EC2 instance that downloads a perfbench
-  binary plus its runner configuration, executes it, uploads results, and
-  optionally stops itself.
+  an encrypted result bucket, and an EC2 instance that downloads the benchmark
+  binaries plus their runner configuration, runs the selected benchmarks,
+  uploads results, and optionally stops itself.
 
 Parameters:
   InstanceType:
@@ -17,17 +17,21 @@ Parameters:
   SubnetCidr:
     Type: String
     Default: 10.0.0.0/24
-  BinaryS3Key:
+  PerfbenchS3Key:
     Type: String
     Default: bin/perfbench
     Description: Key used by deploy.sh for the static perfbench binary.
+  BackendbenchS3Key:
+    Type: String
+    Default: bin/backendbench
+    Description: Key used by deploy.sh for the static backendbench binary.
   RunnerS3Key:
     Type: String
-    Default: bin/run-perfbench
+    Default: bin/run-benchmarks
     Description: Key used by deploy.sh for the workload runner.
   ConfigS3Key:
     Type: String
-    Default: bin/perfbench.env
+    Default: bin/benchmarks.env
     Description: Key used by deploy.sh for the shell-escaped workload options.
   AutoStop:
     Type: String
@@ -222,7 +226,7 @@ Resources:
         Fn::Base64: !Sub |
           #!/bin/bash
           set -uo pipefail
-          exec > /var/log/perfbench-bootstrap.log 2>&1
+          exec > /var/log/benchmarks-bootstrap.log 2>&1
 
           export AWS_REGION="${AWS::Region}"
           export AWS_DEFAULT_REGION="${AWS::Region}"
@@ -243,19 +247,20 @@ Resources:
             return 1
           }
 
-          fetch "${BinaryS3Key}" ./perfbench || exit 1
-          fetch "${RunnerS3Key}" ./run-perfbench || exit 1
-          fetch "${ConfigS3Key}" ./perfbench.env || exit 1
-          chmod +x ./perfbench ./run-perfbench
+          fetch "${PerfbenchS3Key}" ./perfbench || exit 1
+          fetch "${BackendbenchS3Key}" ./backendbench || exit 1
+          fetch "${RunnerS3Key}" ./run-benchmarks || exit 1
+          fetch "${ConfigS3Key}" ./benchmarks.env || exit 1
+          chmod +x ./perfbench ./backendbench ./run-benchmarks
 
           mkdir -p out
-          ./run-perfbench
+          ./run-benchmarks
           BENCH_STATUS=$?
 
           TS=$(date +%Y%m%dT%H%M%S)
           RESULT_PREFIX="results/$TS"
           aws s3 cp out/ "s3://$BUCKET/$RESULT_PREFIX/" --recursive
-          aws s3 cp /var/log/perfbench-bootstrap.log \
+          aws s3 cp /var/log/benchmarks-bootstrap.log \
             "s3://$BUCKET/$RESULT_PREFIX/bootstrap.log" || true
 
           if [ "${AutoStop}" = "true" ]; then
@@ -276,9 +281,12 @@ Outputs:
   InstanceId:
     Description: Benchmark runner instance ID for SSM sessions.
     Value: !Ref BenchInstance
-  BinaryUploadTarget:
+  PerfbenchUploadTarget:
     Description: Upload target for the static perfbench binary.
-    Value: !Sub "s3://${BenchBucket}/${BinaryS3Key}"
+    Value: !Sub "s3://${BenchBucket}/${PerfbenchS3Key}"
+  BackendbenchUploadTarget:
+    Description: Upload target for the static backendbench binary.
+    Value: !Sub "s3://${BenchBucket}/${BackendbenchS3Key}"
   RunnerUploadTarget:
     Description: Upload target for the workload runner.
     Value: !Sub "s3://${BenchBucket}/${RunnerS3Key}"

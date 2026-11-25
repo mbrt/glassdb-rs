@@ -1,13 +1,17 @@
 //! Benchmarks raw backend storage-operation latencies. Ported from the Go
 //! `hack/backendbench`.
 //!
-//! Run against a simulated backend (in-memory + GCS-profile latency) or a real
-//! cloud bucket:
+//! It measures the requests that GlassDB sends, one at a time, and prints a
+//! markdown table of their latencies to stdout. Run it against a simulated
+//! backend (in-memory with the S3 latency profile) or a real cloud bucket:
 //!
 //! ```text
 //! cargo run -p glassdb-bench-scale --bin backendbench -- --backend memory
 //! BUCKET=my-bucket cargo run -p glassdb-bench-scale --bin backendbench -- --backend s3
 //! ```
+//!
+//! A real bucket gives the latency of the network path to it, so run it in the
+//! region of the bucket, for example with `hack/aws-bench`.
 
 // See the note in `perfbench`: musl's default allocator contends badly under the
 // concurrent workload, so use mimalloc for musl (static EC2) builds.
@@ -23,10 +27,15 @@ use clap::Parser;
 use rand::Rng;
 
 use glassdb::backend::memory::MemoryBackend;
-use glassdb::middleware::{DelayBackend, gcs_delays};
-use glassdb_backend::{Backend, BackendError, Revision};
-use glassdb_bench_scale::bench::Bench;
+use glassdb::middleware::{DelayBackend, s3_delays};
+use glassdb::s3::tuned_http_client;
+use glassdb::{InlinePolicy, NodeSizePolicy, TransactionLimits};
+use glassdb_backend::{Backend, BackendError, ListLimit, Revision};
+use glassdb_bench_scale::bench::{Bench, Results};
+
 const TEST_ROOT: &str = "backend-bench";
+const KIB: usize = 1024;
+const MIB: usize = 1024 * KIB;
 
 #[derive(Parser)]
 #[command(about = "Benchmark backend storage-operation latencies")]
@@ -34,9 +43,80 @@ struct Args {
     /// Backend to benchmark.
     #[arg(long, default_value = "memory", value_parser = ["memory", "gcs", "s3"])]
     backend: String,
-    /// How long to run each operation benchmark.
-    #[arg(long, default_value = "20s", value_parser = glassdb_bench_scale::parse_duration)]
+    /// How long to run each operation benchmark. 60 s gives about 1,000
+    /// samples of a real S3 write for its p99.
+    #[arg(long, default_value = "60s", value_parser = glassdb_bench_scale::parse_duration)]
     duration: Duration,
+}
+
+type BenchFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BackendError>>>>;
+
+/// A backend-operation benchmark: given a backend, a [`Bench`] timer, and the
+/// value of its [`Size`], it repeats the operation until the timer is finished.
+type BenchFn = fn(Arc<dyn Backend>, Arc<Bench>, usize) -> BenchFuture;
+
+/// What a case transfers in each request.
+#[derive(Clone, Copy)]
+enum Size {
+    /// The body of one object.
+    Bytes(usize),
+    /// The paths of one list page. A list does not transfer the objects.
+    Paths(usize),
+}
+
+/// One row of the result table.
+struct Case {
+    operation: &'static str,
+    size: Size,
+    run: BenchFn,
+}
+
+/// The cases, at the sizes of the objects that GlassDB writes with the default
+/// settings.
+fn cases() -> Vec<Case> {
+    let inline = InlinePolicy::default();
+    let nodes = NodeSizePolicy::builder()
+        .build()
+        .expect("the default node sizes are valid");
+    let sizes = [
+        // A leaf with one value at the inline limit, or a small transaction
+        // record.
+        inline.max_value_bytes,
+        // A leaf that is full at its inline budget, or the record of a
+        // transaction that writes several keys.
+        inline.max_leaf_bytes,
+        // A leaf at its byte split threshold.
+        nodes.node_soft_max_bytes(),
+        // A transaction record that holds the largest value.
+        TransactionLimits::default().max_value_bytes,
+    ];
+    let mut cases = Vec::new();
+    for (operation, run) in [("Read", run_read as BenchFn), ("Write", run_write)] {
+        cases.extend(sizes.map(|n| Case {
+            operation,
+            size: Size::Bytes(n),
+            run,
+        }));
+    }
+    let small = Size::Bytes(inline.max_value_bytes);
+    cases.extend([
+        Case {
+            operation: "Read unchanged",
+            size: small,
+            run: run_read_unchanged,
+        },
+        Case {
+            operation: "Write precondition failure",
+            size: small,
+            run: run_write_fail_pre,
+        },
+        Case {
+            operation: "List",
+            size: Size::Paths(10),
+            run: run_list,
+        },
+    ]);
+    cases
 }
 
 #[tokio::main]
@@ -44,34 +124,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
     let backend = init_backend(&args.backend).await?;
 
-    let tests: &[(&str, BenchFn)] = &[
-        ("WriteSame", run_write_same),
-        ("WriteFailPre", run_write_fail_pre),
-        ("Read", run_read),
-        ("ReadUnchanged", run_read_unchanged),
-    ];
+    let mut rows = Vec::new();
+    for case in cases() {
+        eprintln!("running {} {}", case.operation, case.size);
+        let value = match case.size {
+            Size::Bytes(n) | Size::Paths(n) => n,
+        };
+        let bench = Arc::new(Bench::new(args.duration));
+        bench.start();
+        (case.run)(backend.clone(), bench.clone(), value).await?;
+        bench.end();
+        rows.push((case, bench.results()));
+    }
 
-    for (name, f) in tests {
-        run_bench(name, backend.clone(), args.duration, *f).await?;
+    println!("| Operation | Size | Mean (ms) | p50 (ms) | p90 (ms) | p99 (ms) | Samples |");
+    println!("| --------- | ---- | --------- | -------- | -------- | -------- | ------- |");
+    for (case, res) in rows {
+        println!("{}", fmt_row(&case, &res));
     }
     Ok(())
 }
-
-type BenchFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), BackendError>>>>;
-
-/// A named backend-operation benchmark: given a backend and a [`Bench`] timer,
-/// it loops the operation until the timer is finished.
-type BenchFn = fn(Arc<dyn Backend>, Arc<Bench>) -> BenchFuture;
 
 async fn init_backend(kind: &str) -> Result<Arc<dyn Backend>, Box<dyn Error>> {
     match kind {
         "memory" => Ok(Arc::new(DelayBackend::new(
             Arc::new(MemoryBackend::new()),
-            gcs_delays(),
+            s3_delays(),
         )?)),
         "s3" => {
             let bucket = env_var("BUCKET")?;
+            // The client of perfbench, so that both tools measure through the
+            // same transport.
             let cfg = aws_config::defaults(aws_config::BehaviorVersion::latest())
+                .http_client(tuned_http_client())
                 .load()
                 .await;
             let client = aws_sdk_s3::Client::new(&cfg);
@@ -92,45 +177,37 @@ fn env_var(k: &str) -> Result<String, Box<dyn Error>> {
     }
 }
 
-async fn run_bench(
-    name: &str,
-    backend: Arc<dyn Backend>,
-    duration: Duration,
-    f: BenchFn,
-) -> Result<(), Box<dyn Error>> {
-    let bench = Arc::new(Bench::new(duration));
-    bench.start();
-    f(backend, bench.clone()).await?;
-    bench.end();
-    let res = bench.results();
+fn fmt_row(case: &Case, res: &Results) -> String {
+    format!(
+        "| {} | {} | {} | {} | {} | {} | {} |",
+        case.operation,
+        case.size,
+        fmt_ms(res.avg()),
+        fmt_ms(res.percentile(0.5)),
+        fmt_ms(res.percentile(0.9)),
+        fmt_ms(res.percentile(0.99)),
+        res.samples.len(),
+    )
+}
 
-    let mut ts = Duration::ZERO;
-    for x in &res.samples {
-        println!("{name},{},{}", fmt_ms(ts), fmt_ms(*x));
-        ts += *x;
+impl std::fmt::Display for Size {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Size::Bytes(n) if n >= MIB => write!(f, "{} MiB", n / MIB),
+            Size::Bytes(n) => write!(f, "{} KiB", n / KIB),
+            Size::Paths(n) => write!(f, "{n} paths"),
+        }
     }
-    eprintln!(
-        "{name}: 50pc: {:?}, 90pc: {:?}, 95pc: {:?}",
-        res.percentile(0.5),
-        res.percentile(0.9),
-        res.percentile(0.95)
-    );
-    Ok(())
+}
+
+fn fmt_ms(d: Duration) -> String {
+    format!("{:.1}", d.as_secs_f64() * 1000.0)
 }
 
 fn random_data(size: usize) -> Vec<u8> {
     let mut b = vec![0u8; size];
     rand::rng().fill_bytes(&mut b);
     b
-}
-
-fn fmt_ms(d: Duration) -> String {
-    let ms = d.as_secs_f64() * 1000.0;
-    if ms > 1000.0 {
-        format!("{ms:.2}")
-    } else {
-        format!("{ms:.4}")
-    }
 }
 
 async fn replace_or_create(
@@ -160,32 +237,29 @@ async fn replace_or_create(
     }
 }
 
-fn run_write_same(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
+fn run_write(b: Arc<dyn Backend>, bench: Arc<Bench>, size: usize) -> BenchFuture {
     Box::pin(async move {
-        let p = format!("{TEST_ROOT}/write-same");
-        let mut revision = replace_or_create(b.as_ref(), &p, random_data(1024)).await?;
-        let mut count = 0u64;
+        let p = format!("{TEST_ROOT}/write-{size}");
+        let mut revision = replace_or_create(b.as_ref(), &p, random_data(size)).await?;
         while !bench.is_finished() {
             // Vary the content so each overwrite is a genuine state change,
             // including on providers whose revision is content-derived.
-            let data = random_data(1024);
+            let data = random_data(size);
             bench
                 .measure_once(|| async {
                     revision = b.write_if(&p, data, &revision).await?;
                     Ok(())
                 })
                 .await?;
-            count += 1;
         }
-        let _ = count;
         Ok(())
     })
 }
 
-fn run_write_fail_pre(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
+fn run_write_fail_pre(b: Arc<dyn Backend>, bench: Arc<Bench>, size: usize) -> BenchFuture {
     Box::pin(async move {
-        let data = random_data(1024);
-        let p = format!("{TEST_ROOT}/write-same");
+        let data = random_data(size);
+        let p = format!("{TEST_ROOT}/write-fail-pre-{size}");
         replace_or_create(b.as_ref(), &p, data.clone()).await?;
         // A clearly-bogus revision so the CAS always fails its
         // precondition; the error is ignored, the latency is what we measure.
@@ -202,11 +276,10 @@ fn run_write_fail_pre(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
     })
 }
 
-fn run_read(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
+fn run_read(b: Arc<dyn Backend>, bench: Arc<Bench>, size: usize) -> BenchFuture {
     Box::pin(async move {
-        let data = random_data(1024);
-        let p = format!("{TEST_ROOT}/read");
-        replace_or_create(b.as_ref(), &p, data).await?;
+        let p = format!("{TEST_ROOT}/read-{size}");
+        replace_or_create(b.as_ref(), &p, random_data(size)).await?;
         while !bench.is_finished() {
             bench
                 .measure_once(|| async {
@@ -219,13 +292,12 @@ fn run_read(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
     })
 }
 
-fn run_read_unchanged(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
+fn run_read_unchanged(b: Arc<dyn Backend>, bench: Arc<Bench>, size: usize) -> BenchFuture {
     Box::pin(async move {
-        let data = random_data(1024);
-        let p = format!("{TEST_ROOT}/read");
+        let p = format!("{TEST_ROOT}/read-{size}");
         // The write returns the object's current revision; a conditional read
         // against it short-circuits (304 / Precondition).
-        let revision = replace_or_create(b.as_ref(), &p, data).await?;
+        let revision = replace_or_create(b.as_ref(), &p, random_data(size)).await?;
         while !bench.is_finished() {
             bench
                 .measure_once(|| async {
@@ -236,6 +308,26 @@ fn run_read_unchanged(b: Arc<dyn Backend>, bench: Arc<Bench>) -> BenchFuture {
                         Ok(_) | Err(BackendError::Precondition) => Ok(()),
                         Err(e) => Err(e),
                     }
+                })
+                .await?;
+        }
+        Ok(())
+    })
+}
+
+fn run_list(b: Arc<dyn Backend>, bench: Arc<Bench>, paths: usize) -> BenchFuture {
+    Box::pin(async move {
+        let prefix = format!("{TEST_ROOT}/list/");
+        for i in 0..paths {
+            replace_or_create(b.as_ref(), &format!("{prefix}{i}"), Vec::new()).await?;
+        }
+        // One page holds all the paths.
+        let limit = ListLimit::new(paths).unwrap();
+        while !bench.is_finished() {
+            bench
+                .measure_once(|| async {
+                    b.list(&prefix, None, limit).await?;
+                    Ok(())
                 })
                 .await?;
         }

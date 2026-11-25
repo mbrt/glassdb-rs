@@ -1,16 +1,16 @@
 # Real S3 runner
 
-These scripts run `perfbench` on real S3 in AWS. `perfbench` and its
-experiments are explained in
+These scripts run `perfbench` and `backendbench` on real S3 in AWS. `perfbench`
+and its experiments are explained in
 [crates/glassdb-bench-scale/README.md](../../crates/glassdb-bench-scale/README.md),
 and the tools that plot and compare the results in
 [hack/perf/README.md](../perf/README.md).
 
 | File | Purpose |
 | --- | --- |
-| `deploy.sh` | Builds perfbench, provisions the stack, uploads the runner, and downloads results. |
+| `deploy.sh` | Builds perfbench and backendbench, provisions the stack, uploads the runner, and downloads results. |
 | `cloudformation.yaml` | The infrastructure: the instance, its network, and the result bucket. |
-| `run_perfbench.sh` | Runs the experiments on the instance. |
+| `run_benchmarks.sh` | Runs the selected benchmarks on the instance. |
 | `aws.toml` | The perfbench configuration layer with the real-S3 timeouts. |
 | `out/` | The results of the last real-S3 run that the docs refer to. |
 
@@ -20,7 +20,7 @@ The AWS harness preserves a private execution environment: an EC2 instance in
 a VPC without Internet or NAT, an S3 gateway endpoint, SSM interface endpoints,
 an encrypted result bucket, and no inbound access. CloudFormation owns only
 that infrastructure and artifact bootstrap. `deploy.sh` owns workload choices
-by uploading the binary, `run_perfbench.sh`, and a shell-escaped configuration.
+by uploading the binaries, `run_benchmarks.sh`, and a shell-escaped configuration.
 
 Prerequisites are AWS credentials, AWS CLI v2, the Session Manager plugin for
 live logs, and a musl toolchain matching `RUST_TARGET`.
@@ -39,7 +39,10 @@ hack/aws-bench/deploy.sh results
 hack/aws-bench/deploy.sh teardown
 ```
 
-The default real-S3 run executes the `mixed` and `contention` experiments once,
+`BENCHMARKS` selects the tools, comma-separated: `perfbench` (the default),
+`backendbench`, or both. The tools run in the order of the list.
+
+The default perfbench run executes the `mixed` and `contention` experiments once,
 with the longer real-S3 timeouts of `aws.toml` and 20 s for each contention
 cell (`CONTENTION_DURATION`).
 Set `EXPERIMENTS` to a comma-separated list of the names of other experiments,
@@ -54,6 +57,16 @@ A name is a file of `hack/aws-bench/experiments`, or else of
 tag `cloud`, and they change a local experiment for real S3. For example,
 `workers` there continues each worker count from the count before it, because
 real S3 cannot copy a seed, and the grid then seeds once.
+
+`backendbench` measures the latency of single requests to S3 from the same
+region: reads, conditional reads of an unchanged object, conditional writes,
+failed conditional writes, and lists. It runs each case for 60 s and writes a
+markdown table to `out/backendbench.md`. The latency table in the top-level
+README comes from this run:
+
+```bash
+BENCHMARKS=backendbench AWS_REGION=us-east-1 hack/aws-bench/deploy.sh deploy
+```
 
 The stack creates billable EC2, S3, and interface-endpoint resources. Auto-stop
 halts compute after the run, but endpoints and stored objects continue billing
