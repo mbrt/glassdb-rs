@@ -458,6 +458,12 @@ impl CachedStore {
         cursor: Option<&backend::ListCursor>,
         limit: backend::ListLimit,
     ) -> Result<backend::ListPage, StorageError> {
+        // A wrong prefix is a GlassDB bug, not a backend failure (ADR-108).
+        if !backend::implementation::is_valid_list_prefix(prefix) {
+            return Err(StorageError::other(format!(
+                "list prefix must be empty or end in '/': {prefix:?}"
+            )));
+        }
         let _invoked = self.next_invocation();
         Ok(self.backend.list(prefix, cursor, limit).await?)
     }
@@ -1121,6 +1127,20 @@ mod tests {
         (bytes_store(backend), log)
     }
 
+    // ADR-108: a wrong list prefix is a GlassDB bug, so it is the store's own
+    // error and never reaches the backend.
+    #[tokio::test]
+    async fn a_wrong_list_prefix_is_an_internal_error() {
+        let (store, log) = store_rec();
+        assert!(matches!(
+            store
+                .list("p", None, backend::ListLimit::new(1).unwrap())
+                .await,
+            Err(StorageError::Other { .. })
+        ));
+        assert!(log.lock().unwrap().is_empty());
+    }
+
     fn count(log: &OpLog, op: &str) -> usize {
         log.lock().unwrap().iter().filter(|r| r.op == op).count()
     }
@@ -1540,7 +1560,7 @@ mod tests {
                     kind: ExpectedMutationResult::Unavailable,
                     observation: None,
                 },
-                Err(StorageError::Other { .. }) => MutationResult {
+                Err(StorageError::Backend { .. }) => MutationResult {
                     kind: ExpectedMutationResult::Definitive,
                     observation: None,
                 },
@@ -1565,7 +1585,7 @@ mod tests {
                     kind: ExpectedMutationResult::Unavailable,
                     observation: None,
                 },
-                Err(StorageError::Other { .. }) => MutationResult {
+                Err(StorageError::Backend { .. }) => MutationResult {
                     kind: ExpectedMutationResult::Definitive,
                     observation: None,
                 },
@@ -1587,7 +1607,7 @@ mod tests {
                     kind: ExpectedMutationResult::Unavailable,
                     observation: None,
                 },
-                Err(StorageError::Other { .. }) => MutationResult {
+                Err(StorageError::Backend { .. }) => MutationResult {
                     kind: ExpectedMutationResult::Definitive,
                     observation: None,
                 },
@@ -2098,11 +2118,11 @@ mod tests {
                 }
                 ReadCompletionCase::Definitive => {
                     assert!(
-                        matches!(leader, Err(StorageError::Other { .. })),
+                        matches!(leader, Err(StorageError::Backend { .. })),
                         "{context}"
                     );
                     assert!(
-                        matches!(waiter, Err(StorageError::Other { .. })),
+                        matches!(waiter, Err(StorageError::Backend { .. })),
                         "{context}"
                     );
                 }
@@ -3066,7 +3086,7 @@ mod tests {
         });
         assert!(matches!(
             s.create("p", None, v(b"x")).await,
-            Err(StorageError::Other { .. })
+            Err(StorageError::Backend { .. })
         ));
         hook.clear_before();
 
@@ -3379,7 +3399,7 @@ mod tests {
         });
         assert!(matches!(
             store.delete(&expected).await,
-            Err(StorageError::Other { .. })
+            Err(StorageError::Backend { .. })
         ));
         hook.clear_before();
 

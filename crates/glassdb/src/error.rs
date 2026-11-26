@@ -67,6 +67,18 @@ pub enum Error {
         resource: &'static str,
         limit: usize,
     },
+    /// The storage backend failed a request definitively with an error that
+    /// GlassDB does not classify, for example an expired credential or a
+    /// rejected request. The underlying cause is kept in the
+    /// [`std::error::Error::source`] chain. Unlike [`Error::InDoubt`], no change
+    /// of the caller is in question, and a retry is safe once the cause is
+    /// fixed.
+    #[error("storage backend failed: {msg}")]
+    Backend {
+        msg: String,
+        #[source]
+        source: Option<Cause>,
+    },
     /// An unexpected internal failure or invariant violation, with an optional
     /// underlying cause kept in the [`std::error::Error::source`] chain.
     #[error("{msg}")]
@@ -124,6 +136,7 @@ impl Error {
             | StorageError::InvalidCursor
             | StorageError::KeyNotFound
             | StorageError::StaleCollection
+            | StorageError::Backend { .. }
             | StorageError::Other { .. }) => e.into(),
         }
     }
@@ -165,7 +178,7 @@ impl From<BackendError> for Error {
             BackendError::Precondition => Error::Precondition,
             BackendError::InvalidCursor => Error::internal("invalid listing cursor"),
             BackendError::Unavailable(s) => Error::InDoubt(s),
-            BackendError::Other { msg, source } => Error::Internal { msg, source },
+            BackendError::Other { msg, source } => Error::Backend { msg, source },
         }
     }
 }
@@ -184,6 +197,7 @@ impl From<StorageError> for Error {
             StorageError::Precondition => Error::Precondition,
             StorageError::InvalidCursor => Error::internal("invalid listing cursor"),
             StorageError::Unavailable(s) => Error::InDoubt(s),
+            StorageError::Backend { msg, source } => Error::Backend { msg, source },
             StorageError::Other { msg, source } => Error::Internal { msg, source },
         }
     }
@@ -228,8 +242,11 @@ mod tests {
         let trans = TransError::from(backend).context("locking collections");
         let err = Error::from(trans);
 
-        assert!(matches!(err, Error::Internal { .. }));
-        assert_eq!(err.to_string(), "locking collections: gcs request");
+        assert!(matches!(err, Error::Backend { .. }));
+        assert_eq!(
+            err.to_string(),
+            "storage backend failed: locking collections: gcs request"
+        );
         assert_eq!(err.source().unwrap().to_string(), "disk on fire");
     }
 

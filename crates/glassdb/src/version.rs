@@ -78,6 +78,10 @@ pub(crate) async fn check_or_create_db_meta(
         Err(Error::Unavailable(msg)) => {
             Err(Error::Unavailable(format!("creating db metadata: {msg}")))
         }
+        Err(Error::Backend { msg, source }) => Err(Error::Backend {
+            msg: format!("creating db metadata: {msg}"),
+            source,
+        }),
         Err(e) => Err(Error::with_source("creating db metadata", e)),
     }
 }

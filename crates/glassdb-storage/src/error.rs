@@ -25,6 +25,15 @@ pub enum StorageError {
     /// The addressed collection was dropped.
     #[error("stale collection handle")]
     StaleCollection,
+    /// The backend failed the request definitively with an error that it does
+    /// not classify, for example an expired credential. The request had no
+    /// effect.
+    #[error("{msg}")]
+    Backend {
+        msg: String,
+        #[source]
+        source: Option<Cause>,
+    },
     /// Any other storage error (parsing, invariant violations, etc.), with an
     /// optional underlying cause.
     #[error("{msg}")]
@@ -75,6 +84,10 @@ impl StorageError {
     pub fn context(self, ctx: impl std::fmt::Display) -> Self {
         match self {
             StorageError::Unavailable(s) => StorageError::Unavailable(format!("{ctx}: {s}")),
+            StorageError::Backend { msg, source } => StorageError::Backend {
+                msg: format!("{ctx}: {msg}"),
+                source,
+            },
             StorageError::Other { msg, source } => StorageError::Other {
                 msg: format!("{ctx}: {msg}"),
                 source,
@@ -91,7 +104,7 @@ impl From<BackendError> for StorageError {
             BackendError::Precondition => StorageError::Precondition,
             BackendError::InvalidCursor => StorageError::InvalidCursor,
             BackendError::Unavailable(s) => StorageError::Unavailable(s),
-            BackendError::Other { msg, source } => StorageError::Other { msg, source },
+            BackendError::Other { msg, source } => StorageError::Backend { msg, source },
         }
     }
 }
@@ -170,7 +183,7 @@ mod tests {
     fn from_backend_moves_cause_through() {
         let backend = BackendError::with_source("gcs request", cause());
         let storage: StorageError = backend.into();
-        assert!(matches!(storage, StorageError::Other { .. }));
+        assert!(matches!(storage, StorageError::Backend { .. }));
         assert_eq!(storage.source().unwrap().to_string(), "disk on fire");
     }
 }
