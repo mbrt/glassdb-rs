@@ -564,7 +564,7 @@ impl StructuralChangeAttempt<'_> {
         // its error does not fail the changes that landed. Garbage collection
         // removes a participant with a final status and no intents.
         let departure_failed = departed.is_some_and(|departed| departed.is_err());
-        if matches!(result, Err(TransError::MutationInDoubt(_))) {
+        if result.as_ref().is_err_and(TransError::write_may_land) {
             // The join of the participant can still land (ADR-106).
             lifecycle.topology.abandon_in_doubt(self.worker).await;
         } else {

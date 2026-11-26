@@ -346,9 +346,7 @@ enum PassOutcome {
 fn pass_has_pending_writes(result: &Result<PassOutcome, TransError>) -> bool {
     match result {
         Ok(outcome) => outcome.has_pending_writes(),
-        // A CAS on a collection record can still land (ADR-106).
-        Err(TransError::MutationInDoubt(_)) => true,
-        Err(_) => false,
+        Err(error) => error.write_may_land(),
     }
 }
 

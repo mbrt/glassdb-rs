@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted. [ADR-108](108-a-definite-backend-failure-is-not-an-internal-error.md)
+gives a `BackendError::Other` its own class.
 
 ## Context
 

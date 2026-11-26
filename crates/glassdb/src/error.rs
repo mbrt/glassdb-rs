@@ -47,6 +47,11 @@ pub enum Error {
     /// storage was unavailable, even after the engine exhausted its in-place
     /// retries. Unlike [`Error::InDoubt`], no mutation is in question — a read
     /// has no side effects — so the operation is always safe to retry.
+    ///
+    /// [`Database::open`](crate::Database::open) also returns it when its
+    /// metadata create may have landed. The database can then exist, and a
+    /// retry of the open returns its stored metadata, which can differ from
+    /// the requested settings.
     #[error("storage unavailable: {0}")]
     Unavailable(String),
     /// The database is shutting down and is no longer accepting new
@@ -61,6 +66,18 @@ pub enum Error {
     LimitExceeded {
         resource: &'static str,
         limit: usize,
+    },
+    /// The storage backend failed a request definitively with an error that
+    /// GlassDB does not classify, for example an expired credential or a
+    /// rejected request. The underlying cause is kept in the
+    /// [`std::error::Error::source`] chain. Unlike [`Error::InDoubt`], no change
+    /// of the caller is in question, and a retry is safe once the cause is
+    /// fixed.
+    #[error("storage backend failed: {msg}")]
+    Backend {
+        msg: String,
+        #[source]
+        source: Option<Cause>,
     },
     /// An unexpected internal failure or invariant violation, with an optional
     /// underlying cause kept in the [`std::error::Error::source`] chain.
@@ -103,15 +120,24 @@ impl Error {
     /// outage is the matchable, retry-safe [`Error::Unavailable`] instead of
     /// [`Error::InDoubt`].
     ///
-    /// It must be used *only* for genuine reads. Operations that flow through
-    /// the commit path — including reads that confirm a pending write, such as
+    /// It must be used *only* for genuine reads, and for the writes of an
+    /// operation that is safe to retry as a whole because it reads first and
+    /// accepts what a landed write stored, such as the setup of an open.
+    /// Operations that flow through the commit path — including reads that confirm a pending write, such as
     /// re-reading a transaction's commit status — must keep the conservative
     /// `Unavailable -> InDoubt` mapping of [`From`], because there a failed read
     /// inherits the uncertainty of the mutation it was confirming.
     pub(crate) fn from_read(e: StorageError) -> Self {
+        // Each variant is listed, so a new one needs a decision here.
         match e {
             StorageError::Unavailable(s) => Error::Unavailable(s),
-            other => other.into(),
+            e @ (StorageError::NotFound
+            | StorageError::Precondition
+            | StorageError::InvalidCursor
+            | StorageError::KeyNotFound
+            | StorageError::StaleCollection
+            | StorageError::Backend { .. }
+            | StorageError::Other { .. }) => e.into(),
         }
     }
 
@@ -126,12 +152,21 @@ impl Error {
     /// reach its final status, and locked validation writes read locks of the
     /// caller's identity (ADR-091). Neither write is a change of the caller.
     pub(crate) fn from_read_trans(e: TransError) -> Self {
+        // Each variant is listed, so a new one needs a decision here.
         match e {
             TransError::Storage(s) => Error::from_read(s),
             // A lock CAS of the caller's identity that can still land
             // (ADR-106). The engine keeps the identity pinned.
             TransError::MutationInDoubt(s) => Error::Unavailable(s),
-            other => other.into(),
+            e @ (TransError::Retry
+            | TransError::AlreadyFinalized
+            | TransError::Wounded
+            | TransError::ValidateRetry(_)
+            | TransError::LockTimeout
+            | TransError::NoSingleWrite
+            | TransError::InvalidInput(_)
+            | TransError::StaleCollection
+            | TransError::Other { .. }) => e.into(),
         }
     }
 }
@@ -143,7 +178,7 @@ impl From<BackendError> for Error {
             BackendError::Precondition => Error::Precondition,
             BackendError::InvalidCursor => Error::internal("invalid listing cursor"),
             BackendError::Unavailable(s) => Error::InDoubt(s),
-            BackendError::Other { msg, source } => Error::Internal { msg, source },
+            BackendError::Other { msg, source } => Error::Backend { msg, source },
         }
     }
 }
@@ -162,6 +197,7 @@ impl From<StorageError> for Error {
             StorageError::Precondition => Error::Precondition,
             StorageError::InvalidCursor => Error::internal("invalid listing cursor"),
             StorageError::Unavailable(s) => Error::InDoubt(s),
+            StorageError::Backend { msg, source } => Error::Backend { msg, source },
             StorageError::Other { msg, source } => Error::Internal { msg, source },
         }
     }
@@ -206,8 +242,11 @@ mod tests {
         let trans = TransError::from(backend).context("locking collections");
         let err = Error::from(trans);
 
-        assert!(matches!(err, Error::Internal { .. }));
-        assert_eq!(err.to_string(), "locking collections: gcs request");
+        assert!(matches!(err, Error::Backend { .. }));
+        assert_eq!(
+            err.to_string(),
+            "storage backend failed: locking collections: gcs request"
+        );
         assert_eq!(err.source().unwrap().to_string(), "disk on fire");
     }
 

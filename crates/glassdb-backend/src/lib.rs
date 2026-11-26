@@ -78,7 +78,9 @@ pub enum BackendError {
     /// blindly retried; the caller decides how to proceed.
     #[error("storage outcome unknown (in doubt): {0}")]
     Unavailable(String),
-    /// Any other backend error, with an optional underlying cause.
+    /// Any other backend error, with an optional underlying cause. It is
+    /// definite: the request had no effect. A request whose outcome is unknown
+    /// must be [`BackendError::Unavailable`] instead (ADR-009).
     #[error("{msg}")]
     Other {
         msg: String,

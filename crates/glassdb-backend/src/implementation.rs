@@ -39,8 +39,13 @@ pub fn list_provider_token<'a>(
     Ok(Some(cursor.provider_token.as_ref()))
 }
 
+/// Reports whether `prefix` is a valid listing prefix: empty, or ending in `/`.
+pub fn is_valid_list_prefix(prefix: &str) -> bool {
+    prefix.is_empty() || prefix.ends_with('/')
+}
+
 fn validate_list_prefix(prefix: &str) -> Result<(), BackendError> {
-    if prefix.is_empty() || prefix.ends_with('/') {
+    if is_valid_list_prefix(prefix) {
         Ok(())
     } else {
         Err(BackendError::other(format!(

@@ -111,7 +111,8 @@ fn serializability_holds_under_faults() {
         let w = workload.clone();
         let ft = fault_tape(seed);
         block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-            run_and_assert_with_faults(w, FaultConfig::failures(9), seed, ft).await
+            run_and_assert_with_faults(w, FaultConfig::failures(super::FAULT_INTENSITY), seed, ft)
+                .await
         });
     }
 }
@@ -165,7 +166,7 @@ fn pct_schedule_is_byte_identical_per_seed() {
     // The PCT policy must be just as reproducible as the tape policy: a fixed
     // seed yields a byte-for-byte identical op stream across runs.
     let workload = contended_workload();
-    let faults = FaultConfig::failures(5);
+    let faults = FaultConfig::failures(super::FAULT_INTENSITY);
     for seed in [0u64, 1, 7, 42, 1234] {
         let first = pct_record(&workload, faults, seed);
         let second = pct_record(&workload, faults, seed);
@@ -180,6 +181,6 @@ fn pct_seed_breadth_holds_serializability() {
     // Seed-breadth sweep: many PCT schedules over the contended workload, with
     // and without faults. Any invariant violation panics inside the sweep.
     let workload = contended_workload();
-    pct_sweep(&workload, FaultConfig::failures(7));
+    pct_sweep(&workload, FaultConfig::failures(super::FAULT_INTENSITY));
     pct_sweep(&workload, FaultConfig::none());
 }

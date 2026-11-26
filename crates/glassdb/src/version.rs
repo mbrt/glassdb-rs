@@ -43,6 +43,10 @@ impl DatabaseMetadata {
 
 /// Verifies the database metadata exists with the expected version, creating it
 /// if missing. Races against concurrent creators are resolved by re-checking.
+///
+/// The open reads the metadata first and accepts what is stored, so a retry is
+/// safe also after a write of an earlier attempt landed. An outage of any step is
+/// therefore [`Error::Unavailable`].
 pub(crate) async fn check_or_create_db_meta(
     b: &impl Backend,
     name: &str,
@@ -58,7 +62,7 @@ pub(crate) async fn check_or_create_db_meta(
     validate_timing(timing)?;
     Engine::prepare_permanent_collection(b, name)
         .await
-        .map_err(Error::from)?;
+        .map_err(Error::from_read)?;
     let proposed = DatabaseMetadata {
         id: DatabaseId::new_random(),
         timing,
@@ -71,13 +75,20 @@ pub(crate) async fn check_or_create_db_meta(
             // We raced against another instance; re-check the metadata.
             check_db_version(b, name).await
         }
+        Err(Error::Unavailable(msg)) => {
+            Err(Error::Unavailable(format!("creating db metadata: {msg}")))
+        }
+        Err(Error::Backend { msg, source }) => Err(Error::Backend {
+            msg: format!("creating db metadata: {msg}"),
+            source,
+        }),
         Err(e) => Err(Error::with_source("creating db metadata", e)),
     }
 }
 
 async fn check_db_version(b: &impl Backend, name: &str) -> Result<DatabaseMetadata, Error> {
     let p = format!("{name}/{DB_META_PATH}");
-    let reply = b.read(&p).await?;
+    let reply = b.read(&p).await.map_err(|e| Error::from_read(e.into()))?;
     let meta = pb::DatabaseMetadata::decode(reply.contents.as_slice())
         .map_err(|e| Error::with_source("decoding db metadata", e))?;
     if meta.version != DB_VERSION {
@@ -123,7 +134,9 @@ async fn set_db_metadata(
         max_clock_skew_nanos: Some(duration_nanos(metadata.timing.max_clock_skew())?),
     }
     .encode_to_vec();
-    b.write_if_not_exists(&p, body).await?;
+    b.write_if_not_exists(&p, body)
+        .await
+        .map_err(|e| Error::from_read(e.into()))?;
     Ok(())
 }
 

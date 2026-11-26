@@ -763,6 +763,85 @@ async fn absorb_stops_when_the_target_membership_changes_after_ready() {
     assert_not_merged(&local, &[b"a", b"b"], &[b"m", b"n"]).await;
 }
 
+// ADR-107: a peer can wound a merge worker and take its gate on L0, and the
+// peer's merge can land while the worker still holds its old copy of L0. The
+// worker then finds L1 with a new generation and no reservation. It must
+// cancel its merge before Ready, because L1 already holds the range of L0.
+// Otherwise its absorb lands, and its failed drain abandons the absorb, which
+// raises the low key of L1 again and leaves the range of L0 without a node.
+#[tokio::test]
+async fn a_stale_merge_worker_cannot_absorb_a_landed_merge_again() {
+    let memory = Arc::new(MemoryBackend::new());
+    let peer = store_with_backend(memory.clone());
+    seed_two_leaves(&peer, &[b"a"], &[b"m"]).await;
+    let hook = HookBackend::new(memory);
+    let local = store_with_backend(hook.clone());
+    let bg = Arc::new(Background::new());
+    let stale = restructurer(&local, &bg, mergeable());
+    let peer_bg = Arc::new(Background::new());
+    let landing = restructurer(&peer, &peer_bg, mergeable());
+
+    // The worker pauses at its first read of L1 after its gate on L0 landed.
+    let gated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let paused = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Semaphore::new(0));
+    hook.set_before({
+        let (left, right) = (node_path("L0").to_string(), node_path("L1").to_string());
+        let (gated, paused, resume) = (gated.clone(), paused.clone(), resume.clone());
+        move |op| {
+            let pause = match op {
+                BackendOp::WriteIf { path, .. } if *path == left => {
+                    gated.store(true, Ordering::SeqCst);
+                    false
+                }
+                BackendOp::Read { path } | BackendOp::ReadIfModified { path, .. } => {
+                    *path == right && gated.swap(false, Ordering::SeqCst)
+                }
+                _ => false,
+            };
+            let (paused, resume) = (paused.clone(), resume.clone());
+            Box::pin(async move {
+                if pause {
+                    paused.notify_one();
+                    resume.acquire().await.unwrap().forget();
+                }
+                Ok(())
+            })
+        }
+    });
+
+    let (stale_result, ()) = tokio::join!(merge_l0(&stale), async {
+        paused.notified().await;
+        // A peer wounds the worker and removes its gate.
+        let (mut left, observation) = peer
+            .load_node(
+                COLL,
+                "L0",
+                Requirement::after(peer.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        let worker = left.structural_gate().holders()[0];
+        assert!(left.remove_structural_gate(&worker));
+        assert!(
+            peer.store_node(COLL, "L0", &left, Some(&observation))
+                .await
+                .unwrap()
+        );
+        merge_l0(&landing).await.unwrap();
+        resume.add_permits(1);
+    });
+    hook.clear_before();
+    stale_result.unwrap();
+
+    let left = current_node(&local, "L0").await;
+    assert!(left.is_drained());
+    let right = current_node(&local, "L1").await;
+    assert_eq!(right.low_key(), b"");
+    assert_eq!(keys(&right), [b"a", b"m"]);
+    assert!(right.locks().merge_reservation().is_none());
+}
+
 /// The last merge step that a crashed worker completed.
 #[derive(Clone, Copy, Debug)]
 enum MergeCrash {

@@ -381,6 +381,102 @@ async fn direct_commit_batched_in_doubt_recovers() {
     assert!(entry(&tctx, &kb).await.unwrap().is_locked_by(&txb));
 }
 
+// ADR-105: a direct commit whose CAS landed with a lost ack, and that proved
+// the landing on the reload, is committed also when the round then fails with
+// a definite error. Here an acquirer joins the round after the lost ack, and
+// the CAS of its stage is rejected.
+#[tokio::test(start_paused = true)]
+async fn a_landed_direct_commit_survives_a_later_rejection_in_its_round() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()) as Arc<dyn Backend>);
+    let (tm, tctx) = new_algo_from_backend(backend.clone()).await;
+    let ka = b"k".to_vec();
+    let kb = same_leaf_sibling(&ka);
+    let kap = logical_key(&ka);
+    let kbp = logical_key(&kb);
+    // Both keys exist, so each member changes only its own entry.
+    commit_writes(&tm, vec![wa(&kap, b"v1")]).await;
+    commit_writes(&tm, vec![wa(&kbp, b"vb1")]).await;
+
+    let is_leaf = |path: &str| path.contains("/_n/") || path.ends_with("/_r");
+    let leaf_writes = Arc::new(AtomicUsize::new(0));
+    let landed = Arc::new(tokio::sync::Notify::new());
+    let lost = Arc::new(AtomicBool::new(false));
+    // The first leaf CAS lands and loses its ack.
+    backend.set_after({
+        let (leaf_writes, landed, lost) = (leaf_writes.clone(), landed.clone(), lost.clone());
+        move |op, outcome| {
+            let lose = outcome.is_success()
+                && matches!(op, BackendOp::WriteIf { path, .. } if is_leaf(path))
+                && leaf_writes.fetch_add(1, SeqCst) == 0;
+            if lose {
+                lost.store(true, SeqCst);
+                landed.notify_one();
+            }
+            let future: HookFuture = Box::pin(async move {
+                if lose {
+                    Err(glassdb_backend::BackendError::Unavailable(
+                        "lost ack".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            future
+        }
+    });
+    // Every leaf CAS after it is rejected with a definite error.
+    backend.set_before({
+        let lost = lost.clone();
+        move |op| {
+            let reject =
+                lost.load(SeqCst) && matches!(op, BackendOp::WriteIf { path, .. } if is_leaf(path));
+            let future: HookFuture = Box::pin(async move {
+                if reject {
+                    Err(glassdb_backend::BackendError::other("rejected"))
+                } else {
+                    Ok(())
+                }
+            });
+            future
+        }
+    });
+
+    let mut h = begin_accesses(
+        &tm,
+        AccessSet::new(Vec::new(), vec![wa(&kap, b"v2")], Vec::new()),
+    );
+    let tx = *h.id();
+    let txb = TxId::with_priority(2_000_000_000, b"acquire");
+    tctx.tmon.begin_tx(&txb);
+    let data_b = AccessSet::new(Vec::new(), vec![wa(&kbp, b"vb2")], Vec::new());
+    let (committed, acquired) = tokio::join!(tm.commit(&mut h), async {
+        landed.notified().await;
+        let requirement = Requirement::after(tctx.timeline.currentness_barrier());
+        tctx.locker
+            .keys()
+            .lock_at(&txb, &data_b, false, requirement)
+            .await
+    });
+
+    assert!(lost.load(SeqCst), "the direct commit CAS landed");
+    assert!(acquired.is_err(), "the acquirer's CAS was rejected");
+    assert_eq!(
+        committed.unwrap(),
+        BodyDecision::ReturnOutcome,
+        "a landed commit must not be reported as failed"
+    );
+    backend.clear_before();
+    assert_eq!(
+        entry(&tctx, &ka).await.unwrap().current,
+        CurrentState::Inline {
+            writer: tx,
+            value: Arc::from(b"v2".as_slice()),
+        }
+    );
+}
+
 // A value the inline per-value budget rejects, so its transaction takes the
 // locked commit instead of ADR-051's direct one (ADR-053).
 fn external_value() -> Vec<u8> {
