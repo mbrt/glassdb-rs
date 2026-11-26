@@ -986,11 +986,12 @@ impl CasWorker {
             match self.attempt(&submitted.path, batch, &mut round).await {
                 Ok(AttemptEnd::Done) => return Ok(()),
                 Ok(AttemptEnd::Retry) => {}
-                // A member whose CAS can still land must not get an error that
-                // lets its owner retire as if nothing landed (ADR-105). The
-                // other members get the error.
+                // A member that had an in-doubt CAS in this round must not get
+                // an error that lets its owner retire as if nothing landed,
+                // also after it reconciled that CAS (ADR-105). The other
+                // members get the error.
                 Err(error) => {
-                    deliver_in_doubt_outcomes(batch, &round.in_doubt);
+                    deliver_in_doubt_outcomes(batch, &round.ever_in_doubt);
                     return Err(error);
                 }
             }
@@ -1125,6 +1126,7 @@ impl CasWorker {
             // members this in-doubt CAS actually carried inherit its doubt.
             PersistResult::InDoubt(staged_ids) => {
                 for id in staged_ids {
+                    round.ever_in_doubt.insert(id);
                     round.in_doubt.insert(id, loaded_observation.clone());
                 }
                 round.failed = true;
@@ -1223,6 +1225,13 @@ struct RoundState {
     /// Each member keeps the leaf state that its in-doubt CAS expected, so
     /// that the round can fence that CAS before it plans (ADR-105).
     in_doubt: InDoubtMembers,
+    /// Every member that had an in-doubt CAS in this round. A member leaves
+    /// `in_doubt` when its policy reconciles the CAS, but a later error of the
+    /// round must still not reach it: the reconciled decision can depend on
+    /// the stages of a plan whose CAS never lands. The error path gives these
+    /// members the in-doubt exhaustion outcome of their policy, which knows
+    /// what it proved, for example that a direct commit landed (ADR-105).
+    ever_in_doubt: BTreeSet<TxId>,
     /// The last rejected CAS, until the next load shows what the peer changed.
     lost_cas: Option<LostCas>,
 }
@@ -1237,6 +1246,7 @@ impl RoundState {
             failed: false,
             reloaded: false,
             in_doubt: InDoubtMembers::new(),
+            ever_in_doubt: BTreeSet::new(),
             lost_cas: None,
         }
     }
@@ -1279,14 +1289,18 @@ fn deliver_policy_outcomes(
     }
 }
 
-/// Delivers to each member of the round whose CAS is in doubt the exhaustion
-/// outcome of its policy. [`LeafCoordinator::submit_leaf`] gives a delivered
-/// outcome before an error of the round.
+/// Delivers to each member of the round that had an in-doubt CAS the in-doubt
+/// exhaustion outcome of its policy. [`LeafCoordinator::submit_leaf`] gives a
+/// delivered outcome before an error of the round.
 ///
-/// It reads the merged members only when one is in doubt, because the read
-/// absorbs the members that queued since, and they must not get the error.
-fn deliver_in_doubt_outcomes(batch: &BatchHandle<CasReq, TransError>, in_doubt: &InDoubtMembers) {
-    if in_doubt.is_empty() {
+/// It reads the merged members only when one had an in-doubt CAS, because the
+/// read absorbs the members that queued since, and they must not get the
+/// error.
+fn deliver_in_doubt_outcomes(
+    batch: &BatchHandle<CasReq, TransError>,
+    ever_in_doubt: &BTreeSet<TxId>,
+) {
+    if ever_in_doubt.is_empty() {
         return;
     }
     let members = batch
@@ -1294,7 +1308,7 @@ fn deliver_in_doubt_outcomes(batch: &BatchHandle<CasReq, TransError>, in_doubt: 
         .map(|merged| merged.members)
         .unwrap_or_default();
     for (tx, member) in &members {
-        if in_doubt.contains_key(tx) {
+        if ever_in_doubt.contains(tx) {
             *member.slot.lock().unwrap() = Some(CoordinatedOutcome {
                 outcome: member.policy.exhausted_outcome(true),
                 evidence: None,
@@ -4901,6 +4915,420 @@ mod tests {
                 ..
             })
         ));
+        coord.close().await;
+    }
+
+    /// Wraps `inner` so that the first leaf CAS lands and loses its ack, and
+    /// the second one is rejected with a definite error.
+    fn lost_ack_then_reject(inner: Arc<dyn Backend>) -> Arc<HookBackend> {
+        let hooks = HookBackend::new(inner);
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        hooks.set_before({
+            let writes = writes.clone();
+            move |op| {
+                let reject =
+                    matches!(op, BackendOp::WriteIf { .. }) && writes.load(Ordering::SeqCst) == 1;
+                let future: HookFuture = Box::pin(async move {
+                    if reject {
+                        Err(glassdb_backend::BackendError::other("rejected"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                future
+            }
+        });
+        hooks.set_after({
+            let writes = writes.clone();
+            move |op, outcome| {
+                let lose = matches!(op, BackendOp::WriteIf { .. })
+                    && outcome.is_success()
+                    && writes.fetch_add(1, Ordering::SeqCst) == 0;
+                let future: HookFuture = Box::pin(async move {
+                    if lose {
+                        Err(glassdb_backend::BackendError::Unavailable(
+                            "lost ack".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
+                future
+            }
+        });
+        hooks
+    }
+
+    // A commit-shaped policy that stages once, and after a reload that keeps
+    // it in doubt finds that its stage landed. Like a direct commit, it
+    // remembers that proof.
+    struct ProvesLandedProbe {
+        key: Vec<u8>,
+        tx: TxId,
+        evaluations: std::sync::atomic::AtomicUsize,
+        landed: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl MemberPolicy for ProvesLandedProbe {
+        async fn resolve(
+            &self,
+            _ctx: &ResolveCtx<'_>,
+            staged: &StagedLeaf,
+        ) -> Result<Step, TransError> {
+            if self.evaluations.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mut draft = staged.draft();
+                draft.put(
+                    self.key.clone(),
+                    entry(&self.key, LockType::Write, Some(&self.tx), None),
+                );
+                return Ok(draft.stage(StageAdmission::ExistingKeys, MemberOutcome::Landed));
+            }
+            self.landed.store(true, Ordering::SeqCst);
+            Ok(Step::Skip {
+                outcome: MemberOutcome::Landed,
+            })
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
+            if self.landed.load(Ordering::SeqCst) {
+                MemberOutcome::Landed
+            } else if in_doubt {
+                MemberOutcome::InDoubt("round ended after in-doubt CAS".into())
+            } else {
+                MemberOutcome::Moved
+            }
+        }
+
+        fn leaf_scope_keys(&self) -> Vec<&[u8]> {
+            vec![self.key.as_slice()]
+        }
+    }
+
+    // ADR-105: a member that proved after an in-doubt CAS that its stage
+    // landed keeps that outcome when a later attempt of the round fails with
+    // a definite error. Otherwise its owner takes the error as proof that
+    // nothing landed.
+    #[tokio::test(start_paused = true)]
+    async fn a_landed_member_keeps_its_outcome_when_the_round_fails_later() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let seed = TxId::with_priority(1, b"seed");
+        store_leaf_entries(
+            &cold_store(mem.clone()),
+            &leaf(),
+            vec![entry(b"seed", LockType::None, None, Some(&seed))],
+        )
+        .await;
+        let (coord, _nodes, _timeline, _bg) =
+            coord_over(lost_ack_then_reject(mem) as Arc<dyn Backend>).await;
+
+        let path = leaf();
+        let committer = TxId::with_priority(2, b"committer");
+        let peer = TxId::with_priority(3, b"peer");
+        let (committed, staged) = tokio::join!(
+            coord.submit_leaf(
+                &path,
+                &committer,
+                Arc::new(ProvesLandedProbe {
+                    key: b"k".to_vec(),
+                    tx: committer,
+                    evaluations: std::sync::atomic::AtomicUsize::new(0),
+                    landed: std::sync::atomic::AtomicBool::new(false),
+                }),
+                Requirement::ANY,
+            ),
+            coord.submit_leaf(
+                &path,
+                &peer,
+                Arc::new(AlwaysStageProbe {
+                    key: b"peer".to_vec(),
+                    tx: peer,
+                }),
+                Requirement::ANY,
+            ),
+        );
+
+        assert!(
+            matches!(
+                committed,
+                Ok(Some(CoordinatedOutcome {
+                    outcome: MemberOutcome::Landed,
+                    ..
+                }))
+            ),
+            "the landed member must not get the error of the round: {:?}",
+            committed.map(|outcome| outcome.map(|outcome| outcome.outcome))
+        );
+        // The peer rode the first in-doubt CAS too, so it gets an outcome.
+        assert!(staged.is_ok(), "the peer had an in-doubt CAS too");
+        coord.close().await;
+    }
+
+    // A write-back-shaped policy that stages once and, after its in-doubt
+    // reload, skips with a release that the plan of the round must confirm.
+    struct ReleasesAfterReloadProbe {
+        key: Vec<u8>,
+        tx: TxId,
+        evaluations: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl MemberPolicy for ReleasesAfterReloadProbe {
+        async fn resolve(
+            &self,
+            _ctx: &ResolveCtx<'_>,
+            staged: &StagedLeaf,
+        ) -> Result<Step, TransError> {
+            if self.evaluations.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mut draft = staged.draft();
+                draft.put(
+                    self.key.clone(),
+                    entry(&self.key, LockType::Write, Some(&self.tx), None),
+                );
+                return Ok(draft.stage(
+                    StageAdmission::ExistingKeys,
+                    MemberOutcome::Released {
+                        superseded: Vec::new(),
+                    },
+                ));
+            }
+            Ok(Step::Skip {
+                outcome: MemberOutcome::Released {
+                    superseded: Vec::new(),
+                },
+            })
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
+            if in_doubt {
+                MemberOutcome::InDoubt("round ended after in-doubt CAS".into())
+            } else {
+                MemberOutcome::Moved
+            }
+        }
+
+        fn leaf_scope_keys(&self) -> Vec<&[u8]> {
+            vec![self.key.as_slice()]
+        }
+    }
+
+    // ADR-105: a member that reconciled its in-doubt CAS with a skip whose
+    // outcome can depend on the stages of others, as a write-back's release
+    // can, gets its in-doubt outcome when the plan never lands, not that
+    // skip outcome.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconciled_member_gets_no_outcome_from_a_plan_that_never_lands() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let seed = TxId::with_priority(1, b"seed");
+        store_leaf_entries(
+            &cold_store(mem.clone()),
+            &leaf(),
+            vec![entry(b"seed", LockType::None, None, Some(&seed))],
+        )
+        .await;
+        let (coord, _nodes, _timeline, _bg) =
+            coord_over(lost_ack_then_reject(mem) as Arc<dyn Backend>).await;
+
+        let path = leaf();
+        let committer = TxId::with_priority(2, b"committer");
+        let peer = TxId::with_priority(3, b"peer");
+        let (committed, staged) = tokio::join!(
+            coord.submit_leaf(
+                &path,
+                &committer,
+                Arc::new(ReleasesAfterReloadProbe {
+                    key: b"k".to_vec(),
+                    tx: committer,
+                    evaluations: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                Requirement::ANY,
+            ),
+            coord.submit_leaf(
+                &path,
+                &peer,
+                Arc::new(AlwaysStageProbe {
+                    key: b"peer".to_vec(),
+                    tx: peer,
+                }),
+                Requirement::ANY,
+            ),
+        );
+
+        assert!(
+            matches!(
+                committed,
+                Ok(Some(CoordinatedOutcome {
+                    outcome: MemberOutcome::InDoubt(_),
+                    ..
+                }))
+            ),
+            "the reconciled member must get its in-doubt outcome: {:?}",
+            committed.map(|outcome| outcome.map(|outcome| outcome.outcome))
+        );
+        // The peer rode the first in-doubt CAS too, so it gets an outcome.
+        assert!(staged.is_ok(), "the peer had an in-doubt CAS too");
+        coord.close().await;
+    }
+
+    // A commit-shaped policy that stages, skips once after its in-doubt
+    // reload, and then stages again.
+    struct RestagesAfterSkipProbe {
+        key: Vec<u8>,
+        tx: TxId,
+        evaluations: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl MemberPolicy for RestagesAfterSkipProbe {
+        async fn resolve(
+            &self,
+            _ctx: &ResolveCtx<'_>,
+            staged: &StagedLeaf,
+        ) -> Result<Step, TransError> {
+            if self.evaluations.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Ok(Step::Skip {
+                    outcome: MemberOutcome::Moved,
+                });
+            }
+            let mut draft = staged.draft();
+            draft.put(
+                self.key.clone(),
+                entry(&self.key, LockType::Write, Some(&self.tx), None),
+            );
+            Ok(draft.stage(StageAdmission::ExistingKeys, MemberOutcome::Landed))
+        }
+
+        fn reorderable(&self) -> bool {
+            false
+        }
+
+        fn exhausted_outcome(&self, in_doubt: bool) -> MemberOutcome {
+            if in_doubt {
+                MemberOutcome::InDoubt("round ended after in-doubt CAS".into())
+            } else {
+                MemberOutcome::Moved
+            }
+        }
+
+        fn leaf_scope_keys(&self) -> Vec<&[u8]> {
+            vec![self.key.as_slice()]
+        }
+    }
+
+    // ADR-105: a member that reconciles its in-doubt CAS with a skip, stages
+    // again, and whose new CAS is in doubt gets an in-doubt outcome when the
+    // round fails. It guards against delivering the member's earlier skip
+    // outcome instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_member_whose_last_cas_is_in_doubt_gets_an_in_doubt_outcome() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let seed = TxId::with_priority(1, b"seed");
+        store_leaf_entries(
+            &cold_store(mem.clone()),
+            &leaf(),
+            vec![entry(b"seed", LockType::None, None, Some(&seed))],
+        )
+        .await;
+        // CAS 0 lands and loses its ack, CAS 1 is rejected, CAS 2 lands and loses
+        // its ack, and every read after it fails.
+        let hooks = HookBackend::new(mem);
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        hooks.set_before({
+            let (writes, broken) = (writes.clone(), broken.clone());
+            move |op| {
+                let result = match op {
+                    BackendOp::WriteIf { .. } if writes.load(Ordering::SeqCst) == 1 => {
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        Err(glassdb_backend::BackendError::Precondition)
+                    }
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                        if broken.load(Ordering::SeqCst) =>
+                    {
+                        Err(glassdb_backend::BackendError::other("rejected"))
+                    }
+                    _ => Ok(()),
+                };
+                let future: HookFuture = Box::pin(async move { result });
+                future
+            }
+        });
+        hooks.set_after({
+            let (writes, broken) = (writes.clone(), broken.clone());
+            move |op, outcome| {
+                let lose = matches!(op, BackendOp::WriteIf { .. })
+                    && outcome.is_success()
+                    && match writes.fetch_add(1, Ordering::SeqCst) {
+                        0 => true,
+                        2 => {
+                            broken.store(true, Ordering::SeqCst);
+                            true
+                        }
+                        _ => false,
+                    };
+                let future: HookFuture = Box::pin(async move {
+                    if lose {
+                        Err(glassdb_backend::BackendError::Unavailable(
+                            "lost ack".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
+                future
+            }
+        });
+        let (coord, _nodes, _timeline, _bg) = coord_over(hooks.clone() as Arc<dyn Backend>).await;
+
+        let path = leaf();
+        let committer = TxId::with_priority(2, b"committer");
+        let peer = TxId::with_priority(3, b"peer");
+        let (committed, _staged) = tokio::join!(
+            coord.submit_leaf(
+                &path,
+                &committer,
+                Arc::new(RestagesAfterSkipProbe {
+                    key: b"k".to_vec(),
+                    tx: committer,
+                    evaluations: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                Requirement::ANY,
+            ),
+            coord.submit_leaf(
+                &path,
+                &peer,
+                Arc::new(AlwaysStageProbe {
+                    key: b"peer".to_vec(),
+                    tx: peer,
+                }),
+                Requirement::ANY,
+            ),
+        );
+
+        assert!(
+            matches!(
+                committed,
+                Ok(Some(CoordinatedOutcome {
+                    outcome: MemberOutcome::InDoubt(_),
+                    ..
+                }))
+            ),
+            "the member whose last CAS is in doubt must get an in-doubt outcome: {:?}",
+            committed.map(|outcome| outcome.map(|outcome| outcome.outcome))
+        );
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            3,
+            "the round sent three CASes"
+        );
         coord.close().await;
     }
 

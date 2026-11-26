@@ -145,9 +145,9 @@ impl DirectCommit {
             // `route_member` found the leaf in the same cache, so a missing
             // leaf here is a later read, for example after a reclamation. The
             // locking path decides the absence at its barrier, so direct
-            // commit needs no proof for it. The round reports an in-doubt CAS
-            // as an outcome, so this error proves that nothing landed
-            // (ADR-092).
+            // commit needs no proof for it. A round gives each member whose
+            // CAS can have landed an outcome, also when it fails later, so this
+            // error proves that nothing landed (ADR-092, ADR-105).
             let outcome = match self.coord.coordinate(operation).await {
                 Ok(outcome) => outcome,
                 Err(TransError::Storage(
