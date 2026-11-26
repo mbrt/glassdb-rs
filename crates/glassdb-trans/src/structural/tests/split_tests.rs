@@ -1986,6 +1986,67 @@ async fn a_batch_that_cannot_join_the_topology_leaves_nothing_behind() {
     );
 }
 
+// ADR-106: a join whose fence is in doubt too can still land. Each
+// participant of that join then ends pinned as wounded, so GC keeps its record
+// and a late join cannot leave a participant without one.
+#[tokio::test]
+async fn a_participant_whose_join_stays_in_doubt_is_pinned() {
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let s = store_with_backend(backend.clone() as Arc<dyn Backend>);
+    seed_sibling_leaves(&s, 2).await;
+    let joined = Arc::new(std::sync::Mutex::new(Vec::new()));
+    backend.set_before({
+        let record = ObjectPath::CollectionRecord {
+            collection: collection(),
+        }
+        .to_string();
+        let joined = joined.clone();
+        move |op| {
+            let refused = match op {
+                BackendOp::WriteIf { path, value, .. } if *path == record => {
+                    let written = CollectionRecord::decode(value).unwrap();
+                    joined
+                        .lock()
+                        .unwrap()
+                        .extend(written.topology_participants().copied());
+                    true
+                }
+                _ => false,
+            };
+            let future: HookFuture = Box::pin(async move {
+                if refused {
+                    Err(glassdb_backend::BackendError::Unavailable("refused".into()))
+                } else {
+                    Ok(())
+                }
+            });
+            future
+        }
+    });
+    let bg = Arc::new(Background::new());
+    let sp = restructurer_with_topology(&s, &bg, TestTopology::writers(tiny()));
+    push_soft_cap_splits(&sp.candidates, 2);
+
+    sp.run_once().await;
+    backend.clear_before();
+
+    let joined: std::collections::BTreeSet<TxId> = joined.lock().unwrap().iter().copied().collect();
+    assert!(!joined.is_empty(), "the sweep sent no join");
+    for participant in &joined {
+        let status = s
+            .foundation
+            .tx_records
+            .commit_status_at(
+                participant,
+                Requirement::after(s.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap()
+            .status;
+        assert_eq!(status, TxCommitStatus::Wounded, "participant {participant}");
+    }
+}
+
 // Two causes can ask for a split of the same node in one sweep. The node
 // splits for each of them, one after the other, and neither waits for the
 // gate of the other.

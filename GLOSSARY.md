@@ -431,6 +431,10 @@ _Avoid_: Membership version
 The number of changes of one node since its creation. A state of a node never repeats while the node exists.
 _Avoid_: Node version, change count, write generation
 
+**Record sequence**:
+The number of changes of one collection record since its creation. A state of a collection record never repeats while the record exists.
+_Avoid_: Record version, directory generation
+
 **Routing**:
 The resolution of a logical key or range endpoint to a leaf by descent through a collection tree. Its result records observed placement; it does not reserve the key or keep that placement current.
 _Avoid_: Shard calculation, ownership proof

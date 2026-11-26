@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted — implemented.
+Accepted — implemented. Extended to collection records by
+[ADR-106](106-a-collection-record-state-never-repeats.md).
 
 Refines [ADR-081](081-in-doubt-cas-stays-in-doubt-until-fenced.md): any change
 of a leaf fences an in-doubt CAS, and the coordinator fences one itself before

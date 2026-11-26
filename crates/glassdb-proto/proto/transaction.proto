@@ -250,6 +250,10 @@ message CollectionRecord {
     bytes topology_freeze = 4;
     // Structural operations that joined before the freeze was installed.
     repeated bytes topology_participants = 5;
+    // The number of changes of this record since its creation. Each replace
+    // stores the expected value plus one, so a state of the record never
+    // repeats while the record exists (ADR-106).
+    uint64 record_sequence = 6;
 }
 
 message CollectionDirectoryEntry {

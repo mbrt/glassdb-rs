@@ -453,6 +453,11 @@ pub struct CollectionRecord {
     /// Structural operations that joined before the freeze was installed.
     #[prost(bytes = "vec", repeated, tag = "5")]
     pub topology_participants: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// The number of changes of this record since its creation. Each replace
+    /// stores the expected value plus one, so a state of the record never
+    /// repeats while the record exists (ADR-106).
+    #[prost(uint64, tag = "6")]
+    pub record_sequence: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CollectionDirectoryEntry {

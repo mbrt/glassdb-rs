@@ -6,7 +6,8 @@ use glassdb_concurr::RetrySchedule;
 use glassdb_data::{CollectionAddress, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxLock, TxRecord};
 use glassdb_storage::{
-    CasRetries, CollectionRecord, CollectionStore, Converged, Decision, Requirement, Timeline,
+    CasRetries, CollectionRecord, CollectionStore, Converged, Decision, Fenced, Requirement,
+    Timeline,
 };
 
 use crate::error::TransError;
@@ -103,13 +104,24 @@ impl TopologyMembership {
             }
             Ok::<_, TransError>(Decision::Write(record, ()))
         };
-        let converge = |proof| {
-            self.records.converge(
-                collection,
-                proof,
-                CasRetries::Unbounded(self.retry),
-                &decide,
-            )
+        let converge = |proof| async move {
+            // A join adds a holder, so its owner must know whether it can
+            // still land (ADR-106).
+            match self
+                .records
+                .converge(
+                    collection,
+                    proof,
+                    CasRetries::Unbounded(self.retry),
+                    &decide,
+                )
+                .await?
+            {
+                Fenced::Converged(converged) => Ok(converged),
+                Fenced::InDoubt => Err(TransError::MutationInDoubt(format!(
+                    "topology join on {collection:?}"
+                ))),
+            }
         };
         let mut joined = converge(Requirement::ANY).await?;
         if matches!(joined, Converged::Missing) {
@@ -155,11 +167,37 @@ impl TopologyMembership {
                     }))
                 },
             )
-            .await?;
+            .await?
+            .or_unavailable()?;
         match left {
             Converged::Written { .. } => Ok(true),
             Converged::Done(()) | Converged::Missing => Ok(false),
             Converged::Stop(()) | Converged::Exhausted => Err(TransError::Retry),
+        }
+    }
+
+    /// Aborts `id`, whose join can still land, and keeps the abort pinned
+    /// (ADR-106). GC then keeps its record, so a late join cannot leave a
+    /// participant without one.
+    pub(super) async fn abandon_in_doubt(&self, id: &TxId) {
+        // A dropped owner operation states that a write of `id` can still
+        // land, so the abort below stays pinned.
+        match self.mon.begin_owner_operation(id) {
+            Ok(operation) => drop(operation),
+            Err(e) => tracing::debug!(
+                target: "glassdb::restructurer",
+                participant = %id,
+                error = %e,
+                "marking the join of a topology participant in doubt failed"
+            ),
+        }
+        if let Err(e) = self.mon.abort_owned_tx(id).await {
+            tracing::debug!(
+                target: "glassdb::restructurer",
+                participant = %id,
+                error = %e,
+                "abandoning topology participant failed"
+            );
         }
     }
 

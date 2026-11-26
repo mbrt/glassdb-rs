@@ -2282,6 +2282,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
     }
     .to_string();
     let observed = ctx.tx_records.get_at(&id, Requirement::ANY).await.unwrap();
+    let applied = matches!(case, DirectoryWriteBack::LostWriteReply);
     if matches!(
         case,
         DirectoryWriteBack::WriteFailure | DirectoryWriteBack::LostWriteReply
@@ -2302,7 +2303,6 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
                 })
             }
         };
-        let applied = matches!(case, DirectoryWriteBack::LostWriteReply);
         if applied {
             hooks.set_after(move |operation, outcome| {
                 if outcome.is_success() {
@@ -2314,13 +2314,19 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         } else {
             hooks.set_before(fail_write);
         }
-        assert!(
-            ctx.gc
-                .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
-                .await
-                .is_err()
-        );
-        assert!(!is_gone(&ctx.tx_records, &id).await);
+        let reclaimed = ctx
+            .gc
+            .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
+            .await;
+        if applied {
+            // ADR-106: the fence finds a changed record sequence, so the
+            // write-back is complete although its reply was lost.
+            assert_eq!(reclaimed.unwrap(), GcOutcome::Reclaimed);
+            assert!(is_gone(&ctx.tx_records, &id).await);
+        } else {
+            assert!(reclaimed.is_err());
+            assert!(!is_gone(&ctx.tx_records, &id).await);
+        }
         let (record, _) = owner
             .records
             .load_record(
@@ -2337,39 +2343,42 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         hooks.clear_before();
         hooks.clear_after();
     }
-    operations.lock().unwrap().clear();
-    let outcome = ctx
-        .gc
-        .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
-        .await
-        .unwrap();
-    let live_value = matches!(case, DirectoryWriteBack::LiveValue);
-    if live_value {
-        assert!(!is_gone(&ctx.tx_records, &id).await);
-        // Each GC pass captures a new bound. A live value must continue to
-        // bypass bounded directory completion after owner write-back.
-        ctx.gc
+    // A lost reply completed the write-back in the GC pass above.
+    if !applied {
+        operations.lock().unwrap().clear();
+        let outcome = ctx
+            .gc
             .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
             .await
             .unwrap();
-        assert!(!is_gone(&ctx.tx_records, &id).await);
-    } else {
-        assert_eq!(outcome, GcOutcome::Reclaimed);
-        assert!(is_gone(&ctx.tx_records, &id).await);
+        let live_value = matches!(case, DirectoryWriteBack::LiveValue);
+        if live_value {
+            assert!(!is_gone(&ctx.tx_records, &id).await);
+            // Each GC pass captures a new bound. A live value must continue to
+            // bypass bounded directory completion after owner write-back.
+            ctx.gc
+                .try_reclaim(&id, &observed, ctx.timeline.currentness_barrier())
+                .await
+                .unwrap();
+            assert!(!is_gone(&ctx.tx_records, &id).await);
+        } else {
+            assert_eq!(outcome, GcOutcome::Reclaimed);
+            assert!(is_gone(&ctx.tx_records, &id).await);
+        }
+        let recorded = std::mem::take(&mut *operations.lock().unwrap());
+        let calls: Vec<_> = recorded
+            .iter()
+            .filter(|op| op.path == path)
+            .map(|op| op.op)
+            .collect();
+        let expected: &[&str] = match case {
+            DirectoryWriteBack::Unreferenced => &["read_if_modified", "write_if"],
+            DirectoryWriteBack::LiveValue => &[],
+            DirectoryWriteBack::LostWriteReply => unreachable!("a lost reply skips this pass"),
+            DirectoryWriteBack::WriteFailure => &["read", "write_if"],
+        };
+        assert_eq!(calls, expected);
     }
-    let recorded = std::mem::take(&mut *operations.lock().unwrap());
-    let calls: Vec<_> = recorded
-        .iter()
-        .filter(|op| op.path == path)
-        .map(|op| op.op)
-        .collect();
-    let expected: &[&str] = match case {
-        DirectoryWriteBack::Unreferenced => &["read_if_modified", "write_if"],
-        DirectoryWriteBack::LiveValue => &[],
-        DirectoryWriteBack::WriteFailure => &["read", "write_if"],
-        DirectoryWriteBack::LostWriteReply => &["read"],
-    };
-    assert_eq!(calls, expected);
     let (record, _) = owner
         .records
         .load_record(

@@ -1059,9 +1059,11 @@ mark-sweep ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
   depend on time ([ADR-079](adr/079-gc-safety-does-not-depend-on-time.md)).
   Before GC deletes a committed record, it releases the locks on keys that the
   transaction did not write
-  ([ADR-095](adr/095-the-record-lists-every-lock-of-the-identity.md)). A lock
-  CAS cannot land after GC deleted the record of its identity, so no stray
-  holder exists ([ADR-105](adr/105-a-node-state-never-repeats.md)).
+  ([ADR-095](adr/095-the-record-lists-every-lock-of-the-identity.md)). A CAS
+  that adds a holder cannot land after GC deleted the record of its identity,
+  on a leaf or on a collection record, so no stray holder exists
+  ([ADR-105](adr/105-a-node-state-never-repeats.md),
+  [ADR-106](adr/106-a-collection-record-state-never-repeats.md)).
 - **Retention period.** GC still waits the pending timeout plus the allowed
   clock skew, from the last update of the record, before it checks a final
   record ([ADR-079](adr/079-gc-safety-does-not-depend-on-time.md)). The wait

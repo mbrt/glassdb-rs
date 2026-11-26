@@ -38,6 +38,11 @@ pub enum TransError {
     /// The addressed collection was dropped.
     #[error("stale collection handle")]
     StaleCollection,
+    /// A CAS on a collection record can still land after this error
+    /// (ADR-106). The owner keeps its owner operation unresolved, so its
+    /// identity stays pinned.
+    #[error("collection record mutation in doubt: {0}")]
+    MutationInDoubt(String),
     /// Any other transaction error, with an optional underlying cause.
     #[error("{msg}")]
     Other {
@@ -79,6 +84,9 @@ impl TransError {
                 source,
             },
             TransError::InvalidInput(msg) => TransError::InvalidInput(format!("{ctx}: {msg}")),
+            TransError::MutationInDoubt(msg) => {
+                TransError::MutationInDoubt(format!("{ctx}: {msg}"))
+            }
             sentinel => sentinel,
         }
     }
