@@ -116,6 +116,7 @@ impl FaultConfig {
             fault_prob: 0,
             lost_ack_prob: 0,
             late_landing_prob: 0,
+            rejection_prob: 0,
             max_delay: FAULTLESS_MAX_DELAY,
             max_late_landing: Duration::ZERO,
         }
@@ -364,7 +365,13 @@ pub trait SimWorkload: Clone + Default + 'static {
 }
 
 fn client_error_is_admissible(faults: FaultConfig, error: &Error) -> bool {
-    faults.failures_enabled() && matches!(error, Error::InDoubt(_) | Error::Unavailable(_))
+    // Under failures, a transport can also reject a request, so an operation
+    // can end with `Backend` (ADR-108). `Internal` is a bug in any run.
+    faults.failures_enabled()
+        && matches!(
+            error,
+            Error::InDoubt(_) | Error::Unavailable(_) | Error::Backend { .. }
+        )
 }
 
 /// Immutable inputs for one harness run.
@@ -800,20 +807,28 @@ mod sim_tests {
     }
 
     #[test]
-    fn only_uncertain_errors_are_admissible_with_failures() {
+    fn only_fault_errors_are_admissible_with_failures() {
+        let fault_errors = [
+            Error::InDoubt("test".into()),
+            Error::Unavailable("test".into()),
+            Error::Backend {
+                msg: "test".into(),
+                source: None,
+            },
+        ];
+        for error in &fault_errors {
+            assert!(client_error_is_admissible(FaultConfig::failures(1), error));
+            assert!(!client_error_is_admissible(FaultConfig::none(), error));
+            assert!(!client_error_is_admissible(
+                FaultConfig::slow_mutations(),
+                error
+            ));
+        }
         let failures = FaultConfig::failures(1);
-        assert!(client_error_is_admissible(
-            failures,
-            &Error::InDoubt("test".into())
-        ));
-        assert!(client_error_is_admissible(
-            failures,
-            &Error::Unavailable("test".into())
-        ));
         assert!(!client_error_is_admissible(failures, &Error::NotFound));
         assert!(!client_error_is_admissible(
-            FaultConfig::slow_mutations(),
-            &Error::InDoubt("test".into())
+            failures,
+            &Error::internal("a bug")
         ));
     }
 

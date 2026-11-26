@@ -15,6 +15,9 @@
 //! - **lost ack** (after landing): the op *lands* at the store but the response
 //!   is lost, reported as [`BackendError::Unavailable`] (outcome unknown) — the
 //!   in-doubt case that drives commit-status / redrive recovery;
+//! - **rejection** (before landing): the request never reaches the store, and
+//!   the transport returns a non-retryable [`BackendError::Other`], as a real
+//!   store does for an expired credential;
 //! - **late landing** (mutations only): the caller gets
 //!   [`BackendError::Unavailable`] at once, and the request reaches the store
 //!   later, after the caller may have read the object back. Real stores can
@@ -52,16 +55,21 @@ pub struct FaultOptions {
     /// Chance a reply is delayed after the backend finishes, including unchanged
     /// conditional reads and absent reads.
     pub reply_delay_prob: u8,
-    /// Chance the transport faults an operation (drops it on one side or the
-    /// other).
+    /// Chance the transport faults an operation: it drops the operation on one
+    /// side or the other, or rejects it with a definite error.
     pub fault_prob: u8,
     /// Given a fault, the chance it happens *after* landing (the op reaches the
-    /// store but the ack is lost) rather than before. The remainder are dropped
-    /// requests that never land.
+    /// store but the ack is lost) rather than before. The remainder do not land
+    /// before the reply: late landings (mutations only), rejections, or dropped
+    /// requests.
     pub lost_ack_prob: u8,
     /// Given a mutation fault that is not a lost ack, the chance that the
     /// request reaches the store later instead of never.
     pub late_landing_prob: u8,
+    /// Given a request that never reaches the store, outside an outage, the
+    /// chance that the transport rejects it with a non-retryable error instead
+    /// of `Unavailable`.
+    pub rejection_prob: u8,
     /// Upper bound on an injected delay.
     pub max_delay: Duration,
     /// Upper bound on the time until a late request reaches the store.
@@ -70,7 +78,8 @@ pub struct FaultOptions {
 
 impl FaultOptions {
     /// Scales the fault probabilities by `intensity` (0 = none, 255 = max). The
-    /// before/after split (`lost_ack_prob`) is intensity-independent: a dropped
+    /// split of a fault into its kinds (`lost_ack_prob`, `late_landing_prob`,
+    /// and `rejection_prob`) is intensity-independent: for example, a dropped
     /// link is roughly as likely to lose the request as the ack.
     pub fn from_intensity(intensity: u8) -> Self {
         let scale = |max: u8| ((max as u16 * intensity as u16) / 255) as u8;
@@ -80,6 +89,7 @@ impl FaultOptions {
             fault_prob: scale(24),
             lost_ack_prob: 128,
             late_landing_prob: 128,
+            rejection_prob: 64,
             max_delay: Duration::from_millis(200),
             // Longer than the GC safety horizon of the simulation protocol
             // timing, so GC can act before the request lands.
@@ -94,10 +104,14 @@ impl Default for FaultOptions {
     }
 }
 
-/// Where in an operation's lifecycle the transport drops it.
+/// How the transport faults an operation: where in its lifecycle it drops the
+/// operation, or that it rejects it.
 enum Fault {
     /// The request never reached the store (nothing landed).
     Dropped,
+    /// The request never reached the store, and the transport returned a
+    /// non-retryable error.
+    Rejected,
     /// The op landed at the store but its ack was lost (outcome unknown).
     LostAck,
     /// The caller gets no reply, and the request reaches the store after this
@@ -234,7 +248,8 @@ impl FaultBackend {
         }
         let mut t = self.tape.lock().unwrap();
         let request_delay = self.roll_delay(&mut t, self.opts.delay_prob);
-        let faulted = self.down.load(Ordering::SeqCst) || t.roll(self.opts.fault_prob);
+        let down = self.down.load(Ordering::SeqCst);
+        let faulted = down || t.roll(self.opts.fault_prob);
         let fault = faulted.then(|| {
             if t.roll(self.opts.lost_ack_prob) {
                 Fault::LostAck
@@ -242,6 +257,8 @@ impl FaultBackend {
                 Fault::LateLanding(Duration::from_nanos(
                     t.below(self.opts.max_late_landing.as_nanos() as u64 + 1),
                 ))
+            } else if !down && t.roll(self.opts.rejection_prob) {
+                Fault::Rejected
             } else {
                 Fault::Dropped
             }
@@ -272,6 +289,9 @@ impl FaultBackend {
                 return Err(BackendError::Unavailable(
                     "injected dropped request (lost before landing)".into(),
                 ));
+            }
+            Some(Fault::Rejected) => {
+                return Err(BackendError::other("injected rejection (not applied)"));
             }
             // The op reaches the store; only a *successful* landing is reported
             // as an in-doubt lost ack. A genuine error is returned as-is.
@@ -451,6 +471,7 @@ mod tests {
             fault_prob: 0,
             lost_ack_prob: 0,
             late_landing_prob: 0,
+            rejection_prob: 0,
             max_delay: Duration::from_millis(10),
             max_late_landing: Duration::ZERO,
         };
@@ -474,6 +495,7 @@ mod tests {
             fault_prob: 255,
             lost_ack_prob: 0,
             late_landing_prob: 0,
+            rejection_prob: 0,
             max_delay: Duration::from_millis(0),
             max_late_landing: Duration::ZERO,
         };
@@ -501,6 +523,7 @@ mod tests {
             fault_prob: 255,
             lost_ack_prob: 255,
             late_landing_prob: 0,
+            rejection_prob: 0,
             max_delay: Duration::from_millis(0),
             max_late_landing: Duration::ZERO,
         };
@@ -527,6 +550,7 @@ mod tests {
             fault_prob: 255,
             lost_ack_prob: 0,
             late_landing_prob: 255,
+            rejection_prob: 0,
             max_delay: Duration::ZERO,
             max_late_landing: Duration::from_secs(1),
         };
@@ -557,6 +581,7 @@ mod tests {
             fault_prob: 255,
             lost_ack_prob: 255,
             late_landing_prob: 0,
+            rejection_prob: 0,
             max_delay: Duration::from_millis(0),
             max_late_landing: Duration::ZERO,
         };
@@ -571,17 +596,48 @@ mod tests {
         assert!(matches!(mem.read("p").await, Err(BackendError::NotFound)));
     }
 
+    // A rejected request never reaches the store, and its error is not
+    // `Unavailable`.
+    #[tokio::test]
+    async fn a_rejected_request_does_not_land_and_is_not_retryable() {
+        let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let opts = FaultOptions {
+            delay_prob: 0,
+            reply_delay_prob: 0,
+            fault_prob: 255,
+            lost_ack_prob: 0,
+            late_landing_prob: 0,
+            rejection_prob: 255,
+            max_delay: Duration::ZERO,
+            max_late_landing: Duration::ZERO,
+        };
+        let fb = FaultBackend::with_tape(mem.clone(), vec![0; 64], 1, opts);
+        fb.set_active(true);
+
+        assert!(matches!(
+            fb.write_if_not_exists("p", b"v".to_vec()).await,
+            Err(BackendError::Other { .. })
+        ));
+        assert!(matches!(
+            fb.read("p").await,
+            Err(BackendError::Other { .. })
+        ));
+        assert!(matches!(mem.read("p").await, Err(BackendError::NotFound)));
+    }
+
     #[tokio::test]
     async fn outage_downs_whole_transport_then_heals() {
         let mem: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         // Isolate the outage: disable the i.i.d. rolls, and force any fault to be
-        // a dropped request so the empty store is never written.
+        // a dropped request so the empty store is never written. Rejections are
+        // almost certain outside an outage, so the outage must not reject.
         let opts = FaultOptions {
             delay_prob: 0,
             reply_delay_prob: 0,
             fault_prob: 0,
             lost_ack_prob: 0,
             late_landing_prob: 0,
+            rejection_prob: 255,
             max_delay: Duration::from_millis(0),
             max_late_landing: Duration::ZERO,
         };
