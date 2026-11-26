@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted — implemented.
+Accepted — implemented. Refined by
+[ADR-109](109-a-created-object-starts-at-a-random-sequence.md).
 
 Extends [ADR-105](105-a-node-state-never-repeats.md) from nodes to collection
 records. Refines [ADR-059](059-pin-foreign-wounds-until-owner-retirement.md):

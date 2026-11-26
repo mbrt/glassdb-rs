@@ -1005,6 +1005,32 @@ mod tests {
         assert_ne!(read.revision(), first.revision());
     }
 
+    // ADR-109: a root that is created again by another create request does not
+    // repeat the state of the first create, so a late CAS that expected that
+    // state cannot land.
+    #[tokio::test]
+    async fn a_root_created_again_does_not_repeat_its_first_state() {
+        let store = store_over(Arc::new(MemoryBackend::new()));
+        let c = collection();
+        assert!(
+            store
+                .create_root(&c, &Node::leaf(LeafBody::new()))
+                .await
+                .unwrap()
+        );
+        let (_, first) = store.load_root(&c, Requirement::ANY).await.unwrap();
+        store.delete_root(&first).await.unwrap();
+        assert!(
+            store
+                .create_root(&c, &Node::leaf(LeafBody::new()))
+                .await
+                .unwrap()
+        );
+
+        let index = Node::index(IndexNode::from_children([(b"".to_vec(), node_id(1))]));
+        assert!(!store.store_root(&c, &index, &first).await.unwrap());
+    }
+
     #[tokio::test]
     async fn hot_reload_checks_current_without_full_read() {
         let recorder = RecordingBackend::new(Arc::new(MemoryBackend::new()));

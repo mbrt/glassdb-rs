@@ -163,10 +163,10 @@ message Node {
     // first node at its level. A copy with a low key above a routed key is
     // older than a merge (ADR-073).
     bytes low_key = 11;
-    // The number of changes of this node since its creation. Each replace
-    // stores the expected value plus one, so a state of the node never repeats
-    // while the node exists (ADR-105).
-    uint64 node_sequence = 12;
+    // Changes on each change of this node, from a random start at each
+    // creation. Each replace stores the expected value plus one, wrapping, so a
+    // state of the node never repeats (ADR-105, ADR-109).
+    uint32 node_sequence = 12;
 }
 
 // A structural intent for one split or merge. It lives at
@@ -250,10 +250,10 @@ message CollectionRecord {
     bytes topology_freeze = 4;
     // Structural operations that joined before the freeze was installed.
     repeated bytes topology_participants = 5;
-    // The number of changes of this record since its creation. Each replace
-    // stores the expected value plus one, so a state of the record never
-    // repeats while the record exists (ADR-106).
-    uint64 record_sequence = 6;
+    // Changes on each change of this record, from a random start at each
+    // creation. Each replace stores the expected value plus one, wrapping, so a
+    // state of the record never repeats (ADR-106, ADR-109).
+    uint32 record_sequence = 6;
 }
 
 message CollectionDirectoryEntry {

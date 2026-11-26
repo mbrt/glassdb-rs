@@ -32,7 +32,9 @@ pub struct CollectionRecord {
     directory_generation: u64,
     topology_freeze: Option<TxId>,
     topology_participants: BTreeSet<TxId>,
-    record_sequence: u64,
+    /// Changes on each change of the record, from a random start at its
+    /// creation (ADR-106, ADR-109). Only the collection store sets it.
+    record_sequence: u32,
 }
 
 impl CollectionRecord {
@@ -48,15 +50,16 @@ impl CollectionRecord {
         }
     }
 
-    /// Returns the record as a newly created one.
+    /// Returns the record as a newly created one, with a random start of its
+    /// record sequence.
     fn created(mut self) -> Self {
-        self.record_sequence = 0;
+        self.record_sequence = crate::sequence::random_start();
         self
     }
 
     /// Returns the record as the change that follows `expected`.
     fn following(mut self, expected: &CollectionRecord) -> Self {
-        self.record_sequence = expected.record_sequence + 1;
+        self.record_sequence = expected.record_sequence.wrapping_add(1);
         self
     }
 
@@ -471,8 +474,10 @@ impl CollectionStore {
             }
         };
         let (Some(expected), Some(current)) = (expected.value(), loaded.value()) else {
-            // A collection record path is created once, so a CAS cannot land
-            // on a deleted record.
+            // A CAS cannot land on a deleted record. A later create of the
+            // path starts a new random record sequence, so it does not bring
+            // the expected state back either (ADR-109), except for a retry of
+            // one create request below GlassDB.
             return true;
         };
         if current.record_sequence != expected.record_sequence {
@@ -791,10 +796,13 @@ mod tests {
     fn golden_encoding() {
         let mut record = CollectionRecord::new();
         record.add_child(name("users"), collection_id(1)).unwrap();
+        record.record_sequence = 0x0403_0201;
         let got = record.encode();
         let want = [
             0x0a, 0x19, 0x0a, 0x05, 0x75, 0x73, 0x65, 0x72, 0x73, 0x12, 0x10, 0x01, 0x01, 0x01,
             0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+            // field 6 (varint).
+            0x30, 0x81, 0x84, 0x8c, 0x20,
         ];
         assert_eq!(record.encoded_len(), got.len());
         assert_eq!(got, want, "collection-record encoding drifted: {got:02x?}");
@@ -973,13 +981,14 @@ mod tests {
     // ADR-106: a lock that is taken and released does not restore the earlier
     // state of the record.
     #[tokio::test]
-    async fn each_change_increases_the_record_sequence() {
+    async fn each_change_changes_the_record_sequence() {
         let records = store_over(Arc::new(MemoryBackend::new()));
         let collection = CollectionAddress::new("db", collection_id(1));
         let reader = tx_id(&[1]);
         let mut seeded = CollectionRecord::new();
         seeded.add_directory_reader(reader);
-        // A create stores 0, also for a record copied from a changed one.
+        // A create stores a new start, also for a record copied from a changed
+        // one.
         let prior = seeded.clone();
         seeded = seeded.following(&prior);
         assert!(records.create_record(&collection, &seeded).await.unwrap());
@@ -987,7 +996,7 @@ mod tests {
             .load_record(&collection, Requirement::ANY)
             .await
             .unwrap();
-        assert_eq!(created.record_sequence, 0);
+        assert_ne!(created.record_sequence, seeded.record_sequence);
 
         let mut released = created.clone();
         released.remove_directory_holder(&reader);
@@ -1001,9 +1010,42 @@ mod tests {
             .load_record(&collection, Requirement::ANY)
             .await
             .unwrap();
-        assert_eq!(taken_again.record_sequence, 2);
+        assert_eq!(
+            taken_again.record_sequence,
+            created.record_sequence.wrapping_add(2)
+        );
         assert!(!records.store_record(&released, &first).await.unwrap());
         assert_ne!(last.revision(), first.revision());
+    }
+
+    // ADR-109: a record that is created again by another create request does
+    // not repeat the state of the first create, so a late CAS that expected
+    // that state cannot land.
+    #[tokio::test]
+    async fn a_record_created_again_does_not_repeat_its_first_state() {
+        let records = store_over(Arc::new(MemoryBackend::new()));
+        let collection = CollectionAddress::new("db", collection_id(1));
+        assert!(
+            records
+                .create_record(&collection, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        let (first, first_seen) = records
+            .load_record(&collection, Requirement::ANY)
+            .await
+            .unwrap();
+        records.delete_record(&first_seen).await.unwrap();
+        assert!(
+            records
+                .create_record(&collection, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+
+        let mut locked = first;
+        locked.add_directory_reader(tx_id(&[1]));
+        assert!(!records.store_record(&locked, &first_seen).await.unwrap());
     }
 
     // ADR-106: an in-doubt CAS that did not land yet is fenced, so it cannot

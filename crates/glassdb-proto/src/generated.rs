@@ -301,11 +301,11 @@ pub struct Node {
     /// older than a merge (ADR-073).
     #[prost(bytes = "vec", tag = "11")]
     pub low_key: ::prost::alloc::vec::Vec<u8>,
-    /// The number of changes of this node since its creation. Each replace
-    /// stores the expected value plus one, so a state of the node never repeats
-    /// while the node exists (ADR-105).
-    #[prost(uint64, tag = "12")]
-    pub node_sequence: u64,
+    /// Changes on each change of this node, from a random start at each
+    /// creation. Each replace stores the expected value plus one, wrapping, so a
+    /// state of the node never repeats (ADR-105, ADR-109).
+    #[prost(uint32, tag = "12")]
+    pub node_sequence: u32,
     #[prost(oneof = "node::Body", tags = "3, 4")]
     pub body: ::core::option::Option<node::Body>,
 }
@@ -453,11 +453,11 @@ pub struct CollectionRecord {
     /// Structural operations that joined before the freeze was installed.
     #[prost(bytes = "vec", repeated, tag = "5")]
     pub topology_participants: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
-    /// The number of changes of this record since its creation. Each replace
-    /// stores the expected value plus one, so a state of the record never
-    /// repeats while the record exists (ADR-106).
-    #[prost(uint64, tag = "6")]
-    pub record_sequence: u64,
+    /// Changes on each change of this record, from a random start at each
+    /// creation. Each replace stores the expected value plus one, wrapping, so a
+    /// state of the record never repeats (ADR-106, ADR-109).
+    #[prost(uint32, tag = "6")]
+    pub record_sequence: u32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct CollectionDirectoryEntry {

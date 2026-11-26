@@ -579,9 +579,9 @@ pub struct Node {
     locks: NodeLocks,
     /// Set after a merge moved the range and entries into the right sibling.
     drained: bool,
-    /// The number of changes of the node since its creation (ADR-105). Only
-    /// the node store sets it.
-    node_sequence: u64,
+    /// Changes on each change of the node, from a random start at its
+    /// creation (ADR-105, ADR-109). Only the node store sets it.
+    node_sequence: u32,
 }
 
 impl Node {
@@ -829,9 +829,9 @@ impl Node {
         self.locks.membership_generation()
     }
 
-    /// Returns the number of changes of the node since its creation. A state
-    /// of the node never repeats while the node exists (ADR-105).
-    pub fn node_sequence(&self) -> u64 {
+    /// Returns the node sequence. A state of the node never repeats while the
+    /// node exists (ADR-105), also when its path is created again (ADR-109).
+    pub fn node_sequence(&self) -> u32 {
         self.node_sequence
     }
 
@@ -995,15 +995,16 @@ impl Node {
         self.locks.clear_holders();
     }
 
-    /// Returns the node as a newly created one.
+    /// Returns the node as a newly created one, with a random start of its
+    /// node sequence.
     pub(crate) fn created(mut self) -> Self {
-        self.node_sequence = 0;
+        self.node_sequence = crate::sequence::random_start();
         self
     }
 
     /// Returns the node as the change that follows `expected`.
     pub(crate) fn following(mut self, expected: &Node) -> Self {
-        self.node_sequence = expected.node_sequence + 1;
+        self.node_sequence = expected.node_sequence.wrapping_add(1);
         self
     }
 
@@ -1948,14 +1949,17 @@ mod tests {
     // Changing the on-disk format must break these tests.
     #[test]
     fn golden_leaf_encoding() {
-        let node = Node::leaf(LeafBody::from_entries([golden_entry()]))
+        let mut node = Node::leaf(LeafBody::from_entries([golden_entry()]))
             .with_high_key(Some(b"m".to_vec()))
             .with_right_sibling(Some(NodeId::from_bytes([7; 16])));
+        node.node_sequence = 0x0403_0201;
         let got = node.encode();
         let want = [
             [0x0a, 0x01, 0x6d, 0x12, 0x10].as_slice(),
             &[7; 16],
             &golden_entry_bytes(),
+            // field 12 (varint).
+            &[0x60, 0x81, 0x84, 0x8c, 0x20],
         ]
         .concat();
         assert_eq!(node.encoded_len(), got.len());

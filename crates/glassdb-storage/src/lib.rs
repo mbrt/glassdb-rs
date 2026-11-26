@@ -12,6 +12,7 @@ mod leaf;
 mod lock;
 mod node;
 mod node_store;
+mod sequence;
 mod stale_view;
 mod structural_intent;
 mod structural_intent_store;

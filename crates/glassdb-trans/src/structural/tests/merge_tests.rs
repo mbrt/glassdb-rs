@@ -279,7 +279,8 @@ async fn merge_is_vetoed_when_the_merged_leaf_would_need_a_capacity_split() {
         .node_soft_max_bytes(usize::MAX)
         .build()
         .unwrap();
-    let key = |first: u8| [&[first], [b'x'; 59].as_slice()].concat();
+    // The keys leave room for the random node sequence of both leaves.
+    let key = |first: u8| [&[first], [b'x'; 55].as_slice()].concat();
     let (a, b, m, n) = (key(b'a'), key(b'b'), key(b'm'), key(b'n'));
     let s = store();
     seed_two_leaves(&s, &[&a, &b], &[&m, &n]).await;

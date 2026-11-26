@@ -539,7 +539,7 @@ value or tombstone with this identity proves that the whole commit landed. If
 there is no marker, unchanged previous states prove that it did not land, but
 only if at least one output could not return to its previous state through
 tombstone reclamation, and only after the leaf changed. Each change of a node
-increases its node sequence, so a state of a node never repeats. Before a
+changes its node sequence, so a state of a node never repeats. Before a
 round plans on a leaf in the state that an in-doubt CAS expected, it writes the
 leaf again to fence that CAS
 ([ADR-105](adr/105-a-node-state-never-repeats.md)). Otherwise,
@@ -961,11 +961,14 @@ The cache and the coordinator depend on, and keep, these properties:
 1. Backend single-object reads and conditional mutations are linearizable. A
    read after a definitive mutation sees that mutation or a later state.
 2. A conditional mutation stays safe if its predicate becomes true again,
-   because revisions can repeat (ABA). A node never comes back to an earlier
-   state while it exists, because each change increases its node sequence
-   ([ADR-105](adr/105-a-node-state-never-repeats.md)). Create-if-absent is only
-   for permanent idempotent paths, or fresh identity paths whose existence alone
-   cannot publish newer live state.
+   because revisions can repeat (ABA). A node or a collection record never
+   comes back to an earlier state, because each change changes its sequence
+   ([ADR-105](adr/105-a-node-state-never-repeats.md),
+   [ADR-106](adr/106-a-collection-record-state-never-repeats.md)), and each
+   create starts the sequence at a random value
+   ([ADR-109](adr/109-a-created-object-starts-at-a-random-sequence.md)).
+   Create-if-absent is only for permanent idempotent paths, or fresh identity
+   paths whose existence alone cannot publish newer live state.
 3. In one open database, no two backend point calls on the same path overlap.
    The only exception is a cancelled mutation that can still run remotely.
 4. A call on a path starts only after the earlier definitive result on that path
