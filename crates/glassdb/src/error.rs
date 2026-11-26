@@ -116,9 +116,15 @@ impl Error {
     /// `Unavailable -> InDoubt` mapping of [`From`], because there a failed read
     /// inherits the uncertainty of the mutation it was confirming.
     pub(crate) fn from_read(e: StorageError) -> Self {
+        // Each variant is listed, so a new one needs a decision here.
         match e {
             StorageError::Unavailable(s) => Error::Unavailable(s),
-            other => other.into(),
+            e @ (StorageError::NotFound
+            | StorageError::Precondition
+            | StorageError::InvalidCursor
+            | StorageError::KeyNotFound
+            | StorageError::StaleCollection
+            | StorageError::Other { .. }) => e.into(),
         }
     }
 
@@ -133,12 +139,21 @@ impl Error {
     /// reach its final status, and locked validation writes read locks of the
     /// caller's identity (ADR-091). Neither write is a change of the caller.
     pub(crate) fn from_read_trans(e: TransError) -> Self {
+        // Each variant is listed, so a new one needs a decision here.
         match e {
             TransError::Storage(s) => Error::from_read(s),
             // A lock CAS of the caller's identity that can still land
             // (ADR-106). The engine keeps the identity pinned.
             TransError::MutationInDoubt(s) => Error::Unavailable(s),
-            other => other.into(),
+            e @ (TransError::Retry
+            | TransError::AlreadyFinalized
+            | TransError::Wounded
+            | TransError::ValidateRetry(_)
+            | TransError::LockTimeout
+            | TransError::NoSingleWrite
+            | TransError::InvalidInput(_)
+            | TransError::StaleCollection
+            | TransError::Other { .. }) => e.into(),
         }
     }
 }

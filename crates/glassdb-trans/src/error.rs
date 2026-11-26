@@ -73,6 +73,26 @@ impl TransError {
         }
     }
 
+    /// Reports whether a write of the identity that got this error can still
+    /// land, so that its owner must keep the identity pinned (ADR-106).
+    pub(crate) fn write_may_land(&self) -> bool {
+        // Each variant is listed, so a new one needs a decision here.
+        match self {
+            // A CAS on a collection record that adds a holder.
+            TransError::MutationInDoubt(_) => true,
+            TransError::Storage(_)
+            | TransError::Retry
+            | TransError::AlreadyFinalized
+            | TransError::Wounded
+            | TransError::ValidateRetry(_)
+            | TransError::LockTimeout
+            | TransError::NoSingleWrite
+            | TransError::InvalidInput(_)
+            | TransError::StaleCollection
+            | TransError::Other { .. } => false,
+        }
+    }
+
     /// Prepends human-readable context while preserving the error's
     /// classification and any underlying cause.
     #[must_use]
@@ -115,10 +135,20 @@ impl From<BackendError> for TransError {
 /// [`Reader`](crate::reader::Reader) and the
 /// [`KeyResolver`](crate::key_resolver::KeyResolver).
 pub(crate) fn trans_to_storage(e: TransError) -> StorageError {
+    // Each variant is listed, so a new one needs a decision here.
     match e {
         TransError::Storage(s) => s,
         TransError::StaleCollection => StorageError::StaleCollection,
-        other => StorageError::other(other.to_string()),
+        // A CAS that can still land stays in doubt (ADR-106).
+        TransError::MutationInDoubt(msg) => StorageError::Unavailable(msg),
+        e @ (TransError::Retry
+        | TransError::AlreadyFinalized
+        | TransError::Wounded
+        | TransError::ValidateRetry(_)
+        | TransError::LockTimeout
+        | TransError::NoSingleWrite
+        | TransError::InvalidInput(_)
+        | TransError::Other { .. }) => StorageError::other(e.to_string()),
     }
 }
 
@@ -130,6 +160,16 @@ mod tests {
 
     fn cause() -> io::Error {
         io::Error::other("disk on fire")
+    }
+
+    // ADR-106: a CAS that can still land stays in doubt on the storage
+    // surface of the read paths.
+    #[test]
+    fn a_mutation_in_doubt_stays_in_doubt_as_a_storage_error() {
+        assert!(matches!(
+            trans_to_storage(TransError::MutationInDoubt("lock".into())),
+            StorageError::Unavailable(msg) if msg == "lock"
+        ));
     }
 
     #[test]
