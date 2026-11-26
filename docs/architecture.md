@@ -222,6 +222,19 @@ state. A member receives an outcome with staged changes only after the CAS succe
 A member that is skipped because an earlier member already staged its change
 also waits for that CAS.
 
+### Rounds yield to a starving writer of another instance
+
+On a busy leaf, the next round of a database instance sends its CAS right
+after the last one lands. A writer on another instance must read the leaf
+first, so it can lose almost every race. Only that writer knows that it
+starves. When a key change of another writer rejects `REJECTIONS_TO_REQUEST`
+leaf CASes in a row of a round, the instance writes a yield request to the
+`_y` object of the collection. An instance whose rounds of a leaf run back to
+back for `POLL_EVERY` reads those requests. While a request of another
+instance lasts, its rounds in the collection leave the requested gap after the
+last round of each leaf
+([ADR-110](adr/110-a-starving-leaf-writer-asks-other-instances-to-yield.md)).
+
 ### Keep physical state out of the lock boundary
 
 The calls between `Algo` and `Locker` carry only logical data:
@@ -1016,6 +1029,7 @@ A missing historical body never becomes a missing key or a missing collection.
 | `_i` | collection record | `mydb/_c/<collection-id>/_i` |
 | `_r` | tree root | `mydb/_c/<collection-id>/_r` |
 | `_n` | standalone node | `mydb/_c/<collection-id>/_n/<node-id>` |
+| `_y` | yield requests | `mydb/_c/<collection-id>/_y` |
 | `_t` | transaction record | `mydb/_t/<a>/<b>/<transaction-identity>` |
 | `_s` | structural intent | `mydb/_s/<participant-id>/<intent-id>` |
 
@@ -1084,8 +1098,8 @@ mark-sweep ([ADR-022](adr/022-garbage-collection-mark-sweep.md)):
   coordinator round ([ADR-029](adr/029-gc-through-shard-coordinator.md)). Entry
   references, membership locks, directory holders, and topology participants
   each need their own completion evidence. GC deletes only the exact revision
-  that it checked. It reclaims a dropped collection one node page at a time and
-  removes the root and the collection record last.
+  that it checked. It reclaims a dropped collection one node page at a time,
+  then its yield requests, and removes the root and the collection record last.
 - **Writer independence.** GC backlog never blocks transaction admission or
   completion, adds requests to the commit path, or runs inside transaction
   bodies. At the GC limit, garbage only stays longer. Shared CPU, backend

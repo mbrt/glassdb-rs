@@ -22,6 +22,8 @@ mod tree_router;
 pub mod txrecord;
 mod wire_id;
 mod wire_size;
+mod wire_time;
+mod yield_request;
 
 /// Persistent-cache media and harnesses for deterministic simulation.
 #[cfg(feature = "sim")]
@@ -64,3 +66,4 @@ pub use structural_intent::{
 pub use structural_intent_store::{StructuralIntentPage, StructuralIntentStore};
 pub use timeline::{CurrentnessBarrier, Requirement, SequencePoint, StalenessCutoff, Timeline};
 pub use tree_router::{RoutedLeaf, RoutedLeafGroup, TreeRouter};
+pub use yield_request::{YieldRequest, YieldRequestStore, YieldRequests};

@@ -9,6 +9,305 @@ This file is evidence, not a record of accepted behavior:
   performance-affecting changes.
 - ADRs record significant decisions once accepted.
 
+## 2026-11-26: a database instance starves a foreign writer of its leaves
+
+Status: accepted (ADR-110). A round whose CASes another writer keeps
+rejecting writes a yield request of its instance for the collection, and an
+instance that keeps a leaf of that collection busy leaves a gap between its
+rounds while the request lasts. The starvation ends, and the loads with low
+contention, with contention that a split resolves, and with no contention do
+not change. Two instances that write the same hot keys pay for it. A gap after
+each lost leaf CAS, the first candidate, was rejected because it costs the
+normal case. The new experiments `foreign-writers` and `foreign-hot-keys`
+measure the starvation. The lock waits on a holder of another instance are a
+separate problem.
+
+### The question
+
+The entry of 2026-11-25 found a stale read-only call that hangs for up to
+28 s under 200 writers on another instance. The cause is not in the stale
+view. Each instance that writes a busy leaf of another instance loses almost
+every leaf CAS. A read-only transaction meets it after 3 failed validations,
+when it takes read locks (ADR-091). A writer on the other instance meets it
+on each commit.
+
+### Setup
+
+All runs used `0935676ab` with temporary changes, and `--backend=memory
+--delays=s3 --prefix-depth=3 --time=virtual`. The cells of `foreign-writers`
+have a measure window of 30 s (20 throughput windows of 1.5 s) and the wide
+pool of 20,000 keys in one collection, about 314 leaves. `rw-single` and
+`rw-many` give the load, with 50 or 200 workers of each shape. One probe worker
+of each shape, a read-modify-write of 1 key and of 10 keys, measures the
+latency. The workloads are `local` (the load and the probes on one instance),
+`foreign` (the probes on another instance), and `symmetric` (two instances,
+each with the load and the probes). The probe means below are 1 key / 10 keys,
+and the empty windows are of 20. Each variant ran 2 times on `foreign-writers`
+and 3 times on the CI cases.
+
+The normal case is the shapes that do not starve:
+
+- `pair`: a temporary experiment with two instances, each with 1, 5, or 20
+  workers of `rw-single` and `rw-many` on the wide pool of one collection.
+- The CI cases `false-sharing`, `false-sharing-spans`, `split-merge-fight`, and
+  `contention`.
+- The `local` cells of `foreign-writers`.
+
+### The cause
+
+Temporary timers on the coordinator rounds, the lock passes, and the
+transaction calls showed this sequence:
+
+1. The coordinator merges all writers of its instance on a leaf into one
+   round. The first load of a round accepts the cached leaf, so the next round
+   sends its CAS about 1 ms after the last one lands.
+2. A foreign writer must read the leaf before its CAS. Its CAS then races a
+   CAS of the other instance that started first, and loses almost every time.
+   In one traced round, all 50 attempts lost, in 21.3 s, of which 9.5 s was
+   backoff. The round ended exhausted, and the lock request got a conflict.
+3. After the conflict, the parallel lock pass hits the 5 s deadlock timeout,
+   and the serial pass after it took 6 to 31 s.
+
+With the ADR-091 escalation turned off, the stale call did not hang. With
+`--prefix-depth=5`, which gives each leaf its own prefix limit, the hang
+stayed, so the limit of the prefix is not the cause.
+
+On the base, `foreign` at 200 workers took 1,696–2,001 / 15,381–31,340 ms,
+with 9 to 20 empty windows. `local` took 188–194 / 320–322 ms. Two instances
+that both carry the load (`symmetric`) starve each other's probes too:
+1,329–2,818 / 4,367–16,013 ms at 200 workers, with 11 to 19 empty windows.
+
+### Variants against the starvation
+
+`foreign` at 200 workers. These runs used the temporary experiment that
+`foreign-writers` replaced, so their base differs a little from the base
+above. The same probe in `local` took 186–192 / 322–327 ms.
+
+| Variant | Probe means (ms) | Empty windows | Commits of the load |
+| --- | --- | --- | --- |
+| Base | 2,352–4,367 / 10,342–10,453 | 11–15 / 18–19 | 54,100–54,300 |
+| Contention backoff 1 / 1 ms | 1,911–2,065 / 3,935–6,076 | 12 / 13–17 | 53,600–54,000 |
+| Gap of 60 ms, always on | 466–485 / 1,217–1,253 | 0–1 / 3 | 65,500–65,900 |
+| Gap of 100 ms, always on | 194–214 / 488–527 | 0 / 0 | 74,000–74,100 |
+| Gap of 100 ms after a lost CAS on that leaf | 1,282–2,167 / 10,414–31,097 | 9–11 / 19–20 | 54,100–54,200 |
+| Gap of 100 ms after any lost CAS | 196–203 / 501–529 | 0 / 0 | 74,000–74,200 |
+| The same, and a fresh load | 123–140 / 306–315 | 0 / 0 | 67,300 |
+
+- A shorter backoff alone does not help: the foreign writer still starts each
+  race last.
+- A gap that is always on cost 14% to 31% on the 10-key probe of `local` at
+  50 workers (gaps of 100 and 150 ms), with nothing to gain.
+- A mark on the leaf that lost does not work: the losses are rare and spread
+  over many leaves, so a mark almost never covers the next leaf of the probe.
+- A gap that grows with the losses and shrinks without them cannot work. A
+  gap that is too short gives fewer losses, because the foreign writer then
+  lands less often: at 200 workers, 50–69 losses in 30 s with no gap and
+  1,127–1,190 with a gap of 100 ms. Such a rule shrinks the gap when the
+  foreign writer starves.
+- Without the fresh load, about 14% of the rounds of `symmetric` lost a CAS:
+  after the gap, the round sent its CAS from a cached state that the other
+  instance had changed. The fresh load cut this to 5% to 6%.
+- A mark of 1 s, 2 s, or 5 s gave the same results.
+
+The extra commits of the load with a gap come from larger rounds: all leaves
+share one prefix partition, whose write limit binds, and with a gap each write
+carries more transactions.
+
+### The full candidate
+
+The candidate had the gap of 100 ms after any lost CAS, for 2 s, with a fresh
+load in each round while the gap is on (`RetryTiming::foreign_gap`). A fresh
+load that finds a change of another writer counted as a lost CAS. Without that,
+the fresh loads hid the losses from the contention split (ADR-085), and in the
+simulation tests of `contended_keys`, the leaf that four instances share no
+longer split.
+
+`foreign-writers`, base and candidate:
+
+| Cell | Base | Candidate |
+| --- | --- | --- |
+| `local`, 50 | 108 / 226–233 (0) | 111–112 / 230–237 (0) |
+| `local`, 200 | 188–194 / 320–322 (0) | 190–192 / 316–324 (0) |
+| `foreign`, 50 | 418–476 / 1,185–1,487 (1–6) | 100–106 / 262–265 (0) |
+| `foreign`, 200 | 1,696–2,001 / 15,381–31,340 (9–20) | 129–133 / 303–320 (0) |
+| `symmetric`, 50 | 511–820 / 3,018–5,028 (2–16) | 117–127 / 301–313 (0) |
+| `symmetric`, 200 | 1,329–2,818 / 4,367–16,013 (11–19) | 160–175 / 400–417 (0) |
+
+The empty windows are in parentheses. In `symmetric`, the leaves split 1 to 69
+times in each cell on the base, and 0 to 10 times on the candidate.
+
+### The cost to the normal case
+
+With no lost CAS, the gap never turns on. The `local` cells, `contention`
+(latency and throughput 0.97 to 1.03 of the base), and `split-merge-fight`
+(0.99 to 1.01) did not change.
+
+When several instances write the same leaves, every instance loses some
+CASes, so the gap is on most of the time. Ratios to the base: mean latency,
+and commits in parentheses:
+
+| Case | Candidate | Fresh load only after a wait |
+| --- | --- | --- |
+| `pair`, 1 worker | 0.81–1.03 (0.97–1.23) | 1.01–1.02 (0.98–0.99) |
+| `pair`, 5 workers, `rw-single` | 0.97 (1.03) | 1.09 (0.92) |
+| `pair`, 20 workers, `rw-many` | 1.18 (0.85) | 1.20 (0.83) |
+| `pair`, backend reads | 2.2–2.8 | 1.08–1.94 |
+| `false-sharing`, hot writers | 1.00–1.03 (0.97–1.00) | 1.00–1.03 (0.97–1.00) |
+| `false-sharing`, `bg-rmw-seq` | 1.44 (0.69) | 1.45 (0.69) |
+| `false-sharing`, `bg-rmw-pool` | 1.16 (0.87) | 1.08 (0.93) |
+| `false-sharing-spans`, hot writers | 1.11–1.21 (0.83–0.91) | 1.00–1.05 (0.95–1.00) |
+| `false-sharing-spans`, `bg-rmw-seq` | 2.43 (0.41) | 1.96 (0.52) |
+| `false-sharing-spans`, `bg-rmw-pool` | 1.48 (0.68) | 1.17 (0.86) |
+
+The read-only background shapes got faster (0.76 to 0.99). With the fresh
+load only after a wait, `foreign` still took 172–187 / 347–387 ms at both
+loads, and `symmetric` 155–222 / 364–523 ms, with no empty windows.
+
+In `false-sharing`, the background instance writes the leaves around the hot
+keys with several workers, and it loses CASes to the hot writers, so its gap is
+on. The hot writers gain nothing from the gap: they are not starved. The
+background instance lost about 47 CASes in each run, and the instance of the
+load in the starvation case 50 to 69. Three narrower variants failed:
+
+- The wait only on a leaf with a recent lost CAS or foreign change: `foreign`
+  at 200 workers took 555–958 / 2,048–7,857 ms, with 4 to 17 empty windows.
+- The gap only for a round that starts within 5 ms of the last round of its
+  leaf: `false-sharing-spans` `bg-rmw-seq` was still 2.06 times slower,
+  because its leaf is busy too.
+- The fresh load alone, with no wait: `foreign` at 200 workers took
+  815–1,154 / 4,367–7,510 ms, with 6 to 17 empty windows.
+
+### Lock waits on a holder of another instance
+
+At 200 workers in `symmetric`, the probes of one instance still stopped for
+several windows in some runs, with or without the gap. The two probes of that
+instance stop in the same windows, so the cause is on the whole instance. A
+trace showed lock waits, not CAS rounds: 41 rounds took 500 ms or more, but
+751 lock acquisitions took 1 s or more. A waiter on a holder of another
+instance gets no notice when the holder ends. It polls the transaction record
+of the holder with the `RetryTiming.wait` schedule (200 ms, up to 5 s), and it
+keeps its own locks while it waits. A poll of at most 500 ms seemed to help,
+but 2 runs are too few to show it.
+
+### Yield requests
+
+Only the writer that starves knows that it starves, so the next design lets
+it tell the other instances. Each step below ran on `foreign-writers` at 200
+workers. The probe means are 1 key / 10 keys.
+
+| Variant | `foreign` (ms) | `symmetric` (ms) |
+| --- | --- | --- |
+| A request for each leaf, after 5 rejected CASes in a row, read after a lost CAS | 1,785–2,329 / 10,559–15,775 | 3,088–9,591 / 21,067–22,471 |
+| The same, also read while the rounds of a leaf run back to back | 1,919 / 7,713 | |
+| A request for the whole collection | 385 / 1,139 | |
+| The same, after 10 rejected CASes, withdrawn when the round lands | 484–987 / 1,807–2,034 | 390–708 / 1,487–3,422 |
+| One request for each instance and collection, kept for 5 s | 274 / 675 | 249–284 / 687–786 |
+| The same, kept for 10 s | 192 / 456 | 226–308 / 602–765 |
+| The same, 5 s, without the fresh load | 224 / 542 | 328–346 / 774–867 |
+
+- After a lost CAS alone, the instance of the load almost never reads the
+  requests. It loses a CAS only when the starving writer lands one. In one
+  run, it read them 98 times and yielded on 223 rounds of about 54,000
+  commits.
+- A request for one leaf leaves each leaf and each later round of the probe
+  transaction to its own detection.
+- A request that the round withdraws when it lands ends the yield too early,
+  so the next round of the same transaction starves again.
+- The fresh load is not needed. Without it, no change of another writer
+  hides from the contention split, so the change of the first candidate that
+  reports one is not needed either.
+
+The longest streak of rejected CASes of each round, in one run of 30 s, on the
+base:
+
+| Case | 5–9 | 10–19 | 20–49 |
+| --- | --- | --- | --- |
+| The starving probe instance (`foreign`, 200 workers) | 33 | 20 | 11 |
+| `pair`, 20 workers, each instance | 128–131 | 1–2 | 0 |
+| `false-sharing`, worst instance | 7 | 1 | 0 |
+| `false-sharing-spans`, worst instance | 4 | 2 | 1 |
+
+So the threshold is 10. A reader that polled at the first round of a busy
+leaf added 37% to the backend reads of `contention`, which has one instance.
+A poll only after a leaf stays busy for 1 s adds 28%, about 3.5% of all its
+backend operations, with no change in latency or commits.
+
+### The hot-key shapes
+
+`foreign-hot-keys` checks whether a hot subset of keys starves a foreign
+writer. On the base, the probes with their own keys in a leaf of hot load keys
+took 55–58 ms, the same as on the instance of the load: the contention split
+separates them. The probes that write hot keys of the load took 63–109 /
+108–2,203 ms at 200 workers. On the instance of the load, the same probes took
+85 / 15,744 ms: a conflict on the same keys, not a race of leaf CASes.
+
+### The final change
+
+The change counts only the rejections that a key change of another writer
+causes, and a change of the node starts the count again. With every rejection
+counted, splits gave long streaks too, and `false-sharing-spans` `bg-rmw-seq`
+took 1.15–1.16 times the base, against 1.04 between two runs of the base. The
+round writes the request during its retry backoff, not between its leaf load
+and its CAS.
+
+Ratios to the base, from two runs of the change against two runs of the
+base, 3 runs each, 2 for `pair`. The noise is the ratio between the two runs
+of the base:
+
+| Case | Change | Noise |
+| --- | --- | --- |
+| `pair`, 1, 5, and 20 workers | 0.96–1.04 | |
+| `false-sharing`, `bg-rmw-seq` | 1.11 | 1.09 |
+| `false-sharing-spans`, `bg-rmw-seq` | 1.06–1.14 | 1.04 |
+| `false-sharing-spans`, `span` | 0.94–1.20 | 1.06 |
+| `false-sharing-spans`, other shapes | 0.98–1.05 | 0.99–1.01 |
+| `contention`, backend reads | 1.28 | 1.00 |
+
+The background shape `bg-rmw-seq` of `false-sharing-spans` writes a busy leaf
+beside the hot writers of other instances, and it is about 10% slower. Some
+rounds of this experiment reach the threshold: a prototype with the same
+threshold wrote 38 requests in 3 runs. The runs did not record which instance
+wrote them.
+
+`foreign` at 200 workers took 227–283 / 524–714 ms, and `symmetric`
+311–427 / 767–1,463 ms, with 4 to 9 empty windows of the 10-key probe.
+
+The hot keys of `foreign-hot-keys` pay for it. Both instances get long streaks
+of rejections from each other, so both request and both yield, and a yielding
+instance holds its locks longer:
+
+| `foreign-hot-keys`, hot keys, 200 workers | Base | Change |
+| --- | --- | --- |
+| Probe, 1 key / 10 keys (ms) | 63–109 / 108–2,203 | 119–237 / 566–30,053 |
+| Commits of the probe | 340–874 | 131–276 |
+| Commits of the load | 4,199–5,975 | 5,678–7,534 |
+
+Two variants did not remove this cost:
+
+- A wait only on rounds that start at most 5 ms after the last round of their
+  leaf: the 1-key probe took 152–219 ms, and `foreign` 1,027 ms on the
+  10-key probe.
+- A threshold of 20: the 1-key probe took 96–327 ms, but `foreign` took
+  1,395–1,510 ms on the 10-key probe, and `symmetric` 1,400–6,369 ms with up
+  to 18 empty windows.
+
+### Conclusions
+
+- The instance that writes a leaf back to back must yield, because the foreign
+  writer must read the leaf before each CAS. A gap of about 3/2 of a load and
+  a CAS between the rounds of each leaf ends the starvation.
+- The instance that yields cannot tell a starving foreign writer from an active
+  one. Each rule on its side alone also yields in the normal case, and there
+  it costs up to 2.4 times on a busy leaf beside foreign writers.
+- Only the writer that starves knows that it starves: another writer rejects
+  many of its CASes in a row. A yield request in an object of the collection,
+  which an instance reads only while it keeps a leaf of that collection busy,
+  keeps the normal case free of the gap.
+- The same signal comes from two instances that write the same hot keys.
+  There the light writer pays, and no threshold separates the two cases.
+- The lock waits on a holder of another instance need their own
+  investigation.
+
 ## 2026-11-25: a round of checks after a stale view moves its floor
 
 Status: rejected. With writers on another instance, most leaves change between

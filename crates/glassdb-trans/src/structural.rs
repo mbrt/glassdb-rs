@@ -35,6 +35,7 @@ use glassdb_concurr::{Background, ScanCadence, join_all_bounded, rt};
 use glassdb_data::{CollectionAddress, DbPrefix, NodeId, ObjectPath, TxId};
 use glassdb_storage::{
     InlinePolicy, NodeSizePolicy, NodeStore, StructuralIntentStore, Timeline, TreeRouter,
+    YieldRequestStore,
 };
 use tokio::sync::Notify;
 
@@ -195,6 +196,7 @@ impl Restructurer {
         bg: Weak<Background>,
         membership: TopologyMembership,
         nodes: NodeStore,
+        yield_requests: YieldRequestStore,
         intent_store: StructuralIntentStore,
         timeline: Timeline,
         mon: Monitor,
@@ -208,6 +210,7 @@ impl Restructurer {
         let parts = TopologyParts::new(topology, coordinator.node_size_policy, inline, mon.clone());
         let coord = LeafCoordinator::with_hinter(
             nodes.clone(),
+            yield_requests,
             key_state.clone(),
             mon.clone(),
             coordinator,

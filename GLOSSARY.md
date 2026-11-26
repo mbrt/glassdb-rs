@@ -501,6 +501,10 @@ _Avoid_: CAS conflict, lost CAS (alone)
 The time that a coordinator round waits before its first leaf load, so that other operations on the leaf can join the round.
 _Avoid_: Batch delay, collection window
 
+**Yield request**:
+A request that a database instance stores for a collection when its coordinator rounds keep failing on a leaf. While it lasts, the other instances leave a gap between their rounds of each leaf of the collection. It expires unless the instance renews it.
+_Avoid_: Starvation note, contention note, fairness hint
+
 ## Structural changes
 
 **Topology**:

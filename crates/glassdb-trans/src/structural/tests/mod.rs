@@ -351,6 +351,7 @@ fn restructurer_with_parts(
     let key_state = KeyStateResolver::new(mon.clone());
     let coord = LeafCoordinator::with_hinter(
         store.nodes.clone(),
+        store.foundation.yield_requests.clone(),
         key_state.clone(),
         mon.clone(),
         CoordinatorConfig {

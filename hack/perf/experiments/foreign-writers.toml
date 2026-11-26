@@ -1,0 +1,64 @@
+# Writers on two database instances that share the leaves of one collection.
+# `rw-single` and `rw-many` give the load at 50 and at 200 workers of each
+# shape, and one probe worker of each shape measures the latency:
+#
+# * `local`: the load and the probes on one instance, the reference.
+# * `foreign`: the load on one instance, and the probes on another.
+# * `symmetric`: two instances, each with the full load and the probes.
+#
+# Without yield requests (ADR-110), the instance of the load wins almost every
+# leaf CAS, and the probes on another instance starve
+# (hack/perf/investigations.md, 2026-11-26). A run takes about 40 s to 80 s of
+# wall time for each cell, so the experiment is not part of the CI comparison.
+tags = ["extra", "area/contention"]
+include = ["../configs/workers.toml"]
+
+[shapes.probe-single]
+kind = "read-modify-write"
+pool = "wide"
+keys = 1
+
+[shapes.probe-many]
+kind = "read-modify-write"
+pool = "wide"
+keys = 10
+
+[workloads.local.groups.all]
+instances = 1
+shapes = { probe-single = 1, probe-many = 1 }
+loads = { rw-single = "cell", rw-many = "cell" }
+
+[workloads.foreign.groups.load]
+instances = 1
+shapes = {}
+loads = { rw-single = "cell", rw-many = "cell" }
+
+[workloads.foreign.groups.probes]
+instances = 1
+shapes = { probe-single = 1, probe-many = 1 }
+
+[workloads.symmetric.groups.a]
+instances = 1
+shapes = { probe-single = 1, probe-many = 1 }
+loads = { rw-single = "cell", rw-many = "cell" }
+
+[workloads.symmetric.groups.b]
+instances = 1
+shapes = { probe-single = 1, probe-many = 1 }
+loads = { rw-single = "cell", rw-many = "cell" }
+
+[cell]
+databases = 1
+collections = 1
+
+[cell.measure]
+until = "duration"
+duration = "30s"
+
+[[axes]]
+path = "cell.workload"
+values = ["local", "foreign", "symmetric"]
+
+[[axes]]
+path = "cell.workers"
+values = [50, 200]

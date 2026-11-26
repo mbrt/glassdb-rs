@@ -1589,6 +1589,7 @@ mod tests {
         let router = TreeRouter::new(nodes.clone(), parallelism);
         let coord = LeafCoordinator::with_hinter(
             nodes.clone(),
+            foundation.yield_requests.clone(),
             key_state,
             mon.clone(),
             CoordinatorConfig {

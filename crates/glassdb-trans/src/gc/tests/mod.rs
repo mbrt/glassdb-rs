@@ -298,6 +298,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
     let key_state = KeyStateResolver::new(mon.clone());
     let coord = LeafCoordinator::with_hinter(
         nodes.clone(),
+        foundation.yield_requests.clone(),
         key_state,
         mon.clone(),
         crate::leaf_coord::CoordinatorConfig::default(),
@@ -335,6 +336,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         CollectionLifecycle::new(
             records.clone(),
             nodes.clone(),
+            foundation.yield_requests.clone(),
             mon.clone(),
             timeline.clone(),
             RetrySchedule::default(),
@@ -1608,6 +1610,7 @@ async fn reclaim_membership_only(committed: bool, cached_holder: bool) {
     );
     let coord = LeafCoordinator::with_hinter(
         owner.nodes.clone(),
+        owner.yield_requests.clone(),
         KeyStateResolver::new(owner.monitor.clone()),
         owner.monitor.clone(),
         crate::leaf_coord::CoordinatorConfig::default(),
@@ -2247,6 +2250,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
     let lifecycle = CollectionLifecycle::new(
         owner.records.clone(),
         owner.nodes.clone(),
+        owner.yield_requests.clone(),
         owner.monitor.clone(),
         owner.timeline.clone(),
         RetrySchedule::default(),
@@ -2791,6 +2795,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropR
     let lifecycle = CollectionLifecycle::new(
         owner.records.clone(),
         owner.nodes.clone(),
+        owner.yield_requests.clone(),
         owner.monitor.clone(),
         owner.timeline.clone(),
         RetrySchedule::default(),
