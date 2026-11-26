@@ -445,7 +445,7 @@ impl CollectionStore {
             };
             // An error of a read after an applied `Decision::Advance` also gets
             // here. The fence then finds a changed record sequence.
-            if !self.fence(&path, &in_doubt).await? {
+            if !self.fence(&path, &in_doubt).await {
                 return Ok(Fenced::InDoubt);
             }
         }
@@ -459,32 +459,32 @@ impl CollectionStore {
     /// A loaded record with the same one is in the state that the CAS
     /// expected: a write of that state again changes only the record sequence,
     /// and a lost write is a change too.
-    async fn fence(
-        &self,
-        path: &ObjectPath,
-        expected: &Observation<CollectionRecord>,
-    ) -> Result<bool, StorageError> {
+    async fn fence(&self, path: &ObjectPath, expected: &Observation<CollectionRecord>) -> bool {
+        // Only a definitive result fences the CAS. A failed read or rewrite
+        // tells nothing about the CAS, so it stays in doubt.
         let fresh = Requirement::after(self.records.currentness_barrier());
         let loaded = match self.records.read(path.clone(), fresh).await {
             Ok(loaded) => loaded,
-            Err(StorageError::Unavailable(_)) => return Ok(false),
-            Err(error) => return Err(error),
+            Err(error) => {
+                tracing::debug!(%path, %error, "fence read failed, the CAS stays in doubt");
+                return false;
+            }
         };
         let (Some(expected), Some(current)) = (expected.value(), loaded.value()) else {
             // A collection record path is created once, so a CAS cannot land
             // on a deleted record.
-            return Ok(true);
+            return true;
         };
         if current.record_sequence != expected.record_sequence {
-            return Ok(true);
+            return true;
         }
         let again = current.as_ref().clone().following(current);
         match self.records.replace(&loaded, Arc::new(again)).await {
-            Ok(CasResult::Applied(_) | CasResult::Rejected) | Err(StorageError::NotFound) => {
-                Ok(true)
+            Ok(CasResult::Applied(_) | CasResult::Rejected) | Err(StorageError::NotFound) => true,
+            Err(error) => {
+                tracing::debug!(%path, %error, "fence rewrite failed, the CAS stays in doubt");
+                false
             }
-            Err(StorageError::Unavailable(_)) => Ok(false),
-            Err(error) => Err(error),
         }
     }
 
@@ -1067,6 +1067,88 @@ mod tests {
             record.directory_lock().holders(),
             std::slice::from_ref(&reader)
         );
+    }
+
+    // ADR-106: only a definitive result fences an in-doubt CAS. A fence whose
+    // read fails, for any reason, leaves the CAS in doubt.
+    #[tokio::test]
+    async fn a_failed_fence_read_leaves_the_cas_in_doubt() {
+        let hook = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let records = store_over(hook.clone());
+        let collection = CollectionAddress::new("db", collection_id(4));
+        assert!(
+            records
+                .create_record(&collection, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        let in_doubt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        hook.set_before({
+            let in_doubt = in_doubt.clone();
+            move |op| {
+                let result = match op {
+                    BackendOp::WriteIf { .. } => {
+                        in_doubt.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Err(BackendError::Unavailable("lost".into()))
+                    }
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                        if in_doubt.load(std::sync::atomic::Ordering::SeqCst) =>
+                    {
+                        Err(BackendError::other("rejected"))
+                    }
+                    _ => Ok(()),
+                };
+                Box::pin(ready(result)) as HookFuture
+            }
+        });
+
+        assert!(matches!(
+            add_reader(&records, &collection, tx_id(&[1]))
+                .await
+                .unwrap(),
+            Fenced::InDoubt
+        ));
+    }
+
+    // ADR-106: a fence whose rewrite fails, for any reason, leaves the CAS in
+    // doubt too.
+    #[tokio::test]
+    async fn a_failed_fence_rewrite_leaves_the_cas_in_doubt() {
+        let hook = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let records = store_over(hook.clone());
+        let collection = CollectionAddress::new("db", collection_id(5));
+        assert!(
+            records
+                .create_record(&collection, &CollectionRecord::new())
+                .await
+                .unwrap()
+        );
+        // The CAS does not land and comes back in doubt. The fence then reads
+        // the record unchanged, and its rewrite is rejected.
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        hook.set_before({
+            let writes = writes.clone();
+            move |op| {
+                let result = match op {
+                    BackendOp::WriteIf { .. } => {
+                        match writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                            0 => Err(BackendError::Unavailable("lost".into())),
+                            _ => Err(BackendError::other("rejected")),
+                        }
+                    }
+                    _ => Ok(()),
+                };
+                Box::pin(ready(result)) as HookFuture
+            }
+        });
+
+        assert!(matches!(
+            add_reader(&records, &collection, tx_id(&[1]))
+                .await
+                .unwrap(),
+            Fenced::InDoubt
+        ));
+        assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     // ADR-106: when the fence is in doubt too, the owner learns that its CAS
