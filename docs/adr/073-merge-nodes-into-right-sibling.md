@@ -8,6 +8,8 @@ underfull threshold of leaves applies only with the size causes topology policy.
 [ADR-084](084-size-causes-are-the-default-topology-policy.md) makes the size
 causes the default topology policy again. Its merges for write spans can make
 a leaf of up to twice the soft cap of entries.
+[ADR-107](107-a-merge-absorbs-only-into-a-target-at-its-boundary.md) adds a
+precondition to the absorb and corrects the proof of this ADR.
 
 Refines [ADR-031](031-dynamic-range-sharding.md) by adding merges to the B-link
 topology, and extends its background split policy into one maintenance policy

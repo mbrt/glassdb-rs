@@ -266,6 +266,11 @@ impl Merger {
         let Some(target) = self.target(collection, left, requirement).await? else {
             return Ok(None);
         };
+        // The target already holds the range of `left`, so a peer merged this
+        // copy of `left` after it wounded this worker (ADR-107).
+        if Some(target.node.low_key()) != left.high_key() {
+            return Ok(None);
+        }
         if let Err(veto) = self.need(left, &target.node, reason) {
             self.count_veto(veto);
             return Ok(None);
@@ -400,8 +405,10 @@ impl Merger {
                 CasRetries::Bounded(NODE_CAS_ATTEMPTS),
                 |mut right, _| async move {
                     // Recovery advances the generation to fence this absorb after
-                    // it deleted the intent.
+                    // it deleted the intent. A target whose low key is below the
+                    // boundary already holds the range of `left` (ADR-107).
                     if right.is_drained()
+                        || right.low_key() != merge.boundary.as_slice()
                         || right.membership_generation() != merge.generation
                         || right.drop_intent().is_some()
                         || right.locks().merge_reservation().is_some()
