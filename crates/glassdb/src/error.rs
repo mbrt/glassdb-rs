@@ -47,6 +47,11 @@ pub enum Error {
     /// storage was unavailable, even after the engine exhausted its in-place
     /// retries. Unlike [`Error::InDoubt`], no mutation is in question — a read
     /// has no side effects — so the operation is always safe to retry.
+    ///
+    /// [`Database::open`](crate::Database::open) also returns it when its
+    /// metadata create may have landed. The database can then exist, and a
+    /// retry of the open returns its stored metadata, which can differ from
+    /// the requested settings.
     #[error("storage unavailable: {0}")]
     Unavailable(String),
     /// The database is shutting down and is no longer accepting new
@@ -103,8 +108,10 @@ impl Error {
     /// outage is the matchable, retry-safe [`Error::Unavailable`] instead of
     /// [`Error::InDoubt`].
     ///
-    /// It must be used *only* for genuine reads. Operations that flow through
-    /// the commit path — including reads that confirm a pending write, such as
+    /// It must be used *only* for genuine reads, and for the writes of an
+    /// operation that is safe to retry as a whole because it reads first and
+    /// accepts what a landed write stored, such as the setup of an open.
+    /// Operations that flow through the commit path — including reads that confirm a pending write, such as
     /// re-reading a transaction's commit status — must keep the conservative
     /// `Unavailable -> InDoubt` mapping of [`From`], because there a failed read
     /// inherits the uncertainty of the mutation it was confirming.
