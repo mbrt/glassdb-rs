@@ -1486,14 +1486,15 @@ impl Monitor {
                 })
         };
 
-        let mut create_may_land = false;
-        // Whether this owner saw its own pending record. GC never deletes a
-        // pending record, so a later empty path proves that this commit landed.
-        let mut saw_pending = expected.as_ref().is_some_and(|observed| {
-            observed
-                .value()
-                .is_some_and(|stored| stored.status == TxCommitStatus::Pending)
-        });
+        let mut attempts = CommitAttempts {
+            saw_pending: expected.as_ref().is_some_and(|observed| {
+                observed
+                    .value()
+                    .is_some_and(|stored| stored.status == TxCommitStatus::Pending)
+            }),
+            create_may_land: false,
+            write_may_land: false,
+        };
         // The block keeps every early return inside it, so every error reports
         // a create that may still land.
         let result: Result<(), TransError> = async {
@@ -1514,7 +1515,7 @@ impl Monitor {
                     // the record's reclamation horizon.
                     Err(StorageError::Precondition) => CommitWriteFailure::Rejected,
                     Err(StorageError::Unavailable(_)) => {
-                        create_may_land |= expected.is_none();
+                        attempts.note_in_doubt(expected.is_none());
                         CommitWriteFailure::InDoubt { started_at }
                     }
                     Err(error) => return Err(error.into()),
@@ -1532,10 +1533,6 @@ impl Monitor {
                 };
 
                 let record_state = TxRecordState::try_from_observation(&status.observation)?;
-                let attempts = CommitAttempts {
-                    saw_pending,
-                    create_may_land,
-                };
                 match classify_commit_observation(record_state, attempts)? {
                     CommitResolution::Committed => {
                         self.record_durable_observation(tid, &status.observation);
@@ -1566,7 +1563,7 @@ impl Monitor {
                         // landed yet. If it lands later, the next write is rejected
                         // and its read-back decides the outcome.
                         expected = Some(status.observation);
-                        saw_pending = true;
+                        attempts.saw_pending = true;
                         // Only this owner writes a pending record, and its
                         // lease refresh stopped before the first attempt. So a
                         // rejection lost to an earlier pending write of this
@@ -1582,10 +1579,7 @@ impl Monitor {
             }
         }
         .await;
-        result.map_err(|error| CommitWriteError {
-            error,
-            create_may_land,
-        })
+        result.map_err(|error| attempts.failure(tid, error))
     }
 
     /// Advances an abort-side lifecycle transition from an exact observation.
@@ -2641,10 +2635,45 @@ fn classify_abort_observation(
 /// record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CommitAttempts {
-    /// The owner saw its own pending record.
+    /// The owner saw its own pending record. GC never deletes a pending
+    /// record, so a later empty path proves that this commit landed.
     saw_pending: bool,
     /// An earlier create of the committed record was in doubt.
     create_may_land: bool,
+    /// An earlier write of the committed record was in doubt, so it can have
+    /// landed.
+    write_may_land: bool,
+}
+
+impl CommitAttempts {
+    /// Notes an attempt that ended in doubt. `create` tells whether it was a
+    /// create of the record.
+    fn note_in_doubt(&mut self, create: bool) {
+        self.create_may_land |= create;
+        self.write_may_land = true;
+    }
+
+    /// Returns the failure of the commit of `tid` that ends with `error`.
+    ///
+    /// After a write that can have landed, only a final record that proves
+    /// another outcome is definitive. Any other failure leaves the commit in
+    /// doubt.
+    fn failure(self, tid: &TxId, error: TransError) -> CommitWriteError {
+        let error = match error {
+            error if !self.write_may_land => error,
+            TransError::AlreadyFinalized | TransError::Storage(StorageError::Unavailable(_)) => {
+                error
+            }
+            error => in_doubt(format!(
+                "transaction {tid} commit outcome is unknown after an in-doubt write: {}",
+                with_sources(&error)
+            )),
+        };
+        CommitWriteError {
+            error,
+            create_may_land: self.create_may_land,
+        }
+    }
 }
 
 /// Classifies what a durable read proves after a committed-record write did not
@@ -2692,6 +2721,18 @@ fn classify_commit_observation(
 /// which the public surface classifies as `Error::InDoubt`.
 fn in_doubt(reason: impl Into<String>) -> TransError {
     TransError::Storage(StorageError::Unavailable(reason.into()))
+}
+
+/// Returns the message of `error` and of its sources. An in-doubt error has no
+/// source, so its message must keep the chain.
+fn with_sources(error: &TransError) -> String {
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        message.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    message
 }
 
 fn notify_waiters(waiters: &mut Vec<oneshot::Sender<()>>) {
@@ -2778,6 +2819,7 @@ mod tests {
                 let attempts = CommitAttempts {
                     saw_pending,
                     create_may_land,
+                    write_may_land: create_may_land,
                 };
                 let classify = |state| classify_commit_observation(state, attempts).unwrap();
                 assert_eq!(classify(TxRecordState::Committed), Committed);
@@ -3798,6 +3840,76 @@ mod tests {
                 Err(BackendError::Unavailable(
                     "injected lost ack (landed, ack lost)".into(),
                 ))
+            });
+            future
+        });
+
+        let mut record = TxRecord::new(tx, TxCommitStatus::Pending);
+        record.locks.push(lock);
+        let error = owner.commit_tx(record).await.unwrap_err();
+        assert!(
+            matches!(error, TransError::Storage(StorageError::Unavailable(_))),
+            "expected an in-doubt outcome, got {error:?}"
+        );
+    }
+
+    // A commit write that may have landed decides the outcome class of every
+    // later failure of the same commit. Here the write lands and its ack is
+    // lost, and then the read-back fails with an error that is not
+    // `Unavailable`. The commit can have happened, so the owner must report it
+    // in doubt, not as an internal error.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_read_back_after_an_in_doubt_commit_write_stays_in_doubt() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let b: Arc<dyn Backend> = backend.clone();
+        let (owner, _owner_ctx) = new_test_monitor(b);
+        let tx = tx_id(b"read-back-fails");
+        let lock = TxLock::TopologyParticipant {
+            collection: CollectionAddress::root("test"),
+        };
+        owner
+            .begin_persisted_tx(
+                &tx,
+                TxRecoveryManifest {
+                    locks: vec![lock.clone()],
+                    ..TxRecoveryManifest::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let lost_ack = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        backend.set_after({
+            let lost_ack = lost_ack.clone();
+            move |operation, outcome| {
+                let lose = is_commit_write(operation) && outcome.is_success();
+                if lose {
+                    lost_ack.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let future: HookFuture = Box::pin(async move {
+                    if lose {
+                        Err(BackendError::Unavailable(
+                            "injected lost ack (landed, ack lost)".into(),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
+                future
+            }
+        });
+        backend.set_before(move |operation| {
+            let fail = lost_ack.load(std::sync::atomic::Ordering::SeqCst)
+                && matches!(
+                    operation,
+                    BackendOp::Read { .. } | BackendOp::ReadIfModified { .. }
+                );
+            let future: HookFuture = Box::pin(async move {
+                if fail {
+                    Err(BackendError::other("bad request"))
+                } else {
+                    Ok(())
+                }
             });
             future
         });
