@@ -188,7 +188,8 @@ fn membership_holds_under_faults() {
         let w = workload.clone();
         let ft = fault_tape(seed);
         block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-            run_and_assert_with_faults(w, FaultConfig::failures(9), seed, ft).await
+            run_and_assert_with_faults(w, FaultConfig::failures(super::FAULT_INTENSITY), seed, ft)
+                .await
         });
     }
 }
@@ -220,7 +221,7 @@ fn pct_seed_breadth_holds_membership() {
     // Seed-breadth sweep: many PCT schedules over the contended workload, with
     // and without faults. Any invariant violation panics inside the sweep.
     let workload = contended_membership();
-    workload.pct_sweep(FaultConfig::failures(7));
+    workload.pct_sweep(FaultConfig::failures(super::FAULT_INTENSITY));
     workload.pct_sweep(FaultConfig::none());
 }
 
@@ -236,10 +237,13 @@ fn membership_holds_while_nodes_merge() {
 
 #[test]
 fn membership_holds_while_nodes_merge_under_faults_and_restarts() {
-    // Crashes and outages interrupt merges at every step, so structural
-    // recovery must finish or abandon them within the membership bound.
+    // Crashes and outages interrupt merges, so structural recovery must
+    // finish or abandon them within the membership bound.
     for (faults, seeds) in [
-        (FaultConfig::failures(9), [0u64, 3, 99, 2024].as_slice()),
+        (
+            FaultConfig::failures(super::FAULT_INTENSITY),
+            [0u64, 3, 99, 2024].as_slice(),
+        ),
         (
             FaultConfig::failures(200),
             [0u64, 1, 7, 42, 99, 1234].as_slice(),
@@ -258,6 +262,6 @@ fn membership_holds_while_nodes_merge_under_faults_and_restarts() {
 #[test]
 fn pct_seed_breadth_holds_membership_while_nodes_merge() {
     let workload = fill_then_shrink();
-    workload.pct_sweep(FaultConfig::failures(7));
+    workload.pct_sweep(FaultConfig::failures(super::FAULT_INTENSITY));
     workload.pct_sweep(FaultConfig::none());
 }

@@ -150,7 +150,7 @@ fn exact_history_holds_with_slow_mutations() {
 #[test]
 fn pct_seed_breadth_holds_exact_history() {
     let workload = contended_history();
-    let faults = FaultConfig::failures(7);
+    let faults = FaultConfig::failures(super::FAULT_INTENSITY);
     pct_sweep(&workload, faults);
 }
 
@@ -201,7 +201,7 @@ fn long_and_short_history() -> HistoryWorkload {
 fn pct_seed_breadth_holds_exact_history_of_long_and_short_transactions() {
     let workload = long_and_short_history();
     pct_sweep(&workload, FaultConfig::none());
-    pct_sweep(&workload, FaultConfig::failures(7));
+    pct_sweep(&workload, FaultConfig::failures(super::FAULT_INTENSITY));
 }
 
 #[test]
@@ -210,7 +210,13 @@ fn exact_history_holds_with_guided_faults() {
         let workload = contended_history();
         let faults_tape = fault_tape(seed);
         block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-            run_and_assert_with_faults(workload, FaultConfig::failures(9), seed, faults_tape).await
+            run_and_assert_with_faults(
+                workload,
+                FaultConfig::failures(super::FAULT_INTENSITY),
+                seed,
+                faults_tape,
+            )
+            .await
         });
     }
 }
@@ -303,14 +309,23 @@ fn stale_history_holds_with_guided_faults() {
         let workload = stale_history();
         let faults_tape = fault_tape(seed);
         block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-            run_and_assert_with_faults(workload, FaultConfig::failures(9), seed, faults_tape).await
+            run_and_assert_with_faults(
+                workload,
+                FaultConfig::failures(super::FAULT_INTENSITY),
+                seed,
+                faults_tape,
+            )
+            .await
         });
     }
 }
 
 #[test]
 fn pct_seed_breadth_holds_stale_history() {
-    pct_sweep(&stale_history(), FaultConfig::failures(7));
+    pct_sweep(
+        &stale_history(),
+        FaultConfig::failures(super::FAULT_INTENSITY),
+    );
 }
 
 /// One instance caches the values of two shared collections, and the other
@@ -423,7 +438,10 @@ fn shared_collection_history() -> HistoryWorkload {
 #[test]
 fn shared_collection_history_holds_under_contention_and_failures() {
     let workload = shared_collection_history();
-    for faults in [FaultConfig::none(), FaultConfig::failures(7)] {
+    for faults in [
+        FaultConfig::none(),
+        FaultConfig::failures(super::FAULT_INTENSITY),
+    ] {
         pct_sweep(&workload, faults);
     }
 }
@@ -484,7 +502,10 @@ fn updated_collection_history() -> HistoryWorkload {
 #[test]
 fn updated_collection_history_holds_under_contention_and_failures() {
     let workload = updated_collection_history();
-    for faults in [FaultConfig::none(), FaultConfig::failures(7)] {
+    for faults in [
+        FaultConfig::none(),
+        FaultConfig::failures(super::FAULT_INTENSITY),
+    ] {
         pct_sweep(&workload, faults);
     }
 }
@@ -568,5 +589,5 @@ fn exact_history_holds_while_leaves_merge() {
 fn pct_seed_breadth_holds_exact_history_while_leaves_merge() {
     let workload = shrinking_history();
     workload.pct_sweep(FaultConfig::none());
-    workload.pct_sweep(FaultConfig::failures(7));
+    workload.pct_sweep(FaultConfig::failures(super::FAULT_INTENSITY));
 }

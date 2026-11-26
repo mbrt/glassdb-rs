@@ -54,7 +54,8 @@ fn ring_invariant_holds_under_faults() {
         let w = workload.clone();
         let ft = fault_tape(seed);
         block_on_with(TapeScheduler::new(tape(seed)), seed, async move {
-            run_and_assert_with_faults(w, FaultConfig::failures(9), seed, ft).await
+            run_and_assert_with_faults(w, FaultConfig::failures(super::FAULT_INTENSITY), seed, ft)
+                .await
         });
     }
 }
@@ -86,6 +87,6 @@ fn pct_seed_breadth_holds_ring_invariant() {
     // Seed-breadth sweep: many PCT schedules over the contended ring, with and
     // without faults. Any invariant violation panics inside the sweep.
     let workload = contended_cycle();
-    pct_sweep(&workload, FaultConfig::failures(7));
+    pct_sweep(&workload, FaultConfig::failures(super::FAULT_INTENSITY));
     pct_sweep(&workload, FaultConfig::none());
 }
