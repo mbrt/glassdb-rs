@@ -128,6 +128,9 @@ impl Error {
     pub(crate) fn from_read_trans(e: TransError) -> Self {
         match e {
             TransError::Storage(s) => Error::from_read(s),
+            // A lock CAS of the caller's identity that can still land
+            // (ADR-106). The engine keeps the identity pinned.
+            TransError::MutationInDoubt(s) => Error::Unavailable(s),
             other => other.into(),
         }
     }
@@ -220,6 +223,20 @@ mod tests {
             Error::InDoubt(msg) => assert_eq!(msg, "committing writes: lost ack"),
             other => panic!("expected in-doubt, got {other:?}"),
         }
+    }
+
+    // An operation that stages no change of the caller can leave a read lock
+    // in doubt (ADR-091, ADR-106). That lock is not a change of the caller, so
+    // the caller's outcome is known, and the error is not `InDoubt`.
+    #[test]
+    fn an_in_doubt_lock_of_an_operation_without_changes_is_unavailable() {
+        let trans = TransError::MutationInDoubt("directory lock".into());
+
+        match Error::from_read_trans(trans.clone()) {
+            Error::Unavailable(msg) => assert_eq!(msg, "directory lock"),
+            other => panic!("expected unavailable, got {other:?}"),
+        }
+        assert!(matches!(Error::from(trans), Error::InDoubt(_)));
     }
 
     #[test]
