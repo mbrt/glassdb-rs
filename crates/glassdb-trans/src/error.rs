@@ -15,8 +15,10 @@ pub enum TransError {
     /// The transaction should be retried from the beginning (Go `ErrRetry`).
     #[error("retry transaction")]
     Retry,
-    /// The transaction record already has a final status.
-    #[error("transaction already has a final status")]
+    /// The identity cannot commit: its transaction record already has a
+    /// final status, or a create of its pending record can still land
+    /// (ADR-111).
+    #[error("transaction cannot commit")]
     AlreadyFinalized,
     /// The transaction was aborted by a higher-priority transaction under the
     /// wound-wait rule (Go `ErrWounded`). It must be retried from the beginning

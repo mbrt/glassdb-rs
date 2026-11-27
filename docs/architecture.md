@@ -445,7 +445,11 @@ the identity and the status
    changed. Locked validation always resolves the logical reads, and treats the
    transaction's own exclusive lock as protection for the previous state. An
    invalidated read causes a locked replay.
-3. **Commit.** The transaction record becomes committed.
+3. **Commit.** The transaction record becomes committed. If a create of the
+   pending record can still land, the owner does not commit. The transaction
+   then replays under a new identity, so that a late create cannot bring back
+   the pending record of a committed identity
+   ([ADR-111](adr/111-an-owner-does-not-commit-while-a-pending-create-can-land.md)).
 4. **Write-back.** Write-back uses the same bounded parallelism over routed leaf
    groups. If a live structural holder is present, write-back leaves the work to
    lazy recovery.

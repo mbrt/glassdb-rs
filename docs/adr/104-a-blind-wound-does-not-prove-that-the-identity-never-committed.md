@@ -4,6 +4,10 @@
 
 Accepted.
 
+[ADR-111](111-an-owner-does-not-commit-while-a-pending-create-can-land.md) stops a
+pending record from coming back after GC deleted a committed record, which
+would break the rule for `Wounded`.
+
 Refines [ADR-079](079-gc-safety-does-not-depend-on-time.md): it gives the reader
 rule for the leaked wounds and the stray holders of that ADR. Refines
 [ADR-024](024-hold-and-wait-conflict-resolution.md): the lazy pending record

@@ -862,3 +862,57 @@ async fn clean_rejection_on_single_rw_still_commits() {
     let got = read_int(&coll.read(b"k").await.unwrap().unwrap());
     assert_eq!(got, 42, "the increment must be applied exactly once");
 }
+
+/// The statuses of the transaction records of database `db`.
+async fn record_statuses(memory: &MemoryBackend, db: &str) -> Vec<TxCommitStatus> {
+    let page = memory
+        .list(
+            &format!("{db}/_t/"),
+            None,
+            glassdb::backend::ListLimit::new(1000).unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut statuses = Vec::new();
+    for path in page.objects {
+        let body = memory.read(&path).await.unwrap().contents;
+        statuses.push(glassdb_storage::txrecord::status(&body).unwrap());
+    }
+    statuses
+}
+
+// Regression (ADR-111): the first create of a pending record reports
+// `Unavailable`. The identity must not commit, because the create could land
+// after GC deleted its committed record. The transaction commits under a
+// renewed identity, and the old identity ends `Aborted`.
+#[tokio::test(start_paused = true)]
+async fn a_pending_create_in_doubt_replays_under_a_new_identity() {
+    let memory = Arc::new(MemoryBackend::new());
+    let backend = HookBackend::new(memory.clone());
+    let db = Database::open("pending", backend.clone()).await.unwrap();
+    arm_before(
+        &backend,
+        fail_before(
+            |op| {
+                matches!(op, BackendOp::WriteIfNotExists { path, value }
+                    if path.contains("/_t/")
+                        && glassdb_storage::txrecord::status(value)
+                            .is_ok_and(|status| status == TxCommitStatus::Pending))
+            },
+            || not_applied("pending create"),
+        ),
+    );
+
+    db.root_collection()
+        .create_collection_if_absent(b"c")
+        .await
+        .expect("the transaction replays and commits");
+
+    let mut statuses = record_statuses(&memory, "pending").await;
+    statuses.sort_by_key(|status| format!("{status:?}"));
+    assert_eq!(
+        statuses,
+        [TxCommitStatus::Aborted, TxCommitStatus::Committed],
+        "the old identity aborted, and a renewed identity committed"
+    );
+}

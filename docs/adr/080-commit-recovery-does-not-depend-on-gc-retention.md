@@ -6,6 +6,8 @@ Accepted — implemented.
 
 [ADR-079](079-gc-safety-does-not-depend-on-time.md) renames the safety horizon
 to retention period.
+[ADR-111](111-an-owner-does-not-commit-while-a-pending-create-can-land.md) stops a
+commit while a create of the pending record can still land.
 
 Refines the classification of a missing record in
 [ADR-057](057-bounded-in-doubt-commit-recovery.md). The rule of
