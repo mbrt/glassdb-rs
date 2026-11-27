@@ -4,15 +4,14 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use glassdb_backend::{Backend, BackendError, BackendStats, StatsBackend};
+use glassdb_backend::{Backend, BackendStats, StatsBackend};
 use glassdb_concurr::{Background, DedupKeySnapshot, RetrySchedule, rt};
-use glassdb_data::{CollectionAddress, CollectionId, DatabaseId, DbPrefix, ObjectPath, TxId};
+use glassdb_data::{CollectionAddress, CollectionId, DatabaseId, DbPrefix, TxId};
 use glassdb_storage::transaction::TxRecordStore;
 use glassdb_storage::{
-    CacheStats, CachedStore, CollectionRecord, CollectionStore, InlinePolicy, LeafBody,
-    MonotonicFloor, Node, NodeReads, NodeSizePolicy, NodeStore, PersistentCache,
-    PersistentCacheConfig, PersistentCacheMedia, Requirement, StorageError, StructuralIntentStore,
-    Timeline, TreeRouter, ViewRead,
+    CacheStats, CachedStore, CollectionStore, InlinePolicy, MonotonicFloor, NodeReads,
+    NodeSizePolicy, NodeStore, PersistentCache, PersistentCacheConfig, PersistentCacheMedia,
+    Requirement, StorageError, StructuralIntentStore, Timeline, TreeRouter, ViewRead,
 };
 
 use crate::access::AccessSet;
@@ -262,13 +261,8 @@ impl Engine {
         B: Backend + ?Sized,
     {
         let collection = CollectionAddress::root(name);
-        let record_path = ObjectPath::CollectionRecord {
-            collection: collection.clone(),
-        }
-        .to_string();
-        Self::ensure_collection_record(backend, &record_path).await?;
-        let root_path = ObjectPath::TreeRoot { collection }.to_string();
-        Self::ensure_tree_root(backend, &root_path).await
+        CollectionStore::ensure_record_on(backend, &collection).await?;
+        NodeStore::ensure_root_on(backend, &collection).await
     }
 
     /// Returns the reader of one execution of a transaction body. `view` is
@@ -376,42 +370,6 @@ impl Engine {
         EngineDiagnostics {
             gc: self.gc.diagnostics(),
             coordinator_dedup: self.coord.dedup_snapshot(),
-        }
-    }
-
-    async fn ensure_collection_record<B>(backend: &B, path: &str) -> Result<(), StorageError>
-    where
-        B: Backend + ?Sized,
-    {
-        match backend
-            .write_if_not_exists(path, CollectionRecord::new().encode())
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(BackendError::Precondition) => {
-                let stored = backend.read(path).await?;
-                CollectionRecord::decode(&stored.contents)?;
-                Ok(())
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    async fn ensure_tree_root<B>(backend: &B, path: &str) -> Result<(), StorageError>
-    where
-        B: Backend + ?Sized,
-    {
-        match backend
-            .write_if_not_exists(path, Node::leaf(LeafBody::new()).encode())
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(BackendError::Precondition) => {
-                let stored = backend.read(path).await?;
-                Node::decode(&stored.contents)?;
-                Ok(())
-            }
-            Err(error) => Err(error.into()),
         }
     }
 }

@@ -309,6 +309,34 @@ pub struct CollectionStore {
 }
 
 impl CollectionStore {
+    /// Creates an empty record of `collection` directly on `backend` if the
+    /// path is empty, and checks that a present record decodes. It needs no
+    /// store. Like every create, it starts at a random record sequence
+    /// (ADR-109).
+    pub async fn ensure_record_on<B>(
+        backend: &B,
+        collection: &CollectionAddress,
+    ) -> Result<(), StorageError>
+    where
+        B: glassdb_backend::Backend + ?Sized,
+    {
+        let path = ObjectPath::CollectionRecord {
+            collection: collection.clone(),
+        }
+        .to_string();
+        match backend
+            .write_if_not_exists(&path, CollectionRecord::new().created().encode())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(glassdb_backend::BackendError::Precondition) => {
+                CollectionRecord::decode(&backend.read(&path).await?.contents)?;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Creates a collection store over the shared decoded-object cache. A
     /// batch of record checks runs at most `parallelism` checks at a time.
     pub fn new(objects: CachedStore, parallelism: NonZeroUsize) -> Self {
@@ -1046,6 +1074,32 @@ mod tests {
         let mut locked = first;
         locked.add_directory_reader(tx_id(&[1]));
         assert!(!records.store_record(&locked, &first_seen).await.unwrap());
+    }
+
+    // ADR-109: the open creates the permanent record directly on the
+    // backend. That create also starts at a random sequence, so a late CAS
+    // that expected the state of an earlier create cannot land.
+    #[tokio::test]
+    async fn a_record_ensured_again_does_not_repeat_its_first_state() {
+        let memory = MemoryBackend::new();
+        let collection = CollectionAddress::root("db");
+        let path = ObjectPath::CollectionRecord {
+            collection: collection.clone(),
+        }
+        .to_string();
+        CollectionStore::ensure_record_on(&memory, &collection)
+            .await
+            .unwrap();
+        let first = memory.read(&path).await.unwrap();
+        memory.delete_if(&path, &first.revision).await.unwrap();
+        CollectionStore::ensure_record_on(&memory, &collection)
+            .await
+            .unwrap();
+
+        let late = memory
+            .write_if(&path, first.contents.clone(), &first.revision)
+            .await;
+        assert!(matches!(late, Err(BackendError::Precondition)), "{late:?}");
     }
 
     // ADR-106: an in-doubt CAS that did not land yet is fenced, so it cannot

@@ -248,8 +248,18 @@ struct OwnerLifecycle {
     admission: OwnerAdmission,
     commit_write: CommitWrite,
     /// A create of the committed record ended in doubt, so it can still land
-    /// on an empty path. No later write can clear this.
+    /// on an empty path. No later write can clear this. The owner then never
+    /// acknowledges a wound, so GC keeps the record that fences the create
+    /// (ADR-080). [`Self::pending_creates_may_land`] guards the pending
+    /// record instead.
     commit_create_may_land: bool,
+    /// The creates of the pending record that can still land on an empty
+    /// path: sent and not answered yet, or ended in doubt. Only a create that
+    /// landed or was rejected leaves the count. While it is not zero, the
+    /// identity does not commit, so a late create cannot bring back the
+    /// pending record of a committed identity (ADR-111).
+    /// [`Self::commit_create_may_land`] guards the committed record instead.
+    pending_creates_may_land: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,7 +321,10 @@ impl OwnerLifecycle {
     }
 
     fn begin_commit_write(&mut self) -> Result<(), TransError> {
-        if self.admission == OwnerAdmission::Closed {
+        // A create of the pending record that can still land would land on
+        // the empty path after GC deleted the committed record, and a wound of
+        // it would state that this identity never committed (ADR-111).
+        if self.admission == OwnerAdmission::Closed || self.pending_creates_may_land > 0 {
             return Err(TransError::AlreadyFinalized);
         }
         self.commit_write = CommitWrite::InFlight;
@@ -1082,6 +1095,9 @@ impl Monitor {
     /// Marks the transaction committed, writing the final transaction record
     /// (if it produced any writes or held any locks), updating local storage,
     /// and notifying waiters.
+    ///
+    /// Returns [`TransError::AlreadyFinalized`] without a write when the
+    /// identity cannot commit. The caller then aborts the identity.
     pub(crate) async fn commit_tx(&self, record: TxRecord) -> Result<(), TransError> {
         let tid = record.id;
         // In v2 the transaction record is the value store: it must be persisted
@@ -1097,11 +1113,13 @@ impl Monitor {
             || !record.collection_changes.is_empty()
             || !record.prepared_collections.is_empty()
         {
+            // The refresh stops first, so that it sends no create of the
+            // pending record after the check of `begin_commit_write`.
+            self.stop_tx_refresh(&tid);
             // This handshake shares the owner-state lock with local wounding.
             // Either the wound closes admission first, or the commit is marked
             // as dispatched before a local task can report safe retirement.
             self.begin_commit_write(&tid)?;
-            self.stop_tx_refresh(&tid);
             let result = self.persist_committed_record(record).await;
             let create_may_land = result.as_ref().is_err_and(|error| error.create_may_land);
             let lost = result
@@ -1953,12 +1971,12 @@ impl Monitor {
         tid: &TxId,
         require_running_refresh: bool,
     ) -> Result<Option<PendingWrite>, TransError> {
-        let st = self.shard_for(tid).lock().unwrap();
+        let mut st = self.shard_for(tid).lock().unwrap();
         let entry = st
             .transactions
-            .get(tid)
+            .get_mut(tid)
             .ok_or_else(|| TransError::other("pending transaction disappeared"))?;
-        let TxRuntimeRole::Owned(owned) = &entry.role else {
+        let TxRuntimeRole::Owned(owned) = &mut entry.role else {
             return Err(TransError::other(
                 "pending transaction is tracked as foreign",
             ));
@@ -1976,20 +1994,44 @@ impl Monitor {
         let mut pending_record = TxRecord::new(*tid, TxCommitStatus::Pending);
         pending_record.timestamp = Some(rt::system_now());
         record.recovery.clone().apply_to(&mut pending_record);
+        let expected = record.last_observation.clone();
+        // The count changes under the same lock as the refresh state, so a
+        // commit that stops the refresh sees each create that the refresh
+        // can still send.
+        if expected.is_none() {
+            owned.lifecycle.pending_creates_may_land += 1;
+        }
         Ok(Some(PendingWrite {
             record: pending_record,
-            expected: record.last_observation.clone(),
+            expected,
         }))
     }
 
+    /// Sends a pending write from [`Self::pending_write_snapshot`]. A create
+    /// leaves the count of creates that can land only when it landed or was
+    /// rejected.
     async fn write_pending(
         &self,
         write: &PendingWrite,
     ) -> Result<Observation<TxRecord>, StorageError> {
-        match &write.expected {
-            Some(observed) => self.inner.tx_records.set_if(&write.record, observed).await,
-            None => self.inner.tx_records.set(&write.record).await,
-        }
+        let Some(observed) = &write.expected else {
+            let result = self.inner.tx_records.set(&write.record).await;
+            if matches!(result, Ok(_) | Err(StorageError::Precondition)) {
+                let tid = &write.record.id;
+                let mut st = self.shard_for(tid).lock().unwrap();
+                if let Some(TxRuntimeEntry {
+                    role: TxRuntimeRole::Owned(owned),
+                    ..
+                }) = st.transactions.get_mut(tid)
+                {
+                    let count = &mut owned.lifecycle.pending_creates_may_land;
+                    debug_assert!(*count > 0, "a pending create left an empty count");
+                    *count = count.saturating_sub(1);
+                }
+            }
+            return result;
+        };
+        self.inner.tx_records.set_if(&write.record, observed).await
     }
 
     async fn persist_pending_tx(&self, tid: &TxId) -> Result<(), TransError> {
@@ -5009,6 +5051,122 @@ mod tests {
         assert_eq!(mon2.tx_status(&tx).await.unwrap(), TxCommitStatus::Pending);
 
         mon.abort_owned_tx(&tx).await.unwrap();
+    }
+
+    /// Whether `operation` creates a pending transaction record.
+    fn is_pending_create(operation: &BackendOp<'_>) -> bool {
+        matches!(
+            operation,
+            BackendOp::WriteIfNotExists { value, .. }
+                if glassdb_storage::txrecord::status(value)
+                    .is_ok_and(|status| status == TxCommitStatus::Pending)
+        )
+    }
+
+    /// Commits `tx` with a recorded lock, so that the commit writes a record.
+    async fn commit_with_a_lock(mon: &Monitor, tx: TxId) -> Result<(), TransError> {
+        let mut record = TxRecord::new(tx, TxCommitStatus::Committed);
+        record.locks.push(TxLock::TopologyParticipant {
+            collection: CollectionAddress::root("test"),
+        });
+        mon.commit_tx(record).await
+    }
+
+    // Regression (ADR-111): the first create of the pending record reports
+    // `Unavailable`, and the backend applies it later. If the identity
+    // committed, the create could land after GC deleted the committed record,
+    // and a wound of it would state that the identity never committed. The
+    // identity must not commit, and its owner acknowledges the abort.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_create_in_doubt_stops_the_commit() {
+        let memory = Arc::new(MemoryBackend::new());
+        let backend = HookBackend::new(memory.clone());
+        let (mon, t) = new_test_monitor(backend.clone());
+        let tx = tx_id(b"in-doubt-pending");
+        let delayed = DelayedWrite::default();
+        let held = Arc::new(AtomicBool::new(false));
+        backend.set_before({
+            let delayed = delayed.clone();
+            move |operation| {
+                let hold = is_pending_create(operation) && !held.swap(true, Ordering::SeqCst);
+                if hold {
+                    delayed.hold(operation);
+                }
+                Box::pin(async move {
+                    if hold {
+                        Err(BackendError::Unavailable("held pending create".into()))
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+        });
+        mon.begin_persisted_tx(&tx, TxRecoveryManifest::default())
+            .await
+            .unwrap();
+
+        let result = commit_with_a_lock(&mon, tx).await;
+        assert!(
+            matches!(result, Err(TransError::AlreadyFinalized)),
+            "{result:?}"
+        );
+        assert_eq!(
+            mon.abort_owned_tx(&tx).await.unwrap(),
+            OwnerAbortOutcome::Acknowledged
+        );
+        assert!(matches!(
+            delayed.release(&memory).await,
+            Err(BackendError::Precondition)
+        ));
+        assert_eq!(
+            t.tx_records
+                .commit_status_at(&tx, Requirement::ANY)
+                .await
+                .unwrap()
+                .status,
+            TxCommitStatus::Aborted
+        );
+    }
+
+    // ADR-111: the refresh sends the first create of the pending record, and
+    // the backend has not answered it when the owner commits. The answer is
+    // `Unavailable`, and the backend can still apply the create, so the
+    // identity must not commit.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_create_without_an_answer_stops_the_commit() {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+        let (mon, t) = new_test_monitor(backend.clone());
+        let tx = tx_id(b"unanswered");
+        let sent = Arc::new(AtomicBool::new(false));
+        backend.set_before({
+            let sent = sent.clone();
+            move |operation| {
+                let pending_create = is_pending_create(operation);
+                sent.fetch_or(pending_create, Ordering::SeqCst);
+                Box::pin(async move {
+                    if !pending_create {
+                        return Ok(());
+                    }
+                    rt::sleep(Duration::from_secs(1)).await;
+                    Err(BackendError::Unavailable("unanswered create".into()))
+                })
+            }
+        });
+        mon.begin_tx(&tx);
+        mon.start_refresh_tx(&tx);
+        while !sent.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let result = commit_with_a_lock(&mon, tx).await;
+        assert!(
+            matches!(result, Err(TransError::AlreadyFinalized)),
+            "{result:?}"
+        );
+        assert!(matches!(
+            t.tx_records.get_at(&tx, Requirement::ANY).await,
+            Err(StorageError::NotFound)
+        ));
     }
 
     // Regression (review 1.1 / ADR-022): the lazily-materialized pending record

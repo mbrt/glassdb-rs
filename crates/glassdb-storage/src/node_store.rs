@@ -259,6 +259,34 @@ impl From<NodeStore> for NodeReads {
 }
 
 impl NodeStore {
+    /// Creates an empty tree root of `collection` directly on `backend` if
+    /// the path is empty, and checks that a present root decodes. It needs no
+    /// store. Like every create, it starts at a random node sequence
+    /// (ADR-109).
+    pub async fn ensure_root_on<B>(
+        backend: &B,
+        collection: &CollectionAddress,
+    ) -> Result<(), StorageError>
+    where
+        B: backend::Backend + ?Sized,
+    {
+        let path = ObjectPath::TreeRoot {
+            collection: collection.clone(),
+        }
+        .to_string();
+        match backend
+            .write_if_not_exists(&path, Node::leaf(LeafBody::new()).created().encode())
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(backend::BackendError::Precondition) => {
+                Node::decode(&backend.read(&path).await?.contents)?;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Creates a node store that reads and compare-and-swaps through `objects`.
     pub fn new(objects: CachedStore, parallelism: NonZeroUsize) -> Self {
         let nodes = objects.typed();
@@ -1029,6 +1057,31 @@ mod tests {
 
         let index = Node::index(IndexNode::from_children([(b"".to_vec(), node_id(1))]));
         assert!(!store.store_root(&c, &index, &first).await.unwrap());
+    }
+
+    // ADR-109: the open creates the permanent root directly on the backend.
+    // That create also starts at a random sequence, so a late CAS that
+    // expected the state of an earlier create cannot land.
+    #[tokio::test]
+    async fn a_root_ensured_again_does_not_repeat_its_first_state() {
+        let memory = MemoryBackend::new();
+        let c = collection();
+        let path = ObjectPath::TreeRoot {
+            collection: c.clone(),
+        }
+        .to_string();
+        NodeStore::ensure_root_on(&memory, &c).await.unwrap();
+        let first = memory.read(&path).await.unwrap();
+        memory.delete_if(&path, &first.revision).await.unwrap();
+        NodeStore::ensure_root_on(&memory, &c).await.unwrap();
+
+        let late = memory
+            .write_if(&path, first.contents.clone(), &first.revision)
+            .await;
+        assert!(
+            matches!(late, Err(backend::BackendError::Precondition)),
+            "{late:?}"
+        );
     }
 
     #[tokio::test]
