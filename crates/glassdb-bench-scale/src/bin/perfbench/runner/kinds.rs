@@ -13,8 +13,9 @@ use toml::value::Table;
 
 use super::model::PoolSpec;
 
-/// The units of CPU work of each key that a transaction writes, from the wall
-/// time of a measurement in virtual time over its transactions.
+/// The units of CPU work of each key that a transaction writes, its read
+/// included. They keep a written key at 80 µs, the first-order value of its
+/// CPU time.
 const WRITE_CPU_UNITS: usize = 20;
 
 /// The inputs of one transaction.

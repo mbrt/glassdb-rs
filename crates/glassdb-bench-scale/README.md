@@ -141,12 +141,12 @@ result.
 CPU work takes no model time, so after each transaction a worker waits in its
 place, and the wait is in the measured latency. The wait is a first-order model
 of the CPU time (`Kind::cpu_units`): 4 µs for each key that the transaction
-only reads or scans, and 80 µs for each key that it writes. A transaction costs
-at least 4 µs. Each database instance has 32 model cores: a worker holds one
-core while it waits, so the workers of one instance spend at most 32 CPU
-charges at the same time. With `--latency-jitter`, each wait varies within 15%
-of its mean. If model time does not advance for 60 s of wall time while a cell
-runs, for example in a livelock, the run fails.
+only reads or scans, and 80 µs for each key that it writes, its read included.
+A transaction costs at least 4 µs. Each database instance has 32 model cores:
+a worker holds one core while it waits, so the workers of one instance spend at
+most 32 CPU charges at the same time. With `--latency-jitter`, each wait varies
+within 15% of its mean. If model time does not advance for 60 s of wall time
+while a cell runs, for example in a livelock, the run fails.
 
 Virtual time needs `--backend=memory`. Its results repeat and do not depend on
 the host, so the CI comparison of two revisions uses it, and so do the

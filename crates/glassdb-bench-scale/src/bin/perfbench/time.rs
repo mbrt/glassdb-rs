@@ -27,8 +27,10 @@ pub(crate) enum TimeMode {
 /// of one key that a transaction reads with warm caches and the memory
 /// backend. Each kind gives the units of one transaction
 /// ([`Kind::cpu_units`](crate::runner::kinds::Kind::cpu_units)). The value
-/// is a first-order approximation, measured as the wall time of a measurement
-/// in virtual time over its transactions, with one worker of each kind.
+/// is a first-order approximation. It started at 5 µs, so that a stale read
+/// of one cached key took about as much wall time as model time. When that
+/// read got cheaper, the value followed the change of its wall time in
+/// virtual time with one worker (7.2 µs to 5.5 µs), rounded.
 const VIRTUAL_CPU_UNIT: Duration = Duration::from_micros(4);
 
 /// The largest change of a CPU charge from its mean, as a fraction of the
