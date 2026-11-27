@@ -16,11 +16,15 @@ pub struct RetryTiming {
     pub contention: RetrySchedule,
     /// Retries while a backend fails or throttles, or while other
     /// transactions must make progress first: unavailable reads, conditional
-    /// writes with no known result, waits for lock holders, polls and writes
-    /// of transaction records, and new lock acquisitions after a leaf round
-    /// used all of its CAS attempts or the leaf is full. Defaults to 200 ms
-    /// first, and at most 5 s.
+    /// writes with no known result, writes of transaction records, and new
+    /// lock acquisitions after a leaf round used all of its CAS attempts or
+    /// the leaf is full. Defaults to 200 ms first, and at most 5 s.
     pub wait: RetrySchedule,
+    /// Waits for a lock holder: the polls of its transaction record, and the
+    /// waits between two reads of the object that it holds (ADR-024). The
+    /// backend is healthy, and a waiting transaction pays each delay, so the
+    /// delay stays short. Defaults to 200 ms first, and at most 1 s.
+    pub holder_poll: RetrySchedule,
 }
 
 impl Default for RetryTiming {
@@ -37,6 +41,10 @@ impl Default for RetryTiming {
                 initial_interval: Duration::from_millis(200),
                 max_interval: Duration::from_secs(5),
             },
+            holder_poll: RetrySchedule {
+                initial_interval: Duration::from_millis(200),
+                max_interval: Duration::from_secs(1),
+            },
         }
     }
 }
@@ -48,6 +56,7 @@ impl RetryTiming {
         Self {
             contention: schedule,
             wait: schedule,
+            holder_poll: schedule,
         }
     }
 }

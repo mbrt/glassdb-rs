@@ -16,6 +16,7 @@ use glassdb_storage::{
 
 use crate::collections::{CollectionChange, CollectionOp, DirectoryRead};
 use crate::error::TransError;
+use crate::monitor::HolderWait;
 use crate::monitor::{Monitor, TxFinalStatus};
 use crate::wound_wait::resolve_tx_conflict;
 
@@ -205,10 +206,12 @@ impl CollectionLocker {
         id: &TxId,
         desired: LockType,
     ) -> Result<(), TransError> {
+        let wait = self.monitor.holder_wait();
+        let wait = &wait;
         let decide = |record: CollectionRecord, _| async move {
             let mut record = match self
                 .state
-                .resolve_record(parent, record, Some(id), PendingHolders::Wait)
+                .resolve_record(parent, record, Some(id), PendingHolders::Wait, wait)
                 .await?
             {
                 Ok(record) => record,
@@ -232,8 +235,12 @@ impl CollectionLocker {
             if conflicts
                 && let Some(holder) = lock.holders().iter().find(|holder| *holder != id).cloned()
             {
-                return match resolve_tx_conflict(&self.monitor, id, &holder).await? {
-                    TxFinalStatus::Committed => {
+                return match resolve_tx_conflict(wait, id, &holder).await? {
+                    // The holder can have left the record already (ADR-024).
+                    None => Ok(Decision::Reload(Requirement::after(
+                        self.state.timeline.currentness_barrier(),
+                    ))),
+                    Some(TxFinalStatus::Committed) => {
                         match self
                             .state
                             .help_committed_write_back(parent, &holder)
@@ -248,7 +255,7 @@ impl CollectionLocker {
                             ))),
                         }
                     }
-                    TxFinalStatus::Aborted => {
+                    Some(TxFinalStatus::Aborted) => {
                         record.remove_directory_holder(&holder);
                         Ok(Decision::Advance(record))
                     }
@@ -367,6 +374,8 @@ impl CollectionStateResolver {
         requirement: Requirement,
         pending: PendingHolders,
     ) -> Result<(CollectionRecord, Observation<CollectionRecord>), TransError> {
+        let wait = self.monitor.holder_wait();
+        let wait = &wait;
         let resolved = self
             .records
             .converge(
@@ -380,7 +389,10 @@ impl CollectionStateResolver {
                         return Ok(Decision::Reload(requirement));
                     }
                     Ok::<_, TransError>(
-                        match self.resolve_record(parent, record, own, pending).await? {
+                        match self
+                            .resolve_record(parent, record, own, pending, wait)
+                            .await?
+                        {
                             Ok(record) => Decision::Done((record, observed)),
                             Err(next) => next,
                         },
@@ -413,12 +425,13 @@ impl CollectionStateResolver {
         mut record: CollectionRecord,
         own: Option<&TxId>,
         pending: PendingHolders,
+        wait: &HolderWait<'_>,
     ) -> Result<Result<CollectionRecord, Decision<CollectionRecord, T>>, TransError> {
         if let Some(holder) = record.topology_freeze().cloned()
             && Some(&holder) != own
         {
-            let Some(status) = self.holder_status(&holder, pending).await? else {
-                return Ok(Ok(record));
+            let Some(status) = self.holder_status(&holder, pending, wait).await? else {
+                return Ok(self.unresolved(record, pending));
             };
             return match status {
                 TxFinalStatus::Committed => Err(TransError::StaleCollection),
@@ -440,8 +453,8 @@ impl CollectionStateResolver {
         let Some(holder) = holder else {
             return Ok(Ok(record));
         };
-        let Some(status) = self.holder_status(&holder, pending).await? else {
-            return Ok(Ok(record));
+        let Some(status) = self.holder_status(&holder, pending, wait).await? else {
+            return Ok(self.unresolved(record, pending));
         };
         match status {
             TxFinalStatus::Committed => {
@@ -461,15 +474,32 @@ impl CollectionStateResolver {
         }
     }
 
-    /// Returns the final status of `holder`, or `None` if `pending` skips a
-    /// holder that has none yet.
+    /// Returns what a resolution does with a holder that has no final status
+    /// yet. A skip keeps the record. A wait reads the record again at a fresh
+    /// barrier, because the holder can have left it already (ADR-024).
+    fn unresolved<T>(
+        &self,
+        record: CollectionRecord,
+        pending: PendingHolders,
+    ) -> Result<CollectionRecord, Decision<CollectionRecord, T>> {
+        match pending {
+            PendingHolders::Skip => Ok(record),
+            PendingHolders::Wait => Err(Decision::Reload(Requirement::after(
+                self.timeline.currentness_barrier(),
+            ))),
+        }
+    }
+
+    /// Returns the final status of `holder`, or `None` if it has none yet. A
+    /// wait waits for at most one step of `wait`.
     async fn holder_status(
         &self,
         holder: &TxId,
         pending: PendingHolders,
+        wait: &HolderWait<'_>,
     ) -> Result<Option<TxFinalStatus>, TransError> {
         match pending {
-            PendingHolders::Wait => self.monitor.await_tx_final(holder).await.map(Some),
+            PendingHolders::Wait => wait.final_status(holder).await,
             PendingHolders::Skip => Ok(match self.monitor.tx_status(holder).await? {
                 TxCommitStatus::Committed => Some(TxFinalStatus::Committed),
                 // The CAS on the collection record checks that the lock is
@@ -646,6 +676,7 @@ mod tests {
     use super::*;
     use crate::collections::{DirectoryEvidence, DirectoryReadKind};
     use crate::monitor::{OwnerAbortOutcome, ProtocolTiming};
+    use crate::retry_timing::RetryTiming;
 
     fn tx_id(prefix: &[u8]) -> TxId {
         TxId::with_priority(0, prefix)
@@ -666,6 +697,7 @@ mod tests {
             transactions.clone(),
             timeline.clone(),
             Arc::downgrade(&background),
+            RetrySchedule::default(),
             RetrySchedule::default(),
             ProtocolTiming::default(),
             crate::gc::GcHints::default(),
@@ -1043,6 +1075,7 @@ mod tests {
             timeline.clone(),
             Arc::downgrade(&background),
             RetrySchedule::default(),
+            RetryTiming::default().holder_poll,
             ProtocolTiming::default(),
             crate::gc::GcHints::default(),
         );
@@ -1061,6 +1094,70 @@ mod tests {
             timeline,
             _background: background,
         }
+    }
+
+    // ADR-024: a waiter for a directory holder reads the record again after
+    // each step of its wait. Here the holder leaves the record, and GC deletes
+    // its transaction record, so the status of the holder stays unknown to the
+    // waiter.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_sees_a_holder_leave_the_record_before_its_final_status() {
+        let backend: Arc<dyn glassdb_backend::Backend> = Arc::new(MemoryBackend::new());
+        let owner = instance(backend.clone());
+        let waiter = instance(backend.clone());
+        let transactions = TxRecordStore::new(
+            CachedStore::new(backend, 1 << 20, Timeline::new(), None),
+            DbPrefix::try_from("db").unwrap(),
+        );
+        let parent = CollectionAddress::root("db");
+        let reader = TxId::with_priority(1_000_000_000, b"older");
+        let writer = TxId::with_priority(2_000_000_000, b"younger");
+        let pending = transactions
+            .set(&TxRecord::new(reader, TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        let mut record = CollectionRecord::new();
+        record.add_directory_reader(reader);
+        assert!(owner.records.create_record(&parent, &record).await.unwrap());
+
+        let locks = write_lock(&parent);
+        let lock = waiter.locker.lock(&writer, &locks);
+        tokio::pin!(lock);
+        // The steps of the wait grow to the cap before the holder leaves.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), &mut lock)
+                .await
+                .is_err(),
+            "the younger writer did not wait"
+        );
+        let (mut record, observed) = owner
+            .records
+            .load_record(&parent, Requirement::ANY)
+            .await
+            .unwrap();
+        record.remove_directory_holder(&reader);
+        assert!(
+            owner
+                .records
+                .store_record(&record, &observed)
+                .await
+                .unwrap()
+        );
+        // The reader commits, and GC deletes its record at once, before the
+        // next poll of the waiter.
+        let committed = transactions
+            .set_if(&TxRecord::new(reader, TxCommitStatus::Committed), &pending)
+            .await
+            .unwrap();
+        transactions.delete(&committed).await.unwrap();
+
+        // One step of the wait is at most the cap of the holder poll.
+        let cap = RetryTiming::default().holder_poll.max_interval;
+        tokio::time::timeout(cap + Duration::from_millis(10), lock)
+            .await
+            .expect("the writer did not read the record again")
+            .unwrap();
+        assert_eq!(holders(&waiter.records, &parent).await, vec![writer]);
     }
 
     // Instance `b` caches the absence of two records, and instance `a` then

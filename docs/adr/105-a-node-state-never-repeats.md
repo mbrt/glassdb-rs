@@ -3,7 +3,8 @@
 ## Status
 
 Accepted — implemented. Extended to collection records by
-[ADR-106](106-a-collection-record-state-never-repeats.md).
+[ADR-106](106-a-collection-record-state-never-repeats.md). Refined by
+[ADR-109](109-a-created-object-starts-at-a-random-sequence.md).
 
 Refines [ADR-081](081-in-doubt-cas-stays-in-doubt-until-fenced.md): any change
 of a leaf fences an in-doubt CAS, and the coordinator fences one itself before

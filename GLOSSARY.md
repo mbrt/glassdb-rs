@@ -428,11 +428,11 @@ A leaf counter that changes when a transaction or a structural change changes, o
 _Avoid_: Membership version
 
 **Node sequence**:
-The number of changes of one node since its creation. A state of a node never repeats while the node exists.
+A value of one node that changes on each change of the node, from a random start at each creation. A state of a node never repeats while the node exists, and a node that is created again does not repeat a state.
 _Avoid_: Node version, change count, write generation
 
 **Record sequence**:
-The number of changes of one collection record since its creation. A state of a collection record never repeats while the record exists.
+A value of one collection record that changes on each change of the record, from a random start at each creation. A state of a collection record never repeats while the record exists, and a record that is created again does not repeat a state.
 _Avoid_: Record version, directory generation
 
 **Routing**:

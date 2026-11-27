@@ -522,6 +522,10 @@ async fn builder_custom_options() {
                 initial_interval: Duration::from_millis(10),
                 max_interval: Duration::from_millis(100),
             },
+            holder_poll: RetrySchedule {
+                initial_interval: Duration::from_millis(10),
+                max_interval: Duration::from_millis(100),
+            },
         })
         .protocol_timing(ProtocolTiming::new(
             Duration::from_secs(1),

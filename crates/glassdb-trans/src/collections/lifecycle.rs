@@ -10,11 +10,12 @@ use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
     CasRetries, CollectionRecord, CollectionStore, Converged, Decision, Fenced, LeafBody,
-    LeafObservation, Node, NodeStore, Requirement, StorageError,
+    LeafObservation, Node, NodeStore, Requirement, StorageError, Timeline,
 };
 
 use super::{CollectionChange, CollectionOp};
 use crate::error::TransError;
+use crate::monitor::HolderWait;
 use crate::monitor::{Monitor, TxFinalStatus};
 use crate::wound_wait::{Reclaim, resolve_tx_conflict, try_reclaim};
 
@@ -42,6 +43,7 @@ pub struct CollectionLifecycle {
     records: CollectionStore,
     nodes: NodeStore,
     monitor: Monitor,
+    timeline: Timeline,
     retry: RetrySchedule,
     // A drop must outlive every pre-existing topology participant before its
     // commit point, so fencing settles them rather than racing them.
@@ -54,6 +56,7 @@ impl CollectionLifecycle {
         records: CollectionStore,
         nodes: NodeStore,
         monitor: Monitor,
+        timeline: Timeline,
         retry: RetrySchedule,
         topology: Arc<dyn TopologySettler>,
     ) -> Self {
@@ -61,9 +64,16 @@ impl CollectionLifecycle {
             records,
             nodes,
             monitor,
+            timeline,
             retry,
             topology,
         }
+    }
+
+    /// Returns the requirement of a read after a bounded wait for a holder
+    /// that can have left the object (ADR-024).
+    fn fresh(&self) -> Requirement {
+        Requirement::after(self.timeline.currentness_barrier())
     }
 
     /// Creates both objects of every fresh, still-undiscoverable collection.
@@ -256,6 +266,8 @@ impl CollectionLifecycle {
     ) -> Result<(), TransError> {
         // A freeze adds a holder, so its owner must know whether it can still
         // land (ADR-106).
+        let wait = self.monitor.holder_wait();
+        let wait = &wait;
         let frozen = self
             .records
             .converge(
@@ -266,9 +278,13 @@ impl CollectionLifecycle {
                     if record.topology_freeze() != Some(id)
                         && let Some(holder) = record.topology_freeze().cloned()
                     {
-                        match resolve_tx_conflict(&self.monitor, id, &holder).await? {
-                            TxFinalStatus::Committed => return Err(TransError::StaleCollection),
-                            TxFinalStatus::Aborted => {
+                        match resolve_tx_conflict(wait, id, &holder).await? {
+                            // The holder can have left the record (ADR-024).
+                            None => return Ok(Decision::Reload(self.fresh())),
+                            Some(TxFinalStatus::Committed) => {
+                                return Err(TransError::StaleCollection);
+                            }
+                            Some(TxFinalStatus::Aborted) => {
                                 record.remove_topology_freeze(&holder);
                             }
                         }
@@ -287,7 +303,9 @@ impl CollectionLifecycle {
                         // participants can only leave.
                         return Ok(Decision::Done(()));
                     };
-                    resolve_tx_conflict(&self.monitor, id, &participant).await?;
+                    if resolve_tx_conflict(wait, id, &participant).await?.is_none() {
+                        return Ok(Decision::Reload(self.fresh()));
+                    }
                     self.topology
                         .settle_topology_participant(collection, &participant)
                         .await?;
@@ -345,6 +363,8 @@ impl CollectionLifecycle {
     /// Installs the drop intent of `id` on the node at `path`. Returns `false`
     /// when the node is missing.
     async fn fence(&self, path: &ObjectPath, id: &TxId) -> Result<bool, TransError> {
+        let wait = self.monitor.holder_wait();
+        let wait = &wait;
         let fenced = self
             .nodes
             .converge(
@@ -357,12 +377,21 @@ impl CollectionLifecycle {
                     if node.drop_intent() == Some(id) {
                         return Ok(Decision::Done(()));
                     }
-                    if let Some(holder) = node.drop_intent().cloned() {
-                        self.resolve_drop_intent_holder(&holder, id).await?;
+                    // A holder can leave the node before its final status is
+                    // known here, so a wait reads the node again (ADR-024).
+                    if let Some(holder) = node.drop_intent().cloned()
+                        && !self.resolve_drop_intent_holder(&holder, id, wait).await?
+                    {
+                        return Ok(Decision::Reload(self.fresh()));
                     }
                     if let Some(holder) = self.pending_node_holder(&node, id).await? {
-                        self.resolve_pending_holder(&holder, id).await?;
-                        return Ok(Decision::Reload(Requirement::ANY));
+                        return Ok(Decision::Reload(
+                            if self.resolve_pending_holder(&holder, id, wait).await? {
+                                Requirement::ANY
+                            } else {
+                                self.fresh()
+                            },
+                        ));
                     }
                     // The topology freeze has drained structural participants.
                     // This exact-revision rewrite fuses the remaining one-shot
@@ -407,18 +436,32 @@ impl CollectionLifecycle {
         Ok(None)
     }
 
-    async fn resolve_pending_holder(&self, holder: &TxId, id: &TxId) -> Result<(), TransError> {
-        if matches!(try_reclaim(&self.monitor, id, holder).await?, Reclaim::Wait) {
-            self.monitor.await_tx_final(holder).await?;
-        }
-        Ok(())
+    /// Wounds or waits for a pending holder of a node. Returns whether the
+    /// holder has a final status, after at most one step of `wait`.
+    async fn resolve_pending_holder(
+        &self,
+        holder: &TxId,
+        id: &TxId,
+        wait: &HolderWait<'_>,
+    ) -> Result<bool, TransError> {
+        Ok(match try_reclaim(&self.monitor, id, holder).await? {
+            Reclaim::Wounded => true,
+            Reclaim::Wait => wait.final_status(holder).await?.is_some(),
+        })
     }
 
-    /// Establishes that a foreign drop intent can be replaced.
-    async fn resolve_drop_intent_holder(&self, holder: &TxId, id: &TxId) -> Result<(), TransError> {
-        match resolve_tx_conflict(&self.monitor, id, holder).await? {
-            TxFinalStatus::Committed => Err(TransError::StaleCollection),
-            TxFinalStatus::Aborted => Ok(()),
+    /// Establishes that a foreign drop intent can be replaced. Returns `false`
+    /// when its holder has no final status after one step of `wait`.
+    async fn resolve_drop_intent_holder(
+        &self,
+        holder: &TxId,
+        id: &TxId,
+        wait: &HolderWait<'_>,
+    ) -> Result<bool, TransError> {
+        match resolve_tx_conflict(wait, id, holder).await? {
+            None => Ok(false),
+            Some(TxFinalStatus::Committed) => Err(TransError::StaleCollection),
+            Some(TxFinalStatus::Aborted) => Ok(true),
         }
     }
 
@@ -525,12 +568,13 @@ mod tests {
     use glassdb_storage::transaction::{
         TxCollectionChange, TxCollectionOp, TxRecord, TxRecordStore,
     };
-    use glassdb_storage::{CachedStore, CurrentState, IndexNode, LeafBody, LeafEntry, Timeline};
+    use glassdb_storage::{CachedStore, CurrentState, IndexNode, LeafBody, LeafEntry, Observation};
     use tokio::sync::Notify;
 
     use super::*;
     use crate::engine::{AssemblyFixture, EngineConfig};
     use crate::monitor::TxRecoveryManifest;
+    use crate::retry_timing::RetryTiming;
 
     fn tx_id(prefix: &[u8]) -> TxId {
         TxId::with_priority(0, prefix)
@@ -637,6 +681,7 @@ mod tests {
             store.timeline.clone(),
             Arc::downgrade(&background),
             RetrySchedule::default(),
+            RetryTiming::default().holder_poll,
             crate::monitor::ProtocolTiming::default(),
             crate::gc::GcHints::default(),
         );
@@ -652,6 +697,7 @@ mod tests {
             store.records.clone(),
             store.nodes.clone(),
             monitor.clone(),
+            store.timeline.clone(),
             retry,
             Arc::new(UnexpectedTopologySettler),
         )
@@ -668,6 +714,7 @@ mod tests {
             fixture.records.clone(),
             fixture.nodes.clone(),
             fixture.monitor.clone(),
+            fixture.timeline.clone(),
             RetrySchedule::default(),
             Arc::new(UnexpectedTopologySettler),
         )
@@ -1003,6 +1050,180 @@ mod tests {
             .unwrap();
         assert_eq!(final_source.drop_intent(), Some(&drop_id));
         assert_eq!(final_source.right_sibling(), shrink_landed.then_some(RIGHT));
+    }
+
+    /// The older holder and the younger requester of the waits below.
+    fn older_holder_and_younger_requester() -> (TxId, TxId) {
+        (
+            TxId::with_priority(1_000_000_000, b"older"),
+            TxId::with_priority(2_000_000_000, b"younger"),
+        )
+    }
+
+    /// Writes a pending record of `holder` through its own cache, so that the
+    /// test can later end it as GC would.
+    async fn pending_record(
+        backend: Arc<dyn Backend>,
+        holder: TxId,
+    ) -> (TxRecordStore, Observation<TxRecord>) {
+        let transactions = TxRecordStore::new(
+            CachedStore::new(backend, 1 << 20, Timeline::new(), None),
+            DbPrefix::try_from("db").unwrap(),
+        );
+        let pending = transactions
+            .set(&TxRecord::new(holder, TxCommitStatus::Pending))
+            .await
+            .unwrap();
+        (transactions, pending)
+    }
+
+    /// Commits the holder of `pending` and deletes its record at once, before
+    /// the next poll of a waiter.
+    async fn commit_and_collect(transactions: &TxRecordStore, pending: &Observation<TxRecord>) {
+        let holder = pending.value().unwrap().id;
+        let committed = transactions
+            .set_if(&TxRecord::new(holder, TxCommitStatus::Committed), pending)
+            .await
+            .unwrap();
+        transactions.delete(&committed).await.unwrap();
+    }
+
+    /// Waits until `task` ends, at most one step of the holder poll after the
+    /// holder left.
+    async fn within_one_step<T>(task: tokio::task::JoinHandle<T>) -> T {
+        let cap = RetryTiming::default().holder_poll.max_interval;
+        tokio::time::timeout(cap + Duration::from_millis(10), task)
+            .await
+            .expect("the requester did not read the object again")
+            .unwrap()
+    }
+
+    // ADR-024: a node fence that meets a pending holder reads the node again
+    // after each step of its wait. The holder here leaves the node, and GC
+    // deletes its transaction record.
+    #[tokio::test(start_paused = true)]
+    async fn a_fence_sees_a_holder_leave_the_node_before_its_final_status() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let owner = store(backend.clone());
+        let waiter = store(backend.clone());
+        let (monitor, _background) = monitor_over(&waiter);
+        let lifecycle = lifecycle_over(&waiter, &monitor, RetrySchedule::default());
+        let (holder, drop_id) = older_holder_and_younger_requester();
+        let (transactions, pending) = pending_record(backend, holder).await;
+        let mut node = Node::leaf(LeafBody::from_entries([live_entry(b"a")]));
+        node.set_structural_gate(holder);
+        assert!(
+            owner
+                .nodes
+                .store_node(&collection(), &SOURCE, &node, None)
+                .await
+                .unwrap()
+        );
+
+        let fencing =
+            tokio::spawn(
+                async move { lifecycle.fence_node(&collection(), &SOURCE, &drop_id).await },
+            );
+        // The steps of the wait grow to the cap before the holder leaves.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!fencing.is_finished(), "the younger fence did not wait");
+        let (mut node, observed) = owner
+            .nodes
+            .load_node(&collection(), &SOURCE, Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(node.remove_structural_gate(&holder));
+        assert!(
+            owner
+                .nodes
+                .store_node(&collection(), &SOURCE, &node, Some(&observed))
+                .await
+                .unwrap()
+        );
+        commit_and_collect(&transactions, &pending).await;
+
+        within_one_step(fencing).await.unwrap();
+        let (fenced, _) = owner
+            .nodes
+            .load_node(
+                &collection(),
+                &SOURCE,
+                Requirement::after(owner.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fenced.drop_intent(), Some(&drop_id));
+    }
+
+    // ADR-024: a drop that meets a foreign topology freeze reads the record
+    // again after each step of its wait. The holder here leaves the record,
+    // and GC deletes its transaction record.
+    #[tokio::test(start_paused = true)]
+    async fn a_freeze_sees_a_holder_leave_the_record_before_its_final_status() {
+        let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let owner = store(backend.clone());
+        let waiter = store(backend.clone());
+        let (monitor, _background) = monitor_over(&waiter);
+        let lifecycle = lifecycle_over(&waiter, &monitor, RetrySchedule::default());
+        let (holder, drop_id) = older_holder_and_younger_requester();
+        let (transactions, pending) = pending_record(backend, holder).await;
+        let mut record = CollectionRecord::new();
+        assert!(record.set_topology_freeze(holder));
+        assert!(
+            owner
+                .records
+                .create_record(&collection(), &record)
+                .await
+                .unwrap()
+        );
+        assert!(
+            owner
+                .nodes
+                .create_root(&collection(), &Node::leaf(LeafBody::new()))
+                .await
+                .unwrap()
+        );
+        let drop = CollectionChange {
+            parent: CollectionAddress::root("db"),
+            name: CollectionName::new("dropped").unwrap(),
+            collection: collection(),
+            expected: None,
+            op: CollectionOp::Drop,
+        };
+
+        let dropping = tokio::spawn(async move {
+            lifecycle
+                .install_drop_intents(&drop_id, std::slice::from_ref(&drop))
+                .await
+        });
+        // The steps of the wait grow to the cap before the holder leaves.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(!dropping.is_finished(), "the younger drop did not wait");
+        let (mut record, observed) = owner
+            .records
+            .load_record(&collection(), Requirement::ANY)
+            .await
+            .unwrap();
+        assert!(record.remove_topology_freeze(&holder));
+        assert!(
+            owner
+                .records
+                .store_record(&record, &observed)
+                .await
+                .unwrap()
+        );
+        commit_and_collect(&transactions, &pending).await;
+
+        within_one_step(dropping).await.unwrap();
+        let (frozen, _) = owner
+            .records
+            .load_record(
+                &collection(),
+                Requirement::after(owner.timeline.currentness_barrier()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(frozen.topology_freeze(), Some(&drop_id));
     }
 
     #[tokio::test]

@@ -593,7 +593,7 @@ type InDoubtMembers = BTreeMap<TxId, LeafObservation>;
 
 /// Whether `loaded` proves that a CAS which expected `expected` can never land.
 ///
-/// Each change of a node increases its node sequence, so a state of the node
+/// Each change of a node changes its node sequence, so a state of the node
 /// never comes back while the node exists (ADR-105). Any change after the
 /// expected state fences the CAS.
 fn fences(expected: &LeafObservation, loaded: &LeafObservation) -> bool {
@@ -4424,6 +4424,11 @@ mod tests {
         }
     }
 
+    /// Room for the node sequence of a stored node: a tag and the widest
+    /// varint of a random 32-bit start (ADR-109). A node that a test builds
+    /// has sequence 0, which takes no room.
+    const SEQUENCE_ROOM: usize = 6;
+
     // An unresolved member must decline to propose a replacement stage. Its
     // in-doubt outcome belongs only to the member carried by the failed CAS;
     // clouding a co-batched member that never staged would put a write it
@@ -4444,7 +4449,7 @@ mod tests {
         let large_len = Node::leaf(LeafBody::from_entries([large])).encoded_len();
         assert!(large_len > small_len);
         let policy = NodeSizePolicy::builder()
-            .node_max_bytes(small_len)
+            .node_max_bytes(small_len + SEQUENCE_ROOM)
             .split_headroom_bytes(0)
             .build()
             .unwrap();
@@ -4551,7 +4556,7 @@ mod tests {
         let small_len = Node::leaf(LeafBody::from_entries([small])).encoded_len();
         assert!(Node::leaf(LeafBody::from_entries([large])).encoded_len() > small_len);
         let policy = NodeSizePolicy::builder()
-            .node_max_bytes(small_len)
+            .node_max_bytes(small_len + SEQUENCE_ROOM)
             .split_headroom_bytes(0)
             .build()
             .unwrap();

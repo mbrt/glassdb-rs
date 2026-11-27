@@ -336,6 +336,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
             records.clone(),
             nodes.clone(),
             mon.clone(),
+            timeline.clone(),
             RetrySchedule::default(),
             Arc::new(UnexpectedTopologySettler),
         ),
@@ -2197,6 +2198,7 @@ async fn recover_directory_change(op: TxCollectionOp, case: DirectoryWriteBack) 
         owner.records.clone(),
         owner.nodes.clone(),
         owner.monitor.clone(),
+        owner.timeline.clone(),
         RetrySchedule::default(),
         Arc::new(UnexpectedTopologySettler),
     );
@@ -2740,6 +2742,7 @@ async fn reclaim_aborted_drop(with_child: bool, durable_locks: bool, case: DropR
         owner.records.clone(),
         owner.nodes.clone(),
         owner.monitor.clone(),
+        owner.timeline.clone(),
         RetrySchedule::default(),
         Arc::new(UnexpectedTopologySettler),
     );
