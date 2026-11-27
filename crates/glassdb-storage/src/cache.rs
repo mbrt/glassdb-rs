@@ -55,7 +55,7 @@ fn shard_hash<Q: Hash + ?Sized>(path: &Q) -> u64 {
 /// Returns the index of the shard of `path` in a cache of `shards` shards, for
 /// tests and benchmarks that put their paths in one shard.
 pub fn shard_index<Q: Hash + ?Sized>(path: &Q, shards: usize) -> usize {
-    (shard_hash(path) as usize) & (shards - 1)
+    shard::index_for_hash(shard_hash(path), shards)
 }
 
 /// The key of one entry. It hashes as `(slot, path)`, so a lookup can hash a
@@ -646,13 +646,14 @@ mod tests {
     }
 
     #[test]
-    fn evicts_lru() {
+    fn evicts_the_oldest_when_no_entry_was_hit() {
         // Budget for two 3-byte entries.
         let c = CacheShard::new(6);
         c.set(L, "a", e("aaa"));
         c.set(L, "b", e("bbb"));
         assert_eq!(c.size(), 6);
-        // Adding a third entry evicts the least recently used ("a").
+        // A new entry counts as used, so the eviction for "c" clears every
+        // bit, and then removes the oldest ("a").
         c.set(L, "c", e("ccc"));
         assert_eq!(c.get(L, "a"), None);
         assert!(c.get(L, "b").is_some());

@@ -25,6 +25,12 @@ pub fn index(key: &[u8], n: usize) -> usize {
     (fnv1a(key) & (n as u32 - 1)) as usize
 }
 
+/// Returns the shard index for a key whose hash is `hash`, given `n` shards,
+/// as [`Sharded::for_hash`] selects it. `n` must be a power of two.
+pub fn index_for_hash(hash: u64, n: usize) -> usize {
+    (hash as usize) & (n - 1)
+}
+
 /// Owns [`count`] independent shards of type `T`, routed by key hash. It is
 /// meant to be embedded in a wrapper that delegates per-key operations to the
 /// shard returned by [`Sharded::for_key`].
@@ -50,7 +56,7 @@ impl<T> Sharded<T> {
 
     /// Returns the shard responsible for a key whose hash is `hash`.
     pub fn for_hash(&self, hash: u64) -> &T {
-        &self.shards[(hash as usize) & (self.shards.len() - 1)]
+        &self.shards[index_for_hash(hash, self.shards.len())]
     }
 
     /// Returns the number of shards.
