@@ -430,8 +430,9 @@ impl Database {
     ///
     /// # Errors
     ///
-    /// A failed LIST ends the full GC with an error. Failed checks do not: the
-    /// report counts them.
+    /// A LIST retries a storage outage in place with the `wait` schedule of
+    /// [`RetryTiming`]. A LIST that still fails ends the full GC with an
+    /// error. Failed checks do not: the report counts them.
     ///
     /// # Cancellation
     ///

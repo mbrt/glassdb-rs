@@ -680,6 +680,7 @@ impl DormantEngine {
             gc_hints.clone(),
             gc_parallelism,
             Some(backend.write_meter()),
+            retry.wait,
         );
         let collection_commit = CollectionCommit::new(
             collection_catalog.clone(),

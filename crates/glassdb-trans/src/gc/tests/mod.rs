@@ -344,6 +344,7 @@ async fn new_ctx_with_config(backend: Arc<dyn Backend>, config: &EngineConfig) -
         hints.clone(),
         DEFAULT_GC_PARALLELISM,
         None,
+        RetrySchedule::default(),
     );
     Ctx {
         gc,
@@ -540,6 +541,55 @@ async fn committed_unreferenced_is_collected() {
         ctx.coord.stats_and_reset().submissions,
         0,
         "an unreferenced committed record needs no key-lock release"
+    );
+}
+
+/// Fails the next `failures` LISTs of `hooks` with an outage. Returns the
+/// number of failures left.
+fn fail_lists(hooks: &HookBackend, failures: usize) -> Arc<std::sync::atomic::AtomicUsize> {
+    let left = Arc::new(std::sync::atomic::AtomicUsize::new(failures));
+    hooks.set_before({
+        let left = left.clone();
+        move |op| {
+            let fail = matches!(op, BackendOp::List { .. })
+                && left
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok();
+            let future: HookFuture = Box::pin(async move {
+                if fail {
+                    Err(BackendError::Unavailable("list outage".into()))
+                } else {
+                    Ok(())
+                }
+            });
+            future
+        }
+    });
+    left
+}
+
+// A LIST that still fails after its retries ends the full GC with the outage.
+#[tokio::test(start_paused = true)]
+async fn a_full_gc_ends_on_a_lasting_list_outage() {
+    let hooks = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let ctx = new_ctx_with(hooks.clone()).await;
+    let left = fail_lists(&hooks, usize::MAX);
+
+    let result = tokio::time::timeout(Duration::from_secs(3600), ctx.gc.collect(NonZeroUsize::MIN))
+        .await
+        .expect("the retries of a LIST are not bounded");
+
+    assert!(
+        matches!(
+            result,
+            Err(TransError::Storage(StorageError::Unavailable(_)))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        usize::MAX - left.load(Ordering::SeqCst),
+        1 + super::LIST_UNAVAILABLE_RETRIES,
+        "one attempt and its retries"
     );
 }
 
