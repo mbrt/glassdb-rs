@@ -127,8 +127,7 @@ pub struct CollectionAddress {
 
 impl CollectionAddress {
     /// Creates an address from a database prefix and collection identity.
-    pub fn new(db_prefix: impl Into<Arc<str>>, id: CollectionId) -> Self {
-        let db_prefix = db_prefix.into();
+    pub fn new(db_prefix: impl AsRef<str>, id: CollectionId) -> Self {
         let db_prefix = DbPrefix::try_from(db_prefix.as_ref())
             .expect("database prefix must be a valid physical path component");
         CollectionAddress { db_prefix, id }
@@ -140,7 +139,7 @@ impl CollectionAddress {
     }
 
     /// Creates the permanent root collection address for `db_prefix`.
-    pub fn root(db_prefix: impl Into<Arc<str>>) -> Self {
+    pub fn root(db_prefix: impl AsRef<str>) -> Self {
         Self::new(db_prefix, CollectionId::root())
     }
 

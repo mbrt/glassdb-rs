@@ -103,10 +103,10 @@ impl Weighable for CacheEntry {
 
 /// The shared decoded cache: the latest state and the earlier states of each
 /// path, in one budget and one eviction order (ADR-103).
-#[derive(Clone)]
 ///
 /// A lookup takes the path of an object, so that a hit formats no backend
 /// name. A change takes its key, which the cache keeps.
+#[derive(Clone)]
 pub(super) struct DecodedCache(Arc<Cache<ObjectKey, CacheEntry>>);
 
 impl DecodedCache {

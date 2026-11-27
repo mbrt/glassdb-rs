@@ -52,6 +52,12 @@ fn shard_hash<Q: Hash + ?Sized>(path: &Q) -> u64 {
     SHARD_HASHER.hash_one(path)
 }
 
+/// Returns the index of the shard of `path` in a cache of `shards` shards, for
+/// tests and benchmarks that put their paths in one shard.
+pub fn shard_index<Q: Hash + ?Sized>(path: &Q, shards: usize) -> usize {
+    (shard_hash(path) as usize) & (shards - 1)
+}
+
 /// The key of one entry. It hashes as `(slot, path)`, so a lookup can hash a
 /// borrowed path and compare it without an allocation.
 #[derive(PartialEq, Eq)]
@@ -817,7 +823,7 @@ mod tests {
         let mut i = 0;
         while res.len() < count {
             let k = format!("k{i}");
-            if (shard_hash(k.as_str()) as usize) & (n - 1) == target {
+            if shard_index(k.as_str(), n) == target {
                 res.push(k);
             }
             i += 1;

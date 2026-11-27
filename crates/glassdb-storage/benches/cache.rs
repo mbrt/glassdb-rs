@@ -1,7 +1,7 @@
-//! Microbenchmarks for the byte-weighted LRU cache.
+//! Microbenchmarks for the byte-weighted decoded cache.
 //!
 //! All keys are generated to hash to a single shard so the per-shard
-//! data-structure cost (LRU ordering on access, delete-by-key, insert) is
+//! data-structure cost (access marks, delete-by-key, insert) is
 //! measured directly instead of being diluted across shards.
 //!
 //! Run with `cargo bench -p glassdb-storage --bench cache`. To A/B two
@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use glassdb_concurr::shard;
-use glassdb_storage::cache::{Cache, Slot, Weighable};
+use glassdb_storage::cache::{Cache, Slot, Weighable, shard_index};
 
 const WORKING_SET_SIZES: [usize; 3] = [1_000, 10_000, 100_000];
 const ENTRY_BYTES: usize = 64;
@@ -48,7 +48,7 @@ fn keys_for_shard(target: usize, n_shards: usize, count: usize) -> Vec<String> {
     let mut i = 0u64;
     while res.len() < count {
         let k = format!("key{i}");
-        if shard::index(k.as_bytes(), n_shards) == target {
+        if shard_index(k.as_str(), n_shards) == target {
             res.push(k);
         }
         i += 1;
@@ -71,7 +71,7 @@ fn filled_cache(keys: &[String]) -> Cache<String, Payload> {
     cache
 }
 
-/// `get` of a hot key refreshes its LRU recency on every call.
+/// `get` of a hot key marks its entry as used on every call.
 fn bench_get(c: &mut Criterion) {
     let n_shards = shard::count();
     let mut group = c.benchmark_group("cache_get_hot");
@@ -91,7 +91,7 @@ fn bench_get(c: &mut Criterion) {
     group.finish();
 }
 
-/// `update` on an existing key refreshes its LRU recency and replaces the value.
+/// `update` on an existing key moves it to the back and replaces the value.
 fn bench_update(c: &mut Criterion) {
     let n_shards = shard::count();
     let mut group = c.benchmark_group("cache_update_existing");
