@@ -849,8 +849,9 @@ transition of the intent recorded, not against the current structural gate. A
 worker publishes its split shrink or merge drain with one CAS that expects that
 revision. The revision alone tells whether the worker can still land, and a
 later structural change of the same source cannot protect an abandoned intent.
-Each gate installation increases the membership generation, so the recorded
-revision cannot come back. Structural recovery runs on its own schedule in its
+A state of a node never comes back while the node exists, so the recorded
+revision cannot come back
+([ADR-105](adr/105-a-node-state-never-repeats.md)). Structural recovery runs on its own schedule in its
 own namespace, and does not use the GC candidate queue.
 
 ## Storage, caching, and consistency

@@ -476,8 +476,10 @@ impl NodeLocks {
             return;
         }
         self.structure.set_writer(id);
-        // The node state from before the gate must never come back, so that a
-        // late copy of this CAS cannot land after a recovery fence (ADR-073).
+        // Merges and scan validation compare the membership generation, so
+        // the increase shows them that the node changes its structure: an
+        // absorb that recorded the earlier generation stops (ADR-073). The
+        // node sequence alone stops a late copy of this CAS (ADR-105).
         self.advance_membership_generation();
     }
 
@@ -498,7 +500,7 @@ impl NodeLocks {
             return;
         }
         self.merge_reservation = Some(intent);
-        // Same fence as a structural gate installation.
+        // Same increase as a structural gate installation.
         self.advance_membership_generation();
     }
 
