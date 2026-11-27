@@ -48,14 +48,14 @@ impl EarlierStates {
         if self.earlier(key).is_some() {
             return;
         }
-        self.cache.update_earlier(key.as_str(), |old| {
+        self.cache.update_earlier(key, |old| {
             old.or_else(|| Some(PathEarlierStates(Arc::from([]))))
         });
     }
 
     /// Removes the earlier states of `key` and its mark.
     pub(super) fn drop(&self, key: &ObjectKey) {
-        self.cache.delete_earlier(key.as_str());
+        self.cache.delete_earlier(key.object_path());
     }
 
     /// Returns the earlier states of a path after `replaced` stops being its
@@ -143,7 +143,7 @@ impl EarlierStates {
         };
         Ok(Some(Observation {
             key: key.clone(),
-            value: Some(downcast::<C>(key.as_str(), state.value.clone())?),
+            value: Some(downcast::<C>(key.object_path(), state.value.clone())?),
             revision: Some(state.revision.clone()),
             evidence: state.evidence.clone(),
         }))
@@ -169,7 +169,7 @@ impl EarlierStates {
         };
         let mut watermark = observed.evidence.get();
         let mut extend = |value: &ErasedValue, evidence: &Evidence| -> Result<bool, StorageError> {
-            let value = downcast::<C>(observed.key.as_str(), value.clone())?;
+            let value = downcast::<C>(observed.key.object_path(), value.clone())?;
             let same = part(&value).as_ref() == Some(&mine);
             if same {
                 if let Some(earlier) = evidence.start() {
@@ -199,10 +199,10 @@ impl EarlierStates {
     }
 
     fn latest(&self, key: &ObjectKey) -> Option<LatestState> {
-        self.cache.latest(key.as_str())
+        self.cache.latest(key.object_path())
     }
 
     fn earlier(&self, key: &ObjectKey) -> Option<PathEarlierStates> {
-        self.cache.earlier(key.as_str())
+        self.cache.earlier(key.object_path())
     }
 }

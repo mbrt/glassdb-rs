@@ -58,7 +58,7 @@ fn keys_for_shard(target: usize, n_shards: usize, count: usize) -> Vec<String> {
 
 /// Builds a cache whose targeted shard comfortably holds `keys.len()` entries
 /// without eviction, pre-filled with `keys`.
-fn filled_cache(keys: &[String]) -> Cache<Payload> {
+fn filled_cache(keys: &[String]) -> Cache<String, Payload> {
     let n = keys.len();
     let n_shards = shard::count();
     // `Cache::new` divides the budget evenly across shards, so size the total so

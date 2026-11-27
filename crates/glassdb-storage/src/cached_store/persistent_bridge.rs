@@ -163,7 +163,7 @@ impl PersistentBridge {
         let value = Arc::new(decoded);
         let revision = Revision::from_backend(backend::Revision::new(token));
         let seed = latest.install_persistent::<C>(
-            key.as_str(),
+            key,
             value,
             size,
             revision,

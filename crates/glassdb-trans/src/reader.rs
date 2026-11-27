@@ -27,14 +27,12 @@ const READ_UNAVAILABLE_RETRIES: usize = 5;
 #[derive(Clone)]
 pub struct BodyReader {
     reader: Reader,
-    resolver: KeyResolver,
 }
 
 impl BodyReader {
     pub(crate) fn new(resolver: KeyResolver, timeline: Timeline, retry: RetrySchedule) -> Self {
         Self {
-            reader: Reader::new(resolver.clone(), timeline, retry),
-            resolver,
+            reader: Reader::new(resolver, timeline, retry),
         }
     }
 
@@ -52,6 +50,7 @@ impl BodyReader {
         overlay: &[ScanMutation],
     ) -> Result<ScanResult, StorageError> {
         match self
+            .reader
             .resolver
             .scan_keys(collection, range, overlay, None, None)
             .await
@@ -61,7 +60,8 @@ impl BodyReader {
             // reports a dropped collection.
             Err(StorageError::StaleCollection) => {
                 let fresh = Requirement::after(self.reader.timeline.currentness_barrier());
-                self.resolver
+                self.reader
+                    .resolver
                     .scan_keys_at(collection, range, overlay, None, None, fresh)
                     .await
             }

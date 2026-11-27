@@ -1530,6 +1530,7 @@ version = "0.4.2"
 dependencies = [
  "async-trait",
  "criterion",
+ "foldhash 0.2.0",
  "futures",
  "glassdb-backend",
  "glassdb-concurr",

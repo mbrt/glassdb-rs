@@ -4,10 +4,12 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use glassdb_data::ObjectPath;
+
 use crate::cache::{Cache, EvictionHook, Slot, Weighable};
 use crate::error::StorageError;
 
-use super::{Codec, Evidence, Revision};
+use super::{Codec, Evidence, ObjectKey, Revision};
 
 pub(super) type ErasedValue = Arc<dyn Any + Send + Sync>;
 
@@ -102,7 +104,10 @@ impl Weighable for CacheEntry {
 /// The shared decoded cache: the latest state and the earlier states of each
 /// path, in one budget and one least-recently-used order (ADR-103).
 #[derive(Clone)]
-pub(super) struct DecodedCache(Arc<Cache<CacheEntry>>);
+///
+/// A lookup takes the path of an object, so that a hit formats no backend
+/// name. A change takes its key, which the cache keeps.
+pub(super) struct DecodedCache(Arc<Cache<ObjectKey, CacheEntry>>);
 
 impl DecodedCache {
     /// Creates the decoded cache. When `sink` is set, the cache passes to it
@@ -110,15 +115,18 @@ impl DecodedCache {
     pub(super) fn new(max_size: usize, sink: Option<Arc<dyn EvictionSink>>) -> Self {
         let cache = match sink {
             Some(sink) => {
-                let hook: EvictionHook<CacheEntry> = Box::new(move |slot, path, entry| {
-                    if slot == Slot::Latest
-                        && let CacheEntry::Latest(LatestState::Present {
-                            revision, evidence, ..
-                        }) = entry
-                    {
-                        sink.evicted(path, &revision, &evidence);
-                    }
-                });
+                let hook: EvictionHook<ObjectKey, CacheEntry> =
+                    Box::new(move |slot, key, entry| {
+                        if slot == Slot::Latest
+                            && let CacheEntry::Latest(LatestState::Present {
+                                revision,
+                                evidence,
+                                ..
+                            }) = entry
+                        {
+                            sink.evicted(key.as_str(), &revision, &evidence);
+                        }
+                    });
                 Cache::with_eviction(max_size, hook)
             }
             None => Cache::new(max_size),
@@ -128,7 +136,7 @@ impl DecodedCache {
 
     /// Returns the latest state of `path`, and moves it to the
     /// most-recently-used position.
-    pub(super) fn latest(&self, path: &str) -> Option<LatestState> {
+    pub(super) fn latest(&self, path: &ObjectPath) -> Option<LatestState> {
         self.0
             .get(Slot::Latest, path)
             .and_then(CacheEntry::into_latest)
@@ -136,7 +144,7 @@ impl DecodedCache {
 
     /// Returns the earlier states of `path`, and moves them to the
     /// most-recently-used position.
-    pub(super) fn earlier(&self, path: &str) -> Option<PathEarlierStates> {
+    pub(super) fn earlier(&self, path: &ObjectPath) -> Option<PathEarlierStates> {
         self.0
             .get(Slot::Earlier, path)
             .and_then(CacheEntry::into_earlier)
@@ -146,7 +154,7 @@ impl DecodedCache {
     /// an auxiliary result. `None` removes the state.
     pub(super) fn update_latest<R>(
         &self,
-        path: &str,
+        path: &ObjectKey,
         f: impl FnOnce(Option<LatestState>) -> (Option<LatestState>, R),
     ) -> R {
         self.0.update_with_result(Slot::Latest, path, |old| {
@@ -159,7 +167,7 @@ impl DecodedCache {
     /// removes them.
     pub(super) fn update_earlier(
         &self,
-        path: &str,
+        path: &ObjectKey,
         f: impl FnOnce(Option<PathEarlierStates>) -> Option<PathEarlierStates>,
     ) {
         self.0.update(Slot::Earlier, path, |old| {
@@ -172,7 +180,7 @@ impl DecodedCache {
     /// `None` to leave them as they are, and an auxiliary result.
     pub(super) fn update_both<R>(
         &self,
-        path: &str,
+        path: &ObjectKey,
         f: impl FnOnce(
             Option<LatestState>,
             Option<PathEarlierStates>,
@@ -192,18 +200,18 @@ impl DecodedCache {
     }
 
     /// Removes the latest state of `path`.
-    pub(super) fn delete_latest(&self, path: &str) {
+    pub(super) fn delete_latest(&self, path: &ObjectPath) {
         self.0.delete(Slot::Latest, path);
     }
 
     /// Removes the earlier states of `path`.
-    pub(super) fn delete_earlier(&self, path: &str) {
+    pub(super) fn delete_earlier(&self, path: &ObjectPath) {
         self.0.delete(Slot::Earlier, path);
     }
 
     /// Returns a copy of the latest state of every path. Each shard is copied
     /// under its own lock, so the result is not one atomic snapshot.
-    pub(super) fn latest_states(&self) -> Vec<(String, LatestState)> {
+    pub(super) fn latest_states(&self) -> Vec<(ObjectKey, LatestState)> {
         self.0
             .entries()
             .into_iter()
@@ -216,7 +224,7 @@ impl DecodedCache {
 /// means a path was used through the wrong typed store, which is an internal
 /// error.
 pub(super) fn downcast<C: Codec>(
-    path: &str,
+    path: &ObjectPath,
     value: ErasedValue,
 ) -> Result<Arc<C::Value>, StorageError> {
     value.downcast::<C::Value>().map_err(|_| {

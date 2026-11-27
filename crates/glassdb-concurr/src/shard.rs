@@ -48,6 +48,11 @@ impl<T> Sharded<T> {
         &self.shards[index(key, self.shards.len())]
     }
 
+    /// Returns the shard responsible for a key whose hash is `hash`.
+    pub fn for_hash(&self, hash: u64) -> &T {
+        &self.shards[(hash as usize) & (self.shards.len() - 1)]
+    }
+
     /// Returns the number of shards.
     pub fn len(&self) -> usize {
         self.shards.len()
