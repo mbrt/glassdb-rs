@@ -326,6 +326,7 @@ async fn read_retry_budget_applies_to_each_point_read() {
         .retry_timing(RetryTiming {
             contention: no_delay(),
             wait: no_delay(),
+            holder_poll: no_delay(),
         })
         .open()
         .await
@@ -360,6 +361,7 @@ async fn an_outage_in_the_cut_check_is_a_read_outage() {
         .retry_timing(RetryTiming {
             contention: no_delay(),
             wait: no_delay(),
+            holder_poll: no_delay(),
         })
         .open()
         .await

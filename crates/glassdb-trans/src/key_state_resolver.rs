@@ -187,6 +187,11 @@ impl KeyStateResolver {
         let Some(holder) = node.drop_intent() else {
             return Ok(());
         };
+        // Unlike the other waits for a holder (ADR-024), this wait has no
+        // bounded step that reads the node again: the callers have no step
+        // that reads it again. A body replay of the drop can clear the intent
+        // before a final status, so the read can wait for the end of the drop.
+        // The holder poll of the monitor bounds the rest of the wait.
         if self.monitor.await_tx_final(holder).await? == TxFinalStatus::Committed {
             return Err(TransError::StaleCollection);
         }
@@ -381,6 +386,7 @@ mod tests {
             transactions,
             timeline,
             Arc::downgrade(&background),
+            RetrySchedule::default(),
             RetrySchedule::default(),
             ProtocolTiming::default(),
             crate::gc::GcHints::default(),
@@ -885,6 +891,7 @@ mod tests {
             transactions.clone(),
             timeline.clone(),
             Arc::downgrade(&background),
+            RetrySchedule::default(),
             RetrySchedule::default(),
             ProtocolTiming::default(),
             crate::gc::GcHints::default(),

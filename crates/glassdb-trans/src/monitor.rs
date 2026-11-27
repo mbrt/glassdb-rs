@@ -24,6 +24,9 @@ use crate::error::TransError;
 use crate::gc::GcHints;
 
 mod final_status;
+mod holder_wait;
+
+pub(crate) use holder_wait::HolderWait;
 
 use final_status::{FinalStatusCache, KnownFinal};
 
@@ -606,6 +609,9 @@ struct Inner {
     // strong owner.
     background: Weak<Background>,
     retry: RetrySchedule,
+    // Polls of a foreign transaction record, and the waits for a lock holder
+    // between two reads of its object (ADR-024).
+    holder_poll: RetrySchedule,
     timing: ProtocolTiming,
     // Reports the wounds whose lock sets GC must release.
     gc_hints: GcHints,
@@ -856,13 +862,15 @@ impl TxStatusEvidence {
 
 impl Monitor {
     /// Creates a monitor with retry-backoff and transaction-liveness timing.
-    /// The retry config tunes the backoff used when polling a peer
-    /// transaction's commit status and when writing a transaction's final record.
+    /// `retry` tunes the backoff of the writes of transaction records.
+    /// `holder_poll` tunes the polls of the commit status of a peer
+    /// transaction, and the waits for a lock holder (ADR-024).
     pub fn with_config(
         tx_records: TxRecordStore,
         timeline: Timeline,
         background: Weak<Background>,
         retry: RetrySchedule,
+        holder_poll: RetrySchedule,
         timing: ProtocolTiming,
         gc_hints: GcHints,
     ) -> Self {
@@ -873,6 +881,7 @@ impl Monitor {
                 final_status: Mutex::new(FinalStatusCache::new(FINAL_STATUS_CACHE_SIZE)),
                 background,
                 retry,
+                holder_poll,
                 timing,
                 gc_hints,
                 shards: Sharded::new(|_| Mutex::new(State::default())),
@@ -891,6 +900,11 @@ impl Monitor {
 
     pub(crate) fn protocol_timing(&self) -> ProtocolTiming {
         self.inner.timing
+    }
+
+    /// Starts a bounded wait for lock holders (ADR-024).
+    pub(crate) fn holder_wait(&self) -> HolderWait<'_> {
+        HolderWait::new(self)
     }
 
     /// Registers a new pending local transaction.
@@ -2456,7 +2470,7 @@ impl Monitor {
     /// status just before it registered, so the first fetch comes after one
     /// backoff.
     async fn poll_tx_status_with_liveness(&self, tid: &TxId) {
-        let mut backoff = self.inner.retry.backoff();
+        let mut backoff = self.inner.holder_poll.backoff();
         let finalized = loop {
             rt::sleep(backoff.next_delay()).await;
             if !self.retain_live_waiters(tid) {
@@ -3053,6 +3067,7 @@ mod tests {
             tx_records.clone(),
             timeline,
             Arc::downgrade(&bg),
+            RetrySchedule::default(),
             RetrySchedule::default(),
             timing,
             crate::gc::GcHints::default(),

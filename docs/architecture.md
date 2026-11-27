@@ -583,7 +583,9 @@ When a lock request conflicts with a holder
   writes a pinned `Wounded`. A database instance that can prove its own victim
   retired writes `Aborted`.
 - A **younger** requester waits and keeps the locks that it has
-  (hold-and-wait).
+  (hold-and-wait). The wait has bounded steps, and the requester reads the
+  held object again after each step, because the holder can leave the object
+  before the requester learns its final status.
 
 For key locks, an older transaction never waits for a younger one, so no wait
 cycle can form. A wounded transaction renews its identity and replays its body. The new

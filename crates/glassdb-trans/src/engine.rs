@@ -449,6 +449,7 @@ impl AssemblyFoundation {
             timeline.clone(),
             Arc::downgrade(&background),
             config.retry.wait,
+            config.retry.holder_poll,
             config.protocol_timing,
             gc_hints.clone(),
         );
@@ -523,6 +524,7 @@ impl AssemblyFixture {
             self.tx_records.clone(),
             self.timeline.clone(),
             Arc::downgrade(background),
+            retry,
             retry,
             protocol_timing,
             self.foundation.gc_hints.clone(),
@@ -655,6 +657,7 @@ impl DormantEngine {
             records.clone(),
             nodes.clone(),
             monitor.clone(),
+            timeline.clone(),
             retry.contention,
             Arc::new(restructurer.clone()),
         );

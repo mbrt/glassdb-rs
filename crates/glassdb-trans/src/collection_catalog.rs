@@ -227,6 +227,7 @@ mod tests {
             timeline.clone(),
             Arc::downgrade(&background),
             RetrySchedule::default(),
+            RetrySchedule::default(),
             crate::monitor::ProtocolTiming::default(),
             crate::gc::GcHints::default(),
         );

@@ -31,7 +31,6 @@ use std::num::NonZeroUsize;
 use std::ops::{AddAssign, Sub};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use async_trait::async_trait;
 use glassdb_concurr::{join_all_bounded, map_all_bounded, rt};
@@ -1018,16 +1017,6 @@ enum LeafOutcome {
     InDoubt,
 }
 
-/// How a hold-and-wait wake happened, so the re-poll cadence can be tuned: a
-/// holder that reaches a final status is real progress, while a poll timeout
-/// only re-checks for a lock that the holder released before its final status.
-enum Woke {
-    /// The holder's final status was durably verified.
-    FinalStatus,
-    /// The backed-off poll timer elapsed before the holder reached a final status.
-    PollTimeout,
-}
-
 /// Exposes data-node and collection locking through separate views.
 ///
 /// The key view hides routing, waits, wound-wait, and CAS retries behind a
@@ -1187,7 +1176,7 @@ impl KeyLocker {
             path: path.clone(),
             requirement: Requirement::ANY,
         };
-        let mut wait = self.retry.wait.backoff();
+        let wait = self.tmon.holder_wait();
         let mut contention = self.retry.contention.backoff();
         let mut contended = 0;
         loop {
@@ -1207,10 +1196,7 @@ impl KeyLocker {
                     }
                 }
                 ReleaseOutcome::Wait(holder) => {
-                    let delay = wait.next_delay();
-                    if let Woke::FinalStatus = self.wait_for_holder(&holder, delay).await? {
-                        wait = self.retry.wait.backoff();
-                    }
+                    wait.final_status(&holder).await?;
                     continue;
                 }
                 ReleaseOutcome::Contended => {}
@@ -1473,7 +1459,7 @@ impl KeyLocker {
         // Paces the hold-and-wait re-poll. It advances across successive blind
         // polls of a holder that will not budge, and resets whenever a holder
         // finalizes — real progress.
-        let mut backoff = self.retry.wait.backoff();
+        let wait = self.tmon.holder_wait();
         loop {
             let operation = AcquireOperation {
                 id: *id,
@@ -1501,29 +1487,12 @@ impl KeyLocker {
                 // timeout bounds the total wait and escalates to the
                 // cannot-deadlock serial order.
                 AcquireOutcome::Wait(holder) => {
-                    let delay = backoff.next_delay();
-                    if let Woke::FinalStatus = self.wait_for_holder(&holder, delay).await? {
-                        backoff = self.retry.wait.backoff();
-                    }
+                    wait.final_status(&holder).await?;
                 }
                 AcquireOutcome::LeafFull => return Ok(LeafOutcome::LeafFull),
                 AcquireOutcome::Conflict => return Ok(LeafOutcome::Conflict),
                 AcquireOutcome::InDoubt => return Ok(LeafOutcome::InDoubt),
             }
-        }
-    }
-
-    /// Parks until the conflicting `holder` reaches a final status **or**
-    /// `timeout` elapses, whichever comes first, then lets the caller
-    /// re-resolve, reporting which woke it.
-    async fn wait_for_holder(&self, holder: &TxId, timeout: Duration) -> Result<Woke, TransError> {
-        let wait = self.tmon.await_tx_final(holder);
-        tokio::select! {
-            status = wait => {
-                status?;
-                Ok(Woke::FinalStatus)
-            },
-            _ = rt::sleep(timeout) => Ok(Woke::PollTimeout),
         }
     }
 }
