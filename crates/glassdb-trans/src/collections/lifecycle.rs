@@ -10,7 +10,7 @@ use glassdb_data::{CollectionAddress, NodeId, ObjectPath, TxId};
 use glassdb_storage::transaction::TxCommitStatus;
 use glassdb_storage::{
     CasRetries, CollectionRecord, CollectionStore, Converged, Decision, Fenced, LeafBody,
-    LeafObservation, Node, NodeStore, Requirement, StorageError, Timeline,
+    LeafObservation, Node, NodeStore, Requirement, StorageError, Timeline, YieldRequestStore,
 };
 
 use super::{CollectionChange, CollectionOp};
@@ -42,6 +42,7 @@ pub trait TopologySettler: Send + Sync {
 pub struct CollectionLifecycle {
     records: CollectionStore,
     nodes: NodeStore,
+    yield_requests: YieldRequestStore,
     monitor: Monitor,
     timeline: Timeline,
     retry: RetrySchedule,
@@ -55,6 +56,7 @@ impl CollectionLifecycle {
     pub fn new(
         records: CollectionStore,
         nodes: NodeStore,
+        yield_requests: YieldRequestStore,
         monitor: Monitor,
         timeline: Timeline,
         retry: RetrySchedule,
@@ -63,6 +65,7 @@ impl CollectionLifecycle {
         Self {
             records,
             nodes,
+            yield_requests,
             monitor,
             timeline,
             retry,
@@ -206,6 +209,7 @@ impl CollectionLifecycle {
                     None => break,
                 }
             }
+            deleted += u64::from(self.yield_requests.delete(collection).await?);
             let root = self
                 .nodes
                 .load_root_state(collection, Requirement::ANY)
@@ -696,6 +700,7 @@ mod tests {
         CollectionLifecycle::new(
             store.records.clone(),
             store.nodes.clone(),
+            YieldRequestStore::new(store.objects.clone()),
             monitor.clone(),
             store.timeline.clone(),
             retry,
@@ -713,6 +718,7 @@ mod tests {
         CollectionLifecycle::new(
             fixture.records.clone(),
             fixture.nodes.clone(),
+            fixture.yield_requests.clone(),
             fixture.monitor.clone(),
             fixture.timeline.clone(),
             RetrySchedule::default(),

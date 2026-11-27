@@ -262,3 +262,19 @@ message CollectionDirectoryEntry {
     // Stable 16-byte collection ID.
     bytes collection_id = 2;
 }
+
+// The yield requests of the database instances that starve on the leaves of
+// one collection (ADR-110), sorted by instance so the encoding is canonical.
+message YieldRequests {
+    repeated YieldRequest requests = 1;
+}
+
+message YieldRequest {
+    // A random token of the database instance that asks the others to yield.
+    fixed64 instance = 1;
+    // The request has no effect after this time.
+    google.protobuf.Timestamp expires_at = 2;
+    // The time between two coordinator rounds of one leaf that the instance
+    // asks for, in microseconds.
+    uint64 gap_micros = 3;
+}

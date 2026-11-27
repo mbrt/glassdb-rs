@@ -417,6 +417,7 @@ mod tests {
         use crate::tlocker::Locker;
         let coord = LeafCoordinator::with_hinter(
             local.nodes.clone(),
+            local.yield_requests.clone(),
             KeyStateResolver::new(local.monitor.clone()),
             local.monitor.clone(),
             CoordinatorConfig::default(),

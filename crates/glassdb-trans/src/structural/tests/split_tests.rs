@@ -1348,6 +1348,7 @@ async fn split_help_forwards_a_committed_entry_holder_before_moving_its_entry() 
     let other_key_state = KeyStateResolver::new(other_mon.clone());
     let other_coord = LeafCoordinator::with_hinter(
         other.nodes.clone(),
+        other.foundation.yield_requests.clone(),
         other_key_state,
         other_mon.clone(),
         crate::leaf_coord::CoordinatorConfig::default(),

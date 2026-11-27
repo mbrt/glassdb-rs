@@ -40,7 +40,7 @@ use glassdb_data::{ObjectPath, TxId};
 use glassdb_storage::{
     CasReceipt, CasResult, CurrentnessBarrier, LeafBody, LeafEdit, LeafEntry, LeafObservation,
     LeafObservationCheck, LockType, Node, NodeLocks, NodeSizePolicy, NodeStore, Requirement,
-    StorageError,
+    StorageError, YieldRequestStore,
 };
 
 use crate::error::TransError;
@@ -49,7 +49,9 @@ use crate::monitor::Monitor;
 use crate::retry_timing::RetryTiming;
 
 mod stage;
+mod yield_request;
 pub(crate) use stage::{StageDraft, StagedLeaf};
+use yield_request::{REJECTIONS_TO_REQUEST, Yielding};
 
 /// Maximum inner CAS retries on a single leaf/root before treating the
 /// operation as conflicted and restarting the transaction.
@@ -527,6 +529,7 @@ struct CoordCore {
     // Where stored over-cap leaves are reported: the background
     // [`Restructurer`](crate::structural::Restructurer)'s queue when one is wired.
     hinter: Arc<dyn StructuralHinter>,
+    yielding: Yielding,
 }
 
 struct CoordState {
@@ -976,11 +979,47 @@ impl CasWorker {
         submitted: &CasReq,
         batch: &BatchHandle<CasReq, TransError>,
     ) -> Result<(), TransError> {
+        let before = self.core.yielding.before_round(&submitted.path);
+        // While this instance yields the collection, the round waits for the
+        // gap after the last round of the leaf (ADR-110). The gap comes
+        // before the batching window, so that the submissions that arrive
+        // during the gap join the round.
+        if let Some(gap) = before.wait {
+            rt::sleep(gap).await;
+        }
         self.wait_for_batching_window().await;
+        let result = match before.poll {
+            // The poll decides only the later rounds, so it runs at the same
+            // time as this one.
+            Some(collection) => {
+                let poll = self.core.yielding.poll(&collection);
+                futures::join!(self.run_attempts(submitted, batch), poll).0
+            }
+            None => self.run_attempts(submitted, batch).await,
+        };
+        self.core.yielding.round_ended(&submitted.path);
+        result
+    }
+
+    /// Runs the CAS attempts of a round until it delivers the outcomes of its
+    /// members.
+    async fn run_attempts(
+        &self,
+        submitted: &CasReq,
+        batch: &BatchHandle<CasReq, TransError>,
+    ) -> Result<(), TransError> {
         let mut round = RoundState::new(submitted.requirement, &self.core.config.retry);
         for attempt in 0..CAS_RETRIES {
             if attempt > 0 {
-                round.wait_for_retry().await;
+                // The yield request goes out during the backoff, so that it
+                // does not delay a CAS of the round (ADR-110).
+                match round.request_due.take() {
+                    Some(attempt) => {
+                        let request = self.core.yielding.request(&submitted.path, attempt);
+                        futures::join!(round.wait_for_retry(), request);
+                    }
+                    None => round.wait_for_retry().await,
+                }
                 self.core.stats.n_retries.fetch_add(1, Ordering::Relaxed);
             }
             match self.attempt(&submitted.path, batch, &mut round).await {
@@ -1030,6 +1069,7 @@ impl CasWorker {
         batch: &BatchHandle<CasReq, TransError>,
         round: &mut RoundState,
     ) -> Result<AttemptEnd, TransError> {
+        let started = rt::Instant::now();
         let edit = match self.load_round_leaf(path, round).await {
             Ok(edit) => edit,
             // A root split can turn the routed root leaf into an index
@@ -1052,10 +1092,8 @@ impl CasWorker {
             }
             Err(e) => return Err(e.into()),
         };
-        if let Some(lost) = round.lost_cas.take()
-            && lost.cause(edit.node()) == LostCasCause::OtherKeys
-        {
-            self.core.hinter.lost_leaf_cas(path, &lost.round_keys);
+        if let Some(lost) = round.lost_cas.take() {
+            self.note_lost_cas(path, &lost, edit.node(), round);
         }
         // Read the merged set *after* obtaining the leaf so this round
         // absorbs every member that queued while the load I/O was in flight
@@ -1108,7 +1146,10 @@ impl CasWorker {
             .persist(path, edit, &mut plan, round.requirement)
             .await?;
         let (observed, applied) = match persist_result {
-            PersistResult::Applied(receipt) => (loaded_observation, Some(receipt)),
+            PersistResult::Applied(receipt) => {
+                self.core.yielding.cas_ended(path, true);
+                (loaded_observation, Some(receipt))
+            }
             PersistResult::Unchanged(observed) => (observed, None),
             // The CAS did not land, or the clean plan's loaded state
             // changed. Neither resolves an earlier in-doubt mutation.
@@ -1116,6 +1157,14 @@ impl CasWorker {
             // (ADR-085). A rejected CAS already cost a backend
             // operation, so recording it costs little.
             PersistResult::Rejected => {
+                // The next load shows the cause of this rejection, after the
+                // backoff that writes the request. So the rejections before
+                // it decide (ADR-110).
+                if round.rejected_by_writers + 1 >= REJECTIONS_TO_REQUEST
+                    && self.core.yielding.starves(path)
+                {
+                    round.request_due = Some(started.elapsed());
+                }
                 round.lost_cas = loaded_observation
                     .value()
                     .map(|expected| LostCas::new(expected.clone(), &members));
@@ -1135,6 +1184,31 @@ impl CasWorker {
         };
         deliver_plan(plan.members, &members, applied.as_ref(), &observed)?;
         Ok(AttemptEnd::Done)
+    }
+
+    /// Reports the rejected CAS `lost` of a round of `path`, now that the
+    /// round loaded `current`. Each topology policy receives a lost leaf CAS
+    /// (ADR-085). The count of the rejections by other writers in a row
+    /// grows, and the yield state records the rejection (ADR-110). A change
+    /// of the node itself, such as a split, shows no other writer, so it
+    /// starts the count again.
+    fn note_lost_cas(
+        &self,
+        path: &ObjectPath,
+        lost: &LostCas,
+        current: &Node,
+        round: &mut RoundState,
+    ) {
+        match lost.cause(current) {
+            LostCasCause::NodeChange => {
+                round.rejected_by_writers = 0;
+                return;
+            }
+            LostCasCause::OtherKeys => self.core.hinter.lost_leaf_cas(path, &lost.round_keys),
+            LostCasCause::SameKeys => {}
+        }
+        self.core.yielding.cas_ended(path, false);
+        round.rejected_by_writers += 1;
     }
 
     /// Writes the loaded leaf again, so that its node sequence fences each CAS
@@ -1234,6 +1308,14 @@ struct RoundState {
     ever_in_doubt: BTreeSet<TxId>,
     /// The last rejected CAS, until the next load shows what the peer changed.
     lost_cas: Option<LostCas>,
+    /// The leaf CASes of the round that a key change of another writer
+    /// rejected. The round ends when a CAS lands, so they are in a row
+    /// (ADR-110). A change of the node itself breaks the row.
+    rejected_by_writers: u32,
+    /// While the round must write the yield request of its instance before
+    /// its next attempt, the time of the leaf load and the CAS of the attempt
+    /// that measured the gap.
+    request_due: Option<Duration>,
 }
 
 impl RoundState {
@@ -1248,6 +1330,8 @@ impl RoundState {
             in_doubt: InDoubtMembers::new(),
             ever_in_doubt: BTreeSet::new(),
             lost_cas: None,
+            rejected_by_writers: 0,
+            request_due: None,
         }
     }
 
@@ -1378,12 +1462,15 @@ impl LeafCoordinator {
     /// normally the background [`Restructurer`](crate::structural::Restructurer)'s queue.
     pub fn with_hinter(
         nodes: NodeStore,
+        yield_requests: YieldRequestStore,
         key_state: KeyStateResolver,
         tmon: Monitor,
         config: CoordinatorConfig,
         hinter: Arc<dyn StructuralHinter>,
     ) -> Self {
+        let yielding = Yielding::new(yield_requests);
         let core = Arc::new(CoordCore {
+            yielding,
             tmon,
             nodes,
             key_state,
@@ -1626,7 +1713,14 @@ mod tests {
         let mon = foundation.monitor.clone();
         let nodes = foundation.nodes.clone();
         let key_state = KeyStateResolver::new(mon.clone());
-        let coord = LeafCoordinator::with_hinter(nodes.clone(), key_state, mon, config, hinter);
+        let coord = LeafCoordinator::with_hinter(
+            nodes.clone(),
+            foundation.yield_requests.clone(),
+            key_state,
+            mon,
+            config,
+            hinter,
+        );
         (coord, nodes, timeline, bg)
     }
 
@@ -3265,6 +3359,97 @@ mod tests {
                 Vec::new()
             };
             assert_eq!(hints.lost_rounds(), expected, "{name}");
+        }
+    }
+
+    // ADR-110: only the round that starves knows that it starves, so a round
+    // whose `REJECTIONS_TO_REQUEST` leaf CASes in a row another writer
+    // rejects must write the yield request of its instance. Fewer rejections
+    // happen without starvation. A change of the node alone, such as a split,
+    // shows no other writer. An instance whose earlier leaf CASes landed
+    // races fairly and does not starve. None of these must write a request.
+    #[tokio::test(start_paused = true)]
+    async fn a_round_whose_leaf_cas_keeps_failing_asks_the_other_instances_to_yield() {
+        // (name, the change of the peer, rejections, the keys of earlier
+        // rounds that land, whether the instance requests)
+        type Case = (
+            &'static str,
+            PeerChange,
+            u32,
+            &'static [&'static [u8]],
+            bool,
+        );
+        let cases: [Case; 4] = [
+            (
+                "fewer rejections",
+                |node| with_peer_writer(node, b"b"),
+                REJECTIONS_TO_REQUEST - 1,
+                &[],
+                false,
+            ),
+            (
+                "rejections by a writer",
+                |node| with_peer_writer(node, b"b"),
+                REJECTIONS_TO_REQUEST,
+                &[],
+                true,
+            ),
+            (
+                "node changes",
+                |node| node.clone(),
+                REJECTIONS_TO_REQUEST,
+                &[],
+                false,
+            ),
+            (
+                "earlier rounds landed",
+                |node| with_peer_writer(node, b"b"),
+                REJECTIONS_TO_REQUEST,
+                // Far more than one in `LANDED_SHARE` of the outcomes.
+                &[b"c", b"d", b"e", b"f", b"g", b"h", b"i", b"j"],
+                false,
+            ),
+        ];
+        for (name, change, rejections, landed, requested) in cases {
+            let inner = slow_leaf_backend();
+            let seed = TxId::with_priority(1, b"seed");
+            store_leaf_entries(
+                &cold_store(inner.clone()),
+                &leaf(),
+                vec![
+                    entry(b"a", LockType::None, None, Some(&seed)),
+                    entry(b"b", LockType::None, None, Some(&seed)),
+                    entry(b"c", LockType::None, None, Some(&seed)),
+                    entry(b"d", LockType::None, None, Some(&seed)),
+                    entry(b"e", LockType::None, None, Some(&seed)),
+                    entry(b"f", LockType::None, None, Some(&seed)),
+                    entry(b"g", LockType::None, None, Some(&seed)),
+                    entry(b"h", LockType::None, None, Some(&seed)),
+                    entry(b"i", LockType::None, None, Some(&seed)),
+                    entry(b"j", LockType::None, None, Some(&seed)),
+                ],
+            )
+            .await;
+            let (backend, peer_wins) = peer_wins_leaf_cas(inner.clone(), change);
+            let (coord, _nodes, _timeline, _bg) =
+                coord_over_config(backend, fast_retry(), Arc::new(NoStructuralHints)).await;
+            for key in landed {
+                assert!(spawn_lock(&coord, key, 3).await.unwrap().unwrap(), "{name}");
+            }
+            coord.stats_and_reset();
+            peer_wins.store(rejections as usize, Ordering::SeqCst);
+
+            assert!(spawn_lock(&coord, b"a", 2).await.unwrap().unwrap());
+            let retries = coord.stats_and_reset().cas_retries;
+            coord.close().await;
+            assert_eq!(retries, u64::from(rejections), "{name}");
+
+            let objects = CachedStore::new(inner, 1 << 20, Timeline::new(), None);
+            let requests = YieldRequestStore::new(objects)
+                .read(&collection())
+                .await
+                .unwrap();
+            assert_eq!(!requests.is_absent(), requested, "{name}");
         }
     }
 

@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use glassdb_data::{
     CollectionAddress, CollectionName, ID_BYTES, LeafRef, LogicalKey, ObjectPath, TxId,
@@ -13,6 +12,7 @@ use crate::cached_store::Codec;
 use crate::error::StorageError;
 use crate::lock::{LockType, lock_type_from_proto as parse_lock_type, lock_type_to_proto};
 use crate::wire_id::decode_id;
+use crate::wire_time::{proto_ts_to_system, system_to_proto_ts};
 
 /// Canonical protobuf codec for transaction-record objects.
 pub(crate) struct TxRecordCodec;
@@ -459,32 +459,10 @@ fn validate_database_membership(
     Ok(())
 }
 
-fn system_to_proto_ts(timestamp: SystemTime) -> prost_types::Timestamp {
-    match timestamp.duration_since(UNIX_EPOCH) {
-        Ok(duration) => prost_types::Timestamp {
-            seconds: duration.as_secs() as i64,
-            nanos: duration.subsec_nanos() as i32,
-        },
-        Err(error) => {
-            let duration = error.duration();
-            prost_types::Timestamp {
-                seconds: -(duration.as_secs() as i64),
-                nanos: -(duration.subsec_nanos() as i32),
-            }
-        }
-    }
-}
-
-fn proto_ts_to_system(timestamp: prost_types::Timestamp) -> SystemTime {
-    if timestamp.seconds >= 0 {
-        UNIX_EPOCH + Duration::new(timestamp.seconds as u64, timestamp.nanos.max(0) as u32)
-    } else {
-        UNIX_EPOCH - Duration::new((-timestamp.seconds) as u64, timestamp.nanos.unsigned_abs())
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
     use glassdb_data::{CollectionId, MAX_COLLECTION_NAME_BYTES, NodeId};
 
     use super::*;

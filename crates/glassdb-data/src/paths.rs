@@ -247,6 +247,9 @@ pub enum ObjectPath {
         collection: CollectionAddress,
         id: NodeId,
     },
+    /// The yield requests of the database instances that starve on the leaves
+    /// of a collection (ADR-110).
+    YieldRequests { collection: CollectionAddress },
     /// A participant-owned structural intent.
     StructuralIntent {
         db_prefix: DbPrefix,
@@ -322,6 +325,7 @@ impl std::fmt::Display for ObjectPath {
             }
             ObjectPath::TreeRoot { collection } => tree::write_tree_root(f, collection),
             ObjectPath::Node { collection, id } => tree::write_node(f, collection, id),
+            ObjectPath::YieldRequests { collection } => tree::write_yield_requests(f, collection),
             ObjectPath::StructuralIntent {
                 db_prefix,
                 participant,
@@ -597,6 +601,9 @@ mod tests {
             ObjectPath::TreeRoot {
                 collection: collection.clone(),
             },
+            ObjectPath::YieldRequests {
+                collection: collection.clone(),
+            },
             ObjectPath::Node { collection, id },
             ObjectPath::StructuralIntent {
                 db_prefix,
@@ -730,6 +737,13 @@ mod tests {
             }
             .to_string(),
             format!("{collection_prefix}/_r")
+        );
+        assert_eq!(
+            ObjectPath::YieldRequests {
+                collection: collection.clone(),
+            }
+            .to_string(),
+            format!("{collection_prefix}/_y")
         );
         assert_eq!(
             ObjectPath::Node {

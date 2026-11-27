@@ -12,6 +12,7 @@ use glassdb_storage::{
     CacheStats, CachedStore, CollectionStore, InlinePolicy, MonotonicFloor, NodeReads,
     NodeSizePolicy, NodeStore, PersistentCache, PersistentCacheConfig, PersistentCacheMedia,
     Requirement, StorageError, StructuralIntentStore, Timeline, TreeRouter, ViewRead,
+    YieldRequestStore,
 };
 
 use crate::access::AccessSet;
@@ -385,6 +386,7 @@ struct AssemblyFoundation {
     records: CollectionStore,
     nodes: NodeStore,
     structural_intents: StructuralIntentStore,
+    yield_requests: YieldRequestStore,
     timeline: Timeline,
     tx_records: TxRecordStore,
     background: Arc<Background>,
@@ -406,6 +408,7 @@ impl AssemblyFoundation {
         let records = CollectionStore::new(objects.clone(), config.transaction_leaf_parallelism);
         let nodes = NodeStore::new(objects.clone(), config.transaction_leaf_parallelism);
         let structural_intents = StructuralIntentStore::new(objects.clone());
+        let yield_requests = YieldRequestStore::new(objects.clone());
         let tx_records = TxRecordStore::new(objects.clone(), db_prefix);
         let background = Arc::new(Background::new());
         let gc_hints = GcHints::new(config.gc_limits);
@@ -424,6 +427,7 @@ impl AssemblyFoundation {
             records,
             nodes,
             structural_intents,
+            yield_requests,
             timeline,
             tx_records,
             background,
@@ -442,6 +446,7 @@ pub(crate) struct AssemblyFixture {
     pub(crate) records: CollectionStore,
     pub(crate) nodes: NodeStore,
     pub(crate) structural_intents: StructuralIntentStore,
+    pub(crate) yield_requests: YieldRequestStore,
     pub(crate) timeline: Timeline,
     pub(crate) tx_records: TxRecordStore,
     pub(crate) background: Arc<Background>,
@@ -469,6 +474,7 @@ impl AssemblyFixture {
             records: foundation.records.clone(),
             nodes: foundation.nodes.clone(),
             structural_intents: foundation.structural_intents.clone(),
+            yield_requests: foundation.yield_requests.clone(),
             timeline: foundation.timeline.clone(),
             tx_records: foundation.tx_records.clone(),
             background: foundation.background.clone(),
@@ -559,6 +565,7 @@ impl DormantEngine {
             records,
             nodes,
             structural_intents,
+            yield_requests,
             timeline,
             tx_records,
             background,
@@ -587,6 +594,7 @@ impl DormantEngine {
             background_weak.clone(),
             topology.clone(),
             nodes.clone(),
+            yield_requests.clone(),
             structural_intents.clone(),
             timeline.clone(),
             monitor.clone(),
@@ -621,6 +629,7 @@ impl DormantEngine {
         let collection_lifecycle = CollectionLifecycle::new(
             records.clone(),
             nodes.clone(),
+            yield_requests,
             monitor.clone(),
             timeline.clone(),
             retry.contention,

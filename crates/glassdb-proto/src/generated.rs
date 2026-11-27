@@ -468,3 +468,23 @@ pub struct CollectionDirectoryEntry {
     #[prost(bytes = "vec", tag = "2")]
     pub collection_id: ::prost::alloc::vec::Vec<u8>,
 }
+/// The yield requests of the database instances that starve on the leaves of
+/// one collection (ADR-110), sorted by instance so the encoding is canonical.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct YieldRequests {
+    #[prost(message, repeated, tag = "1")]
+    pub requests: ::prost::alloc::vec::Vec<YieldRequest>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct YieldRequest {
+    /// A random token of the database instance that asks the others to yield.
+    #[prost(fixed64, tag = "1")]
+    pub instance: u64,
+    /// The request has no effect after this time.
+    #[prost(message, optional, tag = "2")]
+    pub expires_at: ::core::option::Option<::prost_types::Timestamp>,
+    /// The time between two coordinator rounds of one leaf that the instance
+    /// asks for, in microseconds.
+    #[prost(uint64, tag = "3")]
+    pub gap_micros: u64,
+}

@@ -8,6 +8,7 @@ use super::{CollectionAddress, DbPrefix, ObjectPath, PathError, parse_id};
 const COLLECTION_RECORD_MARKER: &str = "_i";
 const NODE_MARKER: &str = "_n";
 const TREE_ROOT_MARKER: &str = "_r";
+const YIELD_REQUESTS_MARKER: &str = "_y";
 
 pub(super) fn collection_prefix(db_prefix: &str, id: CollectionId) -> String {
     format!("{db_prefix}/_c/{}", base64::encode(id.as_bytes()))
@@ -44,6 +45,13 @@ pub(super) fn parse_object(path: &str) -> Option<Result<ObjectPath, PathError>> 
             parse_collection(prefix).map(|collection| ObjectPath::CollectionRecord { collection })
         });
     }
+    if let Some(prefix) = path.strip_suffix("/_y") {
+        return Some(if prefix.is_empty() {
+            Err(PathError::Parse(path.to_string()))
+        } else {
+            parse_collection(prefix).map(|collection| ObjectPath::YieldRequests { collection })
+        });
+    }
     if let Some(prefix) = path.strip_suffix("/_r") {
         return Some(if prefix.is_empty() {
             Err(PathError::Parse(path.to_string()))
@@ -68,6 +76,14 @@ pub(super) fn write_tree_root(
 ) -> fmt::Result {
     write_collection_prefix(f, collection)?;
     write!(f, "/{TREE_ROOT_MARKER}")
+}
+
+pub(super) fn write_yield_requests(
+    f: &mut fmt::Formatter<'_>,
+    collection: &CollectionAddress,
+) -> fmt::Result {
+    write_collection_prefix(f, collection)?;
+    write!(f, "/{YIELD_REQUESTS_MARKER}")
 }
 
 pub(super) fn write_node(

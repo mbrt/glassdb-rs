@@ -1,0 +1,96 @@
+# A load on one database instance that writes random keys of a hot subset, and
+# probes on another instance. The probes write their own keys, which sort
+# between hot keys of the load (`false-sharing`), or keys that the load also
+# writes (`true-contention`). `local-ref` runs all probes on the instance of
+# the load. A split separates the own keys of the probes from the load
+# (ADR-085), and a conflict on the same keys is not a race of leaf CASes, so
+# neither case starves a foreign writer (hack/perf/investigations.md,
+# 2026-11-26). A cell takes about 40 s to 80 s of wall time, so the experiment
+# is not part of the CI comparison.
+tags = ["extra", "area/contention"]
+include = ["../configs/workers.toml"]
+
+# The load writes random keys "0000" to "1999", about 30 leaves.
+[pools.hotload]
+keys = 2000
+
+# The own keys of the probes, "00000" to "00010", sort between the load keys
+# "0000" and "0001".
+[pools.probe]
+keys = 11
+key-bytes = 5
+
+[shapes.load-single]
+kind = "read-modify-write"
+pool = "hotload"
+source = "pool"
+keys = 1
+
+[shapes.load-many]
+kind = "read-modify-write"
+pool = "hotload"
+source = "pool"
+keys = 10
+
+[shapes.own-single]
+kind = "read-modify-write"
+pool = "probe"
+source = { index = { keys = [0] } }
+keys = 1
+
+[shapes.own-many]
+kind = "read-modify-write"
+pool = "probe"
+source = { index = { keys = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] } }
+keys = 10
+
+[shapes.shared-single]
+kind = "read-modify-write"
+pool = "hotload"
+source = { index = { keys = [500] } }
+keys = 1
+
+[shapes.shared-many]
+kind = "read-modify-write"
+pool = "hotload"
+source = { index = { keys = [501, 502, 503, 504, 505, 506, 507, 508, 509, 510] } }
+keys = 10
+
+[workloads.local-ref.groups.all]
+instances = 1
+shapes = { own-single = 1, own-many = 1, shared-single = 1, shared-many = 1 }
+loads = { load-single = "cell", load-many = "cell" }
+
+[workloads.false-sharing.groups.load]
+instances = 1
+shapes = {}
+loads = { load-single = "cell", load-many = "cell" }
+
+[workloads.false-sharing.groups.probes]
+instances = 1
+shapes = { own-single = 1, own-many = 1 }
+
+[workloads.true-contention.groups.load]
+instances = 1
+shapes = {}
+loads = { load-single = "cell", load-many = "cell" }
+
+[workloads.true-contention.groups.probes]
+instances = 1
+shapes = { shared-single = 1, shared-many = 1 }
+
+[cell]
+databases = 1
+collections = 1
+
+[cell.measure]
+until = "duration"
+duration = "30s"
+
+[[axes]]
+path = "cell.workload"
+values = ["local-ref", "false-sharing", "true-contention"]
+
+[[axes]]
+path = "cell.workers"
+values = [50, 200]
