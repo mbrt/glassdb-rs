@@ -154,6 +154,10 @@ impl DatabaseBuilder {
     /// Opens the database, validating the name and creating its metadata if
     /// needed.
     /// Names must contain 1–255 ASCII letters or digits.
+    ///
+    /// The open retries a storage outage in place with the `wait` schedule of
+    /// [`RetryTiming`], and returns [`Error::Unavailable`] when the outage
+    /// lasts longer.
     pub async fn open(self) -> Result<Database, Error> {
         let DatabaseBuilder {
             name,
@@ -167,8 +171,14 @@ impl DatabaseBuilder {
         DbPrefix::try_from(name.as_str())
             .map_err(|error| Error::InvalidInput(error.to_string()))?;
         let backend = Arc::new(glassdb_backend::StatsBackend::new(b));
-        let metadata =
-            check_or_create_db_meta(&backend, &name, node_size_policy, protocol_timing).await?;
+        let metadata = check_or_create_db_meta(
+            &backend,
+            &name,
+            node_size_policy,
+            protocol_timing,
+            engine_config.retry_timing().wait,
+        )
+        .await?;
         let database_id = metadata.id;
         engine_config.set_node_size_policy(
             metadata
