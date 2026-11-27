@@ -100,13 +100,15 @@ impl KeyResolver {
         .await
     }
 
-    /// Returns the committed value a resolved writer recorded for `key`.
+    /// Returns the committed value a resolved writer recorded for `key`, from
+    /// a status read that reaches `requirement`.
     pub(crate) async fn committed_value(
         &self,
         key: &LogicalKey,
         writer: &TxId,
+        requirement: Requirement,
     ) -> Result<KeyCommitStatus, TransError> {
-        self.state.committed_value(key, writer).await
+        self.state.committed_value(key, writer, requirement).await
     }
 
     /// Resolves a page and all dependent transaction states against one shared

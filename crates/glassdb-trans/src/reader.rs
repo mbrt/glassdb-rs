@@ -198,7 +198,10 @@ impl Reader {
                 }
                 ResolvedValue::External | ResolvedValue::Unresolved => {}
             }
-            let cv = match self.resolver.committed_value(key, &writer).await {
+            // A cached status can be older than the commit that the leaf
+            // shows, so the status read is current.
+            let current = Requirement::after(self.timeline.currentness_barrier());
+            let cv = match self.resolver.committed_value(key, &writer, current).await {
                 Ok(value) => value,
                 Err(crate::error::TransError::ValidateRetry(fresh)) => {
                     requirement = requirement.stricter(fresh);
