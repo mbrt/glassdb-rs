@@ -32,7 +32,7 @@ use std::time::Duration;
 use futures::FutureExt;
 use futures::future::{BoxFuture, OptionFuture};
 use glassdb_backend::{ListCursor, ListLimit, WriteMeter};
-use glassdb_concurr::{Background, ScanCadence, rt};
+use glassdb_concurr::{Background, RetrySchedule, ScanCadence, rt};
 use glassdb_data::{CollectionAddress, LogicalKey, TxId};
 use glassdb_storage::transaction::{
     TxCollectionOp, TxCommitStatus, TxListPage, TxLock, TxRecord, TxRecordState, TxRecordStore,
@@ -55,6 +55,8 @@ use scan::{GcScan, PAGE_SIZE};
 // The scan capacity when the budget is small. A scan needs room for two pages,
 // so that a LIST can always start.
 const MIN_SCAN_CAPACITY: usize = 2 * PAGE_SIZE;
+/// The in-place retries of one LIST of a full GC.
+const LIST_UNAVAILABLE_RETRIES: usize = 5;
 // About 10 MB of candidates of each kind (ADR-078).
 const MAX_CANDIDATES: usize = 65_536;
 // A safety limit for memory and backend connections. The write budget, not the
@@ -389,6 +391,8 @@ pub(crate) struct Gc {
     hints: GcHints,
     max_checks: NonZeroUsize,
     writes: Option<WriteMeter>,
+    // Paces the in-place retries of a LIST of a full GC.
+    retry: RetrySchedule,
     // Where this clone counts its estimated writes. Background GC spends
     // them from its budget; full GCs count them only so that GC earns no
     // budget from them.
@@ -412,6 +416,7 @@ impl Gc {
         hints: GcHints,
         max_checks: NonZeroUsize,
         writes: Option<WriteMeter>,
+        retry: RetrySchedule,
     ) -> Self {
         Self {
             tx_records,
@@ -427,6 +432,7 @@ impl Gc {
             hints,
             max_checks,
             writes,
+            retry,
         }
     }
 
@@ -553,13 +559,25 @@ impl Gc {
         }
     }
 
-    /// Lists one page of all transaction records of the database.
+    /// Lists one page of all transaction records of the database. A LIST only
+    /// reads, so an outage is retried in place.
     async fn list_all(&self, cursor: Option<ListCursor>) -> Result<TxListPage, TransError> {
-        self.hints.counters.lists.fetch_add(1, Ordering::Relaxed);
-        Ok(self
-            .tx_records
-            .scan_transaction_ids(0, 0, cursor.as_ref(), ListLimit::new(PAGE_SIZE).unwrap())
-            .await?)
+        let mut backoff = self.retry.backoff();
+        let mut retries = 0;
+        loop {
+            self.hints.counters.lists.fetch_add(1, Ordering::Relaxed);
+            match self
+                .tx_records
+                .scan_transaction_ids(0, 0, cursor.as_ref(), ListLimit::new(PAGE_SIZE).unwrap())
+                .await
+            {
+                Err(StorageError::Unavailable(_)) if retries < LIST_UNAVAILABLE_RETRIES => {
+                    retries += 1;
+                    rt::sleep(backoff.next_delay()).await;
+                }
+                result => return Ok(result?),
+            }
+        }
     }
 
     /// Selects candidates whose durable state and retention period permit

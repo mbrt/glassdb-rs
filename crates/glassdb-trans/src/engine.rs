@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use glassdb_backend::{Backend, BackendError, BackendStats, StatsBackend};
-use glassdb_concurr::{Background, DedupKeySnapshot, RetrySchedule};
+use glassdb_concurr::{Background, DedupKeySnapshot, RetrySchedule, rt};
 use glassdb_data::{CollectionAddress, CollectionId, DatabaseId, DbPrefix, ObjectPath, TxId};
 use glassdb_storage::transaction::TxRecordStore;
 use glassdb_storage::{
@@ -38,6 +38,8 @@ use crate::tlocker::{Locker, LockerStats};
 const DEFAULT_CACHE_SIZE: usize = 512 * 1024 * 1024;
 const DEFAULT_TRANSACTION_LEAF_PARALLELISM: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 const DEFAULT_COLLECTION_RESERVATION_LIMIT: usize = 1024;
+/// The in-place retries of the permanent-collection check of an open.
+const CHECK_UNAVAILABLE_RETRIES: usize = 5;
 
 #[derive(Clone)]
 struct PersistentCacheSetup {
@@ -80,6 +82,11 @@ impl EngineConfig {
     /// Sets the retry schedules.
     pub fn set_retry_timing(&mut self, timing: RetryTiming) {
         self.retry = timing;
+    }
+
+    /// Returns the retry schedules.
+    pub fn retry_timing(&self) -> RetryTiming {
+        self.retry
     }
 
     /// Sets the time that a coordinator round waits before its first leaf load
@@ -560,7 +567,7 @@ impl DormantEngine {
         };
         let foundation =
             AssemblyFoundation::new(backend, persistent, timeline, db_prefix.clone(), &config);
-        verify_permanent_collection(&db_prefix, &foundation).await?;
+        verify_permanent_collection(&db_prefix, &foundation, config.retry.wait).await?;
         Ok(Self::from_foundation(foundation, db_prefix, config, true))
     }
 
@@ -673,6 +680,7 @@ impl DormantEngine {
             gc_hints.clone(),
             gc_parallelism,
             Some(backend.write_meter()),
+            retry.wait,
         );
         let collection_commit = CollectionCommit::new(
             collection_catalog.clone(),
@@ -746,7 +754,28 @@ pub(crate) fn engine_fixture(
     }
 }
 
+/// Checks that the permanent collection exists. The check only reads, so an
+/// outage is retried in place with `retry`.
 async fn verify_permanent_collection(
+    db_prefix: &DbPrefix,
+    foundation: &AssemblyFoundation,
+    retry: RetrySchedule,
+) -> Result<(), StorageError> {
+    let mut backoff = retry.backoff();
+    let mut retries = 0;
+    loop {
+        match check_permanent_collection(db_prefix, foundation).await {
+            Err(StorageError::Unavailable(_)) if retries < CHECK_UNAVAILABLE_RETRIES => {
+                retries += 1;
+                rt::sleep(backoff.next_delay()).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Makes one attempt of [`verify_permanent_collection`].
+async fn check_permanent_collection(
     db_prefix: &DbPrefix,
     foundation: &AssemblyFoundation,
 ) -> Result<(), StorageError> {

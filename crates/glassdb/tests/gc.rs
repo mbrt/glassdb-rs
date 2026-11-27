@@ -1,10 +1,11 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 use glassdb::backend::{BackendError, memory::MemoryBackend};
 use glassdb::middleware::{BackendOp, HookBackend};
-use glassdb::{Backend, Database, GcLimits, ProtocolTiming};
+use glassdb::{Backend, Database, GcLimits, ProtocolTiming, RetrySchedule, RetryTiming};
 use glassdb_data::{DbPrefix, TxId};
 use glassdb_storage::transaction::{TxCommitStatus, TxRecord, TxRecordStore};
 use glassdb_storage::{CachedStore, Requirement, StorageError, Timeline};
@@ -231,6 +232,58 @@ async fn full_gc_checks_every_page_and_reports_records_it_keeps() {
     }
     assert!(record_exists(backend.clone(), &pending).await);
     assert!(record_exists(backend.clone(), &young).await);
+    db.shutdown().await;
+}
+
+// A LIST of a full GC retries an outage in place with the wait schedule. The
+// schedule here is long, so a full GC that did not wait on it would end
+// before the outage ends. Background GC can take some of the failed LISTs too,
+// which changes nothing.
+#[tokio::test(start_paused = true)]
+async fn full_gc_retries_a_list_outage_with_the_wait_schedule() {
+    let hour = Duration::from_secs(3600);
+    let backend = HookBackend::new(Arc::new(MemoryBackend::new()));
+    let db = Database::builder("gc", backend.clone())
+        .retry_timing(RetryTiming {
+            wait: RetrySchedule {
+                initial_interval: hour,
+                max_interval: hour,
+            },
+            ..RetryTiming::default()
+        })
+        .open()
+        .await
+        .unwrap();
+    let outage = Arc::new(AtomicBool::new(true));
+    backend.set_before({
+        let outage = outage.clone();
+        move |operation| {
+            let fail = outage.load(Ordering::SeqCst)
+                && matches!(operation, BackendOp::List { path, .. } if *path == "gc/_t/");
+            Box::pin(async move {
+                if fail {
+                    Err(BackendError::Unavailable("offline".into()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    });
+
+    let full_gc = tokio::spawn({
+        let db = db.clone();
+        async move { db.collect_garbage(NonZeroUsize::MIN).await }
+    });
+    tokio::time::sleep(Duration::from_secs(600)).await;
+    assert!(!full_gc.is_finished(), "the full GC did not wait to retry");
+    outage.store(false, Ordering::SeqCst);
+
+    tokio::time::timeout(hour, full_gc)
+        .await
+        .expect("the full GC did not retry within one delay")
+        .unwrap()
+        .expect("the full GC ended on the outage");
+    backend.clear_before();
     db.shutdown().await;
 }
 

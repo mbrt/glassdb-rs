@@ -2,11 +2,12 @@
 //!
 //! An open reads the database metadata first and accepts whatever metadata is
 //! stored, so a retry of the open is safe even when one of its writes landed.
-//! An outage of any step is therefore [`Error::Unavailable`], never
-//! [`Error::InDoubt`] or [`Error::Internal`].
+//! So the open retries a short outage in place, and a persistent outage of any
+//! step is [`Error::Unavailable`], never [`Error::InDoubt`] or
+//! [`Error::Internal`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use glassdb::backend::memory::MemoryBackend;
 use glassdb::backend::middleware::{BackendOp, HookBackend, HookFuture};
@@ -43,9 +44,9 @@ fn outage() -> Option<BackendError> {
     Some(BackendError::Unavailable("outage".into()))
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_outage_of_any_step_of_a_new_open_is_unavailable() {
-    let cases: [(&str, Fault); 3] = [
+    let cases: [(&str, Fault); 4] = [
         ("metadata read", |op, _| {
             matches!(op, BackendOp::Read { path } if *path == METADATA)
                 .then(outage)
@@ -58,6 +59,11 @@ async fn an_outage_of_any_step_of_a_new_open_is_unavailable() {
         }),
         ("metadata create", |op, _| {
             matches!(op, BackendOp::WriteIfNotExists { path, .. } if *path == METADATA)
+                .then(outage)
+                .flatten()
+        }),
+        ("permanent collection check", |op, _| {
+            matches!(op, BackendOp::Read { path } if *path != METADATA)
                 .then(outage)
                 .flatten()
         }),
@@ -74,7 +80,7 @@ async fn an_outage_of_any_step_of_a_new_open_is_unavailable() {
 // A concurrent creator stored the metadata between the first read and the
 // create of this open. The create then fails its precondition, and the open
 // reads the metadata again. An outage of that read is unavailable too.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_outage_of_the_read_after_a_concurrent_create_is_unavailable() {
     let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
     Database::open("example", inner.clone())
@@ -96,4 +102,53 @@ async fn an_outage_of_the_read_after_a_concurrent_create_is_unavailable() {
         matches!(error, Error::Unavailable(_)),
         "expected unavailable, got {error:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_short_outage_of_any_step_is_retried_in_place() {
+    type Step = fn(&BackendOp<'_>) -> bool;
+    let cases: [(&str, Step); 4] = [
+        (
+            "metadata read",
+            |op| matches!(op, BackendOp::Read { path } if *path == METADATA),
+        ),
+        (
+            "permanent collection",
+            |op| matches!(op, BackendOp::WriteIfNotExists { path, .. } if *path != METADATA),
+        ),
+        (
+            "metadata create",
+            |op| matches!(op, BackendOp::WriteIfNotExists { path, .. } if *path == METADATA),
+        ),
+        (
+            "permanent collection check",
+            |op| matches!(op, BackendOp::Read { path } if *path != METADATA),
+        ),
+    ];
+    for (step, fails) in cases {
+        let backend = HookBackend::new(Arc::new(MemoryBackend::new()) as Arc<dyn Backend>);
+        let failed = Arc::new(AtomicBool::new(false));
+        backend.set_before({
+            let failed = failed.clone();
+            move |op| {
+                let result = if fails(op) && !failed.swap(true, Ordering::SeqCst) {
+                    Err(BackendError::Unavailable("short outage".into()))
+                } else {
+                    Ok(())
+                };
+                let future: HookFuture = Box::pin(async move { result });
+                future
+            }
+        });
+
+        let opened = Database::open("example", backend).await;
+        assert!(
+            failed.load(Ordering::SeqCst),
+            "{step}: the step did not run"
+        );
+        match opened {
+            Ok(db) => db.shutdown().await,
+            Err(error) => panic!("{step}: the open failed: {error:?}"),
+        }
+    }
 }

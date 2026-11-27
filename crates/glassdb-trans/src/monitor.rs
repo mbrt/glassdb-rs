@@ -1364,20 +1364,9 @@ impl Monitor {
             .unwrap_or_else(|| self.current_requirement())
     }
 
-    /// Returns what this instance knows about the value of `tid` for `key`,
-    /// from a status read after the evidence that this instance has.
-    pub(crate) async fn committed_value(
-        &self,
-        key: &LogicalKey,
-        tid: &TxId,
-    ) -> Result<CommittedValue, TransError> {
-        self.committed_value_at(key, tid, self.current_requirement())
-            .await
-    }
-
     /// Returns what this instance knows about the value of `tid` for `key`.
     /// The status read reaches `requirement`.
-    pub(crate) async fn committed_value_at(
+    pub(crate) async fn committed_value(
         &self,
         key: &LogicalKey,
         tid: &TxId,
@@ -4795,17 +4784,25 @@ mod tests {
         }];
         mon1.commit_tx(record).await.unwrap();
 
-        let cs = mon1.committed_value(&key, &tx).await.unwrap().known();
+        let cs = mon1
+            .committed_value(&key, &tx, mon1.current_requirement())
+            .await
+            .unwrap()
+            .known();
         assert_eq!(cs.status, TxCommitStatus::Committed);
         assert_eq!(&*cs.value.value, b"val1");
         // From a remote monitor.
-        let cs = mon2.committed_value(&key, &tx).await.unwrap().known();
+        let cs = mon2
+            .committed_value(&key, &tx, mon2.current_requirement())
+            .await
+            .unwrap()
+            .known();
         assert_eq!(cs.status, TxCommitStatus::Committed);
         assert_eq!(&*cs.value.value, b"val1");
 
         operations.lock().unwrap().clear();
         let cs = mon2
-            .committed_value_at(&key, &tx, mon2.current_requirement())
+            .committed_value(&key, &tx, mon2.current_requirement())
             .await
             .unwrap()
             .known();
@@ -4813,7 +4810,11 @@ mod tests {
 
         // A key the transaction didn't write.
         let key2 = logical_key(b"key2");
-        let cs = mon2.committed_value(&key2, &tx).await.unwrap().known();
+        let cs = mon2
+            .committed_value(&key2, &tx, mon2.current_requirement())
+            .await
+            .unwrap()
+            .known();
         assert_eq!(cs.status, TxCommitStatus::Committed);
         assert!(cs.value.not_written);
         assert!(

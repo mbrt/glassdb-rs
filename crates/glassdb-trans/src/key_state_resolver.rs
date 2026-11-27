@@ -162,15 +162,21 @@ impl KeyStateResolver {
         Self { monitor }
     }
 
-    /// Returns the committed value recorded by `writer` for `key`. GC does not
-    /// delete the record of a writer that a current leaf names, so a reclaimed
-    /// record means that the observation of the writer is old.
+    /// Returns the committed value recorded by `writer` for `key`, from a
+    /// status read that reaches `requirement`. GC does not delete the record
+    /// of a writer that a current leaf names, so a reclaimed record means that
+    /// the observation of the writer is old.
     pub(crate) async fn committed_value(
         &self,
         key: &LogicalKey,
         writer: &TxId,
+        requirement: Requirement,
     ) -> Result<KeyCommitStatus, TransError> {
-        match self.monitor.committed_value(key, writer).await? {
+        match self
+            .monitor
+            .committed_value(key, writer, requirement)
+            .await?
+        {
             CommittedValue::Known(value) => Ok(value),
             CommittedValue::NoValueAfter { after, .. } => Err(TransError::ValidateRetry(after)),
         }
@@ -333,7 +339,7 @@ impl KeyStateResolver {
 
         let committed = match self
             .monitor
-            .committed_value_at(key, holder, requirement)
+            .committed_value(key, holder, requirement)
             .await?
         {
             CommittedValue::Known(committed) => committed,

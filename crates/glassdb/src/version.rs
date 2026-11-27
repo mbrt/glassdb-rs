@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use glassdb_backend::Backend;
+use glassdb_concurr::{RetrySchedule, rt};
 use glassdb_data::{DatabaseId, ID_BYTES};
 use glassdb_proto as pb;
 use glassdb_storage::NodeSizePolicy;
@@ -13,6 +14,8 @@ use crate::error::Error;
 
 const DB_VERSION: &str = "v5";
 const DB_META_PATH: &str = "glassdb";
+/// The in-place retries of the metadata setup of an open.
+const SETUP_UNAVAILABLE_RETRIES: usize = 5;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct DatabaseMetadata {
@@ -45,9 +48,31 @@ impl DatabaseMetadata {
 /// if missing. Races against concurrent creators are resolved by re-checking.
 ///
 /// The open reads the metadata first and accepts what is stored, so a retry is
-/// safe also after a write of an earlier attempt landed. An outage of any step is
-/// therefore [`Error::Unavailable`].
+/// safe also after a write of an earlier attempt landed. So an outage is
+/// retried in place with `retry`, and a persistent outage of any step is
+/// [`Error::Unavailable`].
 pub(crate) async fn check_or_create_db_meta(
+    b: &impl Backend,
+    name: &str,
+    policy: NodeSizePolicy,
+    timing: ProtocolTiming,
+    retry: RetrySchedule,
+) -> Result<DatabaseMetadata, Error> {
+    let mut backoff = retry.backoff();
+    let mut retries = 0;
+    loop {
+        match setup_db_meta(b, name, policy, timing).await {
+            Err(Error::Unavailable(_)) if retries < SETUP_UNAVAILABLE_RETRIES => {
+                retries += 1;
+                rt::sleep(backoff.next_delay()).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Makes one attempt of [`check_or_create_db_meta`].
+async fn setup_db_meta(
     b: &impl Backend,
     name: &str,
     policy: NodeSizePolicy,
@@ -196,6 +221,7 @@ mod tests {
             "mydb",
             NodeSizePolicy::default(),
             ProtocolTiming::new(Duration::from_nanos(123_456_789), Duration::ZERO),
+            RetrySchedule::default(),
         )
         .await
         .unwrap();
@@ -205,6 +231,7 @@ mod tests {
             "mydb",
             NodeSizePolicy::default(),
             ProtocolTiming::default(),
+            RetrySchedule::default(),
         )
         .await
         .unwrap();
@@ -221,6 +248,7 @@ mod tests {
             "mydb",
             NodeSizePolicy::default(),
             ProtocolTiming::default(),
+            RetrySchedule::default(),
         )
         .await
         .unwrap();
@@ -261,7 +289,8 @@ mod tests {
                 &b,
                 "mydb",
                 NodeSizePolicy::default(),
-                ProtocolTiming::default()
+                ProtocolTiming::default(),
+                RetrySchedule::default()
             )
             .await
             .unwrap()
@@ -290,6 +319,7 @@ mod tests {
             "mydb",
             NodeSizePolicy::default(),
             ProtocolTiming::default(),
+            RetrySchedule::default(),
         )
         .await
         .unwrap_err();
@@ -320,6 +350,7 @@ mod tests {
                 name,
                 NodeSizePolicy::default(),
                 ProtocolTiming::default(),
+                RetrySchedule::default(),
             )
             .await
             .unwrap_err();
@@ -340,6 +371,7 @@ mod tests {
             "mydb",
             NodeSizePolicy::default(),
             ProtocolTiming::default(),
+            RetrySchedule::default(),
         )
         .await
         .unwrap_err();
@@ -428,6 +460,7 @@ mod tests {
                 "race",
                 NodeSizePolicy::default(),
                 ProtocolTiming::default(),
+                RetrySchedule::default(),
             )
             .await
         });
@@ -439,9 +472,15 @@ mod tests {
             .split_headroom_bytes(128)
             .build()
             .unwrap();
-        let winner = check_or_create_db_meta(&memory, "race", policy, ProtocolTiming::simulation())
-            .await
-            .unwrap();
+        let winner = check_or_create_db_meta(
+            &memory,
+            "race",
+            policy,
+            ProtocolTiming::simulation(),
+            RetrySchedule::default(),
+        )
+        .await
+        .unwrap();
         release.notify_one();
         let loser = loser.await.unwrap().unwrap();
         assert_eq!(
