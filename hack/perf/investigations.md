@@ -12,13 +12,15 @@ This file is evidence, not a record of accepted behavior:
 ## 2026-11-26: a database instance starves a foreign writer of its leaves
 
 Status: accepted (ADR-110). A round whose CASes another writer keeps
-rejecting writes a yield request of its instance for the collection, and an
-instance that keeps a leaf of that collection busy leaves a gap between its
-rounds while the request lasts. The starvation ends, and the loads with low
-contention, with contention that a split resolves, and with no contention do
-not change. Two instances that write the same hot keys pay for it. A gap after
-each lost leaf CAS, the first candidate, was rejected because it costs the
-normal case. The new experiments `foreign-writers` and `foreign-hot-keys`
+rejecting, on a leaf where few CASes of its instance land, writes a yield
+request of its instance for the collection, and an instance that keeps a leaf
+of that collection busy leaves a gap between its rounds while the request
+lasts. The starvation mostly ends, and the loads with low contention, with
+contention that a split resolves, and with no contention do not change. Two
+instances that write the same hot keys pay for it, and the hot writers of
+`false-sharing` are 3–5% slower, because a writer beside them starves. A gap
+after each lost leaf CAS, the first candidate, was rejected because it costs
+the normal case. The new experiments `foreign-writers` and `foreign-hot-keys`
 measure the starvation. The lock waits on a holder of another instance are a
 separate problem.
 
@@ -291,6 +293,72 @@ Two variants did not remove this cost:
   1,395–1,510 ms on the 10-key probe, and `symmetric` 1,400–6,369 ms with up
   to 18 empty windows.
 
+### The CI comparison: a fair race between five instances
+
+The CI comparison of the final change found a regression in
+`conflict-sweep-short`, with 5 instances of 20 workers each on 50 keys of one
+collection. These runs used `82647a529` with the harness of the change. The
+cells ran 8 times, `foreign-writers` 3 times at 200 workers, and
+`false-sharing` 32 times. Temporary logs counted the requests and the waits.
+
+| `conflict-sweep-short/5/keys1-pool50` | Base | Change |
+| --- | --- | --- |
+| p50 / p90 (ms) | 86 / 890 | 180 / 933 |
+| Throughput (tx/s) | 62.7 | 53.6 |
+| Instances that wrote a request | | 24 of 40 |
+
+No writer starves in this cell: the p90 of the base is the same. In a fair race
+between five instances, a round loses ten CASes in a row often enough, so most
+instances wrote requests, and all instances yielded to each other. Each wait
+was 113 ms on average.
+
+Two variants:
+
+- An instance with its own request does not yield. The sweep took 118 ms
+  at p50, but in `symmetric` both instances requested, so neither yielded, and
+  the 10-key probe had 17–20 empty windows again.
+- The streak, and also at most one landed CAS in 8 among the recent leaf CASes
+  of the instance on that leaf (up to 64). A fair race lands about one in
+  five. A version that required a full history of 64 outcomes missed the
+  probes of `foreign-writers`. They write random keys, so their leaves have
+  almost no history, and the instances wrote 6 requests in 3 runs.
+
+| Case | Base | Streak only | Streak and share, prototype |
+| --- | --- | --- | --- |
+| Sweep, p50 / p90 (ms), tx/s | 86 / 890, 62.7 | 180 / 933, 53.6 | 88 / 908, 62.9 |
+| Sweep, requests in 8 runs | | 40 | 2 |
+| `foreign`, 10-key probe: commits, empty windows | 1–3, 18–20 | 43–55, 4–6 | 17–42, 7–15 |
+| `symmetric`, 10-key probe: commits, empty windows | 2–4, 18–19 | 19–40, 2–8 | 29–36, 5–7 |
+
+With the share, `conflict-sweep-short` has no conclusive change against the
+base in any cell. In `false-sharing`, the hot writers `hot0` and `hot2` are
+3.0–3.2% slower at p50, and the CI comparison of the final change found all
+four hot writers 3.6–4.8% slower. Most requests there come from the background
+instance, on the leaf that it shares with a hot key, where it lands fewer than
+one CAS in 8. The hot instances then yield for the whole collection.
+
+The prototype of the share kept the outcomes of a leaf until a prune removed
+the leaf, so how long they lasted depended on the other leaves of the instance.
+The final change keeps them for a fixed time after the last outcome. That time
+moves the cost between the two cases. In the sweep, the workers of an instance
+can wait for the locks of other instances for longer than 500 ms, so the
+instance forgets its share. After a yield, a starving writer keeps the
+landings of the yield, and requests again later with a longer time. Over 16
+runs of the sweep, and 3 runs of `foreign-writers`:
+
+| Lifetime of the outcomes | Sweep against the base | `foreign`, 10-key probe | `symmetric`, 10-key probe |
+| --- | --- | --- | --- |
+| 500 ms | p50 +22.5%, throughput −5.4% | 32–56, 3–7 | 29–40, 3–6 |
+| 5 s | no conclusive change | 24–28, 10–12 | 17–38, 5–11 |
+
+The probe columns are commits and empty windows. The final change uses 5 s,
+the lifetime of a request.
+
+In 3 runs of `foreign-hot-keys` at 200 workers, the probes on the hot keys
+varied too much between runs to show the cost of the hot keys. The 1-key probe
+of `true-contention` committed 76–247 times in the base, 199–249 times with
+the streak only, and 126–469 times with the share.
+
 ### Conclusions
 
 - The instance that writes a leaf back to back must yield, because the foreign
@@ -303,6 +371,12 @@ Two variants did not remove this cost:
   many of its CASes in a row. A yield request in an object of the collection,
   which an instance reads only while it keeps a leaf of that collection busy,
   keeps the normal case free of the gap.
+- A streak of rejections also comes from a fair race between a few instances.
+  The share of landed CASes on the leaf separates the two: a starving writer
+  lands almost none. The share also delays a new request after a yield ends,
+  so `foreign` has more empty windows than with the streak alone. The
+  lifetime of the outcomes moves the cost between the fair race and the
+  starving writer.
 - The same signal comes from two instances that write the same hot keys.
   There the light writer pays, and no threshold separates the two cases.
 - The lock waits on a holder of another instance need their own

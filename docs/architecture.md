@@ -224,15 +224,16 @@ also waits for that CAS.
 
 ### Rounds yield to a starving writer of another instance
 
-On a busy leaf, the next round of a database instance sends its CAS right
-after the last one lands. A writer on another instance must read the leaf
-first, so it can lose almost every race. Only that writer knows that it
-starves. When a key change of another writer rejects `REJECTIONS_TO_REQUEST`
-leaf CASes in a row of a round, the instance writes a yield request to the
+On a busy leaf, the next round of a database instance sends its CAS right after
+the last one lands. A writer on another instance must read the leaf first, so
+it can lose almost every race. Only that writer knows that it starves. When a
+key change of another writer rejects `REJECTIONS_TO_REQUEST` leaf CASes in a
+row of a round, and at most one in `LANDED_SHARE` of the recent leaf CASes of
+the instance on that leaf landed, the instance writes a yield request to the
 `_y` object of the collection. An instance whose rounds of a leaf run back to
-back for `POLL_EVERY` reads those requests. While a request of another
-instance lasts, its rounds in the collection leave the requested gap after the
-last round of each leaf
+back for `POLL_EVERY` reads those requests. While a request of another instance
+lasts, its rounds in the collection leave the requested gap after the last
+round of each leaf
 ([ADR-110](adr/110-a-starving-leaf-writer-asks-other-instances-to-yield.md)).
 
 ### Keep physical state out of the lock boundary

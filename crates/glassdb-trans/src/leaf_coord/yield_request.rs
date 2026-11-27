@@ -5,9 +5,10 @@
 //! the leaf before its CAS, so it can lose almost every race and starve
 //! (hack/perf/investigations.md, 2026-11-26). Only the writer that starves
 //! knows it. When a key change of another writer rejects
-//! [`REJECTIONS_TO_REQUEST`] leaf CASes in a row of a round, the instance
-//! writes its yield request for the collection, and a later such round renews
-//! it. An instance whose rounds of one leaf run back to back
+//! [`REJECTIONS_TO_REQUEST`] leaf CASes in a row of a round, and at most one
+//! in [`LANDED_SHARE`] of the recent leaf CASes of the instance on that leaf
+//! landed, the instance writes its yield request for the collection. A later
+//! such round renews it. An instance whose rounds of one leaf run back to back
 //! for [`POLL_EVERY`] reads the requests of the collection, at most once in
 //! that time. While a request of another instance has not expired, each round
 //! of this instance in the collection that follows another round of its leaf
@@ -27,6 +28,12 @@ use glassdb_storage::{StorageError, YieldRequest, YieldRequestStore};
 /// let two instances that both carry a load starve each other again
 /// (hack/perf/investigations.md, 2026-11-26).
 pub(super) const REJECTIONS_TO_REQUEST: u32 = 10;
+
+/// A writer that starves lands at most one in this many of its recent leaf
+/// CASes on the leaf. In a fair race between a few instances, a long streak
+/// of rejections happens too, but each instance still lands its share
+/// (hack/perf/investigations.md, 2026-11-26, "The CI comparison").
+const LANDED_SHARE: u32 = 8;
 
 /// How long a request lasts after the round that wrote it.
 const REQUEST_LIFETIME: Duration = Duration::from_secs(5);
@@ -76,6 +83,46 @@ struct LeafRounds {
     /// The start of the run of back-to-back rounds that the last round
     /// belongs to.
     busy_since: Instant,
+    /// The outcomes of the last leaf CASes of this instance on the leaf, one
+    /// bit for each, newest in the lowest bit. A bit is set for a CAS that
+    /// landed. They count only while the last one is recent.
+    outcomes: u64,
+    /// The number of outcomes in `outcomes`, at most 64.
+    recorded: u32,
+    /// When the last outcome was recorded.
+    last_outcome: Instant,
+}
+
+/// How long the rounds of a leaf need state after the last one ended. A leaf
+/// whose last round ended longer ago than the largest gap neither runs back
+/// to back nor waits.
+const ROUNDS_LIFETIME: Duration = MAX_GAP;
+
+/// How long the outcomes of the leaf CASes of an instance on a leaf count
+/// after the last one, as long as a request. The workers of an instance in a
+/// fair race can wait for the locks of other instances for longer than a
+/// round, and must not forget their share of the landed CASes meanwhile.
+const OUTCOMES_LIFETIME: Duration = REQUEST_LIFETIME;
+
+impl LeafRounds {
+    fn new(now: Instant) -> Self {
+        Self {
+            ended: now,
+            busy_since: now,
+            outcomes: 0,
+            recorded: 0,
+            last_outcome: now,
+        }
+    }
+
+    fn outcomes_are_recent(&self, now: Instant) -> bool {
+        self.recorded > 0 && now.saturating_duration_since(self.last_outcome) < OUTCOMES_LIFETIME
+    }
+
+    fn is_stale(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.ended) >= ROUNDS_LIFETIME
+            && !self.outcomes_are_recent(now)
+    }
 }
 
 #[derive(Default)]
@@ -176,16 +223,43 @@ impl Yielding {
         match state.leaves.get_mut(path) {
             Some(rounds) => rounds.ended = now,
             None => {
-                state.leaves.insert(
-                    path.clone(),
-                    LeafRounds {
-                        ended: now,
-                        busy_since: now,
-                    },
-                );
+                state.leaves.insert(path.clone(), LeafRounds::new(now));
             }
         }
         state.prune(now);
+    }
+
+    /// Records the outcome of a leaf CAS of this instance on `path`: it
+    /// landed, or a change of another writer rejected it. A rejection is
+    /// known only at the next load of the round, so the last rejection of a
+    /// round that ends without another load is not recorded.
+    pub(super) fn cas_ended(&self, path: &ObjectPath, landed: bool) {
+        let now = Instant::now();
+        let mut state = self.state.lock().unwrap();
+        let rounds = state
+            .leaves
+            .entry(path.clone())
+            .or_insert_with(|| LeafRounds::new(now));
+        if !rounds.outcomes_are_recent(now) {
+            rounds.outcomes = 0;
+            rounds.recorded = 0;
+        }
+        rounds.outcomes = (rounds.outcomes << 1) | u64::from(landed);
+        rounds.recorded = (rounds.recorded + 1).min(u64::BITS);
+        rounds.last_outcome = now;
+    }
+
+    /// Returns whether at most one in [`LANDED_SHARE`] of the recent leaf
+    /// CASes of this instance on `path` landed. A leaf without recent
+    /// outcomes starves: the rejections of the current round are its only
+    /// evidence.
+    pub(super) fn starves(&self, path: &ObjectPath) -> bool {
+        let now = Instant::now();
+        let state = self.state.lock().unwrap();
+        state.leaves.get(path).is_none_or(|rounds| {
+            !rounds.outcomes_are_recent(now)
+                || rounds.outcomes.count_ones() * LANDED_SHARE <= rounds.recorded
+        })
     }
 
     /// Reads the requests of `collection`, and yields it while a request of
@@ -218,7 +292,8 @@ impl Yielding {
 
     /// Writes or renews the request of this instance for the collection of
     /// `path`, after a key change of another writer rejected
-    /// [`REJECTIONS_TO_REQUEST`] leaf CASes in a row of a round.
+    /// [`REJECTIONS_TO_REQUEST`] leaf CASes in a row of a round, and the leaf
+    /// [`starves`](Self::starves).
     /// The last load and CAS of the round took `attempt`. A failed write
     /// changes nothing: the next long streak writes again.
     pub(super) async fn request(&self, path: &ObjectPath, attempt: Duration) {
@@ -276,11 +351,7 @@ impl State {
         if self.leaves.len() + self.collections.len() < self.prune_at {
             return;
         }
-        // A leaf whose last round ended longer ago than the largest gap
-        // neither runs back to back nor waits.
-        let keep = MAX_GAP.max(BACK_TO_BACK);
-        self.leaves
-            .retain(|_, rounds| now.saturating_duration_since(rounds.ended) < keep);
+        self.leaves.retain(|_, rounds| !rounds.is_stale(now));
         self.collections.retain(|_, entry| !entry.is_stale(now));
         self.prune_at = ((self.leaves.len() + self.collections.len()) * 2).max(MIN_PRUNE_LEN);
     }
@@ -427,6 +498,49 @@ mod tests {
         rt::sleep(RENEW_AFTER / 2).await;
         yielding.request(&leaf(), GAP).await;
         assert!(expiry().await > first);
+    }
+
+    // Regression: in a fair race between five instances on the leaves of 50
+    // keys, a round lost ten CASes in a row often. The instances asked each
+    // other to yield, with no starving writer, and the median latency doubled.
+    // A writer that lands its share of the leaf CASes does not starve.
+    #[tokio::test(start_paused = true)]
+    async fn a_leaf_starves_only_while_its_cases_seldom_land() {
+        // (name, landed CASes, rejected CASes, whether the leaf starves)
+        let cases = [
+            ("no cases", 0, 0, true),
+            ("only rejections", 0, 20, true),
+            ("one in eight lands", 2, 14, true),
+            ("a fair share lands", 3, 12, false),
+            ("old landings expire", 20, 64, true),
+        ];
+        for (name, landed, rejected, starves) in cases {
+            let yielding = Yielding::new(store());
+            for _ in 0..landed {
+                yielding.cas_ended(&leaf(), true);
+            }
+            for _ in 0..rejected {
+                yielding.cas_ended(&leaf(), false);
+            }
+            assert_eq!(yielding.starves(&leaf()), starves, "{name}");
+        }
+    }
+
+    // The outcomes of a leaf are recent only while its CASes continue. Old
+    // outcomes count neither in the state that a prune keeps nor in the
+    // state that it removes, so the decision does not depend on the other
+    // leaves of the instance.
+    #[tokio::test(start_paused = true)]
+    async fn a_leaf_without_recent_cases_starves() {
+        let yielding = Yielding::new(store());
+        for _ in 0..8 {
+            yielding.cas_ended(&leaf(), true);
+        }
+        assert!(!yielding.starves(&leaf()), "recent landings");
+        rt::sleep(OUTCOMES_LIFETIME).await;
+        assert!(yielding.starves(&leaf()), "old landings");
+        yielding.cas_ended(&leaf(), false);
+        assert!(yielding.starves(&leaf()), "old landings after a rejection");
     }
 
     // The state keeps one entry for each recent leaf. Under rounds over many

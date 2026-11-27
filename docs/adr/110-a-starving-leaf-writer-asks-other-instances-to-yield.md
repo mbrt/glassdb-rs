@@ -35,10 +35,11 @@ has the measurements of this decision.
 
 ## Decision
 
-A round whose leaf CAS keeps failing writes a yield request of its database
-instance for the collection. An instance that keeps a leaf of the collection
-busy reads the requests. While a request of another instance lasts, its
-rounds of a leaf leave the requested gap between them.
+A round whose leaf CAS keeps failing, on a leaf where the CASes of its
+instance seldom land, writes a yield request of its database instance for the
+collection. An instance that keeps a leaf of the collection busy reads the
+requests. While a request of another instance lasts, its rounds of a leaf
+leave the requested gap between them.
 
 ### A round whose leaf CAS keeps failing asks for a gap
 
@@ -46,9 +47,15 @@ When a key change of another writer rejects many leaf CASes in a row of one
 round, the instance writes its yield request for the collection of the leaf.
 The coordinator knows the cause of a rejection at the next load of the round,
 as for a lost leaf CAS (ADR-085). A change of the node itself, such as a
-split, shows no other writer, so it starts the count again. The round writes
-the request during its retry backoff, so that the write does not delay its
-next CAS. The request holds:
+split, shows no other writer, so it starts the count again.
+
+A long streak alone also happens in a fair race between a few instances on the
+same leaves. So the instance also keeps the outcomes of its recent leaf CASes
+on each leaf, landed or rejected by another writer, and writes the request
+only when a small share of them landed. A leaf without recorded outcomes
+counts as starved, because a writer of random keys seldom comes back to the
+same leaf. The round writes the request during its retry backoff, so that the
+write does not delay its next CAS. The request holds:
 
 - A random token of the database instance, chosen when the leaf coordinator
   starts.
@@ -100,9 +107,11 @@ a request after the read.
 
 ## Consequences
 
-- A writer on another instance no longer starves on a busy leaf, and the
+- A writer on another instance starves on a busy leaf much less, and the
   instance of the load commits more than before, because its rounds carry
-  larger batches.
+  larger batches. The starvation can come back for a while after a yield
+  ends: the writer landed CASes during the yield, so it requests again only
+  after later rejections push those landings out of its recent outcomes.
 - An instance reads the requests of each collection whose leaf it keeps busy,
   also when no other instance exists. The reads are a small share of the
   backend operations of a busy instance, and latency and commits do not change.
@@ -110,16 +119,18 @@ a request after the read.
   whole collection on the other instances while it lasts. In the measured
   loads with low contention, with contention that a split resolves, and with
   no contention, few rounds reach the threshold. Latency and commits stay
-  within the noise of each experiment, except for a writer of a busy leaf
-  beside hot writers of other instances, which gets a little slower.
+  within the noise of each experiment, except beside hot writers of other
+  instances. There, a writer of a busy leaf lands few of its CASes and writes
+  requests, and the hot writers get a little slower while they yield.
+- A fair race between a few instances on the same hot keys writes few
+  requests, because each instance lands its share of the leaf CASes.
 - When two instances starve each other, both write requests and both yield.
-- When two instances write the same hot keys, the rounds of both get long
-  streaks of rejections, so both write requests and both yield. A yielding
-  instance holds its locks longer, and a light writer on the other instance
-  waits for them. That writer gets slower and commits less often, while the
-  commits of both instances together go up. A transaction conflict on the
-  same keys looks the same to a round as a starvation, so no threshold
-  separates the two cases.
+- When two instances write the same hot keys, a writer whose CASes seldom
+  land writes requests, and the other instance yields. A transaction conflict
+  on the same keys looks the same to a round as a starvation, so no threshold
+  separates the two cases. A yielding instance holds its locks longer, and a
+  light writer on the other instance waits for them, so that writer can get
+  slower and commit less often.
 
 ## Alternatives considered
 
@@ -175,6 +186,24 @@ The collection record holds directory locks and topology participants, and the
 split that serves ordinary contention writes it. A request there would race
 with that split and follow the rules of the record. A node is the object that
 the starving writer cannot write.
+
+### A streak of rejections alone
+
+A request after the streak alone, without the share of landed CASes, also
+comes from a fair race between several instances on the leaves of a few hot
+keys. Many instances wrote requests with no starving writer, all instances
+yielded to each other, and the whole load got slower.
+
+### No yield for an instance that requests itself
+
+An instance with its own request would not yield. This removes the cost of
+the fair race, but when two instances starve each other, both request, so
+neither yields and both starve again.
+
+### A share only over a full history
+
+A request only after a full history of outcomes on the leaf misses a writer
+of random keys. It comes back to the same leaf too seldom to fill the history.
 
 ### A higher threshold
 
