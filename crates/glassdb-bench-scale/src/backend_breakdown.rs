@@ -264,7 +264,7 @@ fn classify_object(path: &ObjectPath) -> ObjectRole {
         ObjectPath::TreeRoot { .. } | ObjectPath::Node { .. } => ObjectRole::Node,
         ObjectPath::Transaction { .. } => ObjectRole::TransactionRecord,
         ObjectPath::StructuralIntent { .. } => ObjectRole::StructuralIntent,
-        _ => ObjectRole::Other,
+        ObjectPath::YieldRequests { .. } => ObjectRole::Other,
     }
 }
 
