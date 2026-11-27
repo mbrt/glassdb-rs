@@ -9,7 +9,9 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 
-use super::parsing::{decode_page_token, encode_page_token, header_str, query_params, xml_escape};
+use super::parsing::{
+    decode_page_token, encode_page_token, header_str, pct_decode, query_params, xml_escape,
+};
 use super::state::{
     DeleteObject, FakeState, HeadObject, ListedObjects, PutObject, PutRequest, ReadObject,
     StoredObject,
@@ -34,9 +36,11 @@ pub(super) async fn handle(
         .map(|collected| collected.to_bytes())
         .unwrap_or_default();
 
+    // The client percent-encodes some characters of the key in the path, for
+    // example `=`. S3 stores and lists the decoded key.
     let trimmed = path.trim_start_matches('/');
     let key = match trimmed.split_once('/') {
-        Some((_bucket, key)) => key.to_string(),
+        Some((_bucket, key)) => pct_decode(key),
         None => String::new(),
     };
 

@@ -550,6 +550,26 @@ async fn backend_conformance() {
     glassdb_backend::implementation::assert_backend_conformance(&b).await;
 }
 
+// The S3 client percent-encodes some characters of a key in the request path,
+// for example the `=` of the path alphabet. A listing must return each key as
+// it was written, in key order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_returns_keys_with_encoded_characters() {
+    let fake = FakeS3::start().await;
+    let b = backend(&fake);
+    let keys = ["p/a b", "p/a%b", "p/a+b", "p/a:b", "p/a=b", "p/a_b"];
+    let nested = ["p/b=/x", "p/b=/y"];
+    for key in keys.iter().chain(&nested) {
+        b.write_if_not_exists(key, b"v".to_vec()).await.unwrap();
+    }
+
+    let page = b.list("p/", None, ListLimit::MAX).await.unwrap();
+    assert_eq!(page.objects, [keys.as_slice(), nested.as_slice()].concat());
+
+    let page = b.list("p/b=/", None, ListLimit::MAX).await.unwrap();
+    assert_eq!(page.objects, nested);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_rejects_invalid_provider_cursor() {
     let fake = FakeS3::start().await;

@@ -39,7 +39,7 @@ pub(super) fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn pct_decode(value: &str) -> String {
+pub(super) fn pct_decode(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
