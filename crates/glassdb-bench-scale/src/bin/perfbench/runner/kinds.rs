@@ -15,7 +15,7 @@ use super::model::PoolSpec;
 
 /// The units of CPU work of each key that a transaction writes, from the wall
 /// time of a measurement in virtual time over its transactions.
-const WRITE_CPU_UNITS: usize = 16;
+const WRITE_CPU_UNITS: usize = 20;
 
 /// The inputs of one transaction.
 pub(crate) struct Op<'a> {

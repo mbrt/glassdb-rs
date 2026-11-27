@@ -29,7 +29,7 @@ pub(crate) enum TimeMode {
 /// ([`Kind::cpu_units`](crate::runner::kinds::Kind::cpu_units)). The value
 /// is a first-order approximation, measured as the wall time of a measurement
 /// in virtual time over its transactions, with one worker of each kind.
-const VIRTUAL_CPU_UNIT: Duration = Duration::from_micros(5);
+const VIRTUAL_CPU_UNIT: Duration = Duration::from_micros(4);
 
 /// The largest change of a CPU charge from its mean, as a fraction of the
 /// mean, with `--latency-jitter`. It is a choice, near the ratio of 1.1 to 1.6
