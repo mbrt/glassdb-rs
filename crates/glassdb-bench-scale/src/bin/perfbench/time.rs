@@ -1,12 +1,14 @@
 //! How the benchmark process advances model time.
 
 use std::error::Error;
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::ValueEnum;
 use glassdb_concurr::rt;
 use rand::{Rng, RngExt};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::Semaphore;
 
 use crate::{backend, stall};
 
@@ -34,6 +36,35 @@ const VIRTUAL_CPU_UNIT: Duration = Duration::from_micros(5);
 /// between the p90 and the p50 latency of reads with no backend operation in
 /// real time.
 const CPU_JITTER: f64 = 0.15;
+
+/// The cores of one database instance in virtual time. It is a choice: a
+/// large host, so that only workloads that use cached states only, with many
+/// workers on one instance, wait for a core.
+const VIRTUAL_CORES_PER_INSTANCE: usize = 32;
+
+/// The model cores of one database instance. A worker holds one core while it
+/// spends the model time of the CPU work of a transaction, so that the
+/// workers of one instance do at most [`VIRTUAL_CORES_PER_INSTANCE`] units of
+/// CPU work at the same time. The cores serve the workers in arrival order,
+/// and the wait for a core is in the measured latency.
+#[derive(Clone)]
+pub(crate) struct Cores(Arc<Semaphore>);
+
+impl Cores {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(Semaphore::new(VIRTUAL_CORES_PER_INSTANCE)))
+    }
+
+    /// Spends `cpu` of model time on one core. Zero takes no core, so real
+    /// time does not wait.
+    pub(crate) async fn spend(&self, cpu: Duration) {
+        if cpu.is_zero() {
+            return;
+        }
+        let _core = self.0.acquire().await.expect("cores are never closed");
+        rt::sleep(cpu).await;
+    }
+}
 
 /// The model time that a worker spends after each transaction, in place of
 /// the CPU work that takes no model time. It is in the measured latency.
@@ -181,5 +212,30 @@ mod tests {
             cpu.charge(16, &mut StdRng::seed_from_u64(1)),
             Duration::ZERO
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_workers_of_one_instance_share_its_cores() {
+        let cores = Cores::new();
+        let cpu = Duration::from_millis(10);
+        let started = rt::Instant::now();
+
+        let spends = (0..2 * VIRTUAL_CORES_PER_INSTANCE).map(|_| cores.spend(cpu));
+        futures::future::join_all(spends).await;
+
+        // Two rounds: half of the workers wait for the first half.
+        assert_eq!(started.elapsed(), cpu * 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_charge_takes_no_core() {
+        let cores = Cores::new();
+        let _all = cores
+            .0
+            .acquire_many(u32::try_from(VIRTUAL_CORES_PER_INSTANCE).unwrap())
+            .await
+            .unwrap();
+        // Real time charges nothing, so it never waits for a core.
+        cores.spend(Duration::ZERO).await;
     }
 }

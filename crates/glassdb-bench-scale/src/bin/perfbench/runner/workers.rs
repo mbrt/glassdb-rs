@@ -19,7 +19,7 @@ use super::model::{DatabaseOptions, PoolSpec};
 use super::seed::{open_collections_of, shutdown};
 use super::sources::WorkerKeys;
 use super::until::Until;
-use crate::time::TransactionCpu;
+use crate::time::{Cores, TransactionCpu};
 
 /// The state that all workers of a cell share.
 pub(crate) struct Shared {
@@ -117,6 +117,9 @@ pub(crate) struct Worker {
     pub(crate) seed: u64,
     /// The stale view of the worker on its instance, if its kind uses one.
     pub(crate) view: OnceLock<StaleDatabaseView>,
+    /// The model cores of the instance of the worker. A worker that opens a
+    /// new instance for each transaction has its own.
+    pub(crate) cores: Cores,
 }
 
 /// A gate between the transactions of all workers of a cell.
@@ -317,12 +320,11 @@ impl Worker {
     }
 
     /// Runs one transaction of the shape, then spends `cpu`, the model time
-    /// that stands for its CPU work. It is in the measured latency.
+    /// that stands for its CPU work, on a core of its instance. It is in the
+    /// measured latency.
     async fn run_kind(&self, op: &Op<'_>, cpu: Duration) -> Result<(), GError> {
         let result = self.shape.kind.run(op).await;
-        if !cpu.is_zero() {
-            rt::sleep(cpu).await;
-        }
+        self.cores.spend(cpu).await;
         result
     }
 

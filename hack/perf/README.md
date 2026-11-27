@@ -38,8 +38,10 @@ Each experiment has one of the tags `ci/counters`, `ci/timing`, `extra`, and
 `cloud`. The experiments of this directory run in both time modes. `make
 bench-all` runs all of them in real time, and `make bench-all TIME=virtual` runs
 all of them in virtual time. In virtual time, a model of the CPU time of each
-kind replaces the CPU time, so the absolute values differ from real time, and
-`workers` shows no CPU saturation (see `--time=virtual` in the crate README).
+kind replaces the CPU time, so the absolute values differ from real time. The
+CPU of each database instance saturates at 32 model cores, so `workers` shows
+no CPU saturation below 32 workers of each instance (see `--time=virtual` in
+the crate README).
 In real time, a cell of `open-in-body` with one database instance can miss the
 cell completion deadline, and the run then stops.
 
@@ -56,6 +58,7 @@ cell completion deadline, and the run then stops.
 | `mixed` | Four shapes (`rw-single`, `rw-many`, `ro-single`, `ro-multi`) at the same time, with low and high conflict, at five collection affinities. |
 | `workers` | The worker grid of the canonical plots: 1 to 200 workers per shape. Each count starts from the seed. |
 | `stale-reads` | The stale-read grid of the canonical plots, on one database instance and one collection: `rw-single` and `rw-many` with 1, 50, 100, and 200 workers each give the load, and one worker for each read-only shape of one and of ten keys reads with `Database::tx`, with a stale view for each transaction, or with one stale view for the worker (`StaleDatabaseView::read_tx`, 5 s bound). |
+| `stale-reads-scaling` | Stale read-only transactions of one key with a new view for each transaction (`stale-single`), 1, 4, 16, and 64 workers on one database instance, beside the writer of `stale-reads-single`. The readers use cached leaf states only, so in real time it shows how the read path scales across the cores of the host, and in virtual time the model cores of the instance cap it. |
 | `affinity` | The affinity grid: 5 affinities × 1, 3, 5, and 7 database instances. It is not part of the canonical plots. |
 | `conflict-sweep` | The conflict grid of the canonical plots: 20 workers on 1 and on 5 database instances run read-modify-write transactions of 1 or 4 keys on one pool, from 5,000 keys down to 5 keys (1 key) or 100 keys (4 keys). A smaller pool gives more conflicts. |
 | `load-shift` | A change of the load on one tree: independent keys, then keys that cross leaf boundaries, then independent keys again. Each warm-up shows whether the topology becomes quiet again. |

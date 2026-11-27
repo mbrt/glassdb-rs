@@ -149,8 +149,13 @@ writes, its read included (`Kind::cpu_units`). A scan costs 5 µs for each key o
 its span, or of the pool for a scan of the whole collection. A transaction
 costs at least 5 µs. These values
 are the wall time of a measurement in virtual time over its transactions, with
-one worker on warm caches. With `--latency-jitter`, each wait is uniform within
-15% of its mean, so that workers on transactions with no backend operation do
+one worker on warm caches. Each database instance has 32 model cores, and a
+worker holds one core while it waits in place of the CPU work. When all cores
+of the instance are busy, the worker waits for a core in arrival order, and
+this wait is in the measured latency too. So the workers of one instance spend
+at most 32 CPU charges at the same time, as on a host with 32 cores. A worker
+that opens a new instance for each transaction has its own cores.
+With `--latency-jitter`, each wait is uniform within 15% of its mean, so that workers on transactions with no backend operation do
 not run in lockstep. A transaction with no backend operation then still
 advances model time. A task that runs in a loop at one
 model instant, such as a livelock, still stops model time. If model time does

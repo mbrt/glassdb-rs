@@ -1,0 +1,22 @@
+# Stale read-only transactions of one key, with a new view for each
+# transaction, on one instance, at several reader counts, beside the writer of
+# `stale-reads-single`. The readers use cached leaf states only, so their
+# throughput depends on the CPU only. In real time, it shows how the read path
+# scales across the cores of the host. In virtual time, the model cores of the
+# instance cap it (`--time=virtual` in the crate README): 64 readers commit
+# about 6.4 million transactions in each second of model time, so in virtual
+# time that cell takes much more wall time than model time. The writer only
+# gives the load.
+tags = ["extra", "area/read"]
+include = ["../configs/default.toml", "../configs/stale-reads-shared-leaves.toml"]
+
+[cell]
+workload = "stale-single-shared-leaves"
+
+[cell.measure]
+duration = "2s"
+max-duration = "2s"
+
+[[axes]]
+path = "workloads.stale-single-shared-leaves.groups.all.shapes.stale-single"
+values = [1, 4, 16, 64]
