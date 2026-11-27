@@ -102,7 +102,7 @@ impl Weighable for CacheEntry {
 }
 
 /// The shared decoded cache: the latest state and the earlier states of each
-/// path, in one budget and one least-recently-used order (ADR-103).
+/// path, in one budget and one eviction order (ADR-103).
 #[derive(Clone)]
 ///
 /// A lookup takes the path of an object, so that a hit formats no backend
@@ -134,16 +134,14 @@ impl DecodedCache {
         Self(Arc::new(cache))
     }
 
-    /// Returns the latest state of `path`, and moves it to the
-    /// most-recently-used position.
+    /// Returns the latest state of `path`, and marks it as used.
     pub(super) fn latest(&self, path: &ObjectPath) -> Option<LatestState> {
         self.0
             .get(Slot::Latest, path)
             .and_then(CacheEntry::into_latest)
     }
 
-    /// Returns the earlier states of `path`, and moves them to the
-    /// most-recently-used position.
+    /// Returns the earlier states of `path`, and marks them as used.
     pub(super) fn earlier(&self, path: &ObjectPath) -> Option<PathEarlierStates> {
         self.0
             .get(Slot::Earlier, path)

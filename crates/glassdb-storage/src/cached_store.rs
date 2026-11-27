@@ -2,7 +2,7 @@
 //!
 //! One database-local cached object store sits between the [`Backend`] and every
 //! typed storage abstraction. All typed stores share this single byte-bounded
-//! LRU, keyed by physical object path; each supplies its own encoding, decoding,
+//! cache, keyed by physical object path; each supplies its own encoding, decoding,
 //! and decoded-size accounting through a [`Codec`]. A path has exactly one
 //! decoded type, so reading it back through a different typed store is an
 //! internal error.
@@ -218,7 +218,7 @@ struct Inner {
 
 impl CachedStore {
     /// Creates a cached store over `backend`, sharing the single byte-bounded
-    /// LRU sized by `max_size`, ordering evidence on `timeline`, and optionally
+    /// cache sized by `max_size`, ordering evidence on `timeline`, and optionally
     /// using an already-open persistent encoded-body tier. When that tier is
     /// present, `timeline` must start after the sequence point returned with
     /// the same opened cache.

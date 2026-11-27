@@ -516,7 +516,7 @@ that started at or before it, and the next newer one. While a floor is raised,
 it also keeps the newest replaced state. The other earlier states of the path go
 at that change. The mark and the earlier states of a path are a
 cache entry of their own, next to the entry of the latest state, in the same
-size limit and least-recently-used order. A point read of a view uses the
+size limit and eviction order. A point read of a view uses the
 interval of its key, not of its leaf state: the leaf states that show the key
 with the same writer, or an absent key with the same membership generation,
 never have the key changed between them. So a write of another key of the leaf
@@ -889,7 +889,10 @@ flowchart TD
   L2 -->|"miss or validation"| Backend
 ```
 
-All typed objects share one byte-weighted LRU with one budget. Each physical
+All typed objects share one byte-weighted cache with one budget. It evicts in
+an order near least-recently-used, with second chances (CLOCK): a hit only sets
+an access bit under the shared lock of its shard, so that the readers of a hot
+path, such as the root of a tree, do not wait for each other. Each physical
 path has one decoded type. Values are not cached separately: the reader gets
 them from the inline bytes of the leaf or from the decoded transaction record
 of the writer. Eviction does not revoke observations that readers or

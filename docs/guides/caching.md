@@ -78,7 +78,7 @@ An observation and its discoverable cache entry are separate things with
 separate lifetimes. Eviction or invalidation changes what a new read can find.
 It does not change the historical fact that a retained observation was current
 after its currentness watermark. A transaction can therefore hold an
-observation after the LRU drops its entry, and still validate it.
+observation after the cache drops its entry, and still validate it.
 
 An observation and its cache entry normally share one evidence cell. When a
 revision-conditional read proves that the revision is unchanged, the cell
