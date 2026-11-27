@@ -1,6 +1,7 @@
 //! Collection addresses, logical keys, and physical backend-object paths.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use crate::base64;
 use crate::ids::{CollectionId, ID_BYTES, NodeId, StructuralIntentId, TxId};
@@ -14,8 +15,15 @@ const ID_ENCODED_LEN: usize = (ID_BYTES * 8).div_ceil(6);
 const DATABASE_METADATA_OBJECT: &str = "glassdb";
 
 /// A database's top-level physical object-path component.
+///
+/// Each path, collection address, and logical key of a database holds its
+/// prefix, and the transactions of all threads copy them. So the process keeps
+/// one copy of each distinct prefix for its lifetime, and a copy of a prefix
+/// shares no reference count between threads. The memory is that of the
+/// distinct prefixes that the process uses, at most
+/// [`MAX_ENCODED_LEN`](Self::MAX_ENCODED_LEN) bytes each.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DbPrefix(Arc<str>);
+pub struct DbPrefix(&'static str);
 
 impl DbPrefix {
     /// Maximum number of bytes in the encoded path component.
@@ -23,7 +31,21 @@ impl DbPrefix {
 
     /// Returns the validated path component.
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0
+    }
+
+    /// Returns the prefix `value`, from the process copy of it.
+    fn intern(value: &str) -> Result<Self, PathError> {
+        static PREFIXES: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+        validate_db_prefix(value)?;
+        let mut prefixes = PREFIXES.lock().unwrap();
+        let prefixes = prefixes.get_or_insert_with(HashSet::new);
+        if let Some(prefix) = prefixes.get(value) {
+            return Ok(DbPrefix(prefix));
+        }
+        let prefix: &'static str = Box::leak(Box::from(value));
+        prefixes.insert(prefix);
+        Ok(DbPrefix(prefix))
     }
 }
 
@@ -31,8 +53,7 @@ impl TryFrom<&str> for DbPrefix {
     type Error = PathError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        validate_db_prefix(value)?;
-        Ok(DbPrefix(Arc::from(value)))
+        Self::intern(value)
     }
 }
 
@@ -40,8 +61,7 @@ impl TryFrom<String> for DbPrefix {
     type Error = PathError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        validate_db_prefix(&value)?;
-        Ok(DbPrefix(Arc::from(value)))
+        Self::intern(&value)
     }
 }
 
@@ -417,6 +437,13 @@ mod tests {
 
     fn tx_id(byte: u8) -> TxId {
         TxId::from_bytes([byte; ID_BYTES])
+    }
+
+    #[test]
+    fn equal_prefixes_share_one_copy() {
+        let first = DbPrefix::try_from("shared").unwrap();
+        let second = DbPrefix::try_from(String::from("shared")).unwrap();
+        assert!(std::ptr::eq(first.as_str(), second.as_str()));
     }
 
     #[test]
