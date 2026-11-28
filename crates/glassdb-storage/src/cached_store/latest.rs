@@ -172,7 +172,7 @@ impl LatestStates {
 
     /// Lists the cached present states with their paths, revisions, and
     /// evidence.
-    pub(super) fn present_states(&self) -> Vec<(String, Revision, Evidence)> {
+    pub(super) fn present_states(&self) -> Vec<(ObjectKey, Revision, Evidence)> {
         self.cache
             .latest_states()
             .into_iter()
@@ -191,7 +191,7 @@ impl LatestStates {
         key: &ObjectKey,
         req: Requirement,
     ) -> Result<Option<Observation<C::Value>>, StorageError> {
-        let Some(state) = self.cache.latest(key.as_str()) else {
+        let Some(state) = self.cache.latest(key.object_path()) else {
             return Ok(None);
         };
         match state {
@@ -204,7 +204,7 @@ impl LatestStates {
                 if !req.is_satisfied_by(evidence.get()) {
                     return Ok(None);
                 }
-                let value = downcast::<C>(key.as_str(), value)?;
+                let value = downcast::<C>(key.object_path(), value)?;
                 Ok(Some(Observation {
                     key: key.clone(),
                     value: Some(value),
@@ -236,9 +236,9 @@ impl LatestStates {
             size,
             revision,
             evidence,
-        }) = self.cache.latest(key.as_str())
+        }) = self.cache.latest(key.object_path())
         {
-            downcast::<C>(key.as_str(), value.clone())?;
+            downcast::<C>(key.object_path(), value.clone())?;
             return Ok(Some(PresentSeed {
                 value,
                 size,
@@ -286,7 +286,7 @@ impl LatestStates {
 
     pub(super) fn install_persistent<C: Codec>(
         &self,
-        path: &str,
+        path: &ObjectKey,
         value: Arc<C::Value>,
         size: usize,
         revision: Revision,
@@ -313,7 +313,7 @@ impl LatestStates {
 
     pub(super) fn install_fetched<C: Codec>(
         &self,
-        path: &str,
+        path: &ObjectKey,
         value: Arc<C::Value>,
         size: usize,
         revision: Revision,
@@ -344,7 +344,7 @@ impl LatestStates {
     ) -> Observation<C::Value> {
         let erased: ErasedValue = value.clone();
         let evidence = self.install_observed::<C>(
-            key.as_str(),
+            &key,
             erased,
             size,
             revision.clone(),
@@ -360,7 +360,7 @@ impl LatestStates {
 
     pub(super) fn install_absent_result(
         &self,
-        path: &str,
+        path: &ObjectKey,
         current_after: SequencePoint,
     ) -> FetchResult {
         FetchResult {
@@ -375,7 +375,7 @@ impl LatestStates {
         key: ObjectKey,
         current_after: SequencePoint,
     ) -> Observation<V> {
-        let evidence = self.install_absent(key.as_str(), current_after);
+        let evidence = self.install_absent(&key, current_after);
         Observation {
             key,
             value: None,
@@ -386,7 +386,7 @@ impl LatestStates {
 
     pub(super) fn confirm_unchanged<C: Codec>(
         &self,
-        path: &str,
+        path: &ObjectKey,
         seed: PresentSeed,
         current_after: SequencePoint,
     ) -> FetchResult {
@@ -411,7 +411,7 @@ impl LatestStates {
         fetched: FetchResult,
     ) -> Result<Observation<C::Value>, StorageError> {
         let value = match fetched.value {
-            Some(any) => Some(downcast::<C>(key.as_str(), any)?),
+            Some(any) => Some(downcast::<C>(key.object_path(), any)?),
             None => None,
         };
         Ok(Observation {
@@ -434,23 +434,23 @@ impl LatestStates {
         Expected::present(revision, observed.evidence.clone())
     }
 
-    pub(super) fn capture_expected(&self, path: &str, expected: &mut Expected) {
-        expected.capture_cached(self.cache.latest(path));
+    pub(super) fn capture_expected(&self, path: &ObjectKey, expected: &mut Expected) {
+        expected.capture_cached(self.cache.latest(path.object_path()));
     }
 
     pub(super) fn advance_expected(&self, expected: &Expected, current_after: SequencePoint) {
         expected.advance(current_after);
     }
 
-    pub(super) fn invalidate_expected(&self, path: &str, expected: &Expected) {
+    pub(super) fn invalidate_expected(&self, path: &ObjectKey, expected: &Expected) {
         self.cache.update_latest(path, |old| match old {
             Some(state) if expected.matches(&state) => (None, ()),
             other => (other, ()),
         });
     }
 
-    pub(super) fn invalidate(&self, path: &str) {
-        self.cache.delete_latest(path);
+    pub(super) fn invalidate(&self, path: &ObjectKey) {
+        self.cache.delete_latest(path.object_path());
     }
 
     /// Installs a present state that a backend operation of this open
@@ -458,7 +458,7 @@ impl LatestStates {
     /// interval.
     fn install_observed<C: Codec>(
         &self,
-        path: &str,
+        path: &ObjectKey,
         value: ErasedValue,
         size: usize,
         revision: Revision,
@@ -475,7 +475,7 @@ impl LatestStates {
     /// states of the path in the same cache update (ADR-103).
     fn install_present(
         &self,
-        path: &str,
+        path: &ObjectKey,
         value: ErasedValue,
         size: usize,
         revision: Revision,
@@ -515,7 +515,7 @@ impl LatestStates {
     }
 
     /// Installs confirmed absence, merging evidence with an existing absence.
-    fn install_absent(&self, path: &str, current_after: SequencePoint) -> Evidence {
+    fn install_absent(&self, path: &ObjectKey, current_after: SequencePoint) -> Evidence {
         let incoming = Evidence::new(current_after);
         let installed = self.cache.update_latest(path, |old| match old {
             Some(LatestState::Absent { evidence }) => {

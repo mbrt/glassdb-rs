@@ -62,7 +62,7 @@ instances = 1
 shapes = { stale-writer = 1, stale-multi = 1 }
 
 # `stale-single` alone beside the writer. Each of its transactions uses cached
-# leaf states only, so it commits one transaction for each 5 µs of model time,
+# leaf states only, so it commits one transaction for each 4 µs of model time,
 # and in virtual time it takes about as much wall time as model time. Its cases
 # have a short window, so that the other shapes keep the long one. The writer
 # has too few transactions in a short window for its metrics, so it only gives
@@ -73,8 +73,9 @@ shapes = { stale-single = 1 }
 loads = { stale-writer = 1 }
 
 # The `stale-view` readers beside the writer. Most of their calls use cached
-# leaf states only, so `stale-view-single` commits about 40,000 transactions in
-# each second of model time, and their cases have a short window, as
+# leaf states only, so with latency jitter `stale-view-single` commits about
+# 43,000 transactions in each second of model time. Without jitter, it commits
+# about 110,000. Their cases have a short window, as
 # `stale-single`. Their bound of 250 ms is shorter than the window, so that
 # their floors move several times in it.
 [workloads.stale-view-shared-leaves.groups.all]

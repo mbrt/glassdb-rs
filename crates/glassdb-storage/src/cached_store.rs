@@ -2,7 +2,7 @@
 //!
 //! One database-local cached object store sits between the [`Backend`] and every
 //! typed storage abstraction. All typed stores share this single byte-bounded
-//! LRU, keyed by physical object path; each supplies its own encoding, decoding,
+//! cache, keyed by physical object path; each supplies its own encoding, decoding,
 //! and decoded-size accounting through a [`Codec`]. A path has exactly one
 //! decoded type, so reading it back through a different typed store is an
 //! internal error.
@@ -25,10 +25,12 @@
 //! immediately before dispatch. Reconciliation happens before the path lane is
 //! released and before the operation becomes ready.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::cache_stats::{CacheMetrics, CacheStats};
 use crate::disk_cache::PersistentCache;
@@ -66,10 +68,13 @@ use persistent_bridge::PersistentBridge;
 ///
 /// Storage constructs keys from typed paths. Raw strings enter only through
 /// backend listings, where they are parsed once before reaching typed stores.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// A key formats its backend form on first use, so that a cache hit formats
+/// nothing. Two keys are equal when their paths are equal, because one path
+/// has one backend form.
+#[derive(Debug, Clone)]
 pub(crate) struct ObjectKey {
     object: ObjectPath,
-    encoded: Arc<str>,
+    encoded: OnceLock<Arc<str>>,
 }
 
 impl ObjectKey {
@@ -77,7 +82,10 @@ impl ObjectKey {
     pub(crate) fn parse(encoded: impl Into<Arc<str>>) -> Result<Self, PathError> {
         let encoded = encoded.into();
         let object = ObjectPath::try_from(encoded.as_ref())?;
-        Ok(Self { object, encoded })
+        Ok(Self {
+            object,
+            encoded: OnceLock::from(encoded),
+        })
     }
 
     /// Returns the classified physical object path.
@@ -87,18 +95,43 @@ impl ObjectKey {
 
     /// Returns the exact canonical name used at backend boundaries.
     pub(crate) fn as_str(&self) -> &str {
-        &self.encoded
+        self.encoded()
     }
 
     fn encoded(&self) -> &Arc<str> {
-        &self.encoded
+        self.encoded
+            .get_or_init(|| Arc::from(self.object.to_string()))
+    }
+}
+
+impl PartialEq for ObjectKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.object == other.object
+    }
+}
+
+impl Eq for ObjectKey {}
+
+impl Hash for ObjectKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.object.hash(state);
+    }
+}
+
+/// A key hashes and compares as its path, so that the decoded cache can find
+/// the entry of a key from its path.
+impl Borrow<ObjectPath> for ObjectKey {
+    fn borrow(&self) -> &ObjectPath {
+        &self.object
     }
 }
 
 impl From<ObjectPath> for ObjectKey {
     fn from(object: ObjectPath) -> Self {
-        let encoded = Arc::from(object.to_string());
-        Self { object, encoded }
+        Self {
+            object,
+            encoded: OnceLock::new(),
+        }
     }
 }
 
@@ -116,14 +149,16 @@ impl From<&ObjectKey> for ObjectKey {
 
 // Cached-store protocol tests intentionally exercise arbitrary opaque keys.
 // Production callers have no raw-string conversion and must use ObjectPath.
+// Each string gets its own path, so that two strings are two keys.
 #[cfg(test)]
 impl From<&str> for ObjectKey {
     fn from(encoded: &str) -> Self {
+        let hex: String = encoded.bytes().map(|byte| format!("{byte:02x}")).collect();
         Self {
             object: ObjectPath::DatabaseMetadata {
-                db_prefix: glassdb_data::DbPrefix::try_from("test").unwrap(),
+                db_prefix: glassdb_data::DbPrefix::try_from(format!("test{hex}")).unwrap(),
             },
-            encoded: Arc::from(encoded),
+            encoded: OnceLock::from(Arc::from(encoded)),
         }
     }
 }
@@ -162,10 +197,16 @@ pub(crate) trait Codec: Send + Sync + 'static {
 
 /// The decoded object cache over a [`Backend`] (ADR-036). Reads and mutations of
 /// every physical object class go through this boundary; listing is an uncached
-/// pass-through. Cloning is cheap (shared `Arc`s), so every typed store holds its
-/// own handle onto the one shared cache.
+/// pass-through. A clone is one shared `Arc`, so every typed store holds its own
+/// handle onto the one shared cache, and the handles of concurrent transactions
+/// share only one reference count.
 #[derive(Clone)]
 pub struct CachedStore {
+    inner: Arc<Inner>,
+}
+
+/// The parts of a [`CachedStore`] that all its handles share.
+struct Inner {
     backend: Arc<dyn Backend>,
     latest: LatestStates,
     earlier: EarlierStates,
@@ -177,7 +218,7 @@ pub struct CachedStore {
 
 impl CachedStore {
     /// Creates a cached store over `backend`, sharing the single byte-bounded
-    /// LRU sized by `max_size`, ordering evidence on `timeline`, and optionally
+    /// cache sized by `max_size`, ordering evidence on `timeline`, and optionally
     /// using an already-open persistent encoded-body tier. When that tier is
     /// present, `timeline` must start after the sequence point returned with
     /// the same opened cache.
@@ -198,44 +239,46 @@ impl CachedStore {
         let cache = DecodedCache::new(max_size, sink);
         let earlier = EarlierStates::new(cache.clone(), ViewFloors::default());
         CachedStore {
-            backend,
-            latest: LatestStates::new(cache, earlier.clone(), timeline.clone()),
-            earlier,
-            timeline,
-            coordinator,
-            metrics,
-            persistent,
+            inner: Arc::new(Inner {
+                backend,
+                latest: LatestStates::new(cache, earlier.clone(), timeline.clone()),
+                earlier,
+                timeline,
+                coordinator,
+                metrics,
+                persistent,
+            }),
         }
     }
 
     /// The floors of the live stale views over this cache. The cache keeps
     /// earlier states while one of them can use them (ADR-103).
     pub fn view_floors(&self) -> ViewFloors {
-        self.earlier.view_floors()
+        self.inner.earlier.view_floors()
     }
 
     /// Starts a cut search on the timeline of this cache (ADR-097).
     pub fn cut_search(&self) -> CutSearch {
-        CutSearch::new(self.timeline.clone())
+        CutSearch::new(self.inner.timeline.clone())
     }
 
     /// Returns cache activity since the previous sample.
     pub fn cache_stats_and_reset(&self) -> CacheStats {
-        self.metrics.snapshot_and_reset()
+        self.inner.metrics.snapshot_and_reset()
     }
 
     /// Drains and syncs the persistent cache, when configured. Before the
     /// drain, it queues the newer watermarks of the states that L1 still has.
     pub async fn shutdown(&self) {
-        if self.persistent.is_configured() {
-            let states = self.latest.present_states();
-            self.persistent.persist_watermarks(
+        if self.inner.persistent.is_configured() {
+            let states = self.inner.latest.present_states();
+            self.inner.persistent.persist_watermarks(
                 states
                     .iter()
                     .map(|(path, revision, evidence)| (path.as_str(), revision, evidence)),
             );
         }
-        self.persistent.shutdown().await;
+        self.inner.persistent.shutdown().await;
     }
 
     pub(crate) fn typed<C: Codec>(&self) -> TypedCachedStore<C> {
@@ -255,12 +298,12 @@ impl CachedStore {
         req: Requirement,
     ) -> Result<Observation<C::Value>, StorageError> {
         if let Some(obs) = self.try_hit::<C>(&key, req)? {
-            self.metrics.l1_hit();
+            self.inner.metrics.l1_hit();
             return Ok(obs);
         }
-        self.metrics.l1_miss();
+        self.inner.metrics.l1_miss();
         let fetched = self.fetch::<C>(&key, req, None).await?;
-        self.latest.to_observation::<C>(key, fetched)
+        self.inner.latest.to_observation::<C>(key, fetched)
     }
 
     /// Returns the cached observation for `path` without contacting the backend,
@@ -296,7 +339,7 @@ impl CachedStore {
             return Ok(ObservationCheck::Changed(current));
         }
         let fetched = self.fetch::<C>(&key, req, Some(obs)).await?;
-        let current = self.latest.to_observation::<C>(key, fetched)?;
+        let current = self.inner.latest.to_observation::<C>(key, fetched)?;
         if same_observed_state(obs, &current) {
             let merged = obs.current_after().max(current.current_after());
             obs.evidence.advance(merged);
@@ -320,23 +363,23 @@ impl CachedStore {
         let bytes = C::encode(key.object_path(), &value)?;
         let size = C::size(&value);
         let path = key.encoded().clone();
-        let expected = self.latest.expected_absent(expected_absence);
-        let permit = self.coordinator.acquire(&path).await;
+        let expected = self.inner.latest.expected_absent(expected_absence);
+        let permit = self.inner.coordinator.acquire(&path).await;
         let round = MutationRound::new(
-            self.latest.clone(),
-            self.persistent.clone(),
-            path.clone(),
+            self.inner.latest.clone(),
+            self.inner.persistent.clone(),
+            key.clone(),
             expected,
             permit,
         );
         let invoked = self.next_invocation();
-        let outcome = match self.backend.write_if_not_exists(&path, bytes).await {
+        let outcome = match self.inner.backend.write_if_not_exists(&path, bytes).await {
             Ok(revision) => MutationOutcome::applied(revision, Some(invoked)),
             Err(BackendError::Precondition) => MutationOutcome::rejected(),
             Err(error) => MutationOutcome::failed(error),
         };
         let applied = round.finish(outcome, |revision| {
-            self.latest.install_mutation::<C>(
+            self.inner.latest.install_mutation::<C>(
                 key,
                 value,
                 size,
@@ -371,18 +414,20 @@ impl CachedStore {
             .clone()
             .ok_or_else(|| StorageError::other("replace requires a present observation"))?;
         let expected_state = self
+            .inner
             .latest
             .expected_present(expected_revision.clone(), expected);
-        let permit = self.coordinator.acquire(&path).await;
+        let permit = self.inner.coordinator.acquire(&path).await;
         let round = MutationRound::new(
-            self.latest.clone(),
-            self.persistent.clone(),
-            path.clone(),
+            self.inner.latest.clone(),
+            self.inner.persistent.clone(),
+            key.clone(),
             expected_state,
             permit,
         );
         let invoked = self.next_invocation();
         let outcome = match self
+            .inner
             .backend
             .write_if(&path, bytes, expected_revision.backend())
             .await
@@ -395,7 +440,7 @@ impl CachedStore {
         let completed = round.finish(outcome, |installed| match installed {
             Some(installed) => CasResult::Applied(CasReceipt {
                 expected_revision: Some(expected_revision),
-                installed: self.latest.install_mutation::<C>(
+                installed: self.inner.latest.install_mutation::<C>(
                     key,
                     value,
                     size,
@@ -405,7 +450,8 @@ impl CachedStore {
                 invoked,
             }),
             None => {
-                self.latest
+                self.inner
+                    .latest
                     .install_absent_observation::<C::Value>(key, invoked);
                 CasResult::Rejected
             }
@@ -427,17 +473,25 @@ impl CachedStore {
             .ok_or_else(|| StorageError::other("delete requires a present observation"))?;
         let key = expected.key.clone();
         let path = key.encoded().clone();
-        let expected_state = self.latest.expected_present(revision.clone(), expected);
-        let permit = self.coordinator.acquire(&path).await;
+        let expected_state = self
+            .inner
+            .latest
+            .expected_present(revision.clone(), expected);
+        let permit = self.inner.coordinator.acquire(&path).await;
         let round = MutationRound::new(
-            self.latest.clone(),
-            self.persistent.clone(),
-            path.clone(),
+            self.inner.latest.clone(),
+            self.inner.persistent.clone(),
+            key.clone(),
             expected_state,
             permit,
         );
         let invoked = self.next_invocation();
-        let outcome = match self.backend.delete_if(&path, revision.backend()).await {
+        let outcome = match self
+            .inner
+            .backend
+            .delete_if(&path, revision.backend())
+            .await
+        {
             Ok(()) => MutationOutcome::applied((), Some(invoked)),
             Err(BackendError::NotFound) => MutationOutcome::applied((), None),
             Err(BackendError::Precondition) => MutationOutcome::rejected(),
@@ -445,7 +499,8 @@ impl CachedStore {
         };
         round
             .finish(outcome, |()| {
-                self.latest
+                self.inner
+                    .latest
                     .install_absent_observation::<C::Value>(key, invoked)
             })?
             .ok_or(StorageError::Precondition)
@@ -465,13 +520,13 @@ impl CachedStore {
             )));
         }
         let _invoked = self.next_invocation();
-        Ok(self.backend.list(prefix, cursor, limit).await?)
+        Ok(self.inner.backend.list(prefix, cursor, limit).await?)
     }
 
     /// Allocates a unique invocation point, ordered before the backend
     /// call it precedes.
     fn next_invocation(&self) -> SequencePoint {
-        self.timeline.now()
+        self.inner.timeline.now()
     }
 
     /// Serves a cached entry that already satisfies `req`, or `None` when the
@@ -481,10 +536,14 @@ impl CachedStore {
         key: &ObjectKey,
         req: Requirement,
     ) -> Result<Option<Observation<C::Value>>, StorageError> {
-        let observed = self.latest.peek::<C>(key, req)?;
-        if observed.as_ref().is_some_and(Observation::exists) && self.persistent.is_configured() {
-            let state = self.coordinator.state(key.encoded());
-            self.persistent.record_present_hit(key.encoded(), &state);
+        let observed = self.inner.latest.peek::<C>(key, req)?;
+        if observed.as_ref().is_some_and(Observation::exists)
+            && self.inner.persistent.is_configured()
+        {
+            let state = self.inner.coordinator.state(key.encoded());
+            self.inner
+                .persistent
+                .record_present_hit(key.encoded(), &state);
         }
         Ok(observed)
     }
@@ -498,7 +557,7 @@ impl CachedStore {
         fallback: Option<&Observation<C::Value>>,
     ) -> Result<FetchResult, StorageError> {
         loop {
-            match self.coordinator.admit_read(key.encoded(), req).await {
+            match self.inner.coordinator.admit_read(key.encoded(), req).await {
                 ReadAdmission::Join(flight) => match flight.wait().await {
                     FlightOutcome::Success(fetched) => return Ok(fetched),
                     FlightOutcome::Error(error) => return Err(error),
@@ -508,19 +567,22 @@ impl CachedStore {
                     if let Some(observed) = fallback
                         && req.is_satisfied_by(observed.current_after())
                     {
-                        return Ok(self.latest.result_from_observation(observed));
+                        return Ok(self.inner.latest.result_from_observation(observed));
                     }
                     if let Some(observed) = self.try_hit::<C>(key, req)? {
-                        return Ok(self.latest.result_from_observation(&observed));
+                        return Ok(self.inner.latest.result_from_observation(&observed));
                     }
                     let state = permit.state().clone();
-                    let mut seed = self.latest.present_seed::<C>(key, fallback)?;
+                    let mut seed = self.inner.latest.present_seed::<C>(key, fallback)?;
                     if seed.is_none()
-                        && let Some(persistent_seed) =
-                            self.persistent.load::<C>(&self.latest, key, &state).await
+                        && let Some(persistent_seed) = self
+                            .inner
+                            .persistent
+                            .load::<C>(&self.inner.latest, key, &state)
+                            .await
                     {
                         if req == Requirement::ANY {
-                            return Ok(self.latest.result_from_seed(persistent_seed));
+                            return Ok(self.inner.latest.result_from_seed(persistent_seed));
                         }
                         seed = Some(persistent_seed);
                     }
@@ -548,6 +610,7 @@ impl CachedStore {
     ) -> Result<FetchResult, StorageError> {
         match seed {
             Some(seed) => match self
+                .inner
                 .backend
                 .read_if_modified(key.as_str(), seed.revision().backend())
                 .await
@@ -556,20 +619,16 @@ impl CachedStore {
                     self.publish_present::<C>(key, reply.contents, reply.revision, invoked, state)
                 }
                 Err(BackendError::Precondition) => {
-                    Ok(self.publish_unchanged::<C>(key.as_str(), seed, invoked))
+                    Ok(self.publish_unchanged::<C>(key, seed, invoked))
                 }
-                Err(BackendError::NotFound) => {
-                    Ok(self.publish_absent(key.as_str(), invoked, state))
-                }
+                Err(BackendError::NotFound) => Ok(self.publish_absent(key, invoked, state)),
                 Err(e) => Err(e.into()),
             },
-            None => match self.backend.read(key.as_str()).await {
+            None => match self.inner.backend.read(key.as_str()).await {
                 Ok(reply) => {
                     self.publish_present::<C>(key, reply.contents, reply.revision, invoked, state)
                 }
-                Err(BackendError::NotFound) => {
-                    Ok(self.publish_absent(key.as_str(), invoked, state))
-                }
+                Err(BackendError::NotFound) => Ok(self.publish_absent(key, invoked, state)),
                 Err(e) => Err(e.into()),
             },
         }
@@ -587,8 +646,8 @@ impl CachedStore {
         let decoded = match C::decode(key.object_path(), &bytes) {
             Ok(decoded) => decoded,
             Err(error) => {
-                let change = self.persistent.begin_change(state);
-                self.latest.invalidate(key.as_str());
+                let change = self.inner.persistent.begin_change(state);
+                self.inner.latest.invalidate(key);
                 change.invalidate(key.encoded().clone());
                 return Err(error);
             }
@@ -596,10 +655,11 @@ impl CachedStore {
         let size = C::size(&decoded);
         let value = Arc::new(decoded);
         let revision = Revision::from_backend(revision);
-        let change = self.persistent.begin_change(state);
+        let change = self.inner.persistent.begin_change(state);
         let fetched =
-            self.latest
-                .install_fetched::<C>(key.as_str(), value, size, revision.clone(), invoked);
+            self.inner
+                .latest
+                .install_fetched::<C>(key, value, size, revision.clone(), invoked);
         if change.replace(
             key.encoded().clone(),
             &revision,
@@ -616,23 +676,25 @@ impl CachedStore {
     /// conditional request.
     fn publish_unchanged<C: Codec>(
         &self,
-        path: &str,
+        path: &ObjectKey,
         seed: PresentSeed,
         invoked: SequencePoint,
     ) -> FetchResult {
-        self.latest.confirm_unchanged::<C>(path, seed, invoked)
+        self.inner
+            .latest
+            .confirm_unchanged::<C>(path, seed, invoked)
     }
 
     /// Publishes a confirmed absence.
     fn publish_absent(
         &self,
-        path: &str,
+        path: &ObjectKey,
         invoked: SequencePoint,
         state: &Arc<PathState>,
     ) -> FetchResult {
-        let change = self.persistent.begin_change(state);
-        let fetched = self.latest.install_absent_result(path, invoked);
-        change.invalidate(Arc::from(path));
+        let change = self.inner.persistent.begin_change(state);
+        let fetched = self.inner.latest.install_absent_result(path, invoked);
+        change.invalidate(path.encoded().clone());
         fetched
     }
 }
@@ -661,7 +723,7 @@ impl<C: Codec> Clone for TypedCachedStore<C> {
 impl<C: Codec> TypedCachedStore<C> {
     /// Captures a currentness barrier on the timeline of the shared cache.
     pub(crate) fn currentness_barrier(&self) -> crate::CurrentnessBarrier {
-        self.store.timeline.currentness_barrier()
+        self.store.inner.timeline.currentness_barrier()
     }
 
     fn check_path(key: &ObjectKey) -> Result<(), StorageError> {
@@ -700,13 +762,13 @@ impl<C: Codec> TypedCachedStore<C> {
     /// Makes the decoded cache keep the states of `key` that newer states
     /// replace, while the floors of the live views can use them (ADR-103).
     pub(crate) fn keep_earlier_states(&self, key: impl Into<ObjectKey>) {
-        self.store.earlier.keep(&key.into());
+        self.store.inner.earlier.keep(&key.into());
     }
 
     /// Makes the decoded cache drop the earlier states of `key`, and keep no
     /// more of them until a view marks it again (ADR-103).
     pub(crate) fn drop_earlier_states(&self, key: impl Into<ObjectKey>) {
-        self.store.earlier.drop(&key.into());
+        self.store.inner.earlier.drop(&key.into());
     }
 
     /// Reads the state whose currentness interval covers `point`, for a call
@@ -720,8 +782,13 @@ impl<C: Codec> TypedCachedStore<C> {
     ) -> Result<Observation<C::Value>, StorageError> {
         let key = key.into();
         Self::check_path(&key)?;
-        if let Some(observed) = self.store.earlier.state_at::<C>(&key, requirement, point)? {
-            self.store.metrics.l1_hit();
+        if let Some(observed) = self
+            .store
+            .inner
+            .earlier
+            .state_at::<C>(&key, requirement, point)?
+        {
+            self.store.inner.metrics.l1_hit();
             return Ok(observed);
         }
         self.store.read::<C>(key, requirement).await
@@ -850,7 +917,12 @@ impl<C: Codec> TypedCachedStore<C> {
         part: impl Fn(&C::Value) -> Option<S>,
     ) -> Result<CutKey, StorageError> {
         Self::check_path(&observed.key)?;
-        match self.store.earlier.part_interval::<C, S>(observed, part)? {
+        match self
+            .store
+            .inner
+            .earlier
+            .part_interval::<C, S>(observed, part)?
+        {
             Some(interval) => {
                 Ok(search.add_key(interval.start, interval.watermark, interval.cached_changed))
             }
@@ -1257,7 +1329,7 @@ mod tests {
                     .unwrap();
                 let erased: Arc<dyn Backend> = backend;
                 let (store, _) = simulated_persistent_store(&directory, erased, media).await;
-                assert!(!store.persistent.is_enabled());
+                assert!(!store.inner.persistent.is_enabled());
 
                 let typed: TypedCachedStore<Bytes> = store.typed();
                 let loaded = typed.read("p", Requirement::ANY).await.unwrap();
@@ -1347,7 +1419,7 @@ mod tests {
         clear(&log);
 
         let (reopened, _) = simulated_persistent_store(&directory, erased, media.clone()).await;
-        assert!(reopened.persistent.is_enabled());
+        assert!(reopened.inner.persistent.is_enabled());
         let typed: TypedCachedStore<Bytes> = reopened.typed();
         let mut pause = media.pause_next_operation();
         let mut read = tokio::spawn({
@@ -1365,7 +1437,7 @@ mod tests {
         assert_eq!(loaded.value().unwrap().as_slice(), b"one");
         assert_eq!(count(&log, "read"), 1);
         assert_eq!(count(&log, "read_if_modified"), 0);
-        assert!(!reopened.persistent.is_enabled());
+        assert!(!reopened.inner.persistent.is_enabled());
         let stats = reopened.cache_stats_and_reset();
         assert_eq!(stats.l2_errors, 1, "cache stats: {stats:?}");
 
@@ -1670,7 +1742,7 @@ mod tests {
         }
 
         let known_winner = if matches!(knowledge, KnowledgeCase::KnownWinner) {
-            let bound = store.store.timeline.currentness_barrier();
+            let bound = store.store.inner.timeline.currentness_barrier();
             Some(store.read("p", Requirement::after(bound)).await.unwrap())
         } else {
             None
@@ -1903,7 +1975,7 @@ mod tests {
                 .known_winner
                 .as_ref()
                 .map(Observation::current_after);
-            let barrier = store.store.timeline.now();
+            let barrier = store.store.inner.timeline.now();
 
             let result = match case.completion {
                 CompletionCase::Natural => {
@@ -2040,7 +2112,7 @@ mod tests {
                     .unwrap();
             }
             let store = protocol.store();
-            let barrier = store.store.timeline.now();
+            let barrier = store.store.inner.timeline.now();
             let entered = Arc::new(Notify::new());
             let release = Arc::new(Notify::new());
             let first = Arc::new(AtomicBool::new(true));
@@ -2161,7 +2233,7 @@ mod tests {
                 .await
                 .unwrap();
             let store = protocol.store();
-            let barrier = store.store.timeline.now();
+            let barrier = store.store.inner.timeline.now();
             let entered = Arc::new(Notify::new());
             let first = Arc::new(AtomicBool::new(true));
 
@@ -2304,7 +2376,7 @@ mod tests {
                 }
             });
 
-            let bound = store.store.timeline.currentness_barrier();
+            let bound = store.store.inner.timeline.currentness_barrier();
             let validating = tokio::spawn({
                 let store = store.clone();
                 async move { store.read("p", Requirement::after(bound)).await }
@@ -2681,7 +2753,7 @@ mod tests {
         assert_eq!(count(&log, "read"), 0);
         assert_eq!(count(&log, "read_if_modified"), 0);
 
-        let t = s.store.timeline.currentness_barrier();
+        let t = s.store.inner.timeline.currentness_barrier();
         let o2 = s.read("p", Requirement::after(t)).await.unwrap();
         assert_eq!(count(&log, "read_if_modified"), 1, "stale entry is checked");
         assert!(o2.is_current_after(t), "watermark advanced to the bound");
@@ -2698,7 +2770,7 @@ mod tests {
     async fn barrier_served_locally_when_evidence_sufficient() {
         let (s, log) = store_rec();
         create_value(&s, "p", v(b"a")).await;
-        let barrier = s.store.timeline.currentness_barrier();
+        let barrier = s.store.inner.timeline.currentness_barrier();
         let o = s.read("p", Requirement::after(barrier)).await.unwrap();
         assert!(o.is_current_after(barrier));
         clear(&log);
@@ -2789,7 +2861,7 @@ mod tests {
         let s1 = bytes_store(backend.clone());
         let s2 = bytes_store(backend);
 
-        let barrier = s1.store.timeline.currentness_barrier();
+        let barrier = s1.store.inner.timeline.currentness_barrier();
         let obs = s1
             .create("p", None, v(b"a"))
             .await
@@ -2814,7 +2886,7 @@ mod tests {
         assert_eq!(count(&log, "read_if_modified"), 0);
 
         // A stricter bound checks again and observes the winner.
-        let t = s1.store.timeline.currentness_barrier();
+        let t = s1.store.inner.timeline.currentness_barrier();
         match s1.check_current(&obs, Requirement::after(t)).await.unwrap() {
             ObservationCheck::Changed(cur) => assert_eq!(cur.value().unwrap().as_slice(), b"b"),
             ObservationCheck::Current => panic!("a stricter bound must observe the changed state"),
@@ -2837,7 +2909,7 @@ mod tests {
 
         let observed = create_value(&local, "p", v(b"a")).await;
         replace_value(&peer, &observed, v(b"b")).await;
-        let bound = local.store.timeline.currentness_barrier();
+        let bound = local.store.inner.timeline.currentness_barrier();
         let current = local.read("p", Requirement::after(bound)).await.unwrap();
         assert_eq!(current.value().unwrap().as_slice(), b"b");
 
@@ -2868,8 +2940,8 @@ mod tests {
             .unwrap()
             .into_installed();
 
-        let before = s.store.timeline.now();
-        let barrier = s.store.timeline.currentness_barrier();
+        let before = s.store.inner.timeline.now();
+        let barrier = s.store.inner.timeline.currentness_barrier();
         let receipt = s
             .replace(&obs, v(b"b"))
             .await
@@ -2894,7 +2966,7 @@ mod tests {
     async fn checking_installed_state_does_not_renew_a_cas_receipt() {
         let (store, log) = store_rec();
         let expected = create_value(&store, "p", v(b"old")).await;
-        let first_barrier = store.store.timeline.currentness_barrier();
+        let first_barrier = store.store.inner.timeline.currentness_barrier();
         let receipt = store
             .replace(&expected, v(b"installed"))
             .await
@@ -2903,7 +2975,7 @@ mod tests {
             .unwrap();
         assert!(receipt.confirms_expected(&expected, first_barrier));
 
-        let next_barrier = store.store.timeline.currentness_barrier();
+        let next_barrier = store.store.inner.timeline.currentness_barrier();
         assert!(!receipt.installed().is_current_after(next_barrier));
         clear(&log);
         let check = store
@@ -2947,13 +3019,13 @@ mod tests {
             }
         });
 
-        let earlier = store.store.timeline.currentness_barrier();
+        let earlier = store.store.inner.timeline.currentness_barrier();
         let pending = tokio::spawn({
             let store = store.clone();
             async move { store.read("p", Requirement::ANY).await }
         });
         entered.notified().await;
-        let barrier = store.store.timeline.currentness_barrier();
+        let barrier = store.store.inner.timeline.currentness_barrier();
         memory
             .write_if("p", b"new".to_vec(), &initial)
             .await
@@ -2980,12 +3052,12 @@ mod tests {
         let store = bytes_store(backend);
         let expected = create_value(&store, "p", v(b"a")).await;
 
-        store.store.latest.invalidate("p");
+        store.store.inner.latest.invalidate(&ObjectKey::from("p"));
         let reloaded = store.read("p", Requirement::ANY).await.unwrap();
         assert!(expected.same_state(&reloaded));
         assert!(!expected.evidence.is_shared_with(&reloaded.evidence));
 
-        let before = store.store.timeline.now();
+        let before = store.store.inner.timeline.now();
         replace_value(&store, &expected, v(b"b")).await;
 
         assert!(expected.current_after() >= before);
@@ -3010,7 +3082,7 @@ mod tests {
             .into_installed();
         replace_value(&s2, &obs, v(b"b")).await;
 
-        let before = s1.store.timeline.now();
+        let before = s1.store.inner.timeline.now();
         let r = s1.replace(&obs, v(b"c")).await.unwrap();
         assert!(!r.is_applied());
         assert!(
@@ -3041,7 +3113,7 @@ mod tests {
             .into_receipt()
             .unwrap()
             .into_installed();
-        let before = s.store.timeline.now();
+        let before = s.store.inner.timeline.now();
 
         // The write lands but its acknowledgement is lost.
         hook.set_after(|op, outcome| {
@@ -3110,7 +3182,7 @@ mod tests {
         peer.delete(&present).await.unwrap();
         clear(&log);
 
-        let barrier = local.store.timeline.currentness_barrier();
+        let barrier = local.store.inner.timeline.currentness_barrier();
         let receipt = local
             .create("p", Some(&absent), v(b"final"))
             .await
@@ -3144,7 +3216,7 @@ mod tests {
             .await
             .unwrap();
 
-        let barrier = store.store.timeline.currentness_barrier();
+        let barrier = store.store.inner.timeline.currentness_barrier();
         let receipt = store
             .replace(&expected, v(b"b"))
             .await
@@ -3165,14 +3237,14 @@ mod tests {
         let (s, log) = store_rec();
         create_value(&s, "p", v(b"a")).await;
 
-        let t1 = s.store.timeline.currentness_barrier();
+        let t1 = s.store.inner.timeline.currentness_barrier();
         let w1 = s
             .read("p", Requirement::after(t1))
             .await
             .unwrap()
             .current_after();
         assert!(t1.is_reached_by(w1));
-        let t2 = s.store.timeline.currentness_barrier();
+        let t2 = s.store.inner.timeline.currentness_barrier();
         let w2 = s
             .read("p", Requirement::after(t2))
             .await
@@ -3214,7 +3286,7 @@ mod tests {
     async fn successful_delete_advances_expected_and_installs_absence() {
         let (s, log) = store_rec();
         let expected = create_value(&s, "p", v(b"a")).await;
-        let before = s.store.timeline.now();
+        let before = s.store.inner.timeline.now();
 
         let absent = s.delete(&expected).await.unwrap();
 
@@ -3242,7 +3314,7 @@ mod tests {
         let expected = create_value(&local, "p", v(b"a")).await;
         let peer_observation = peer.read("p", Requirement::ANY).await.unwrap();
         peer.delete(&peer_observation).await.unwrap();
-        let before = local.store.timeline.now();
+        let before = local.store.inner.timeline.now();
         clear(&log);
 
         let absent = local.delete(&expected).await.unwrap();
@@ -3304,7 +3376,7 @@ mod tests {
         release.notify_one();
 
         assert!(deleting.await.unwrap().unwrap().is_absent());
-        let bound = store.store.timeline.currentness_barrier();
+        let bound = store.store.inner.timeline.currentness_barrier();
         let current = store.read("p", Requirement::after(bound)).await.unwrap();
         assert!(current.exists());
         assert_eq!(current.value().unwrap().as_slice(), b"a");
@@ -3325,7 +3397,7 @@ mod tests {
         let expected = create_value(&local, "p", v(b"a")).await;
         let peer_observation = peer.read("p", Requirement::ANY).await.unwrap();
         replace_value(&peer, &peer_observation, v(b"b")).await;
-        let before = local.store.timeline.now();
+        let before = local.store.inner.timeline.now();
 
         assert!(matches!(
             local.delete(&expected).await,
@@ -3352,7 +3424,7 @@ mod tests {
         let backend: Arc<dyn Backend> = hook.clone();
         let store = bytes_store(backend);
         let expected = create_value(&store, "p", v(b"a")).await;
-        let before = store.store.timeline.now();
+        let before = store.store.inner.timeline.now();
 
         hook.set_after(|operation, outcome| {
             ready(
@@ -3388,7 +3460,7 @@ mod tests {
         let backend: Arc<dyn Backend> = hook.clone();
         let store = bytes_store(backend);
         let expected = create_value(&store, "p", v(b"a")).await;
-        let before = store.store.timeline.now();
+        let before = store.store.inner.timeline.now();
 
         hook.set_before(|operation| {
             ready(if matches!(operation, BackendOp::DeleteIf { .. }) {
@@ -3807,14 +3879,14 @@ mod tests {
         // Reader A checks after a captured barrier; its op start is tA.
         let a = tokio::spawn({
             let s = s.clone();
-            let t = s.store.timeline.currentness_barrier();
+            let t = s.store.inner.timeline.currentness_barrier();
             async move { s.read("p", Requirement::after(t)).await }
         });
         while entered.load(Ordering::SeqCst) < 1 {
             tokio::task::yield_now().await;
         }
         // A stricter bound than A's start: it cannot join A's in-flight op.
-        let strict = s.store.timeline.currentness_barrier();
+        let strict = s.store.inner.timeline.currentness_barrier();
         let b = tokio::spawn({
             let s = s.clone();
             async move { s.read("p", Requirement::after(strict)).await }
@@ -4012,9 +4084,22 @@ mod tests {
         let revision = Revision::from_backend(backend::Revision::new("r1".to_owned()));
         let point = SequencePoint::from_raw;
 
-        latest.install_fetched::<Bytes>("fetched", v(b"a"), 1, revision.clone(), point(3));
-        latest.install_persistent::<Bytes>("loaded", v(b"a"), 1, revision, point(5), None);
-        latest.install_absent_result("gone", point(7));
+        latest.install_fetched::<Bytes>(
+            &ObjectKey::from("fetched"),
+            v(b"a"),
+            1,
+            revision.clone(),
+            point(3),
+        );
+        latest.install_persistent::<Bytes>(
+            &ObjectKey::from("loaded"),
+            v(b"a"),
+            1,
+            revision,
+            point(5),
+            None,
+        );
+        latest.install_absent_result(&ObjectKey::from("gone"), point(7));
         assert_eq!(
             *recorder.0.lock().unwrap(),
             vec![
@@ -4066,8 +4151,13 @@ mod tests {
         value: &[u8],
     ) -> Observation<Vec<u8>> {
         let revision = Revision::from_backend(backend::Revision::new(format!("{value:?}")));
-        let fetched =
-            latest.install_fetched::<Kept>(path, v(value), value.len(), revision, timeline.now());
+        let fetched = latest.install_fetched::<Kept>(
+            &ObjectKey::from(path),
+            v(value),
+            value.len(),
+            revision,
+            timeline.now(),
+        );
         latest
             .to_observation::<Kept>(ObjectKey::from(path), fetched)
             .unwrap()
@@ -4078,7 +4168,7 @@ mod tests {
     fn confirm_kept(latest: &LatestStates, timeline: &Timeline, path: &str) {
         let key = ObjectKey::from(path);
         let seed = latest.present_seed::<Kept>(&key, None).unwrap().unwrap();
-        latest.confirm_unchanged::<Kept>(path, seed, timeline.now());
+        latest.confirm_unchanged::<Kept>(&ObjectKey::from(path), seed, timeline.now());
     }
 
     fn floor_at(views: &ViewFloors, observed: &Observation<Vec<u8>>) -> MonotonicFloor {
@@ -4170,7 +4260,7 @@ mod tests {
         let floor = floor_at(&views, &first);
         fetch_kept(&latest, &timeline, "p", b"b");
 
-        latest.invalidate("p");
+        latest.invalidate(&ObjectKey::from("p"));
         assert_eq!(value_at(&earlier, "p", &floor), Some(b"a".to_vec()));
     }
 
@@ -4227,23 +4317,36 @@ mod tests {
         let revision = Revision::from_backend(backend::Revision::new("r1".to_owned()));
         let point = SequencePoint::from_raw;
         let advanced = latest.install_persistent::<Bytes>(
-            "advanced",
+            &ObjectKey::from("advanced"),
             v(b"a"),
             1,
             revision.clone(),
             point(5),
             None,
         );
-        latest.install_persistent::<Bytes>("same", v(b"a"), 1, revision.clone(), point(5), None);
+        latest.install_persistent::<Bytes>(
+            &ObjectKey::from("same"),
+            v(b"a"),
+            1,
+            revision.clone(),
+            point(5),
+            None,
+        );
         // The persistent cache has no copy of a fetched state until its
         // publication.
-        latest.install_fetched::<Bytes>("fetched", v(b"a"), 1, revision.clone(), point(7));
-        latest.confirm_unchanged::<Bytes>("advanced", advanced, point(9));
+        latest.install_fetched::<Bytes>(
+            &ObjectKey::from("fetched"),
+            v(b"a"),
+            1,
+            revision.clone(),
+            point(7),
+        );
+        latest.confirm_unchanged::<Bytes>(&ObjectKey::from("advanced"), advanced, point(9));
 
         let unpersisted: BTreeMap<_, _> = latest
             .present_states()
             .into_iter()
-            .map(|(path, _, evidence)| (path, evidence))
+            .map(|(path, _, evidence)| (path.as_str().to_owned(), evidence))
             .collect();
         assert_eq!(
             unpersisted["advanced"].unpersisted_watermark(),
@@ -4272,6 +4375,7 @@ mod tests {
         let typed = bytes_store(Arc::new(MemoryBackend::new()));
         typed
             .store
+            .inner
             .backend
             .write_if_not_exists("present", b"v".to_vec())
             .await

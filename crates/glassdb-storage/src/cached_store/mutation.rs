@@ -1,9 +1,8 @@
 //! Mutation outcome normalization and cancellation-safe reconciliation.
 
-use std::sync::Arc;
-
 use glassdb_backend::BackendError;
 
+use super::ObjectKey;
 use super::latest::{Expected, LatestStates};
 use super::path_lane::PathPermit;
 use super::persistent_bridge::{PersistentBridge, PersistentChange};
@@ -42,7 +41,7 @@ impl<T> MutationOutcome<T> {
 pub(super) struct MutationRound {
     latest: LatestStates,
     persistent: PersistentBridge,
-    path: Arc<str>,
+    key: ObjectKey,
     expected: Expected,
     permit: Option<PathPermit>,
     persistent_change: Option<PersistentChange>,
@@ -53,15 +52,15 @@ impl MutationRound {
     pub(super) fn new(
         latest: LatestStates,
         persistent: PersistentBridge,
-        path: Arc<str>,
+        key: ObjectKey,
         mut expected: Expected,
         permit: PathPermit,
     ) -> Self {
-        latest.capture_expected(&path, &mut expected);
+        latest.capture_expected(&key, &mut expected);
         Self {
             latest,
             persistent,
-            path,
+            key,
             expected,
             permit: Some(permit),
             persistent_change: None,
@@ -88,7 +87,7 @@ impl MutationRound {
             }
             MutationOutcome::Rejected => {
                 self.begin_path_change();
-                self.latest.invalidate_expected(&self.path, &self.expected);
+                self.latest.invalidate_expected(&self.key, &self.expected);
                 self.invalidate_l2();
                 self.complete();
                 Ok(None)
@@ -99,7 +98,7 @@ impl MutationRound {
             }
             MutationOutcome::InDoubt(error) => {
                 self.begin_path_change();
-                self.latest.invalidate(&self.path);
+                self.latest.invalidate(&self.key);
                 self.invalidate_l2();
                 self.complete();
                 Err(error)
@@ -122,7 +121,7 @@ impl MutationRound {
         let Some(change) = self.persistent_change.take() else {
             return;
         };
-        change.invalidate(self.path.clone());
+        change.invalidate(self.key.encoded().clone());
     }
 
     fn complete(&mut self) {
@@ -135,7 +134,7 @@ impl Drop for MutationRound {
     fn drop(&mut self) {
         if self.armed {
             self.begin_path_change();
-            self.latest.invalidate(&self.path);
+            self.latest.invalidate(&self.key);
             self.invalidate_l2();
         }
         self.permit.take();

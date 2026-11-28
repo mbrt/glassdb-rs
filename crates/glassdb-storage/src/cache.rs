@@ -1,16 +1,25 @@
-//! A thread-safe, byte-weighted LRU cache. Ported from the Go `internal/cache`
-//! package.
+//! A thread-safe, byte-weighted cache that evicts entries in an order near
+//! least-recently-used. Ported from the Go `internal/cache` package.
 //!
 //! The cache is partitioned into independent shards, each with its own lock and
 //! byte budget, to reduce lock contention on this hot DB-level structure.
 //!
+//! A hit changes no order: it takes the shared lock of its shard and sets the
+//! access bit of its entry. So the readers of a hot path, such as the root of a
+//! tree, do not wait for each other. The entries are in insertion order, and
+//! eviction gives a second chance to each entry with its access bit set: it
+//! clears the bit and moves the entry to the back (the CLOCK algorithm).
+//!
 //! Each path has two slots: its latest state and its earlier states (ADR-103).
-//! The two slots of a path are separate entries in one LRU order, and they are
-//! always in the same shard.
+//! The two slots of a path are separate entries in one eviction order, and they
+//! are always in the same shard.
 
+use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::sync::Mutex;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use foldhash::fast::FixedState;
 use glassdb_concurr::shard::{self, Sharded};
 use hashlink::LinkedHashMap;
 use hashlink::linked_hash_map::RawEntryMut;
@@ -29,37 +38,86 @@ pub enum Slot {
     Earlier,
 }
 
+/// Hashes the paths to their shards. The seed is fixed, so that the shard of
+/// a path, and so the entries that a shard evicts, do not change between
+/// runs. It differs from the seed of the entry maps, which hash `(slot, path)`.
+const SHARD_HASHER: FixedState = FixedState::with_seed(0x5eed_5ba2_d000_0001);
+
+/// Hashes the keys of the entry map of each shard. The eviction order does not
+/// depend on it.
+const MAP_HASHER: FixedState = FixedState::with_seed(0x5eed_5ba2_d000_0002);
+
+/// Returns the hash that selects the shard of `path`.
+fn shard_hash<Q: Hash + ?Sized>(path: &Q) -> u64 {
+    SHARD_HASHER.hash_one(path)
+}
+
+/// Returns the index of the shard of `path` in a cache of `shards` shards, for
+/// tests and benchmarks that put their paths in one shard.
+pub fn shard_index<Q: Hash + ?Sized>(path: &Q, shards: usize) -> usize {
+    shard::index_for_hash(shard_hash(path), shards)
+}
+
 /// The key of one entry. It hashes as `(slot, path)`, so a lookup can hash a
 /// borrowed path and compare it without an allocation.
 #[derive(PartialEq, Eq)]
-struct Key {
+struct Key<K> {
     slot: Slot,
-    path: String,
+    path: K,
 }
 
-impl Hash for Key {
+impl<K: Hash> Hash for Key<K> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        (self.slot, self.path.as_str()).hash(state);
+        (self.slot, &self.path).hash(state);
     }
 }
 
-impl Key {
-    fn is(&self, slot: Slot, path: &str) -> bool {
-        self.slot == slot && self.path == path
+impl<K> Key<K> {
+    fn is<Q>(&self, slot: Slot, path: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        self.slot == slot && self.path.borrow() == path
     }
 }
 
 /// An entry that the cache evicted for capacity.
-type Evicted<V> = (Slot, String, V);
+type Evicted<K, V> = (Slot, K, V);
 
-struct Inner<V> {
+/// A value and whether it was used after the eviction last passed it.
+struct Entry<V> {
+    value: V,
+    accessed: AtomicBool,
+}
+
+impl<V> Entry<V> {
+    /// A new value counts as used, as in least-recently-used order, so that
+    /// the eviction that makes room for it does not remove it first.
+    fn new(value: V) -> Self {
+        Self {
+            value,
+            accessed: AtomicBool::new(true),
+        }
+    }
+
+    /// Sets the access bit. It writes only a clear bit, so that the hits of a
+    /// hot entry do not write to its memory.
+    fn mark(&self) {
+        if !self.accessed.load(Ordering::Relaxed) {
+            self.accessed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+struct Inner<K, V> {
     max_size: usize,
     curr_size: usize,
-    /// Entries in LRU order: the front is least-recently-used, the back is
-    /// most-recently-used. The linked list gives O(1) recency refresh and
-    /// eviction, and eviction follows that list order (not the hash buckets),
-    /// so behavior is independent of the hasher.
-    map: LinkedHashMap<Key, V>,
+    /// Entries in eviction order: the front is the next to evict unless its
+    /// access bit is set, and the back is the newest. The linked list gives
+    /// O(1) second chances and evictions, and eviction follows that list order
+    /// (not the hash buckets), so behavior is independent of the hasher.
+    map: LinkedHashMap<Key<K>, Entry<V>, FixedState>,
 }
 
 struct WeightReplacement {
@@ -83,36 +141,47 @@ fn replace_weight(curr_size: usize, old_size: usize, new_size: usize) -> WeightR
     }
 }
 
-impl<V: Weighable + Clone> Inner<V> {
-    fn hash(&self, slot: Slot, path: &str) -> u64 {
+impl<K: Hash + Eq, V: Weighable + Clone> Inner<K, V> {
+    fn hash<Q>(&self, slot: Slot, path: &Q) -> u64
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.map.hasher().hash_one((slot, path))
     }
 
-    fn peek(&self, slot: Slot, path: &str) -> Option<&V> {
+    fn peek<Q>(&self, slot: Slot, path: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let hash = self.hash(slot, path);
         self.map
             .raw_entry()
             .from_hash(hash, |key| key.is(slot, path))
-            .map(|(_, value)| value)
+            .map(|(_, entry)| &entry.value)
     }
 
-    /// Moves the entry to the most-recently-used position and returns it.
-    fn refresh(&mut self, slot: Slot, path: &str) -> Option<&V> {
+    /// Returns the value of a slot, and sets its access bit.
+    fn hit<Q>(&self, slot: Slot, path: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let hash = self.hash(slot, path);
-        match self
+        let (_, entry) = self
             .map
-            .raw_entry_mut()
-            .from_hash(hash, |key| key.is(slot, path))
-        {
-            RawEntryMut::Occupied(mut entry) => {
-                entry.to_back();
-                Some(entry.into_mut())
-            }
-            RawEntryMut::Vacant(_) => None,
-        }
+            .raw_entry()
+            .from_hash(hash, |key| key.is(slot, path))?;
+        entry.mark();
+        Some(&entry.value)
     }
 
-    fn delete_entry(&mut self, slot: Slot, path: &str) {
+    fn delete_entry<Q>(&mut self, slot: Slot, path: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let hash = self.hash(slot, path);
         if let RawEntryMut::Occupied(entry) = self
             .map
@@ -120,21 +189,25 @@ impl<V: Weighable + Clone> Inner<V> {
             .from_hash(hash, |key| key.is(slot, path))
         {
             let old = entry.remove();
-            self.curr_size = replace_weight(self.curr_size, old.size(), 0).size;
+            self.curr_size = replace_weight(self.curr_size, old.value.size(), 0).size;
         }
     }
 
     /// Stores `new` in a slot, or removes the slot when `new` is `None` or
     /// does not fit the budget. Returns whether the total weight overflowed.
     /// The caller evicts for capacity after it stores every slot.
-    fn put(
+    fn put<Q>(
         &mut self,
         slot: Slot,
-        path: &str,
+        path: &Q,
         old_size: usize,
         new: Option<V>,
-        evicted: &mut Vec<Evicted<V>>,
-    ) -> bool {
+        evicted: &mut Vec<Evicted<K, V>>,
+    ) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
+    {
         let Some(new) = new else {
             // Remove an existing entry, or leave an absent one absent.
             self.delete_entry(slot, path);
@@ -144,19 +217,19 @@ impl<V: Weighable + Clone> Inner<V> {
         if self.max_size == 0 || new_size > self.max_size {
             // Keeping an old value here could hide a completed mutation.
             self.delete_entry(slot, path);
-            evicted.push((slot, path.to_string(), new));
+            evicted.push((slot, path.to_owned(), new));
             return false;
         }
         let replacement = replace_weight(self.curr_size, old_size, new_size);
         self.curr_size = replacement.size;
-        // `insert` appends at the back (most-recently-used) and, for an
-        // existing key, moves it there while replacing the value.
+        // `insert` appends at the back (the newest) and, for an existing key,
+        // moves it there while replacing the value.
         self.map.insert(
             Key {
                 slot,
-                path: path.to_string(),
+                path: path.to_owned(),
             },
-            new,
+            Entry::new(new),
         );
         replacement.overflowed
     }
@@ -164,8 +237,8 @@ impl<V: Weighable + Clone> Inner<V> {
     fn recompute_weight(&mut self) -> bool {
         let mut curr_size = 0;
         let mut overflowed = false;
-        for value in self.map.values() {
-            let replacement = replace_weight(curr_size, 0, value.size());
+        for entry in self.map.values() {
+            let replacement = replace_weight(curr_size, 0, entry.value.size());
             curr_size = replacement.size;
             overflowed = replacement.overflowed;
             if overflowed {
@@ -176,11 +249,19 @@ impl<V: Weighable + Clone> Inner<V> {
         overflowed
     }
 
-    fn remove_oldest(&mut self, mut overflowed: bool, evicted: &mut Vec<Evicted<V>>) {
+    fn remove_oldest(&mut self, mut overflowed: bool, evicted: &mut Vec<Evicted<K, V>>) {
         while overflowed || self.curr_size > self.max_size {
-            let Some((key, v)) = self.map.pop_front() else {
+            let Some((key, mut entry)) = self.map.pop_front() else {
                 return;
             };
+            if *entry.accessed.get_mut() {
+                // A second chance. The bit is clear when the eviction comes
+                // back to the entry, so the loop ends.
+                *entry.accessed.get_mut() = false;
+                self.map.insert(key, entry);
+                continue;
+            }
+            let v = entry.value;
             if overflowed {
                 // A saturated total is not exact, so subtracting an eviction
                 // could make the cache appear smaller than its survivors.
@@ -196,34 +277,41 @@ impl<V: Weighable + Clone> Inner<V> {
 }
 
 /// One independent partition of the cache, holding its own lock, entries map,
-/// LRU list, and byte budget.
-pub struct CacheShard<V> {
-    inner: Mutex<Inner<V>>,
+/// eviction order, and byte budget. A hit takes the lock shared, and a change
+/// takes it exclusive.
+pub struct CacheShard<K, V> {
+    inner: RwLock<Inner<K, V>>,
 }
 
-impl<V: Weighable + Clone> CacheShard<V> {
+impl<K: Hash + Eq + Clone, V: Weighable + Clone> CacheShard<K, V> {
     /// Creates a cache shard with the given maximum size in bytes.
     pub fn new(max_size: usize) -> Self {
         CacheShard {
-            inner: Mutex::new(Inner {
+            inner: RwLock::new(Inner {
                 max_size,
                 curr_size: 0,
-                map: LinkedHashMap::new(),
+                map: LinkedHashMap::with_hasher(MAP_HASHER),
             }),
         }
     }
 
-    fn get(&self, slot: Slot, path: &str) -> Option<V> {
-        self.inner.lock().unwrap().refresh(slot, path).cloned()
+    fn get<Q>(&self, slot: Slot, path: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.inner.read().unwrap().hit(slot, path).cloned()
     }
 
     /// Updates one slot and returns the entries that the update evicted for
     /// capacity, including a new value that does not fit.
-    fn update_evicting<F, R>(&self, slot: Slot, path: &str, f: F) -> (R, Vec<Evicted<V>>)
+    fn update_evicting<Q, F, R>(&self, slot: Slot, path: &Q, f: F) -> (R, Vec<Evicted<K, V>>)
     where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
         F: FnOnce(Option<V>) -> (Option<V>, R),
     {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let mut evicted = Vec::new();
         let old = inner.peek(slot, path).cloned();
         let old_size = old.as_ref().map_or(0, Weighable::size);
@@ -235,11 +323,13 @@ impl<V: Weighable + Clone> CacheShard<V> {
 
     /// Updates both slots of `path` under one lock, and returns the entries
     /// that the update evicted for capacity.
-    fn update_both_evicting<F, R>(&self, path: &str, f: F) -> (R, Vec<Evicted<V>>)
+    fn update_both_evicting<Q, F, R>(&self, path: &Q, f: F) -> (R, Vec<Evicted<K, V>>)
     where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
         F: FnOnce(Option<V>, Option<V>) -> (Option<V>, Option<V>, R),
     {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.write().unwrap();
         let mut evicted = Vec::new();
         let latest = inner.peek(Slot::Latest, path).cloned();
         let earlier = inner.peek(Slot::Earlier, path).cloned();
@@ -258,37 +348,42 @@ impl<V: Weighable + Clone> CacheShard<V> {
         (result, evicted)
     }
 
-    fn delete(&self, slot: Slot, path: &str) {
-        self.inner.lock().unwrap().delete_entry(slot, path);
+    fn delete<Q>(&self, slot: Slot, path: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.inner.write().unwrap().delete_entry(slot, path);
     }
 
     fn size(&self) -> usize {
-        self.inner.lock().unwrap().curr_size
+        self.inner.read().unwrap().curr_size
     }
 
-    fn entries(&self) -> Vec<(Slot, String, V)> {
-        let inner = self.inner.lock().unwrap();
+    fn entries(&self) -> Vec<(Slot, K, V)> {
+        let inner = self.inner.read().unwrap();
         inner
             .map
             .iter()
-            .map(|(key, value)| (key.slot, key.path.clone(), value.clone()))
+            .map(|(key, entry)| (key.slot, key.path.clone(), entry.value.clone()))
             .collect()
     }
 }
 
 /// Receives each entry that the cache evicts for capacity. The cache calls it
 /// after it releases the shard lock.
-pub type EvictionHook<V> = Box<dyn Fn(Slot, &str, V) + Send + Sync>;
+pub type EvictionHook<K, V> = Box<dyn Fn(Slot, &K, V) + Send + Sync>;
 
-/// A thread-safe LRU cache that evicts the least-recently-used entries once the
-/// total size exceeds the configured maximum. It is partitioned into
-/// independent shards, each with its own lock and byte budget.
-pub struct Cache<V> {
-    sh: Sharded<CacheShard<V>>,
-    on_evict: Option<EvictionHook<V>>,
+/// A thread-safe cache that evicts entries in an order near least-recently-used
+/// (see the module) once the total size exceeds the configured maximum. It is partitioned into
+/// independent shards, each with its own lock and byte budget. The entries are
+/// keyed by paths of type `K`, and a lookup can use any borrowed form of `K`.
+pub struct Cache<K, V> {
+    sh: Sharded<CacheShard<K, V>>,
+    on_evict: Option<EvictionHook<K, V>>,
 }
 
-impl<V: Weighable + Clone> Cache<V> {
+impl<K: Hash + Eq + Clone, V: Weighable + Clone> Cache<K, V> {
     /// Creates a cache with the given maximum size in bytes. The budget is split
     /// evenly across shards to reduce lock contention. Zero disables retention.
     pub fn new(max_size: usize) -> Self {
@@ -298,11 +393,11 @@ impl<V: Weighable + Clone> Cache<V> {
     /// Creates a cache like [`Self::new`] that passes each entry it evicts for
     /// capacity to `on_evict`. A new value that does not fit its shard's
     /// budget counts as evicted. Explicit removals and replacements do not.
-    pub fn with_eviction(max_size: usize, on_evict: EvictionHook<V>) -> Self {
+    pub fn with_eviction(max_size: usize, on_evict: EvictionHook<K, V>) -> Self {
         Self::build(max_size, Some(on_evict))
     }
 
-    fn build(max_size: usize, on_evict: Option<EvictionHook<V>>) -> Self {
+    fn build(max_size: usize, on_evict: Option<EvictionHook<K, V>>) -> Self {
         let per = max_size / shard::count();
         Cache {
             sh: Sharded::new(move |_| CacheShard::new(per)),
@@ -311,13 +406,20 @@ impl<V: Weighable + Clone> Cache<V> {
     }
 
     /// The shard of both slots of `path`.
-    fn shard(&self, path: &str) -> &CacheShard<V> {
-        self.sh.for_key(path.as_bytes())
+    fn shard<Q>(&self, path: &Q) -> &CacheShard<K, V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + ?Sized,
+    {
+        self.sh.for_hash(shard_hash(path))
     }
 
-    /// Returns the value in a slot of `path`, and moves it to the
-    /// most-recently-used position.
-    pub fn get(&self, slot: Slot, path: &str) -> Option<V> {
+    /// Returns the value in a slot of `path`, and marks it as used.
+    pub fn get<Q>(&self, slot: Slot, path: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.shard(path).get(slot, path)
     }
 
@@ -325,15 +427,21 @@ impl<V: Weighable + Clone> Cache<V> {
     /// the old value (or `None`) and returns the new value, or `None` to remove
     /// the entry. A new value that exceeds its shard's budget also removes the
     /// entry.
-    pub fn update<F>(&self, slot: Slot, path: &str, f: F)
+    pub fn update<Q, F>(&self, slot: Slot, path: &Q, f: F)
     where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
         F: FnOnce(Option<V>) -> Option<V>,
     {
         self.update_with_result(slot, path, |old| (f(old), ()));
     }
 
     /// Removes a slot of `path`.
-    pub fn delete(&self, slot: Slot, path: &str) {
+    pub fn delete<Q>(&self, slot: Slot, path: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.shard(path).delete(slot, path);
     }
 
@@ -346,7 +454,7 @@ impl<V: Weighable + Clone> Cache<V> {
 
     /// Returns a copy of every entry. Each shard is copied under its own lock,
     /// so the result is not one atomic snapshot of the whole cache.
-    pub fn entries(&self) -> Vec<(Slot, String, V)> {
+    pub fn entries(&self) -> Vec<(Slot, K, V)> {
         let mut entries = Vec::new();
         self.sh.each(|s| entries.extend(s.entries()));
         entries
@@ -354,8 +462,10 @@ impl<V: Weighable + Clone> Cache<V> {
 
     /// Atomically updates a slot of `path` and returns an auxiliary result
     /// produced by the update closure.
-    pub(crate) fn update_with_result<F, R>(&self, slot: Slot, path: &str, f: F) -> R
+    pub(crate) fn update_with_result<Q, F, R>(&self, slot: Slot, path: &Q, f: F) -> R
     where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
         F: FnOnce(Option<V>) -> (Option<V>, R),
     {
         let (result, evicted) = self.shard(path).update_evicting(slot, path, f);
@@ -367,8 +477,10 @@ impl<V: Weighable + Clone> Cache<V> {
     /// latest and earlier values. It returns the new latest value, the new
     /// earlier value or `None` to leave the earlier slot as it is, and an
     /// auxiliary result.
-    pub(crate) fn update_both<F, R>(&self, path: &str, f: F) -> R
+    pub(crate) fn update_both<Q, F, R>(&self, path: &Q, f: F) -> R
     where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = K> + ?Sized,
         F: FnOnce(Option<V>, Option<V>) -> (Option<V>, Option<V>, R),
     {
         let (result, evicted) = self.shard(path).update_both_evicting(path, f);
@@ -376,7 +488,7 @@ impl<V: Weighable + Clone> Cache<V> {
         result
     }
 
-    fn evicted(&self, evicted: Vec<Evicted<V>>) {
+    fn evicted(&self, evicted: Vec<Evicted<K, V>>) {
         if let Some(on_evict) = &self.on_evict {
             for (slot, path, value) in evicted {
                 on_evict(slot, &path, value);
@@ -409,7 +521,7 @@ mod tests {
         }
     }
 
-    impl<V: Weighable + Clone> TestUpdates<V> for CacheShard<V> {
+    impl<V: Weighable + Clone> TestUpdates<V> for CacheShard<String, V> {
         fn update_with_result<R>(
             &self,
             slot: Slot,
@@ -420,7 +532,7 @@ mod tests {
         }
     }
 
-    impl<V: Weighable + Clone> TestUpdates<V> for Cache<V> {
+    impl<V: Weighable + Clone> TestUpdates<V> for Cache<String, V> {
         fn update_with_result<R>(
             &self,
             slot: Slot,
@@ -514,7 +626,7 @@ mod tests {
 
     #[test]
     fn update_nope() {
-        let c: CacheShard<TestEntry> = CacheShard::new(100);
+        let c: CacheShard<String, TestEntry> = CacheShard::new(100);
         c.update(L, "a", |old| {
             assert!(old.is_none());
             None
@@ -534,17 +646,37 @@ mod tests {
     }
 
     #[test]
-    fn evicts_lru() {
+    fn evicts_the_oldest_when_no_entry_was_hit() {
         // Budget for two 3-byte entries.
         let c = CacheShard::new(6);
         c.set(L, "a", e("aaa"));
         c.set(L, "b", e("bbb"));
         assert_eq!(c.size(), 6);
-        // Adding a third entry evicts the least recently used ("a").
+        // A new entry counts as used, so the eviction for "c" clears every
+        // bit, and then removes the oldest ("a").
         c.set(L, "c", e("ccc"));
         assert_eq!(c.get(L, "a"), None);
         assert!(c.get(L, "b").is_some());
         assert!(c.get(L, "c").is_some());
+        assert_eq!(c.size(), 6);
+    }
+
+    #[test]
+    fn a_hit_gives_the_oldest_entry_a_second_chance() {
+        // Budget for two 3-byte entries.
+        let c = CacheShard::new(6);
+        c.set(L, "a", e("aaa"));
+        c.set(L, "b", e("bbb"));
+        // The eviction for "c" clears the bits of "b" and "c", and removes
+        // "a", the oldest.
+        c.set(L, "c", e("ccc"));
+        assert_eq!(c.size(), 6);
+        c.get(L, "b");
+        // "b" is now the oldest, but a hit read it, so "c" goes first.
+        c.set(L, "d", e("ddd"));
+        assert_eq!(c.get(L, "c"), None);
+        assert_eq!(c.get(L, "b"), Some(e("bbb")));
+        assert_eq!(c.get(L, "d"), Some(e("ddd")));
         assert_eq!(c.size(), 6);
     }
 
@@ -581,15 +713,20 @@ mod tests {
     }
 
     #[test]
-    fn the_slots_of_a_path_leave_in_least_recently_used_order() {
+    fn the_slots_of_a_path_leave_separately() {
         let c = CacheShard::new(6);
         c.set(Slot::Earlier, "p", e("aaa"));
         c.set(Slot::Latest, "p", e("bbb"));
-        c.get(Slot::Earlier, "p");
+        // The earlier slot is the oldest entry, so it leaves alone.
         c.set(Slot::Latest, "q", e("ccc"));
-        assert_eq!(c.get(Slot::Latest, "p"), None);
-        assert_eq!(c.get(Slot::Earlier, "p"), Some(e("aaa")));
-        assert_eq!(c.get(Slot::Latest, "q"), Some(e("ccc")));
+        assert_eq!(c.get(Slot::Earlier, "p"), None);
+        assert_eq!(c.get(Slot::Latest, "p"), Some(e("bbb")));
+        // The latest slot of "p" is now the oldest, and a hit read it, so
+        // "q" leaves first.
+        c.set(Slot::Earlier, "p", e("ddd"));
+        assert_eq!(c.get(Slot::Latest, "q"), None);
+        assert_eq!(c.get(Slot::Latest, "p"), Some(e("bbb")));
+        assert_eq!(c.get(Slot::Earlier, "p"), Some(e("ddd")));
     }
 
     #[test]
@@ -687,7 +824,7 @@ mod tests {
         let mut i = 0;
         while res.len() < count {
             let k = format!("k{i}");
-            if shard::index(k.as_bytes(), n) == target {
+            if shard_index(k.as_str(), n) == target {
                 res.push(k);
             }
             i += 1;
@@ -730,11 +867,11 @@ mod tests {
     #[test]
     fn eviction_hook_receives_capacity_evictions_only() {
         let n = shard::count();
-        let evicted = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let evicted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = evicted.clone();
         let c = Cache::with_eviction(
             6 * n,
-            Box::new(move |_: Slot, key: &str, value: TestEntry| {
+            Box::new(move |_: Slot, key: &String, value: TestEntry| {
                 sink.lock().unwrap().push((key.to_owned(), value));
             }),
         );

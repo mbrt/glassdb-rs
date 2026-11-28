@@ -30,6 +30,7 @@ use serde_json::{Map, Value as Json};
 
 use super::backend::Factory;
 use super::{Execution, cooldown, progress, stall};
+use crate::time::Cores;
 use config::{CellPoint, Resolved, Start};
 use model::CellSpec;
 use progress::Stage;
@@ -299,6 +300,7 @@ async fn run_cell(
         None => open_instances(&storage, spec).await?,
     };
     let databases: Vec<Database> = instances.iter().map(|i| i.db.clone()).collect();
+    let cores: Vec<Cores> = instances.iter().map(|_| Cores::new()).collect();
 
     let until = spec.until()?;
     let shared = Arc::new(Shared {
@@ -348,7 +350,8 @@ async fn run_cell(
                     if keys.pass_len().is_some() && until.by_passes() && shape.measured {
                         shared.passes_left.fetch_add(1, Ordering::Relaxed);
                     }
-                    let target = if shape.kind.fresh_instance() {
+                    let fresh = shape.kind.fresh_instance();
+                    let target = if fresh {
                         Target::Fresh {
                             opener: Opener {
                                 backend: storage.backend.clone(),
@@ -377,6 +380,11 @@ async fn run_cell(
                             collections: spec.collections,
                             seed: workers::worker_seed(worker_index),
                             view: OnceLock::new(),
+                            cores: if fresh {
+                                Cores::new()
+                            } else {
+                                cores[instance].clone()
+                            },
                         }
                         .spawn(),
                     );

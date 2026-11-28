@@ -131,48 +131,29 @@ watchdogs (`--drain-timeout` and the limit of the full GCs) and
 `--run-cooldown` use wall time, because they protect the host. The `wallMs`
 fields of the result are wall time.
 
-`--time=virtual` replaces wall time with virtual time. The process runs
-on one thread with a paused Tokio clock, and model time jumps over each wait of
-an idle process. The paused clock rounds each timer up to a whole millisecond,
-so `rt` runs model time 1000 times as slow as that clock: model waits are exact
-to a microsecond. The engine and `rt` are the same as in a real-time run. A run takes the time
-of its CPU work, not of its model duration. With `--latency-jitter=false`, two
-runs of the same revision give nearly the same result: the engine randomizes
-the cadence of its background tasks, so a window that holds a pass of the
-garbage collector can count one listing more or less, and records with a
-timestamp can change their size by a byte with the start time of the process.
-This moves the latency of large writes by under 1%. CPU work takes no model
-time, so after each transaction a worker waits in its place, and the wait is in
-the measured latency. The wait is a first-order model of the CPU time: 5 µs for
-each key that the transaction only reads, and 80 µs for each key that it
-writes, its read included (`Kind::cpu_units`). A scan costs 5 µs for each key of
-its span, or of the pool for a scan of the whole collection. A transaction
-costs at least 5 µs. These values
-are the wall time of a measurement in virtual time over its transactions, with
-one worker on warm caches. With `--latency-jitter`, each wait is uniform within
-15% of its mean, so that workers on transactions with no backend operation do
-not run in lockstep. A transaction with no backend operation then still
-advances model time. A task that runs in a loop at one
-model instant, such as a livelock, still stops model time. If model time does
-not advance for 60 s of wall time while a cell runs, the run fails with an error
-that names the cell and its shapes. Virtual time needs `--backend=memory`:
-a paused clock also jumps while a task waits for the operating system, as for
-the socket of `fakes3`. Latencies are lower than in real time, where CPU work
-takes model time and each wait can end up to a millisecond late, so a
-comparison must use one mode on both sides. The
-comparison of two revisions in CI uses it, because both sides have the same
-effects and the results repeat. Use it also for fast checks and for a first look
-at the shape of a sweep. The canonical plots use it too, because they assume
-that each database instance has a host of its own with enough CPU. These
-effects make it unfit for the absolute value of a metric on one host:
+`--time=virtual` replaces wall time with virtual time. The process runs on one
+thread with a paused Tokio clock, and model time jumps over each wait of an
+idle process, so a run takes the time of its CPU work, not of its model
+duration. The engine is the same as in a real-time run. With
+`--latency-jitter=false`, two runs of the same revision give nearly the same
+result.
 
-- CPU and allocation costs take no model time, apart from the wait that models
-  the CPU time of each transaction, so a run shows no saturation of the host.
-- The watchdogs use virtual time, so only a wall-time limit on the process
-  stops a CPU livelock.
+CPU work takes no model time, so after each transaction a worker waits in its
+place, and the wait is in the measured latency. The wait is a first-order model
+of the CPU time (`Kind::cpu_units`): 4 µs for each key that the transaction
+only reads or scans, and 80 µs for each key that it writes, its read included.
+A transaction costs at least 4 µs. Each database instance has 32 model cores:
+a worker holds one core while it waits, so the workers of one instance spend at
+most 32 CPU charges at the same time. With `--latency-jitter`, each wait varies
+within 15% of its mean. If model time does not advance for 60 s of wall time
+while a cell runs, for example in a livelock, the run fails.
 
-The result records the mode as `timeMode`. Results of different modes are not
-comparable.
+Virtual time needs `--backend=memory`. Its results repeat and do not depend on
+the host, so the CI comparison of two revisions uses it, and so do the
+canonical plots. It does not give the absolute value of a metric on one host:
+latencies are lower than in real time, and a run shows no saturation of the
+host CPU. Compare results of one mode only. The result records the mode as
+`timeMode`.
 
 ## Configuration layers
 

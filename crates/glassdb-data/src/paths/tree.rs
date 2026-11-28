@@ -101,8 +101,10 @@ pub(super) fn nodes_prefix(prefix: &str) -> String {
 
 fn parse_collection(prefix: &str) -> Result<CollectionAddress, PathError> {
     let (db_prefix, id) = parse_collection_prefix(prefix)?;
-    DbPrefix::try_from(db_prefix)?;
-    Ok(CollectionAddress::new(db_prefix, id))
+    Ok(CollectionAddress::from_db_prefix(
+        DbPrefix::try_from(db_prefix)?,
+        id,
+    ))
 }
 
 fn write_collection_prefix(

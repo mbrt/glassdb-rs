@@ -26,6 +26,71 @@ limit. Earlier entries that do not pass `--prefix-depth` used 2 segments, where
 all collections of a database share one limit. Pass `--prefix-depth=2` to
 measure them again.
 
+## Cache-only reads and the model cores of an instance
+
+Stale read-only transactions that use cached leaf states only were limited by
+CPU. In real time, 16 readers on one instance committed only about 3.5 times
+as many transactions as one reader. Each transaction copied about 10 reference counts
+of `CachedStore`, and the `Arc<str>` of the database prefix in each path. It
+also formatted the backend name of each path that it looked up, and each cache
+hit took the exclusive lock of its shard. In virtual time, the throughput of
+such readers grew without a limit with their count.
+
+The changes:
+
+- Virtual time gives each database instance 32 model cores (`4e2e614bf`).
+- `CachedStore` is one `Arc`, and the process keeps one copy of each database
+  prefix (`ae0484e4d`, `5f16a7bf9`).
+- The decoded cache finds a state by its path, so a hit formats no backend
+  name (`5f16a7bf9`).
+- A cache hit takes the shard lock shared and sets an access bit. Eviction
+  gives a second chance to an entry with its bit set (CLOCK) (`dee63b5a7`).
+- The model CPU unit of a read key is 4 µs (was 5 µs), and a written key
+  stays at 80 µs (20 units). The cache-only stale read took 24% less wall
+  time in virtual time. A warm read with a backend call and a read-modify-write
+  did not change beyond the noise.
+
+### Setup
+
+- base: `cf02b77d6`; target: this change.
+- The host is an Intel Core Ultra 9 185H (6 performance cores, 22 threads).
+  Other processes loaded it (load average 15 to 23), so each real-time value
+  is the median of three runs, with the base and the target interleaved. Only
+  the ratios between the two sides are reliable.
+- Scaling: `--experiment=hack/perf/experiments/stale-reads-scaling.toml`,
+  `--latency-jitter=false`, `--time=real` and `--time=virtual`.
+- CI cells: the `ci/counters` experiments, one run, `--time=virtual`.
+
+### Results
+
+`stale-reads-scaling`, stale reads of one key, tx/s:
+
+| Readers | Base (real) | Target (real) | Ratio | Base (virtual) | Target (virtual) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 120k | 190k | 1.59 | 200k | 250k |
+| 4 | 270k | 535k | 1.98 | 800k | 1.0M |
+| 16 | 424k | 691k | 1.63 | 3.2M | 4.0M |
+| 64 | 417k | 809k | 1.94 | 12.8M | 8.0M |
+
+- At a lower load (load average about 4), the target committed 1.03M tx/s
+  with 16 readers and 250k with one reader, at a mean latency of 3.5 µs. The
+  base committed about 503k and 172k in an earlier run at a similar load.
+- In virtual time, 64 readers wait for the 32 model cores of the instance,
+  so their latency doubles.
+- What remains at 16 readers is spread out: the cache hit (12%), the
+  sequence counter of `Timeline` (9%), the registration of each transaction
+  in `Monitor` (7%), and the staleness cutoff (6%).
+
+The CI counters:
+
+- No cell changes, except the stale reads, which use the read unit.
+- `stale-reads-single`: 25% more transactions, from the shorter unit.
+- `stale-reads-view`: `stale-view-single` commits 55,612 transactions in
+  place of 19,043, and its mean latency is 9 µs in place of 26 µs. With
+  latency jitter, its timing case changes less: 86,294 transactions in 2 s in
+  place of 83,167. The change comes from the unit alone, so without jitter
+  this case depends strongly on the length of the CPU charge.
+
 ## ADR-092: key accesses cover the binding of their collection
 
 [ADR-092](../adr/092-key-accesses-cover-the-binding-of-their-collection.md)

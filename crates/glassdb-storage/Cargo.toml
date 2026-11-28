@@ -16,6 +16,7 @@ glassdb-concurr = { version = "0.4.2", path = "../glassdb-concurr" }
 glassdb-data = { version = "0.4.2", path = "../glassdb-data" }
 glassdb-proto = { version = "0.4.2", path = "../glassdb-proto" }
 futures = "0.3.32"
+foldhash = "0.2.0"
 hashlink = "0.12.0"
 prost = "0.14.3"
 prost-types = "0.14.3"
